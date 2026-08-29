@@ -1,0 +1,307 @@
+openapi: 3.1.0
+info:
+  title: TaskForge API
+  version: 0.1.0-m1
+  description: |
+    Durable job ingress.
+
+    This document describes **only the endpoints that are implemented**. The rest
+    of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing,
+    cancellation, retry, DLQ, workers, queues — arrives with the milestone that
+    makes it real. An endpoint is never documented here before it works.
+
+    ## Authentication
+
+    None yet. Milestone M1 attributes every request to a single configured
+    development scope, and the service therefore binds to loopback only.
+    Database-backed API keys are milestone M5. See `docs/CURRENT_STATE.md`.
+
+    ## Idempotency
+
+    `POST /v1/jobs` requires an `Idempotency-Key` header. TaskForge canonicalizes
+    every job-defining field and hashes it into a request fingerprint:
+
+    - first use of a key → `201 Created`
+    - same key, equivalent request → `200 OK` with the original job
+    - same key, different request → `409 Conflict`
+
+    "Equivalent" means equivalent after normalization: reordering JSON keys,
+    stating a default explicitly, or repeating a required capability all describe
+    the same job. Numeric spelling (`1` versus `1.0`) is treated as a difference.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development
+
+tags:
+  - name: Jobs
+  - name: Health
+
+paths:
+  /v1/jobs:
+    post:
+      tags: [Jobs]
+      summary: Submit a job
+      description: |
+        Durably accepts a job. The job, its idempotency record, and the broker
+        notification are written in one PostgreSQL transaction, so a success
+        response means the job is durable.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 255 }
+          description: Caller-generated key, unique per distinct submission.
+        - name: X-Request-Id
+          in: header
+          required: false
+          schema: { type: string, maxLength: 128 }
+          description: |
+            Echoed back and included in error bodies. Ignored if it is longer
+            than 128 bytes or contains control characters.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmitJobRequest' }
+            examples:
+              minimal:
+                value:
+                  queue: default
+                  job_type: demo.echo
+                  payload: { message: hello }
+              full:
+                value:
+                  queue: default
+                  job_type: demo.sleep
+                  payload: { duration_ms: 5000 }
+                  priority: 70
+                  max_attempts: 5
+                  timeout_seconds: 45
+                  scheduled_at: null
+                  required_capabilities: [cpu]
+      responses:
+        '201':
+          description: The job was created.
+          headers:
+            X-Request-Id: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '200':
+          description: An identical earlier submission already created this job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400':
+          description: |
+            The body was not a single valid JSON object, or it contained an
+            unknown field. Unknown fields are rejected rather than ignored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: This `Idempotency-Key` was already used for a different request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            The body was valid JSON but the request was invalid — including a
+            non-null `scheduled_at`, which is not implemented in this milestone.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                scheduledNotImplemented:
+                  value:
+                    error:
+                      code: validation_failed
+                      message: the request was rejected by validation
+                      details:
+                        - field: scheduled_at
+                          message: delayed execution is not implemented in this milestone; send null or omit the field
+                      request_id: 6a1f...
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      summary: Read a job
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404':
+          description: |
+            No such job in the caller's scope. A malformed id also answers 404,
+            so a caller cannot distinguish an invalid id from someone else's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness
+      description: |
+        Reports only that the process is running. It deliberately checks no
+        dependency: a liveness probe that fails during a database blip would
+        restart a healthy process and make an outage worse.
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: alive }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness
+      description: Reports whether this process can serve traffic, checking its dependencies under a bounded timeout.
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: A required dependency is unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+components:
+  schemas:
+    SubmitJobRequest:
+      type: object
+      additionalProperties: false
+      required: [queue, job_type, payload]
+      properties:
+        queue:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+          description: Must already exist. Unknown queues are rejected with 422.
+        job_type:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        payload:
+          type: object
+          description: Arbitrary JSON object. Immutable once submitted.
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 50
+          description: Higher wins. V1 is strict priority with deterministic tie-breaking, not fairness.
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 3
+          description: Total attempts, including the first.
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          default: 300
+        scheduled_at:
+          type: [string, 'null']
+          format: date-time
+          default: null
+          description: |
+            Not implemented in this milestone. Must be null or omitted; a
+            non-null value is rejected with 422 rather than silently ignored.
+        required_capabilities:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+          default: []
+          description: Treated as a set — order is insignificant and duplicates are collapsed.
+
+    Job:
+      type: object
+      required: [id, queue, job_type, payload, status, priority, max_attempts, timeout_seconds, required_capabilities, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        queue: { type: string }
+        job_type: { type: string }
+        payload: { type: object }
+        status:
+          type: string
+          enum: [PENDING, QUEUED, LEASED, RUNNING, RETRY_WAIT, CANCEL_REQUESTED, SUCCEEDED, CANCELED, DEAD_LETTERED]
+          description: |
+            The full V1 state machine. Only `QUEUED` is produced in this
+            milestone, because nothing transitions a job yet.
+        priority: { type: integer }
+        max_attempts: { type: integer }
+        timeout_seconds: { type: integer }
+        required_capabilities:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        components:
+          type: object
+          additionalProperties: { type: string, enum: [ok, unavailable] }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - validation_failed
+                - malformed_json
+                - unknown_queue
+                - idempotency_conflict
+                - not_found
+                - payload_too_large
+                - method_not_allowed
+                - internal_error
+              description: Stable machine-readable code. Branch on this, not on `message`.
+            message: { type: string }
+            details:
+              type: array
+              description: Field-level problems. Every problem in a request is reported at once.
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+            request_id: { type: string }
