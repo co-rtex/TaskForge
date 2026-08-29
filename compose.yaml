@@ -1,0 +1,37 @@
+# Local development infrastructure for TaskForge.
+#
+# Every port is bound to 127.0.0.1 on purpose: nothing here is authenticated yet
+# (see docs/CURRENT_STATE.md), so nothing here may be reachable off this machine.
+name: taskforge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: taskforge
+      POSTGRES_PASSWORD: taskforge
+      POSTGRES_DB: taskforge
+      # initdb needs to create the data directory itself with mode 0700,
+      # so PGDATA points at a subdirectory of the tmpfs mount, not the mount.
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Deterministic collation so index ordering does not vary by host locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # 5432 and 5433 are commonly taken by other local projects.
+      - "127.0.0.1:5442:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskforge -d taskforge"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      # Local data is disposable. `make down` is expected to be destructive.
+      - /var/lib/postgresql/data
+
+  elasticmq:
+    # SQS-compatible broker. See docs/adr/0005-elasticmq-for-local-broker.md.
+    image: softwaremill/elasticmq-native:1.6.11
+    ports:
+      - "127.0.0.1:9324:9324"
+    volumes:
+      - ./deploy/local/elasticmq.conf:/opt/elasticmq.conf:ro
