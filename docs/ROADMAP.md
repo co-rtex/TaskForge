@@ -11,9 +11,9 @@ order; it does not report progress evidence.
 
 ---
 
-## Current milestone — M1: Durable job ingress and recoverable outbox
+## M1: Durable job ingress and recoverable outbox
 
-**Status:** in progress
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the evidence.
 
 **Objective.** Accept job submissions durably and idempotently, and deliver a
 recoverable work-availability notification to a real local SQS-compatible broker.
@@ -90,7 +90,7 @@ These are documented as planned work. They are **not** scaffolded as empty code.
 
 ---
 
-## Remaining V1 milestones
+## Current milestone — M2: Workers, sessions, and atomic claim
 
 ### M2 — Workers, sessions, and atomic claim
 **Objective.** A worker registers a process session, claims a job atomically under
@@ -101,7 +101,12 @@ enforcement; `taskforge-worker` with a bounded pool; the `demo.echo` handler.
 **Acceptance.** Exactly one worker wins a contested claim; concurrency limits hold
 under load; a job runs end to end; duplicate broker delivery produces at most one
 active lease.
-**Depends on.** M1.
+**Depends on.** M1 (complete).
+**Status:** not started.
+
+---
+
+## Remaining V1 milestones
 
 ### M3 — Heartbeats, lease renewal, and crash recovery
 **Objective.** A killed worker's job is recovered and completed by another worker,

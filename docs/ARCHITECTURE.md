@@ -13,12 +13,20 @@ Implementation status lives in [CURRENT_STATE.md](CURRENT_STATE.md).
 - **[PARTIAL]** — some of it is built; the section says exactly which part.
 - **[PLANNED]** — designed but not built. Nothing here works yet.
 
-As of this document's last update, everything below is **[PLANNED]** unless marked
-otherwise. Never promote a marker without a passing test.
+Milestone M1 (durable job ingress and recoverable outbox) is built. Everything
+else below is **[PLANNED]** — designed, but not written. Never promote a marker
+without a passing test.
+
+**Implemented today:** the submission transaction (section 6), the transactional
+outbox and its publisher (section 7), the broker interface (section 7), the
+notification contract (section 3), and the parts of the schema those need
+(section 16). Sections 4, 5, 8, 9, 10, 11, and 14 are design only.
 
 ---
 
-## 1. Model: PostgreSQL-authoritative, pull-based claim
+## 1. Model: PostgreSQL-authoritative, pull-based claim — [PARTIAL]
+
+Steps 1, 2, and 5 of the flow below are implemented. Steps 3, 4, and 6-12 are planned.
 
 TaskForge is a **pull-based** system with a **PostgreSQL-authoritative** control
 plane. The broker signals only that work may exist; PostgreSQL decides atomically
@@ -60,22 +68,23 @@ single outbox publisher · a single reconciler instance.
 
 ---
 
-## 2. Components
+## 2. Components — [PARTIAL]
 
-| Component | Responsibility |
-| --- | --- |
-| `taskforge-api` | Validate and durably accept submissions; serve read APIs; serve internal worker control operations. |
-| `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. |
-| `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. |
-| `taskforge-worker` | Register a session, poll, claim, execute trusted handlers, renew leases, report fenced outcomes. |
-| `taskforge-reconciler` | Expire leases, abandon stale attempts, release capacity, finalize cancellation, repair drift. |
-| `taskforge-cli` | Operator and developer command-line interface. |
+| Component | Responsibility | Status |
+| --- | --- | --- |
+| `taskforge-api` | Validate and durably accept submissions; serve read APIs; serve internal worker control operations. | **Built** for submission and read; worker control operations are planned. |
+| `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
+| `taskforge-migrate` | Apply schema migrations. | **Built** |
+| `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. | Planned (M4) |
+| `taskforge-worker` | Register a session, poll, claim, execute trusted handlers, renew leases, report fenced outcomes. | Planned (M2) |
+| `taskforge-reconciler` | Expire leases, abandon stale attempts, release capacity, finalize cancellation, repair drift. | Planned (M3) |
+| `taskforge-cli` | Operator and developer command-line interface. | Planned (M5) |
 
 Every component is safe to run with N replicas.
 
 ---
 
-## 3. Data ownership
+## 3. Data ownership — [IMPLEMENTED] for the tables that exist
 
 **PostgreSQL is authoritative** for job, attempt, lease, worker-session, idempotency,
 outbox, and logical DLQ state. See [ADR-0001](adr/0001-postgresql-as-authoritative-state.md).
@@ -94,7 +103,9 @@ Two distinct dead-letter concepts exist and must not be conflated:
 
 ---
 
-## 4. Job state machine
+## 4. Job state machine — [PLANNED]
+
+The full state set is enforced by a `CHECK` constraint today, but nothing transitions a job yet: the `jobs` table is insert-only and every row is `QUEUED`.
 
 ```
 PENDING ──► QUEUED ──► LEASED ──► RUNNING ──► SUCCEEDED
@@ -147,7 +158,9 @@ finalizes cancellation only after the lease can no longer commit.
 
 ---
 
-## 5. Domain model
+## 5. Domain model — [PARTIAL]
+
+Only Job is implemented, and only its submission fields. Attempt, worker, session, and lease are design.
 
 ### Job
 Id · auth scope · queue · job type · canonical immutable payload · status · priority
@@ -190,7 +203,7 @@ never resurrects a lease.
 
 ---
 
-## 6. Idempotent submission
+## 6. Idempotent submission — [IMPLEMENTED]
 
 Scoped by **auth scope + `Idempotency-Key` header**.
 
@@ -206,7 +219,7 @@ Idempotency scope never leaks between projects or API keys.
 
 ---
 
-## 7. Transactional outbox
+## 7. Transactional outbox — [IMPLEMENTED]
 
 See [ADR-0004](adr/0004-transactional-outbox.md).
 
@@ -217,9 +230,10 @@ its notification was never recorded.
 Publisher loop:
 
 1. Claim a batch of due pending events with `FOR UPDATE SKIP LOCKED`, increment the
-   attempt counter, and push `available_at` forward by a backoff interval. Commit.
-   The advanced `available_at` acts as a visibility timeout, so a publisher that dies
-   mid-flight releases its events automatically.
+   attempt counter, and push `available_at` forward by a fixed **claim timeout**.
+   Commit. That advanced `available_at` is a visibility timeout: a publisher that
+   dies mid-flight releases its events automatically once it lapses. It is
+   deliberately not the retry backoff — a claim is not a failure.
 2. Publish to the broker **outside** the transaction, so no lock is held across
    network I/O.
 3. Mark the event published in a second transaction.
@@ -230,8 +244,11 @@ This is expected and harmless: notifications are advisory, and the claim query i
 thing that enforces single execution. Duplicate delivery can never produce two active
 leases.
 
-Backoff is bounded exponential with jitter; the random source is injected so tests
-are deterministic. Stuck events remain visible and repairable. Event schemas are
+A publish *failure* is what applies retry backoff: the error is recorded and
+`available_at` is set from a bounded exponential policy with jitter. The random
+source is injected so tests are deterministic. A failed event is never marked
+terminally failed — the job it refers to is already durable and would otherwise sit
+queued forever — so stuck events stay visible and repairable. Event schemas are
 versioned.
 
 ### Broker interface
@@ -243,7 +260,7 @@ expressed through visibility timeout.
 
 ---
 
-## 8. Scheduling and claim
+## 8. Scheduling and claim — [PLANNED]
 
 The scheduler promotes due `PENDING` and `RETRY_WAIT` jobs using **PostgreSQL server
 time**, creating notification outbox events transactionally, and re-notifies stranded
@@ -271,7 +288,9 @@ property, and is tested. Weighted fairness and aging are post-V1.
 
 ---
 
-## 9. Concurrency control
+## 9. Concurrency control — [PARTIAL]
+
+The outbox claim and the idempotency constraint are implemented. Queue and worker capacity serialization are planned.
 
 - Queue-level global concurrency is serialized through a queue-capacity row or an
   equivalent transactionally sound reservation. Counting active rows without
@@ -284,7 +303,9 @@ property, and is tested. Weighted fairness and aging are post-V1.
 
 ---
 
-## 10. Retry, timeout, DLQ, replay
+## 10. Retry, timeout, DLQ, replay — [PLANNED]
+
+Bounded exponential backoff with injected jitter exists, but only for outbox *publication*. Job retry is planned.
 
 Failure classes: **retryable**, **permanent**, **timeout**, **canceled**.
 
@@ -302,7 +323,7 @@ defined explicitly rather than implemented ambiguously; see
 
 ---
 
-## 11. Heartbeats, leases, and crash recovery
+## 11. Heartbeats, leases, and crash recovery — [PLANNED]
 
 Server receipt time is authoritative. Development defaults (configurable, never
 hardcoded into domain logic): heartbeat every 5 s, unhealthy after 15 s.
@@ -322,9 +343,11 @@ event or log, but it never mutates the authoritative outcome.
 
 ---
 
-## 12. Reliability invariants
+## 12. Reliability invariants — [PARTIAL]
 
-Each of these must have an automated test.
+Each of these must have an automated test. Invariants 1, 10, 11, and 17 are
+implemented and tested today. The rest depend on components that do not exist yet
+and are listed here as the target.
 
 1. PostgreSQL is authoritative for all control-plane state.
 2. A terminal job never returns to a non-terminal state.
@@ -347,7 +370,7 @@ Each of these must have an automated test.
 
 ---
 
-## 13. Failure model
+## 13. Failure model — [PARTIAL]
 
 | Failure | Response |
 | --- | --- |
@@ -363,7 +386,9 @@ Each of these must have an automated test.
 
 ---
 
-## 14. Observability
+## 14. Observability — [PARTIAL]
+
+Structured JSON logging with correlation identifiers, and distinct liveness/readiness endpoints, are implemented. Tracing and metrics are planned (M6).
 
 OpenTelemetry traces span: API submission → PostgreSQL transaction → outbox → broker
 notification → claim → worker execution → result.
@@ -408,11 +433,14 @@ without explicit authorization; V1 runs entirely locally.
 
 ---
 
-## 16. Planned schema (V1)
+## 16. Schema
 
-Tables: `jobs`, `job_attempts`, `workers`, `worker_sessions`, `leases`, `queues`,
-`idempotency_records`, `outbox_events`, `results`, `dlq_entries`, `api_keys`,
-`audit_events`.
+**Implemented** (`migrations/0001_initial_job_ingress.sql`): `queues`, `jobs`,
+`idempotency_records`, `outbox_events`, plus `schema_migrations` maintained by the
+runner.
+
+**Planned:** `job_attempts`, `workers`, `worker_sessions`, `leases`, `results`,
+`dlq_entries`, `api_keys`, `audit_events`.
 
 Tables are created in the milestone that puts working behavior on them, not in
 advance. Indexes will support eligibility and priority scans, queue and status
