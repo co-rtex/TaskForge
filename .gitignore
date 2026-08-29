@@ -1,0 +1,36 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local environment — never commit real secrets
+.env
+.env.*
+!.env.example
+
+# Docker volumes / local data
+/.data/
+/pgdata/
+
+# Reviewer patch artifacts (generated, never project source)
+/*.patch
+/*.diff
+
+# Tooling caches
+/.cache/
+/coverage.out
+/coverage.html
+
+# Node / Python (later milestones)
+node_modules/
+__pycache__/
+*.egg-info/
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
