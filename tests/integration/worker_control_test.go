@@ -723,7 +723,7 @@ func TestWorkerControl_RequestTimeoutCancelsDatabaseLockWait(t *testing.T) {
 	require.NoError(t, err)
 	defer response.Body.Close()
 
-	// A deadline burned on a contended authority-row lock is an availability
+	// A deadline reached before the outcome was known is an availability
 	// condition the caller may retry, not an internal fault.
 	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
 	var envelope api.ErrorBody
@@ -740,13 +740,21 @@ func TestWorkerControl_RequestTimeoutCancelsDatabaseLockWait(t *testing.T) {
 		Status: response.StatusCode, Code: envelope.Error.Code,
 	}).Retryable(), "a 503 must stay retryable for the worker client")
 
-	// Nothing durable was mutated by the abandoned transaction.
+	// In this specific case the deadline elapsed before the claim transaction
+	// could commit, so no attempt, lease, or job transition exists. The response
+	// wording deliberately does not generalize that to every deadline, because a
+	// deadline reached during COMMIT is genuinely ambiguous.
 	require.Equal(t, 0, countRows(t, "job_attempts"))
 	require.Equal(t, 0, countRows(t, "leases"))
 	var jobStatus string
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT status FROM jobs`).Scan(&jobStatus))
 	require.Equal(t, "QUEUED", jobStatus, "the contended job must remain claimable")
+
+	// The caller is told how to resolve the ambiguity: retry with the same
+	// identifiers, or read the durable state back.
+	require.Contains(t, envelope.Error.Message, "retry")
+	require.Contains(t, envelope.Error.Message, "claim request")
 }
 
 func waitForDatabaseLock(t *testing.T, queryFragment string) {
@@ -828,6 +836,67 @@ func TestClaim_RollsBackAttemptWhenLeaseInsertFails(t *testing.T) {
 	require.Equal(t, "QUEUED", status)
 }
 
+// Gate keys for the advisory-lock barriers below. They are fixed so a failed run
+// leaves a diagnosable lock rather than a random one, and distinct so the two
+// registration-race tests can never gate each other.
+const (
+	claimGateKey   int64 = 7710010001
+	succeedGateKey int64 = 7710010002
+)
+
+// replacementSessionID is fixed per test run so a barriered race can assert the
+// replacement's identity without first observing its return value.
+var replacementSessionID = uuid.New()
+
+// gateOnAdvisoryLock parks a production statement mid-transaction so a race can
+// be arranged deliberately instead of being left to the scheduler.
+//
+// The test takes a session-level advisory lock on its own pooled connection,
+// then installs a trigger whose only effect is to wait for that lock. Any
+// transaction reaching the gated statement blocks there while still holding
+// every row lock it has already acquired, which is exactly what makes the
+// "operation acquired authority first" ordering deterministic. The returned
+// function releases the gate; the trigger itself is dropped in cleanup, after
+// the gated transaction has finished, because DROP TRIGGER would otherwise
+// queue behind it.
+func gateOnAdvisoryLock(t *testing.T, key int64, triggerName, timing, table string) func() {
+	t.Helper()
+	ctx := context.Background()
+
+	holder, err := testPool.Acquire(ctx)
+	require.NoError(t, err)
+	var held bool
+	require.NoError(t, holder.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&held))
+	require.True(t, held, "the test must own the gate before installing it")
+
+	function := fmt.Sprintf("taskforge_test_gate_fn_%d", key)
+	_, err = testPool.Exec(ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN PERFORM pg_advisory_xact_lock(%d); RETURN NEW; END $$`, function, key))
+	require.NoError(t, err)
+	_, err = testPool.Exec(ctx, fmt.Sprintf(
+		`CREATE TRIGGER %s %s ON %s FOR EACH ROW EXECUTE FUNCTION %s()`,
+		triggerName, timing, table, function))
+	require.NoError(t, err)
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			var released bool
+			if err := holder.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&released); err != nil {
+				t.Errorf("release advisory gate: %v", err)
+			}
+			holder.Release()
+		})
+	}
+	t.Cleanup(func() {
+		release()
+		_, _ = testPool.Exec(ctx, fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, triggerName, table))
+		_, _ = testPool.Exec(ctx, fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, function))
+	})
+	return release
+}
+
 // registerReplacement boots a new process session for the same logical worker,
 // which fences the prior current session.
 func registerReplacement(t *testing.T, store *workers.Store, previous workers.Registration) workers.Session {
@@ -893,60 +962,77 @@ func TestRegisterReplacement_RacingClaimYieldsOnlyValidSerialOutcomes(t *testing
 		require.Equal(t, "QUEUED", status, "the job must stay claimable by the replacement")
 	})
 
-	t.Run("unbarriered race resolves to exactly one valid serial outcome", func(t *testing.T) {
-		const rounds = 12
-		fenced, claimed := 0, 0
-		for round := 0; round < rounds; round++ {
-			reset(t)
-			store := controlStore()
-			registration := workerRegistration("race-claim-loop", 1, nil, []string{"demo.echo"})
-			original := registerWorker(t, store, registration)
-			createJob(t, fmt.Sprintf("race-claim-loop-%02d", round), "demo.echo", 50, nil)
+	t.Run("claim first: it holds the session row, replacement waits, and it commits", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		registration := workerRegistration("race-claim-first", 1, nil, []string{"demo.echo"})
+		original := registerWorker(t, store, registration)
+		jobID := createJob(t, "race-claim-first", "demo.echo", 50, nil)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			replacementRegistration := registration
-			replacementRegistration.SessionID = uuid.New()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-			start := make(chan struct{})
-			claimErr := make(chan error, 1)
-			registerErr := make(chan error, 1)
-			go func() {
-				<-start
-				_, err := store.Claim(ctx, testScope, claimRequest(original, "default"))
-				claimErr <- err
-			}()
-			go func() {
-				<-start
-				_, err := store.Register(ctx, testScope, replacementRegistration)
-				registerErr <- err
-			}()
-			close(start)
+		// Park the claim inside its own transaction at the attempt insert, which
+		// is after it has taken the queue and worker-session row locks. The claim
+		// therefore holds the exact row registration must fence.
+		release := gateOnAdvisoryLock(t, claimGateKey,
+			"taskforge_test_gate_job_attempts", "BEFORE INSERT", "job_attempts")
 
-			require.NoError(t, <-registerErr, "replacement registration must always succeed")
-			err := <-claimErr
-			cancel()
+		claimResult := make(chan workers.ClaimResult, 1)
+		claimErr := make(chan error, 1)
+		go func() {
+			result, err := store.Claim(ctx, testScope, claimRequest(original, "default"))
+			claimResult <- result
+			claimErr <- err
+		}()
+		waitForDatabaseLock(t, "INSERT INTO job_attempts")
 
-			attempts, leases := countRows(t, "job_attempts"), countActiveLeases(t)
-			switch {
-			case err == nil:
-				// The claim committed before replacement fenced the old session.
-				claimed++
-				require.Equal(t, 1, attempts, "a winning claim creates exactly one attempt")
-				require.Equal(t, 1, leases, "a winning claim creates exactly one active lease")
-			default:
-				require.ErrorIs(t, err, workers.ErrSessionUnavailable,
-					"the only valid loss is current-session fencing")
-				fenced++
-				require.Equal(t, 0, attempts, "a fenced claim leaves no attempt behind")
-				require.Equal(t, 0, leases, "a fenced claim leaves no capacity reserved")
-			}
-			require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
-			require.Equal(t, "HEALTHY", sessionStatus(t, replacementRegistration.SessionID))
-			require.LessOrEqual(t, countRows(t, "leases"), 1, "no round may produce a second lease")
-		}
-		t.Logf("valid serial outcomes over %d rounds: claimed-before-replacement=%d fenced-after-replacement=%d",
-			rounds, claimed, fenced)
+		registerErr := make(chan error, 1)
+		go func() {
+			replacement := registration
+			replacement.SessionID = replacementSessionID
+			_, err := store.Register(ctx, testScope, replacement)
+			registerErr <- err
+		}()
+		// Registration is now demonstrably blocked on the worker-session row the
+		// claim holds. This is the ordering under test, not a scheduling accident.
+		waitForDatabaseLock(t, "UPDATE worker_sessions")
+
+		release()
+		require.NoError(t, <-claimErr, "the claim held authority first and must commit")
+		result := <-claimResult
+		require.Equal(t, workers.Claimed, result.Disposition)
+		require.NoError(t, <-registerErr, "replacement must proceed once the claim commits")
+
+		// Exactly one attempt and one lease, both bound to the original session.
+		require.Equal(t, 1, countRows(t, "job_attempts"))
+		require.Equal(t, 1, countRows(t, "leases"))
+		require.Equal(t, 1, countActiveLeases(t))
+		var leaseSession uuid.UUID
+		var jobStatus string
+		require.NoError(t, testPool.QueryRow(context.Background(), `
+			SELECT l.worker_session_id, j.status
+			FROM leases l JOIN jobs j ON j.id = l.job_id
+			WHERE j.id = $1`, jobID).Scan(&leaseSession, &jobStatus))
+		require.Equal(t, original.ID, leaseSession,
+			"the lease belongs to the boot that won, never to the replacement")
+		require.Equal(t, "LEASED", jobStatus)
+
+		require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
+		require.Equal(t, "HEALTHY", sessionStatus(t, replacementSessionID))
+
+		// Capacity is intact: the surviving lease still counts against the logical
+		// worker, so the replacement cannot claim a second job past its limit.
+		createJob(t, "race-claim-first-second", "demo.echo", 50, nil)
+		blocked, err := store.Claim(context.Background(), testScope, workers.ClaimRequest{
+			WorkerID: original.WorkerID, SessionID: replacementSessionID,
+			ClaimRequestID: uuid.New(), Queue: "default",
+		})
+		require.NoError(t, err)
+		require.Equal(t, workers.CapacityExhausted, blocked.Disposition,
+			"the winning lease must still reserve logical-worker capacity")
 	})
+
 }
 
 // TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes proves the
@@ -1002,71 +1088,66 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		require.Equal(t, 1, countRows(t, "leases"))
 	})
 
-	t.Run("unbarriered race resolves to exactly one valid serial outcome", func(t *testing.T) {
-		const rounds = 12
-		committed, fenced := 0, 0
-		for round := 0; round < rounds; round++ {
-			reset(t)
-			store := controlStore()
-			registration := workerRegistration("race-succeed-loop", 1, nil, []string{"demo.echo"})
-			original := registerWorker(t, store, registration)
-			createJob(t, fmt.Sprintf("race-succeed-loop-%02d", round), "demo.echo", 50, nil)
-			claim, err := store.Claim(context.Background(), testScope, claimRequest(original, "default"))
-			require.NoError(t, err)
-			fence := assignmentFence(claim.Assignment)
-			require.NoError(t, store.Start(context.Background(), testScope, fence))
+	t.Run("succeed first: it holds the session row, replacement waits, and it commits", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		registration := workerRegistration("race-succeed-first", 1, nil, []string{"demo.echo"})
+		original := registerWorker(t, store, registration)
+		createJob(t, "race-succeed-first", "demo.echo", 50, nil)
+		claim, err := store.Claim(context.Background(), testScope, claimRequest(original, "default"))
+		require.NoError(t, err)
+		fence := assignmentFence(claim.Assignment)
+		require.NoError(t, store.Start(context.Background(), testScope, fence))
 
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			replacementRegistration := registration
-			replacementRegistration.SessionID = uuid.New()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-			start := make(chan struct{})
-			succeedErr := make(chan error, 1)
-			registerErr := make(chan error, 1)
-			go func() {
-				<-start
-				succeedErr <- store.Succeed(ctx, testScope, fence)
-			}()
-			go func() {
-				<-start
-				_, err := store.Register(ctx, testScope, replacementRegistration)
-				registerErr <- err
-			}()
-			close(start)
+		// Park the success at its final lease update, after lockFence has taken
+		// the queue and worker-session row locks.
+		release := gateOnAdvisoryLock(t, succeedGateKey,
+			"taskforge_test_gate_leases", "BEFORE UPDATE", "leases")
 
-			require.NoError(t, <-registerErr, "replacement registration must always succeed")
-			err = <-succeedErr
-			cancel()
+		succeedErr := make(chan error, 1)
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		waitForDatabaseLock(t, "UPDATE leases SET status = 'COMPLETED'")
 
-			var jobStatus, attemptStatus, leaseStatus string
-			require.NoError(t, testPool.QueryRow(context.Background(), `
-				SELECT j.status, a.status, l.status
-				FROM jobs j
-				JOIN job_attempts a ON a.job_id = j.id
-				JOIN leases l ON l.attempt_id = a.id
-				WHERE j.id = $1`, fence.JobID).Scan(&jobStatus, &attemptStatus, &leaseStatus))
+		registerErr := make(chan error, 1)
+		go func() {
+			replacement := registration
+			replacement.SessionID = replacementSessionID
+			_, err := store.Register(ctx, testScope, replacement)
+			registerErr <- err
+		}()
+		waitForDatabaseLock(t, "UPDATE worker_sessions")
 
-			switch {
-			case err == nil:
-				committed++
-				require.Equal(t, "SUCCEEDED", jobStatus)
-				require.Equal(t, "SUCCEEDED", attemptStatus)
-				require.Equal(t, "COMPLETED", leaseStatus)
-				require.Equal(t, 0, countActiveLeases(t), "a committed success releases capacity")
-			default:
-				require.ErrorIs(t, err, workers.ErrFenceRejected,
-					"the only valid loss is current-session fencing")
-				fenced++
-				require.Equal(t, "RUNNING", jobStatus, "a fenced success must not advance the job")
-				require.Equal(t, "RUNNING", attemptStatus)
-				require.Equal(t, "ACTIVE", leaseStatus)
-				require.Equal(t, 1, countActiveLeases(t), "a fenced success must not release capacity")
-			}
-			require.Equal(t, 1, countRows(t, "job_attempts"), "no round may create a second attempt")
-			require.Equal(t, 1, countRows(t, "leases"), "no round may create a second lease")
-			require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
-		}
-		t.Logf("valid serial outcomes over %d rounds: committed-before-replacement=%d fenced-after-replacement=%d",
-			rounds, committed, fenced)
+		release()
+		require.NoError(t, <-succeedErr, "the outcome held authority first and must commit")
+		require.NoError(t, <-registerErr, "replacement must proceed once the outcome commits")
+
+		var jobStatus, attemptStatus, leaseStatus string
+		var finishedAt, releasedAt *time.Time
+		require.NoError(t, testPool.QueryRow(context.Background(), `
+			SELECT j.status, a.status, l.status, a.finished_at, l.released_at
+			FROM jobs j
+			JOIN job_attempts a ON a.job_id = j.id
+			JOIN leases l ON l.attempt_id = a.id
+			WHERE j.id = $1`, fence.JobID).Scan(
+			&jobStatus, &attemptStatus, &leaseStatus, &finishedAt, &releasedAt))
+		require.Equal(t, "SUCCEEDED", jobStatus)
+		require.Equal(t, "SUCCEEDED", attemptStatus)
+		require.Equal(t, "COMPLETED", leaseStatus)
+		require.NotNil(t, finishedAt)
+		require.NotNil(t, releasedAt)
+		require.Equal(t, 1, countRows(t, "job_attempts"))
+		require.Equal(t, 1, countRows(t, "leases"))
+		require.Equal(t, 0, countActiveLeases(t), "a committed success releases capacity")
+
+		require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
+		require.Equal(t, "HEALTHY", sessionStatus(t, replacementSessionID))
+
+		// The fenced old boot still cannot mutate anything after replacement.
+		require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence),
+			workers.ErrFenceRejected)
 	})
+
 }

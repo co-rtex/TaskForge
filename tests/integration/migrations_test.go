@@ -303,15 +303,39 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 		attemptID, jobID, workerID, sessionID)
 	require.NoError(t, err)
 
-	t.Run("0004 rejects a lease whose expiry precedes its renewal", func(t *testing.T) {
-		_, err := conn.Exec(ctx, `
-			INSERT INTO leases (
-				id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
-				claim_request_id, status, acquired_at, renewed_at, expires_at
-			) VALUES ($1, $2, $3, 'upgrade-test', 'default', $4, $5, $6, 'ACTIVE',
-			          now(), now(), now() - interval '1 second')`,
-			uuid.New(), jobID, attemptID, workerID, sessionID, uuid.New())
+	t.Run("0004 isolates leases_timeline_order from the 0002 lease constraints", func(t *testing.T) {
+		// acquired < expires < renewed. That satisfies every constraint migration
+		// 0002 created — expires_at > acquired_at, and status ACTIVE with a NULL
+		// released_at — and violates only migration 0004's requirement that the
+		// expiry follow the last renewal. Without this ordering the row would trip
+		// the older leases_expiry_after_acquisition check and prove nothing about
+		// 0004.
+		insertLease := func(acquired, renewed, expires string) error {
+			_, err := conn.Exec(ctx, fmt.Sprintf(`
+				INSERT INTO leases (
+					id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+					claim_request_id, status, acquired_at, renewed_at, expires_at
+				) VALUES ('%s', '%s', '%s', 'upgrade-test', 'default', '%s', '%s', '%s',
+				          'ACTIVE', now() %s, now() %s, now() %s)`,
+				uuid.New(), jobID, attemptID, workerID, sessionID, uuid.New(),
+				acquired, renewed, expires))
+			return err
+		}
+
+		err := insertLease("- interval '10 seconds'", "+ interval '10 seconds'", "+ interval '5 seconds'")
 		require.Error(t, err)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, "23514", pgErr.Code, "a timeline violation is a check-constraint violation")
+		require.Equal(t, "leases_timeline_order", pgErr.ConstraintName,
+			"the row must fail on 0004's constraint, not on a 0002 lease constraint")
+
+		// Positive control: the same shape with renewal before expiry is accepted,
+		// which proves the rejection above was caused only by the timeline order.
+		require.NoError(t, insertLease(
+			"- interval '10 seconds'", "- interval '5 seconds'", "+ interval '5 minutes'"))
+		_, err = conn.Exec(ctx, `DELETE FROM leases WHERE job_id = $1`, jobID)
+		require.NoError(t, err)
 	})
 
 	claimRequestID := uuid.New()
