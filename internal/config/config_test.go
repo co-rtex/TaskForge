@@ -115,6 +115,38 @@ func TestWorkerConfig_ReportsEveryProblem(t *testing.T) {
 	require.Contains(t, err.Error(), "TASKFORGE_WORKER_POLL_WAIT")
 }
 
+// The SQS ReceiveMessage request converts the poll wait to whole seconds, so a
+// sub-second value truncates to 0, disables long polling, and turns every idle
+// slot into a busy receive loop. The bound is inclusive at both ends.
+func TestWorkerConfig_PollWaitMustBeWholeSecondsWithinTheBrokerBound(t *testing.T) {
+	tests := map[string]struct {
+		pollWait time.Duration
+		valid    bool
+	}{
+		"999ms truncates to zero long-poll seconds": {999 * time.Millisecond, false},
+		"1s is the inclusive lower bound":           {time.Second, true},
+		"10s is the shipped default":                {10 * time.Second, true},
+		"20s is the inclusive SQS maximum":          {20 * time.Second, true},
+		"20s001ms exceeds the SQS maximum":          {20*time.Second + time.Millisecond, false},
+		"30s exceeds the SQS maximum":               {30 * time.Second, false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			c, err := LoadWorker()
+			require.NoError(t, err)
+			c.PollWait = test.pollWait
+
+			err = c.Validate()
+			if test.valid {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "TASKFORGE_WORKER_POLL_WAIT must be between 1s and 20s")
+		})
+	}
+}
+
 func TestWorkerConfig_RejectsUnauthenticatedNonLoopbackEndpoints(t *testing.T) {
 	c, err := LoadWorker()
 	require.NoError(t, err)

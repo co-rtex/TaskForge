@@ -224,8 +224,11 @@ func (c WorkerConfig) Validate() error {
 			break
 		}
 	}
-	if c.PollWait <= 0 || c.PollWait > 20*time.Second {
-		problems = append(problems, "TASKFORGE_WORKER_POLL_WAIT must be between 1ns and 20s")
+	// The SQS ReceiveMessage request carries WaitTimeSeconds as whole seconds, so
+	// anything under 1s truncates to 0 and silently disables long polling, turning
+	// every idle slot into a busy receive loop. 20s is the SQS maximum.
+	if c.PollWait < time.Second || c.PollWait > 20*time.Second {
+		problems = append(problems, "TASKFORGE_WORKER_POLL_WAIT must be between 1s and 20s; the broker request uses whole seconds")
 	}
 	if c.RequestTimeout <= 0 {
 		problems = append(problems, "TASKFORGE_WORKER_REQUEST_TIMEOUT must be positive")
