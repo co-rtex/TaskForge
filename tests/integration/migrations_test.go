@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/database"
@@ -164,15 +165,22 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 	})
 }
 
-func TestMigration0002_BackfillsAndPreservesExistingM1Ingress(t *testing.T) {
+// TestMigrations_CarryRealM1DataThroughEveryM2Migration is the upgrade-safety
+// proof for an existing M1 deployment. It seeds representative real M1 rows
+// after migration 0001 and then applies every M2 migration in order, so the
+// backfill, the dropped speculative index, the timeline constraints, and the
+// globally unique notification claim are all exercised against data that was
+// already durable before M2 existed.
+func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 	freshDSN := withFreshDatabase(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, len(migrations), 2)
-	require.Equal(t, 1, migrations[0].Version)
-	require.Equal(t, 2, migrations[1].Version)
+	require.GreaterOrEqual(t, len(migrations), 5)
+	for i, want := range []int{1, 2, 3, 4, 5} {
+		require.Equal(t, want, migrations[i].Version, "migration order is versioned and deterministic")
+	}
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -182,41 +190,195 @@ func TestMigration0002_BackfillsAndPreservesExistingM1Ingress(t *testing.T) {
 	defer conn.Close(context.Background())
 	require.NoError(t, execMigration(ctx, conn, migrations[0]))
 
+	// Representative real M1 ingress: a durable queued job, its idempotency
+	// record, and its still-pending outbox notification.
 	jobID, eventID := uuid.New(), uuid.New()
+	secondJobID, secondEventID := uuid.New(), uuid.New()
 	createdAt := time.Date(2026, 8, 28, 12, 34, 56, 123000000, time.UTC)
+	laterAt := createdAt.Add(90 * time.Second)
 	_, err = conn.Exec(ctx, `
 		INSERT INTO jobs (
 			id, scope, queue, job_type, payload, status, priority,
 			max_attempts, timeout_seconds, created_at, updated_at
 		) VALUES ($1, 'upgrade-test', 'default', 'demo.echo', '{"message":"preserve"}',
 		          'QUEUED', 50, 3, 300, $2, $2);
+		INSERT INTO jobs (
+			id, scope, queue, job_type, payload, status, priority,
+			max_attempts, timeout_seconds, created_at, updated_at
+		) VALUES ($4, 'upgrade-test', 'default', 'demo.echo', '{"message":"second"}',
+		          'QUEUED', 70, 3, 300, $5, $5);
 		INSERT INTO idempotency_records (scope, idempotency_key, request_fingerprint, job_id)
 		VALUES ('upgrade-test', 'existing-key', repeat('a', 64), $1);
 		INSERT INTO outbox_events (id, event_type, schema_version, payload, status, created_at)
-		VALUES ($3, 'work.available', 1, '{"queue":"default"}', 'PENDING', $2);`,
-		jobID, createdAt, eventID)
+		VALUES ($3, 'work.available', 1, '{"queue":"default"}', 'PENDING', $2);
+		INSERT INTO outbox_events (id, event_type, schema_version, payload, status, created_at, published_at)
+		VALUES ($6, 'work.available', 1, '{"queue":"default"}', 'PUBLISHED', $5, $5);`,
+		jobID, createdAt, eventID, secondJobID, laterAt, secondEventID)
 	require.NoError(t, err)
 
-	require.NoError(t, execMigration(ctx, conn, migrations[1]))
-	var availableAt time.Time
-	var status, workerGroup string
-	require.NoError(t, conn.QueryRow(ctx, `
-		SELECT j.available_at, j.status, q.worker_group
-		FROM jobs j JOIN queues q ON q.name = j.queue
-		WHERE j.id = $1`, jobID).Scan(&availableAt, &status, &workerGroup))
-	require.True(t, createdAt.Equal(availableAt), "available_at must preserve the original created_at instant")
-	require.Equal(t, "QUEUED", status)
-	require.Equal(t, "default", workerGroup)
+	for _, migration := range migrations[1:5] {
+		require.NoError(t, execMigration(ctx, conn, migration),
+			"migration %04d must apply to a database holding real M1 data", migration.Version)
+	}
 
-	var idempotencyJob uuid.UUID
-	require.NoError(t, conn.QueryRow(ctx, `
-		SELECT job_id FROM idempotency_records
-		WHERE scope = 'upgrade-test' AND idempotency_key = 'existing-key'`).Scan(&idempotencyJob))
-	require.Equal(t, jobID, idempotencyJob)
-	var outboxStatus string
-	require.NoError(t, conn.QueryRow(ctx,
-		`SELECT status FROM outbox_events WHERE id = $1`, eventID).Scan(&outboxStatus))
-	require.Equal(t, "PENDING", outboxStatus)
+	t.Run("0002 backfilled eligibility and routing without touching M1 state", func(t *testing.T) {
+		var availableAt time.Time
+		var status, workerGroup string
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT j.available_at, j.status, q.worker_group
+			FROM jobs j JOIN queues q ON q.name = j.queue
+			WHERE j.id = $1`, jobID).Scan(&availableAt, &status, &workerGroup))
+		require.True(t, createdAt.Equal(availableAt), "available_at must preserve the original created_at instant")
+		require.Equal(t, "QUEUED", status)
+		require.Equal(t, "default", workerGroup)
+
+		var secondAvailableAt time.Time
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT available_at FROM jobs WHERE id = $1`, secondJobID).Scan(&secondAvailableAt))
+		require.True(t, laterAt.Equal(secondAvailableAt))
+	})
+
+	t.Run("all seeded M1 rows survive every M2 migration", func(t *testing.T) {
+		var idempotencyJob uuid.UUID
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT job_id FROM idempotency_records
+			WHERE scope = 'upgrade-test' AND idempotency_key = 'existing-key'`).Scan(&idempotencyJob))
+		require.Equal(t, jobID, idempotencyJob)
+
+		var pending, published string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT status FROM outbox_events WHERE id = $1`, eventID).Scan(&pending))
+		require.Equal(t, "PENDING", pending)
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT status FROM outbox_events WHERE id = $1`, secondEventID).Scan(&published))
+		require.Equal(t, "PUBLISHED", published)
+
+		var jobCount int
+		require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM jobs`).Scan(&jobCount))
+		require.Equal(t, 2, jobCount)
+	})
+
+	t.Run("0003 removed the speculative lease-expiry index", func(t *testing.T) {
+		var present bool
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'leases_active_expiry_idx')`,
+		).Scan(&present))
+		require.False(t, present, "M2 never scans leases by expiry; M3 adds the index its query justifies")
+	})
+
+	// The remaining assertions need real M2 rows on top of the upgraded M1 data.
+	workerID, sessionID := uuid.New(), uuid.New()
+	attemptID, leaseID := uuid.New(), uuid.New()
+	_, err = conn.Exec(ctx, `
+		INSERT INTO workers (id, scope, name) VALUES ($1, 'upgrade-test', 'upgrade-worker');
+		INSERT INTO worker_sessions (
+			id, worker_id, scope, hostname, worker_group, concurrency_limit,
+			capabilities, supported_job_types, status
+		) VALUES ($2, $1, 'upgrade-test', 'upgrade.local', 'default', 4,
+		          '{cpu}', '{demo.echo}', 'HEALTHY');`, workerID, sessionID)
+	require.NoError(t, err)
+
+	t.Run("0004 makes control-timeline order a hard invariant", func(t *testing.T) {
+		for name, statement := range map[string]string{
+			"worker session heartbeat before registration": `
+				UPDATE worker_sessions
+				SET last_heartbeat_at = registered_at - interval '1 second'
+				WHERE id = '` + sessionID.String() + `'`,
+			"worker session ended before registration": `
+				UPDATE worker_sessions
+				SET ended_at = registered_at - interval '1 second'
+				WHERE id = '` + sessionID.String() + `'`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := conn.Exec(ctx, statement)
+				require.Error(t, err, "the timeline constraint must reject this row")
+			})
+		}
+	})
+
+	_, err = conn.Exec(ctx, `
+		INSERT INTO job_attempts (
+			id, job_id, scope, queue, attempt_number, worker_id, worker_session_id, status
+		) VALUES ($1, $2, 'upgrade-test', 'default', 1, $3, $4, 'LEASED');`,
+		attemptID, jobID, workerID, sessionID)
+	require.NoError(t, err)
+
+	t.Run("0004 rejects a lease whose expiry precedes its renewal", func(t *testing.T) {
+		_, err := conn.Exec(ctx, `
+			INSERT INTO leases (
+				id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+				claim_request_id, status, acquired_at, renewed_at, expires_at
+			) VALUES ($1, $2, $3, 'upgrade-test', 'default', $4, $5, $6, 'ACTIVE',
+			          now(), now(), now() - interval '1 second')`,
+			uuid.New(), jobID, attemptID, workerID, sessionID, uuid.New())
+		require.Error(t, err)
+	})
+
+	claimRequestID := uuid.New()
+	_, err = conn.Exec(ctx, `
+		INSERT INTO leases (
+			id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+			claim_request_id, status, acquired_at, renewed_at, expires_at
+		) VALUES ($1, $2, $3, 'upgrade-test', 'default', $4, $5, $6, 'ACTIVE',
+		          now(), now(), now() + interval '5 minutes')`,
+		leaseID, jobID, attemptID, workerID, sessionID, claimRequestID)
+	require.NoError(t, err)
+
+	t.Run("0005 makes notification claims globally idempotent", func(t *testing.T) {
+		var perSessionConstraint, globalConstraint bool
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_constraint
+			               WHERE conname = 'leases_worker_session_id_claim_request_id_key')`,
+		).Scan(&perSessionConstraint))
+		require.False(t, perSessionConstraint, "per-session claim uniqueness must be gone")
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM pg_constraint
+			               WHERE conname = 'leases_claim_request_id_key' AND contype = 'u')`,
+		).Scan(&globalConstraint))
+		require.True(t, globalConstraint, "claim ids must be unique across every worker session")
+
+		// A second, different session cannot consume the same durable event id.
+		otherWorkerID, otherSessionID, otherAttemptID := uuid.New(), uuid.New(), uuid.New()
+		_, err := conn.Exec(ctx, `
+			INSERT INTO workers (id, scope, name) VALUES ($1, 'upgrade-test', 'upgrade-worker-two');
+			INSERT INTO worker_sessions (
+				id, worker_id, scope, hostname, worker_group, concurrency_limit,
+				capabilities, supported_job_types, status
+			) VALUES ($2, $1, 'upgrade-test', 'upgrade2.local', 'default', 4,
+			          '{cpu}', '{demo.echo}', 'HEALTHY');
+			INSERT INTO job_attempts (
+				id, job_id, scope, queue, attempt_number, worker_id, worker_session_id, status
+			) VALUES ($3, $4, 'upgrade-test', 'default', 1, $1, $2, 'LEASED');`,
+			otherWorkerID, otherSessionID, otherAttemptID, secondJobID)
+		require.NoError(t, err)
+
+		_, err = conn.Exec(ctx, `
+			INSERT INTO leases (
+				id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+				claim_request_id, status, acquired_at, renewed_at, expires_at
+			) VALUES ($1, $2, $3, 'upgrade-test', 'default', $4, $5, $6, 'ACTIVE',
+			          now(), now(), now() + interval '5 minutes')`,
+			uuid.New(), secondJobID, otherAttemptID, otherWorkerID, otherSessionID, claimRequestID)
+		require.Error(t, err, "one outbox event may consume at most one claim globally")
+	})
+
+	t.Run("one active lease per job survives the upgrade", func(t *testing.T) {
+		secondAttemptID := uuid.New()
+		_, err := conn.Exec(ctx, `
+			INSERT INTO job_attempts (
+				id, job_id, scope, queue, attempt_number, worker_id, worker_session_id, status
+			) VALUES ($1, $2, 'upgrade-test', 'default', 2, $3, $4, 'LEASED')`,
+			secondAttemptID, jobID, workerID, sessionID)
+		require.NoError(t, err)
+		_, err = conn.Exec(ctx, `
+			INSERT INTO leases (
+				id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+				claim_request_id, status, acquired_at, renewed_at, expires_at
+			) VALUES ($1, $2, $3, 'upgrade-test', 'default', $4, $5, $6, 'ACTIVE',
+			          now(), now(), now() + interval '5 minutes')`,
+			uuid.New(), jobID, secondAttemptID, workerID, sessionID, uuid.New())
+		require.Error(t, err, "a job may never hold two active leases")
+	})
 }
 
 func execMigration(ctx context.Context, conn *pgx.Conn, migration database.Migration) error {
@@ -336,4 +498,99 @@ func TestSchema_OutboxPublishedStateMustBeConsistent(t *testing.T) {
 		INSERT INTO outbox_events (id, event_type, schema_version, payload, status, published_at)
 		VALUES (gen_random_uuid(), 'work.available', 1, '{}'::jsonb, 'PENDING', now())`)
 	require.Error(t, err)
+}
+
+// TestSchema_CompositeForeignKeysRejectMismatchedBindings is the database-level
+// proof of reliability invariant 4: an attempt belongs to exactly one job and
+// one worker process session, and a lease belongs to exactly one of those
+// attempts. Application code is not the enforcement point — these composite
+// foreign keys are, so each one gets a row that satisfies every other
+// constraint and fails only on the binding under test.
+func TestSchema_CompositeForeignKeysRejectMismatchedBindings(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	store := controlStore()
+
+	firstJob := createJob(t, "binding-job-one", "demo.echo", 60, nil)
+	secondJob := createJob(t, "binding-job-two", "demo.echo", 50, nil)
+	firstSession := registerWorker(t, store,
+		workerRegistration("binding-worker-one", 2, nil, []string{"demo.echo"}))
+	secondSession := registerWorker(t, store,
+		workerRegistration("binding-worker-two", 2, nil, []string{"demo.echo"}))
+
+	insertAttempt := func(id, jobID uuid.UUID, queue string, workerID, sessionID uuid.UUID, number int) error {
+		_, err := testPool.Exec(ctx, `
+			INSERT INTO job_attempts (
+				id, job_id, scope, queue, attempt_number, worker_id, worker_session_id, status
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'LEASED')`,
+			id, jobID, testScope, queue, number, workerID, sessionID)
+		return err
+	}
+	requireConstraintViolation := func(t *testing.T, err error, constraint string) {
+		t.Helper()
+		require.Error(t, err)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, "23503", pgErr.Code, "a mismatched binding must be a foreign-key violation")
+		require.Equal(t, constraint, pgErr.ConstraintName)
+	}
+
+	t.Run("an attempt cannot bind a session to the wrong logical worker", func(t *testing.T) {
+		// firstSession exists and secondSession's worker exists, but the pair
+		// (firstSession.ID, secondSession.WorkerID, scope) never does.
+		err := insertAttempt(uuid.New(), firstJob, "default",
+			secondSession.WorkerID, firstSession.ID, 1)
+		requireConstraintViolation(t, err, "job_attempts_session_fkey")
+	})
+
+	t.Run("an attempt cannot bind a session id that does not exist", func(t *testing.T) {
+		err := insertAttempt(uuid.New(), firstJob, "default",
+			firstSession.WorkerID, uuid.New(), 1)
+		requireConstraintViolation(t, err, "job_attempts_session_fkey")
+	})
+
+	t.Run("an attempt cannot bind a real job to the wrong queue", func(t *testing.T) {
+		err := insertAttempt(uuid.New(), firstJob, "other-queue",
+			firstSession.WorkerID, firstSession.ID, 1)
+		requireConstraintViolation(t, err, "job_attempts_job_fkey")
+	})
+
+	// A well-formed attempt for the lease-binding cases below.
+	attemptID := uuid.New()
+	require.NoError(t, insertAttempt(attemptID, firstJob, "default",
+		firstSession.WorkerID, firstSession.ID, 1))
+
+	insertLease := func(jobID, attemptID, workerID, sessionID uuid.UUID) error {
+		_, err := testPool.Exec(ctx, `
+			INSERT INTO leases (
+				id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+				claim_request_id, status, acquired_at, renewed_at, expires_at
+			) VALUES ($1, $2, $3, $4, 'default', $5, $6, $7, 'ACTIVE',
+			          now(), now(), now() + interval '5 minutes')`,
+			uuid.New(), jobID, attemptID, testScope, workerID, sessionID, uuid.New())
+		return err
+	}
+
+	t.Run("a lease cannot point at another job's attempt", func(t *testing.T) {
+		// secondJob exists, so leases_job_fkey is satisfied; only the composite
+		// attempt binding (attempt, secondJob, ...) is impossible.
+		err := insertLease(secondJob, attemptID, firstSession.WorkerID, firstSession.ID)
+		requireConstraintViolation(t, err, "leases_attempt_binding_fkey")
+	})
+
+	t.Run("a lease cannot reassign an attempt to another worker session", func(t *testing.T) {
+		// secondSession is a real current session, so leases_session_fkey is
+		// satisfied; the attempt was never bound to it.
+		err := insertLease(firstJob, attemptID, secondSession.WorkerID, secondSession.ID)
+		requireConstraintViolation(t, err, "leases_attempt_binding_fkey")
+	})
+
+	t.Run("a lease cannot reference an attempt that does not exist", func(t *testing.T) {
+		err := insertLease(firstJob, uuid.New(), firstSession.WorkerID, firstSession.ID)
+		requireConstraintViolation(t, err, "leases_attempt_binding_fkey")
+	})
+
+	t.Run("the correctly bound lease is accepted", func(t *testing.T) {
+		require.NoError(t, insertLease(firstJob, attemptID, firstSession.WorkerID, firstSession.ID))
+	})
 }
