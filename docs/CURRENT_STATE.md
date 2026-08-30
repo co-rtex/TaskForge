@@ -50,8 +50,41 @@ notification consumption.
 - Local slots bound polling and execution. Duplicate deliveries are collapsed in
   process, handler panics are contained, shutdown drains cooperative work, and
   session loss cancels the runner and removes readiness.
-- API requests have bounded contexts. Service binds are loopback-only until control
-  endpoints gain authentication.
+- A duplicate delivery releases its slot as soon as the durable claim decision is
+  published; it does not wait for the leader's handler. The event's flight entry is
+  still held for the whole leader path, so a duplicate arriving mid-execution joins
+  as a follower and can never lead a second claim, replay Start on a RUNNING
+  attempt, or invoke the handler again. Only `CLAIMED`, `QUEUE_EMPTY`, and
+  `DUPLICATE_NOTIFICATION` release a receipt.
+- API requests have bounded contexts. A worker-control request that exhausts its
+  server-owned deadline waiting on a contended authority-row lock returns HTTP 503
+  `service_unavailable` with the standard error envelope and commits nothing;
+  genuine faults remain 500 `internal_error`. Service binds are loopback-only until
+  control endpoints gain authentication.
+
+## Effective handler budget in M2
+
+The budget a handler actually gets is the **lesser** of:
+
+- the job's `timeout_seconds`; and
+- the remaining fixed lease window PostgreSQL reports at claim time, minus a small
+  completion margin reserved for reporting the outcome.
+
+A `timeout_seconds` larger than `TASKFORGE_LEASE_DURATION` is accepted for forward
+compatibility, but until M3 adds lease renewal it cannot authorize execution beyond
+one fixed lease: the worker stops the handler at the lease-derived deadline. The
+30-second lease default and the 300-second job-timeout default are unchanged, and
+oversized timeouts are deliberately not rejected. Work that must run longer than one
+lease is M3 work.
+
+## Operating concurrent workers
+
+A logical worker is `(scope, name)`, and only one process session may be current for
+it. `TASKFORGE_WORKER_NAME=local-worker` is a single-process development default:
+every concurrently running worker must be given its own stable, distinct name.
+Booting a second worker under the same name fences the first, and the fenced process
+exits rather than continuing without authority. Names must also stay stable across
+restarts of the same logical worker.
 
 ## Deliberately not implemented yet
 
@@ -76,8 +109,10 @@ PostgreSQL authoritative and reject stale or duplicate mutations.
 
 ## Verification
 
-The completed M2 tree passed these gates on 2026-08-29:
+The M2 tree, including the pre-merge corrective pass, passed these gates on
+2026-08-29:
 
+- `make fmt`
 - `make lint`
 - `make build`
 - `make test-unit`
@@ -85,17 +120,21 @@ The completed M2 tree passed these gates on 2026-08-29:
 - `make test-race` for both unit and integration packages
 - `docker compose config --quiet`
 - `make migrate` against the local database (`schema already up to date`)
-- OpenAPI YAML parsing and `git diff --check`
+- OpenAPI YAML parsing, cross-checked against the Go error-code contract
+- `git diff --check`
 
 The integration suite includes fresh-database migration, migration idempotency and
-concurrency, real M1-data backfill through all M2 migrations, contested claims,
-cross-queue claim-id reuse, capacity, database-clock expiry, fencing, request-timeout
-rollback, and API → outbox → ElasticMQ → worker execution.
+concurrency, real seeded M1 data carried through migrations `0001` to `0005` in
+order, composite foreign-key rejection of mismatched attempt/lease bindings,
+contested claims, cross-queue claim-id reuse, queue and logical-worker capacity,
+database-clock expiry, fencing, registration racing both claim and success,
+request-deadline rollback, and API → outbox → ElasticMQ → worker execution.
 
 The four built binaries were also exercised together on isolated loopback ports. API,
 outbox, and worker readiness all returned ready; submitted `demo.echo` job
-`2868669b-e980-4d38-b0c7-dc94574e5d1c` durably reached `SUCCEEDED`; all three services
-then stopped cleanly.
+`91d06416-a506-4c24-9747-187f5a4f7d12` durably reached `SUCCEEDED` with one attempt
+and a `COMPLETED` lease; all three services then stopped cleanly with no error-level
+log lines.
 
 ## Local environment
 
