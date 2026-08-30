@@ -7,55 +7,66 @@ lifecycle, explicit state machines, idempotent submission, transactional
 database-to-broker delivery, leases and fencing, and crash recovery — rather than
 wrapping an existing queue framework.
 
-> ### Status: early development — milestone 1 of 8
+> ### Status: early development — milestone 2 of 8
 >
 > **What works today:** durable, idempotent job submission and a recoverable
-> transactional outbox that publishes work-availability notifications to a real
-> SQS-compatible broker.
+> transactional outbox; durable logical workers and process sessions; atomic,
+> priority- and capability-aware claims with queue and worker capacity limits;
+> fenced start/success transitions; and bounded execution of the trusted
+> `demo.echo` handler through a real SQS-compatible broker.
 >
-> **What does not exist yet:** workers, claims, leases, retries, cancellation, DLQ,
-> the CLI, the SDK, and the dashboard. Nothing executes a job.
+> **What does not exist yet:** heartbeats, lease renewal, crash reconciliation,
+> retries, cancellation, DLQ, results, the CLI, the SDK, and the dashboard.
 >
 > See [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) for exactly what is implemented
 > and verified at this commit.
 
 ## Execution guarantee
 
-> Durable **at-least-once** job execution with idempotent control-plane transitions,
-> fenced stale attempts, and application-level idempotency support for external handler
-> side effects.
+> **V1 target:** durable at-least-once job execution with idempotent control-plane
+> transitions, fenced stale attempts, and application-level idempotency support for
+> external handler side effects.
 
 TaskForge does not provide exactly-once execution and never claims to. A handler may
 run more than once; handlers with external side effects must be idempotent. See
 [ADR-0002](docs/adr/0002-at-least-once-execution-semantics.md).
+
+M2 proves the successful path and rejects expired or replaced-session fences. It
+does **not** yet recover a worker crash or failed handler: heartbeat, renewal, lease
+expiration, attempt abandonment, and capacity repair arrive in M3. See
+[docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) for the exact current boundary.
 
 ## Design in one paragraph
 
 PostgreSQL is the single authoritative store for job, attempt, lease, worker-session,
 idempotency, and outbox state. The broker carries only small advisory
 work-availability notifications — never authoritative job state — and every state
-change writes its notification in the same transaction that changes the state.
+change that requires a notification writes it in the same transaction that changes
+the state.
 Workers **pull**: a worker with a free slot asks the control plane, and one SQL
 transaction enforces capacity, matches capabilities, picks the highest-priority
 eligible job, and creates the attempt and lease. Correctness never depends on queue
-ordering, broker delivery, or process memory.
+ordering or process memory. A lost broker notification cannot corrupt state or cause
+duplicate execution, but M2 does not yet recreate a lost sole notification; that
+eventual-progress mechanism is planned for M4.
 
 ## Try what exists
 
-Needs Git, Go 1.24+, Docker, Docker Compose, and Make.
+Needs Git, Go 1.25+, Docker, Docker Compose, and Make.
 
 ```bash
 make bootstrap   # create .env from the example, download dependencies
 make up          # start PostgreSQL and ElasticMQ, wait until both are ready
 make migrate     # apply the schema
-make build       # compile ./bin/taskforge-{api,outbox,migrate}
+make build       # compile ./bin/taskforge-{api,outbox,migrate,worker}
 ```
 
-Run the API and the publisher in two terminals:
+Run the API, publisher, and worker in three terminals:
 
 ```bash
 ./bin/taskforge-api
 ./bin/taskforge-outbox
+./bin/taskforge-worker
 ```
 
 Submit a job:
@@ -69,8 +80,9 @@ curl -X POST http://127.0.0.1:8080/v1/jobs \
 
 Sending the same key again returns the same job with `200` instead of `201`; sending
 it with a different body returns `409`. The publisher delivers a `work.available`
-notification to the broker — which nothing consumes yet, because workers are
-milestone M2.
+notification, and the worker claims the authoritative job from PostgreSQL, runs
+`demo.echo`, and commits `SUCCEEDED`. `GET /v1/jobs/{job_id}` shows the durable state;
+M2 intentionally stores no handler result body.
 
 Run the tests:
 

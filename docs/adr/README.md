@@ -16,3 +16,5 @@ supersedes the old one and update the old one's status.
 | [0003](0003-pull-based-claim-with-broker-notification.md) | Pull-based claim with broker notification | Accepted | 2026-08-29 | The broker signals availability; SQL decides who gets which job. |
 | [0004](0004-transactional-outbox.md) | Transactional outbox for broker delivery | Accepted | 2026-08-29 | State changes and their notifications commit atomically. |
 | [0005](0005-elasticmq-for-local-broker.md) | ElasticMQ as the local SQS-compatible broker | Accepted | 2026-08-29 | Real SQS semantics locally with no AWS account and no cost. |
+| [0006](0006-session-bound-worker-eligibility.md) | Session-bound worker eligibility | Accepted | 2026-08-29 | Claims load immutable capabilities, handler types, group, and capacity from a process session. |
+| [0007](0007-globally-idempotent-notification-claims.md) | Globally idempotent notification claims | Accepted | 2026-08-29 | One outbox event can create at most one lease across all worker sessions. |
