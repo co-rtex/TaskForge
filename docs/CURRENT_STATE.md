@@ -72,10 +72,24 @@ The budget a handler actually gets is the **lesser** of:
 
 A `timeout_seconds` larger than `TASKFORGE_LEASE_DURATION` is accepted for forward
 compatibility, but until M3 adds lease renewal it cannot authorize execution beyond
-one fixed lease: the worker stops the handler at the lease-derived deadline. The
-30-second lease default and the 300-second job-timeout default are unchanged, and
-oversized timeouts are deliberately not rejected. Work that must run longer than one
-lease is M3 work.
+one fixed lease. The 30-second lease default and the 300-second job-timeout default
+are unchanged, and oversized timeouts are deliberately not rejected.
+
+How that budget is enforced, precisely:
+
+- The worker invokes the handler with a deadline-bearing `context.Context`.
+- When the budget elapses, the worker cancels that context.
+- A cooperative handler is expected to observe the cancellation and return.
+- Go cannot forcibly terminate arbitrary handler code. An uncooperative handler
+  may keep running until it returns on its own or the process exits, and the
+  worker cannot preempt it. Hard cancellation needs isolated process or container
+  execution, which is post-V1.
+- The control-plane guarantee is the durable one: once the lease authority
+  deadline has passed, the worker cannot successfully report completion, because
+  the fenced transition is rejected against PostgreSQL server time. Late work
+  therefore cannot commit an outcome, even though it may still be running.
+
+Work that must run longer than one lease is M3 work.
 
 ## Operating concurrent workers
 

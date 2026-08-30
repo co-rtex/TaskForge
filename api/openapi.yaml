@@ -218,16 +218,26 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            The request exhausted its server-owned deadline while waiting on a
-            contended PostgreSQL authority-row lock. Nothing was committed and
-            the call is safe to retry. Code `service_unavailable`.
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the outcome is unknown to the
+            caller. Code `service_unavailable`.
+
+            This does **not** assert that nothing was committed: a deadline
+            reached during COMMIT is ambiguous. The operation is safe to retry
+            with the same worker session id, claim request id, and attempt
+            fence, because each of those is idempotent — a retry returns the
+            already-committed result rather than producing a second one. The
+            caller may also read the job back to observe the durable state.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
               example:
                 error:
                   code: service_unavailable
-                  message: the request exceeded its deadline waiting on contended database state
+                  message: >-
+                    the request exceeded its deadline before the outcome was known;
+                    retry with the same worker session and claim request identifiers,
+                    or read the job back to observe the durable result
 
   /internal/v1/claims:
     post:
@@ -285,16 +295,26 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            The request exhausted its server-owned deadline while waiting on a
-            contended PostgreSQL authority-row lock. Nothing was committed and
-            the call is safe to retry. Code `service_unavailable`.
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the outcome is unknown to the
+            caller. Code `service_unavailable`.
+
+            This does **not** assert that nothing was committed: a deadline
+            reached during COMMIT is ambiguous. The operation is safe to retry
+            with the same worker session id, claim request id, and attempt
+            fence, because each of those is idempotent — a retry returns the
+            already-committed result rather than producing a second one. The
+            caller may also read the job back to observe the durable state.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
               example:
                 error:
                   code: service_unavailable
-                  message: the request exceeded its deadline waiting on contended database state
+                  message: >-
+                    the request exceeded its deadline before the outcome was known;
+                    retry with the same worker session and claim request identifiers,
+                    or read the job back to observe the durable result
 
   /internal/v1/attempts/{attempt_id}/start:
     post:
@@ -342,16 +362,26 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            The request exhausted its server-owned deadline while waiting on a
-            contended PostgreSQL authority-row lock. Nothing was committed and
-            the call is safe to retry. Code `service_unavailable`.
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the outcome is unknown to the
+            caller. Code `service_unavailable`.
+
+            This does **not** assert that nothing was committed: a deadline
+            reached during COMMIT is ambiguous. The operation is safe to retry
+            with the same worker session id, claim request id, and attempt
+            fence, because each of those is idempotent — a retry returns the
+            already-committed result rather than producing a second one. The
+            caller may also read the job back to observe the durable state.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
               example:
                 error:
                   code: service_unavailable
-                  message: the request exceeded its deadline waiting on contended database state
+                  message: >-
+                    the request exceeded its deadline before the outcome was known;
+                    retry with the same worker session and claim request identifiers,
+                    or read the job back to observe the durable result
 
   /internal/v1/attempts/{attempt_id}/succeed:
     post:
@@ -401,16 +431,26 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            The request exhausted its server-owned deadline while waiting on a
-            contended PostgreSQL authority-row lock. Nothing was committed and
-            the call is safe to retry. Code `service_unavailable`.
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the outcome is unknown to the
+            caller. Code `service_unavailable`.
+
+            This does **not** assert that nothing was committed: a deadline
+            reached during COMMIT is ambiguous. The operation is safe to retry
+            with the same worker session id, claim request id, and attempt
+            fence, because each of those is idempotent — a retry returns the
+            already-committed result rather than producing a second one. The
+            caller may also read the job back to observe the durable state.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
               example:
                 error:
                   code: service_unavailable
-                  message: the request exceeded its deadline waiting on contended database state
+                  message: >-
+                    the request exceeded its deadline before the outcome was known;
+                    retry with the same worker session and claim request identifiers,
+                    or read the job back to observe the durable result
 
   /healthz:
     get:
@@ -488,7 +528,14 @@ components:
             reporting the outcome. A value larger than the configured lease
             (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
             cannot authorize execution beyond one fixed lease until M3 adds lease
-            renewal; the worker stops the handler at the lease-derived deadline.
+            renewal.
+
+            The worker runs the handler with a deadline-bearing context and
+            cancels it when the budget elapses; a cooperative handler is expected
+            to return. Go cannot forcibly terminate arbitrary handler code, so an
+            uncooperative handler may continue until it returns or the process
+            exits. The durable guarantee is that after the lease authority
+            deadline the worker can no longer successfully report completion.
         scheduled_at:
           type: [string, 'null']
           format: date-time
@@ -530,7 +577,14 @@ components:
             reporting the outcome. A value larger than the configured lease
             (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
             cannot authorize execution beyond one fixed lease until M3 adds lease
-            renewal; the worker stops the handler at the lease-derived deadline.
+            renewal.
+
+            The worker runs the handler with a deadline-bearing context and
+            cancels it when the budget elapses; a cooperative handler is expected
+            to return. Go cannot forcibly terminate arbitrary handler code, so an
+            uncooperative handler may continue until it returns or the process
+            exits. The durable guarantee is that after the lease authority
+            deadline the worker can no longer successfully report completion.
         required_capabilities:
           type: array
           items: { type: string }
@@ -626,8 +680,11 @@ components:
           type: integer
           description: |
             The job's requested budget. The worker applies the lesser of this and
-            `lease_remaining_milliseconds` minus its completion margin, so an M2
-            handler never runs past the fixed lease window.
+            `lease_remaining_milliseconds` minus its completion margin as the
+            deadline on the handler's context, and cancels that context when it
+            elapses. An uncooperative handler may still be running afterwards —
+            Go cannot forcibly terminate it — but it can no longer commit an
+            outcome once the lease authority deadline has passed.
         required_capabilities: { type: array, items: { type: string } }
         attempt_id: { type: string, format: uuid }
         attempt_number: { type: integer, minimum: 1 }
