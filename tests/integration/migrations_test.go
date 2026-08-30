@@ -68,7 +68,10 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 	defer conn.Close(ctx)
 
 	t.Run("expected tables exist", func(t *testing.T) {
-		for _, table := range []string{"queues", "jobs", "idempotency_records", "outbox_events", "schema_migrations"} {
+		for _, table := range []string{
+			"queues", "jobs", "idempotency_records", "outbox_events",
+			"workers", "worker_sessions", "job_attempts", "leases", "schema_migrations",
+		} {
 			var exists bool
 			require.NoError(t, conn.QueryRow(ctx,
 				`SELECT EXISTS (SELECT 1 FROM information_schema.tables
@@ -79,7 +82,7 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 
 	// Tables for later milestones must not be created in advance.
 	t.Run("no speculative tables", func(t *testing.T) {
-		for _, table := range []string{"job_attempts", "workers", "worker_sessions", "leases", "results", "dlq_entries", "api_keys"} {
+		for _, table := range []string{"results", "dlq_entries", "api_keys", "audit_events"} {
 			var exists bool
 			require.NoError(t, conn.QueryRow(ctx,
 				`SELECT EXISTS (SELECT 1 FROM information_schema.tables
@@ -107,6 +110,40 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 		require.Contains(t, def, "WHERE (status = 'PENDING'::text)")
 	})
 
+	t.Run("claim ordering column and partial index exist", func(t *testing.T) {
+		var nullable, defaultValue string
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT is_nullable, column_default
+			FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = 'jobs' AND column_name = 'available_at'`,
+		).Scan(&nullable, &defaultValue))
+		require.Equal(t, "NO", nullable)
+		require.Contains(t, defaultValue, "now()")
+
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'jobs_claim_idx'`).Scan(&def))
+		require.Contains(t, def, "priority DESC")
+		require.Contains(t, def, "available_at")
+		require.Contains(t, def, "WHERE (status = 'QUEUED'::text)")
+	})
+
+	t.Run("one active lease per job is a partial unique invariant", func(t *testing.T) {
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'leases_one_active_per_job_idx'`).Scan(&def))
+		require.Contains(t, def, "UNIQUE")
+		require.Contains(t, def, "WHERE (status = 'ACTIVE'::text)")
+	})
+
+	t.Run("one current process session per logical worker is enforced", func(t *testing.T) {
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'worker_sessions_one_current_per_worker_idx'`).Scan(&def))
+		require.Contains(t, def, "UNIQUE")
+		require.Contains(t, def, "HEALTHY")
+	})
+
 	t.Run("the default queue is seeded", func(t *testing.T) {
 		var n int
 		require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM queues WHERE name = 'default'`).Scan(&n))
@@ -125,6 +162,66 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 		}
 		require.NotContains(t, def, "'FAILED'", "there is deliberately no job-level FAILED status")
 	})
+}
+
+func TestMigration0002_BackfillsAndPreservesExistingM1Ingress(t *testing.T) {
+	freshDSN := withFreshDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrations, err := database.LoadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(migrations), 2)
+	require.Equal(t, 1, migrations[0].Version)
+	require.Equal(t, 2, migrations[1].Version)
+
+	cfg, err := pgx.ParseConfig(freshDSN)
+	require.NoError(t, err)
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+	require.NoError(t, execMigration(ctx, conn, migrations[0]))
+
+	jobID, eventID := uuid.New(), uuid.New()
+	createdAt := time.Date(2026, 8, 28, 12, 34, 56, 123000000, time.UTC)
+	_, err = conn.Exec(ctx, `
+		INSERT INTO jobs (
+			id, scope, queue, job_type, payload, status, priority,
+			max_attempts, timeout_seconds, created_at, updated_at
+		) VALUES ($1, 'upgrade-test', 'default', 'demo.echo', '{"message":"preserve"}',
+		          'QUEUED', 50, 3, 300, $2, $2);
+		INSERT INTO idempotency_records (scope, idempotency_key, request_fingerprint, job_id)
+		VALUES ('upgrade-test', 'existing-key', repeat('a', 64), $1);
+		INSERT INTO outbox_events (id, event_type, schema_version, payload, status, created_at)
+		VALUES ($3, 'work.available', 1, '{"queue":"default"}', 'PENDING', $2);`,
+		jobID, createdAt, eventID)
+	require.NoError(t, err)
+
+	require.NoError(t, execMigration(ctx, conn, migrations[1]))
+	var availableAt time.Time
+	var status, workerGroup string
+	require.NoError(t, conn.QueryRow(ctx, `
+		SELECT j.available_at, j.status, q.worker_group
+		FROM jobs j JOIN queues q ON q.name = j.queue
+		WHERE j.id = $1`, jobID).Scan(&availableAt, &status, &workerGroup))
+	require.True(t, createdAt.Equal(availableAt), "available_at must preserve the original created_at instant")
+	require.Equal(t, "QUEUED", status)
+	require.Equal(t, "default", workerGroup)
+
+	var idempotencyJob uuid.UUID
+	require.NoError(t, conn.QueryRow(ctx, `
+		SELECT job_id FROM idempotency_records
+		WHERE scope = 'upgrade-test' AND idempotency_key = 'existing-key'`).Scan(&idempotencyJob))
+	require.Equal(t, jobID, idempotencyJob)
+	var outboxStatus string
+	require.NoError(t, conn.QueryRow(ctx,
+		`SELECT status FROM outbox_events WHERE id = $1`, eventID).Scan(&outboxStatus))
+	require.Equal(t, "PENDING", outboxStatus)
+}
+
+func execMigration(ctx context.Context, conn *pgx.Conn, migration database.Migration) error {
+	_, err := conn.Exec(ctx, migration.SQL)
+	return err
 }
 
 func TestMigrations_AreIdempotent(t *testing.T) {
@@ -174,7 +271,9 @@ func TestMigrations_AreSafeToRunConcurrently(t *testing.T) {
 			t.Fatal("concurrent migration timed out")
 		}
 	}
-	require.Equal(t, 1, total, "exactly one runner may apply the migration set")
+	migrations, err := database.LoadMigrations()
+	require.NoError(t, err)
+	require.Equal(t, len(migrations), total, "exactly one runner may apply each migration")
 }
 
 // Constraints, not application code, are the last line of defence. If these

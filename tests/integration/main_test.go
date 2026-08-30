@@ -119,9 +119,13 @@ func reset(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 
-	_, err := testPool.Exec(ctx, `TRUNCATE jobs, idempotency_records, outbox_events CASCADE`)
+	_, err := testPool.Exec(ctx, `
+		TRUNCATE leases, job_attempts, worker_sessions, workers,
+		         idempotency_records, outbox_events, jobs, queues CASCADE`)
 	require.NoError(t, err)
-	_, err = testPool.Exec(ctx, `INSERT INTO queues (name) VALUES ('default') ON CONFLICT DO NOTHING`)
+	_, err = testPool.Exec(ctx, `
+		INSERT INTO queues (name, worker_group, max_concurrency)
+		VALUES ('default', 'default', 100)`)
 	require.NoError(t, err)
 
 	drainBroker(t, newBroker(t, ""))
