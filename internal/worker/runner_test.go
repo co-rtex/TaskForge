@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/co-rtex/TaskForge/internal/outbox"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
@@ -45,6 +46,7 @@ type fakeBroker struct {
 	receiveCount atomic.Int32
 	mu           sync.Mutex
 	deleted      []string
+	deletedCh    chan string
 	onDelete     func()
 }
 
@@ -62,9 +64,15 @@ func (b *fakeBroker) Receive(ctx context.Context, _ int, _ time.Duration) ([]que
 func (b *fakeBroker) Delete(_ context.Context, receipt string) error {
 	b.mu.Lock()
 	b.deleted = append(b.deleted, receipt)
+	observer := b.deletedCh
 	b.mu.Unlock()
 	if b.onDelete != nil {
 		b.onDelete()
+	}
+	// deletedCh lets a test use acknowledgement as a barrier instead of a sleep.
+	// It stays nil for every test that does not need that synchronization.
+	if observer != nil {
+		observer <- receipt
 	}
 	return b.deleteErr
 }
@@ -73,6 +81,12 @@ func (b *fakeBroker) deletedCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.deleted)
+}
+
+func (b *fakeBroker) deletedReceipts() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.deleted...)
 }
 
 func testSession(concurrency int) workers.Session {
@@ -584,3 +598,243 @@ func TestRunner_LocalPoolNeverPollsPastItsBound(t *testing.T) {
 
 var _ ControlPlane = (*fakeControl)(nil)
 var _ queue.Broker = (*fakeBroker)(nil)
+
+// notificationBodyForEvent builds a work notification carrying a caller-chosen
+// durable event id so a test can deliver true duplicates of one event alongside
+// an unrelated one.
+func notificationBodyForEvent(t *testing.T, eventID uuid.UUID, queueName string) []byte {
+	t.Helper()
+	data, err := json.Marshal(outbox.WorkAvailableData{Queue: queueName, JobID: "non-authoritative-hint"})
+	require.NoError(t, err)
+	event := outbox.Event{
+		ID: eventID, Type: outbox.EventWorkAvailable,
+		SchemaVersion: outbox.WorkAvailableSchemaVersion,
+		Data:          data, CreatedAt: time.Now(),
+	}
+	body, err := event.Body()
+	require.NoError(t, err)
+	return body
+}
+
+// TestRunner_DuplicateDeliveryReleasesItsSlotBeforeLeaderExecution is the
+// bounded-pool regression for duplicate work notifications.
+//
+// A duplicate used to wait on the leader's entire Start/handler/Succeed path,
+// so N copies of one event could starve an N-slot pool for one job's duration.
+// The pool here has exactly two slots: the leader holds one inside a blocked
+// handler, so unrelated work can only progress if the duplicate returned its
+// slot after the claim decision. Every step is a channel barrier.
+func TestRunner_DuplicateDeliveryReleasesItsSlotBeforeLeaderExecution(t *testing.T) {
+	session := testSession(2)
+	slowEventID, fastEventID := uuid.New(), uuid.New()
+	slowAssignment := testAssignment(session)
+	slowAssignment.JobType = "demo.slow"
+	fastAssignment := testAssignment(session)
+	fastAssignment.JobType = "demo.fast"
+
+	var claims, starts, succeeds sync.Map // event/attempt id -> *atomic.Int32
+	countFor := func(m *sync.Map, key uuid.UUID) *atomic.Int32 {
+		counter, _ := m.LoadOrStore(key, &atomic.Int32{})
+		return counter.(*atomic.Int32)
+	}
+	assignmentFor := func(claimID uuid.UUID) *workers.Assignment {
+		if claimID == slowEventID {
+			return slowAssignment
+		}
+		return fastAssignment
+	}
+
+	slowSucceeded := make(chan struct{})
+	control := &fakeControl{
+		register: func(context.Context, workers.Registration) (workers.Session, error) {
+			return session, nil
+		},
+		claim: func(_ context.Context, request workers.ClaimRequest) (workers.ClaimResult, error) {
+			countFor(&claims, request.ClaimRequestID).Add(1)
+			return workers.ClaimResult{
+				Disposition: workers.Claimed, Assignment: assignmentFor(request.ClaimRequestID),
+			}, nil
+		},
+		start: func(_ context.Context, fence workers.Fence) error {
+			countFor(&starts, fence.AttemptID).Add(1)
+			return nil
+		},
+		succeed: func(_ context.Context, fence workers.Fence) error {
+			countFor(&succeeds, fence.AttemptID).Add(1)
+			if fence.AttemptID == slowAssignment.AttemptID {
+				close(slowSucceeded)
+			}
+			return nil
+		},
+	}
+
+	slowEntered := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	fastRan := make(chan struct{})
+	var slowRuns, fastRuns atomic.Int32
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.slow", HandlerFunc(func(context.Context, Execution) (json.RawMessage, error) {
+		slowRuns.Add(1)
+		close(slowEntered)
+		<-releaseSlow
+		return nil, nil
+	})))
+	require.NoError(t, registry.Register("demo.fast", HandlerFunc(func(context.Context, Execution) (json.RawMessage, error) {
+		fastRuns.Add(1)
+		close(fastRan)
+		return nil, nil
+	})))
+
+	broker := &fakeBroker{messages: make(chan queue.Message), deletedCh: make(chan string, 8)}
+	runner := testRunner(control, broker, registry)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+
+	deliver := func(receipt string, body []byte) {
+		select {
+		case broker.messages <- queue.Message{ID: receipt, ReceiptHandle: receipt, Body: body}:
+		case <-time.After(5 * time.Second):
+			t.Errorf("no free slot accepted receipt %q", receipt)
+		}
+	}
+	acknowledged := map[string]struct{}{}
+	awaitAck := func(receipt string) {
+		t.Helper()
+		for {
+			if _, ok := acknowledged[receipt]; ok {
+				return
+			}
+			select {
+			case got := <-broker.deletedCh:
+				acknowledged[got] = struct{}{}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("receipt %q was never acknowledged", receipt)
+			}
+		}
+	}
+	await := func(signal <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+
+	slowBody := notificationBodyForEvent(t, slowEventID, "default")
+	deliver("slow-original", slowBody)
+	await(slowEntered, "the leader's handler to start")
+
+	// The duplicate must join the existing flight rather than lead a second one.
+	deliver("slow-duplicate", slowBody)
+	awaitAck("slow-duplicate")
+
+	// The only way this can be received is if the duplicate already returned its
+	// slot: the other slot is still parked inside the blocked leader handler.
+	deliver("fast-unrelated", notificationBodyForEvent(t, fastEventID, "default"))
+	await(fastRan, "unrelated work to progress on the freed slot")
+
+	// The leader is still mid-execution, and still owns the event's flight entry.
+	require.Equal(t, int32(0), countFor(&succeeds, slowAssignment.AttemptID).Load(),
+		"the leader must still be blocked while unrelated work progressed")
+	runner.flightsMu.Lock()
+	flight := runner.flights[slowEventID]
+	require.NotNil(t, flight, "execution ownership must be held until the leader finishes")
+	require.Equal(t, 1, flight.followers, "the duplicate must have joined as a follower")
+	runner.flightsMu.Unlock()
+
+	close(releaseSlow)
+	await(slowSucceeded, "the leader to commit its outcome")
+	awaitAck("slow-original")
+	awaitAck("fast-unrelated")
+
+	cancel()
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not stop after cancellation")
+	}
+
+	// The duplicated event resolved to exactly one of everything.
+	require.Equal(t, int32(1), countFor(&claims, slowEventID).Load(), "claims for the duplicated event")
+	require.Equal(t, int32(1), countFor(&starts, slowAssignment.AttemptID).Load(), "Start for the duplicated event")
+	require.Equal(t, int32(1), slowRuns.Load(), "handler executions for the duplicated event")
+	require.Equal(t, int32(1), countFor(&succeeds, slowAssignment.AttemptID).Load(), "Succeed for the duplicated event")
+	require.Equal(t, int32(1), fastRuns.Load(), "the unrelated event ran exactly once")
+
+	// Both copies of the safe duplicate, plus the unrelated receipt, were acked.
+	require.ElementsMatch(t,
+		[]string{"slow-original", "slow-duplicate", "fast-unrelated"}, broker.deletedReceipts())
+
+	runner.flightsMu.Lock()
+	require.Empty(t, runner.flights, "execution ownership must be released once the leader finishes")
+	runner.flightsMu.Unlock()
+}
+
+// TestProcessMessage_UnsafeDispositionsNeverReleaseAFollowerReceipt proves the
+// prompt follower release did not widen what counts as a safe acknowledgement.
+// A follower that joins an in-flight delivery and then observes an unsafe or
+// unresolved leader decision must leave its own receipt on the broker.
+func TestProcessMessage_UnsafeDispositionsNeverReleaseAFollowerReceipt(t *testing.T) {
+	tests := map[string]struct {
+		result workers.ClaimResult
+		err    error
+	}{
+		"NO_ELIGIBLE_JOB":        {result: workers.ClaimResult{Disposition: workers.NoEligibleJob}},
+		"CAPACITY_EXHAUSTED":     {result: workers.ClaimResult{Disposition: workers.CapacityExhausted}},
+		"unresolved claim error": {err: errors.New("control plane unreachable")},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			session := testSession(2)
+			eventID := uuid.New()
+			body := notificationBodyForEvent(t, eventID, "default")
+			leaderClaiming := make(chan struct{})
+			releaseClaim := make(chan struct{})
+			var claims atomic.Int32
+			control := &fakeControl{
+				claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+					if claims.Add(1) == 1 {
+						close(leaderClaiming)
+						<-releaseClaim
+					}
+					return test.result, test.err
+				},
+			}
+			broker := &fakeBroker{}
+			runner := testRunner(control, broker, NewRegistry())
+
+			errs := make(chan error, 2)
+			go func() {
+				errs <- runner.processMessage(context.Background(), session,
+					queue.Message{ID: "leader", ReceiptHandle: "leader", Body: body})
+			}()
+			select {
+			case <-leaderClaiming:
+			case <-time.After(5 * time.Second):
+				t.Fatal("leader never reached its claim")
+			}
+			go func() {
+				errs <- runner.processMessage(context.Background(), session,
+					queue.Message{ID: "follower", ReceiptHandle: "follower", Body: body})
+			}()
+			// Barrier on durable flight state, not on elapsed time: release the
+			// leader only once the second delivery has actually joined as a follower.
+			require.Eventually(t, func() bool {
+				runner.flightsMu.Lock()
+				defer runner.flightsMu.Unlock()
+				flight := runner.flights[eventID]
+				return flight != nil && flight.followers == 1
+			}, 5*time.Second, time.Millisecond, "the duplicate must join the in-flight delivery")
+			close(releaseClaim)
+			require.NoError(t, <-errs)
+			require.NoError(t, <-errs)
+
+			require.Equal(t, 0, broker.deletedCount(),
+				"an unsafe or unresolved decision must leave both receipts on the broker")
+		})
+	}
+}

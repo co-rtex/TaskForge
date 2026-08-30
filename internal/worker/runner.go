@@ -36,10 +36,23 @@ var (
 	ErrShutdownTimeout = errors.New("worker shutdown drain timed out")
 )
 
+// deliveryFlight separates two lifetimes that a duplicated notification would
+// otherwise conflate.
+//
+//   - The claim/ack decision is published as soon as the control plane commits a
+//     durable disposition. Followers wait only on this, so a duplicate releases
+//     its slot instead of idling for the leader's whole handler.
+//   - Execution ownership is the map entry itself. It is held until the leader's
+//     Start/handler/Succeed path ends, so a duplicate that arrives mid-execution
+//     still joins as a follower and can never become a second leader, replay
+//     Start against a RUNNING attempt, or invoke the handler again.
 type deliveryFlight struct {
-	done      chan struct{}
+	decided chan struct{}
+	// safeAck and err are written once under Runner.flightsMu before decided is
+	// closed, so the close is the happens-before edge every follower reads through.
 	safeAck   bool
 	err       error
+	settled   bool
 	followers int
 }
 
@@ -195,19 +208,19 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 
 	flight, leader := r.beginDelivery(notification.EventID)
 	if !leader {
+		// A follower waits only for the durable claim decision, never for the
+		// leader's execution. It acknowledges its own receipt and frees its slot.
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-flight.done:
+		case <-flight.decided:
 			if flight.safeAck {
 				r.acknowledge(ctx, message)
 			}
 			return flight.err
 		}
 	}
-	safeAck := false
-	var flightErr error
-	defer func() { r.finishDelivery(notification.EventID, flight, safeAck, flightErr) }()
+	defer r.endDelivery(notification.EventID, flight)
 
 	request := workers.ClaimRequest{
 		WorkerID: session.WorkerID, SessionID: session.ID,
@@ -224,19 +237,27 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	})
 	if err != nil {
 		if isSessionLost(err) {
-			flightErr = fmt.Errorf("%w: %v", ErrSessionLost, err)
-			return flightErr
+			sessionLost := fmt.Errorf("%w: %v", ErrSessionLost, err)
+			r.decideDelivery(flight, false, sessionLost)
+			return sessionLost
 		}
 		r.log.Warn("claim failed",
 			slog.String("worker_id", session.WorkerID.String()),
 			slog.String("worker_session_id", session.ID.String()),
 			slog.String("claim_request_id", request.ClaimRequestID.String()),
 			slog.String("error", err.Error()))
+		// An unresolved claim error is never a safe acknowledgement: the receipt
+		// must return to the broker so the still-queued work stays reachable.
+		r.decideDelivery(flight, false, nil)
 		return nil
 	}
 
-	if claim.SafeToAcknowledge() {
-		safeAck = true
+	// The durable disposition is committed, so publish it before execution
+	// begins. NO_ELIGIBLE_JOB and capacity exhaustion report false here exactly
+	// as before; only SafeToAcknowledge outcomes release a receipt.
+	safeAck := claim.SafeToAcknowledge()
+	r.decideDelivery(flight, safeAck, nil)
+	if safeAck {
 		r.acknowledge(ctx, message)
 	}
 	if claim.Disposition != workers.Claimed || claim.Assignment == nil {
@@ -260,8 +281,9 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	}
 	if err := r.retry(ctx, func() error { return r.control.Start(ctx, fence) }); err != nil {
 		if isSessionLost(err) {
-			flightErr = fmt.Errorf("%w: %v", ErrSessionLost, err)
-			return flightErr
+			// The claim decision was already published; this session-loss is the
+			// leader's own fatal signal and does not change any follower's ack.
+			return fmt.Errorf("%w: %v", ErrSessionLost, err)
 		}
 		r.log.Warn("start attempt rejected", fenceLog(fence, slog.String("error", err.Error()))...)
 		return nil
@@ -307,8 +329,9 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 
 	if err := r.retry(ctx, func() error { return r.control.Succeed(ctx, fence) }); err != nil {
 		if isSessionLost(err) {
-			flightErr = fmt.Errorf("%w: %v", ErrSessionLost, err)
-			return flightErr
+			// The claim decision was already published; this session-loss is the
+			// leader's own fatal signal and does not change any follower's ack.
+			return fmt.Errorf("%w: %v", ErrSessionLost, err)
 		}
 		r.log.Warn("report successful outcome", fenceLog(fence, slog.String("error", err.Error()))...)
 		return nil
@@ -324,18 +347,38 @@ func (r *Runner) beginDelivery(eventID uuid.UUID) (*deliveryFlight, bool) {
 		flight.followers++
 		return flight, false
 	}
-	flight := &deliveryFlight{done: make(chan struct{})}
+	flight := &deliveryFlight{decided: make(chan struct{})}
 	r.flights[eventID] = flight
 	return flight, true
 }
 
-func (r *Runner) finishDelivery(eventID uuid.UUID, flight *deliveryFlight, safeAck bool, err error) {
+// decideDelivery publishes the durable claim decision to current and future
+// followers without releasing execution ownership.
+func (r *Runner) decideDelivery(flight *deliveryFlight, safeAck bool, err error) {
 	r.flightsMu.Lock()
+	defer r.flightsMu.Unlock()
+	r.settleLocked(flight, safeAck, err)
+}
+
+// endDelivery releases execution ownership once the leader's whole path has
+// ended. The defensive settle covers any leader return that never reached a
+// durable decision: followers then learn the receipt is not safe to acknowledge
+// rather than blocking forever.
+func (r *Runner) endDelivery(eventID uuid.UUID, flight *deliveryFlight) {
+	r.flightsMu.Lock()
+	defer r.flightsMu.Unlock()
+	r.settleLocked(flight, false, nil)
+	delete(r.flights, eventID)
+}
+
+func (r *Runner) settleLocked(flight *deliveryFlight, safeAck bool, err error) {
+	if flight.settled {
+		return
+	}
+	flight.settled = true
 	flight.safeAck = safeAck
 	flight.err = err
-	close(flight.done)
-	delete(r.flights, eventID)
-	r.flightsMu.Unlock()
+	close(flight.decided)
 }
 
 func (r *Runner) acknowledge(ctx context.Context, message queue.Message) {
