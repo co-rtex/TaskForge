@@ -219,15 +219,19 @@ paths:
         '503':
           description: |
             A database call in this request failed because the request's own
-            server-owned deadline elapsed, so the outcome is unknown to the
-            caller. Code `service_unavailable`.
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
 
-            This does **not** assert that nothing was committed: a deadline
-            reached during COMMIT is ambiguous. The operation is safe to retry
-            with the same worker session id, claim request id, and attempt
-            fence, because each of those is idempotent — a retry returns the
-            already-committed result rather than producing a second one. The
-            caller may also read the job back to observe the durable state.
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical registration request on the same
+            `worker_session_id` path with the same immutable registration body.
+            Registration is idempotent under that session identity: a replay
+            that matches returns the already-registered session rather than
+            creating or fencing a second one.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -235,9 +239,10 @@ paths:
                 error:
                   code: service_unavailable
                   message: >-
-                    the request exceeded its deadline before the outcome was known;
-                    retry with the same worker session and claim request identifiers,
-                    or read the job back to observe the durable result
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
 
   /internal/v1/claims:
     post:
@@ -296,15 +301,20 @@ paths:
         '503':
           description: |
             A database call in this request failed because the request's own
-            server-owned deadline elapsed, so the outcome is unknown to the
-            caller. Code `service_unavailable`.
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
 
-            This does **not** assert that nothing was committed: a deadline
-            reached during COMMIT is ambiguous. The operation is safe to retry
-            with the same worker session id, claim request id, and attempt
-            fence, because each of those is idempotent — a retry returns the
-            already-committed result rather than producing a second one. The
-            caller may also read the job back to observe the durable state.
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the request with the same `worker_session_id` and
+            the same `claim_request_id`. The claim is idempotent under that
+            claim identity: an exact replay by the owning session returns the
+            assignment the first call committed rather than reserving a second
+            job, and a copy presented by another session receives
+            `DUPLICATE_NOTIFICATION`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -312,9 +322,10 @@ paths:
                 error:
                   code: service_unavailable
                   message: >-
-                    the request exceeded its deadline before the outcome was known;
-                    retry with the same worker session and claim request identifiers,
-                    or read the job back to observe the durable result
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
 
   /internal/v1/attempts/{attempt_id}/start:
     post:
@@ -363,15 +374,20 @@ paths:
         '503':
           description: |
             A database call in this request failed because the request's own
-            server-owned deadline elapsed, so the outcome is unknown to the
-            caller. Code `service_unavailable`.
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
 
-            This does **not** assert that nothing was committed: a deadline
-            reached during COMMIT is ambiguous. The operation is safe to retry
-            with the same worker session id, claim request id, and attempt
-            fence, because each of those is idempotent — a retry returns the
-            already-committed result rather than producing a second one. The
-            caller may also read the job back to observe the durable state.
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical request with the same attempt fence
+            — the `attempt_id` in the path plus the same `job_id`, `lease_id`,
+            `worker_id`, and `worker_session_id`. The start transition is
+            idempotent under that fence: replaying it against an attempt that
+            is already RUNNING succeeds without changing the recorded start
+            time.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -379,9 +395,10 @@ paths:
                 error:
                   code: service_unavailable
                   message: >-
-                    the request exceeded its deadline before the outcome was known;
-                    retry with the same worker session and claim request identifiers,
-                    or read the job back to observe the durable result
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
 
   /internal/v1/attempts/{attempt_id}/succeed:
     post:
@@ -432,15 +449,20 @@ paths:
         '503':
           description: |
             A database call in this request failed because the request's own
-            server-owned deadline elapsed, so the outcome is unknown to the
-            caller. Code `service_unavailable`.
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
 
-            This does **not** assert that nothing was committed: a deadline
-            reached during COMMIT is ambiguous. The operation is safe to retry
-            with the same worker session id, claim request id, and attempt
-            fence, because each of those is idempotent — a retry returns the
-            already-committed result rather than producing a second one. The
-            caller may also read the job back to observe the durable state.
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical request with the same attempt fence
+            — the `attempt_id` in the path plus the same `job_id`, `lease_id`,
+            `worker_id`, and `worker_session_id`. The success transition is
+            idempotent under that fence: replaying it after the outcome
+            committed succeeds without changing the recorded finish time or
+            re-releasing the lease.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -448,9 +470,10 @@ paths:
                 error:
                   code: service_unavailable
                   message: >-
-                    the request exceeded its deadline before the outcome was known;
-                    retry with the same worker session and claim request identifiers,
-                    or read the job back to observe the durable result
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
 
   /healthz:
     get:

@@ -751,10 +751,14 @@ func TestWorkerControl_RequestTimeoutCancelsDatabaseLockWait(t *testing.T) {
 		`SELECT status FROM jobs`).Scan(&jobStatus))
 	require.Equal(t, "QUEUED", jobStatus, "the contended job must remain claimable")
 
-	// The caller is told how to resolve the ambiguity: retry with the same
-	// identifiers, or read the durable state back.
-	require.Contains(t, envelope.Error.Message, "retry")
-	require.Contains(t, envelope.Error.Message, "claim request")
+	// The shared 503 body is endpoint-neutral: one string serves registration,
+	// claim, start, and succeed, so it names no operation-specific identifier.
+	// Per-endpoint retry guidance lives in api/openapi.yaml and is asserted by
+	// TestOpenAPI_Deadline503GuidanceIsPerEndpoint.
+	require.Contains(t, envelope.Error.Message, "retry the identical request")
+	require.NotContains(t, envelope.Error.Message, "claim request",
+		"the shared message must not name an identifier three of the four endpoints lack")
+	require.NotContains(t, envelope.Error.Message, "read the job")
 }
 
 func waitForDatabaseLock(t *testing.T, queryFragment string) {

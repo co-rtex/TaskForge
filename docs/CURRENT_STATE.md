@@ -57,10 +57,23 @@ notification consumption.
   attempt, or invoke the handler again. Only `CLAIMED`, `QUEUE_EMPTY`, and
   `DUPLICATE_NOTIFICATION` release a receipt.
 - API requests have bounded contexts. A worker-control request that exhausts its
-  server-owned deadline waiting on a contended authority-row lock returns HTTP 503
-  `service_unavailable` with the standard error envelope and commits nothing;
-  genuine faults remain 500 `internal_error`. Service binds are loopback-only until
-  control endpoints gain authentication.
+  server-owned deadline returns HTTP 503 `service_unavailable` with the standard
+  error envelope; genuine faults remain 500 `internal_error`. Service binds are
+  loopback-only until control endpoints gain authentication.
+
+  That deadline can elapse while acquiring a lock, while executing a statement, or
+  during COMMIT, and a COMMIT cut short leaves the immediate outcome unknown. The
+  503 therefore never promises that nothing committed. It tells the caller to retry
+  the identical request under that operation's existing identity or fence:
+
+  - registration replays its own `worker_session_id` and immutable registration body;
+  - a claim replays its `worker_session_id` and `claim_request_id`;
+  - start and succeed replay their attempt fence.
+
+  Each of those is idempotent, so a replay returns the already-committed result
+  rather than producing a second one. Per-endpoint retry guidance is documented in
+  [api/openapi.yaml](../api/openapi.yaml); the shared Go message stays
+  endpoint-neutral because one string serves all four operations.
 
 ## Effective handler budget in M2
 

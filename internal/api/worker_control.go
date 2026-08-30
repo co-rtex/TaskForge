@@ -322,16 +322,22 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 			"the requested state transition is no longer valid", nil)
 	case isDeadlineExhausted(err):
 		// A database call in this request failed because the request's own
-		// deadline elapsed. The outcome is genuinely ambiguous — a deadline
-		// reached during COMMIT may or may not have committed — so the response
-		// promises retryability, not rollback.
+		// deadline elapsed. That can happen while acquiring a lock, while
+		// executing a statement, or during COMMIT, so the outcome may be
+		// ambiguous: the response promises retryability, never rollback.
+		//
+		// This message is shared by every worker-control operation, so it names
+		// no operation-specific identifier. Per-endpoint retry guidance — which
+		// identity or fence to repeat — lives in api/openapi.yaml, where it can
+		// be accurate for each operation.
 		s.log.Warn("worker control request exhausted its deadline",
 			slog.String("request_id", RequestIDFrom(r.Context())),
 			slog.String("op", op))
 		writeError(w, r, s.log, http.StatusServiceUnavailable, CodeServiceUnavailable,
-			"the request exceeded its deadline before the outcome was known; "+
-				"retry with the same worker session and claim request identifiers, "+
-				"or read the job back to observe the durable result", nil)
+			"the request exceeded its deadline before the durable outcome was known; "+
+				"retry the identical request, which is safe because every worker-control "+
+				"operation is idempotent under the identity and fencing identifiers it "+
+				"already carries", nil)
 	default:
 		s.internalError(w, r, op, err)
 	}
