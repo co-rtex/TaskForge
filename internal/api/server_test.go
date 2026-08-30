@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -114,6 +115,18 @@ func TestRequestID_ClientValueIsEchoedWhenSafe(t *testing.T) {
 		RequestIDHeader:   "client-trace-123",
 	})
 	require.Equal(t, "client-trace-123", rec.Header().Get(RequestIDHeader))
+}
+
+func TestRequestTimeoutIsPresentForEveryHandler(t *testing.T) {
+	var deadlinePresent bool
+	handler := withTimeout(time.Second, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, deadlinePresent = r.Context().Deadline()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	require.Equal(t, http.StatusNoContent, recorder.Code)
+	require.True(t, deadlinePresent)
 }
 
 // A client-supplied request id is echoed into logs and headers, so an unbounded

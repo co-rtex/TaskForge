@@ -1,8 +1,9 @@
 // Package api serves TaskForge's HTTP surface.
 //
-// Milestone M1 implements durable job ingress only: submit, read, and health.
-// Every other endpoint in docs/PROJECT_SPEC.md arrives with the milestone that
-// makes it real — an endpoint is never exposed before it works.
+// The public surface implements durable job submission/read. The internal
+// surface implements M2 worker registration, atomic claim, and fenced
+// start/success. Every later endpoint in docs/PROJECT_SPEC.md arrives only with
+// the milestone that makes it real.
 package api
 
 import (
@@ -24,6 +25,7 @@ import (
 // Config configures the HTTP server.
 type Config struct {
 	MaxRequestBytes int64
+	RequestTimeout  time.Duration
 	// DevScope attributes every request to one scope until API keys land in
 	// milestone M5. See internal/config.Config.DevScope.
 	DevScope string
@@ -38,15 +40,27 @@ type ReadinessCheck struct {
 
 // Server wires handlers to their dependencies.
 type Server struct {
-	jobs   *jobs.Store
-	cfg    Config
-	log    *slog.Logger
-	checks []ReadinessCheck
+	jobs    *jobs.Store
+	control WorkerControl
+	cfg     Config
+	log     *slog.Logger
+	checks  []ReadinessCheck
 }
 
 // NewServer builds a Server.
 func NewServer(store *jobs.Store, cfg Config, log *slog.Logger, checks ...ReadinessCheck) *Server {
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 25 * time.Second
+	}
 	return &Server{jobs: store, cfg: cfg, log: log, checks: checks}
+}
+
+// WithWorkerControl enables the implemented internal worker control surface.
+// It is kept separate from NewServer so M1-focused unit tests can construct a
+// validation-only server without a database-backed control store.
+func (s *Server) WithWorkerControl(control WorkerControl) *Server {
+	s.control = control
+	return s
 }
 
 // Handler returns the fully wrapped HTTP handler.
@@ -59,6 +73,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{job_id}", s.handleGetJob)
 	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
+	if s.control != nil {
+		mux.HandleFunc("PUT /internal/v1/worker-sessions/{worker_session_id}", s.handleRegisterWorkerSession)
+		mux.HandleFunc("POST /internal/v1/claims", s.handleClaim)
+		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/start", s.handleStartAttempt)
+		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/succeed", s.handleSucceedAttempt)
+	}
 
 	// ServeMux answers an unmatched method with a plain-text 405 and an unmatched
 	// path with a plain-text 404, neither of which matches the structured error
@@ -70,10 +90,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/jobs/{job_id}", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/healthz", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
+	if s.control != nil {
+		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))
+		mux.HandleFunc("/internal/v1/claims", s.methodNotAllowed(http.MethodPost))
+		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/start", s.methodNotAllowed(http.MethodPost))
+		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/succeed", s.methodNotAllowed(http.MethodPost))
+	}
 	mux.HandleFunc("/", s.handleNotFound)
 
 	var h http.Handler = mux
 	h = withBodyLimit(s.cfg.MaxRequestBytes, h)
+	h = withTimeout(s.cfg.RequestTimeout, h)
 	h = withRecovery(s.log, h)
 	h = withLogging(s.log, h)
 	h = withRequestID(h)
