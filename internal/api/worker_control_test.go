@@ -3,12 +3,15 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -143,3 +146,83 @@ func TestWorkerControl_TransitionUsesThePathAttemptID(t *testing.T) {
 }
 
 var _ WorkerControl = (*fakeWorkerControl)(nil)
+
+// TestIsDeadlineExhausted_ClassifiesOnlyTheReturnedError is the guard against
+// laundering unrelated failures into a retryable 503. Classification reads the
+// error and nothing else, so an expired context can never promote a constraint
+// violation, a driver fault, or a bug into "deadline exhausted".
+func TestIsDeadlineExhausted_ClassifiesOnlyTheReturnedError(t *testing.T) {
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"nil error":                      {nil, false},
+		"raw deadline":                   {context.DeadlineExceeded, true},
+		"wrapped deadline":               {fmt.Errorf("lock queue capacity: %w", context.DeadlineExceeded), true},
+		"store deadline sentinel":        {workers.ErrDeadlineExceeded, true},
+		"wrapped store sentinel":         {fmt.Errorf("claim job: %w", workers.ErrDeadlineExceeded), true},
+		"cancellation is not a deadline": {context.Canceled, false},
+		"wrapped cancellation":           {fmt.Errorf("lock queue capacity: %w", context.Canceled), false},
+		"unrelated driver error":         {errors.New("SQLSTATE 23505 unique violation"), false},
+		"unrelated domain error":         {workers.ErrStateConflict, false},
+		"deadline-shaped message only":   {errors.New("context deadline exceeded"), false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, test.want, isDeadlineExhausted(test.err))
+		})
+	}
+}
+
+// TestWorkerControl_ExpiredContextDoesNotMaskUnrelatedFailures drives the real
+// handler with an already-expired request context. Only an error that itself
+// carries the deadline may become a 503; everything else keeps its own mapping.
+func TestWorkerControl_ExpiredContextDoesNotMaskUnrelatedFailures(t *testing.T) {
+	tests := map[string]struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		"unrelated internal failure under an expired context": {
+			errors.New("insert job attempt: SQLSTATE 23505"), http.StatusInternalServerError, CodeInternal,
+		},
+		"client cancellation under an expired context": {
+			fmt.Errorf("lock queue capacity: %w", context.Canceled), http.StatusInternalServerError, CodeInternal,
+		},
+		"domain conflict under an expired context": {
+			workers.ErrSessionUnavailable, http.StatusConflict, CodeSessionUnavailable,
+		},
+		"genuine deadline under an expired context": {
+			fmt.Errorf("lock queue capacity: %w", workers.ErrDeadlineExceeded),
+			http.StatusServiceUnavailable, CodeServiceUnavailable,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			control := &fakeWorkerControl{
+				claim: func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error) {
+					return workers.ClaimResult{}, test.err
+				},
+			}
+			body := fmt.Sprintf(
+				`{"worker_id":%q,"worker_session_id":%q,"claim_request_id":%q,"queue":"default"}`,
+				uuid.NewString(), uuid.NewString(), uuid.NewString())
+			request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))
+
+			// The request context is already past its deadline before the handler
+			// runs, which is exactly the state that used to force a 503.
+			expired, cancel := context.WithDeadline(request.Context(), time.Now().Add(-time.Second))
+			defer cancel()
+			require.ErrorIs(t, expired.Err(), context.DeadlineExceeded, "the test context must be expired")
+			request = request.WithContext(expired)
+
+			recorder := httptest.NewRecorder()
+			newWorkerControlHandler(control).ServeHTTP(recorder, request)
+
+			require.Equal(t, test.wantStatus, recorder.Code)
+			var envelope ErrorBody
+			require.NoError(t, json.NewDecoder(recorder.Body).Decode(&envelope))
+			require.Equal(t, test.wantCode, envelope.Error.Code)
+		})
+	}
+}

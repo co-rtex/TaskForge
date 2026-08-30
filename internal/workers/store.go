@@ -32,7 +32,9 @@ func NewStore(pool *pgxpool.Pool, leaseDuration time.Duration) *Store {
 // OFFLINE in the same transaction. Because both registration and control
 // transitions lock the session row, either an old operation commits first or
 // it observes that it has been fenced; there is no check-then-update window.
-func (s *Store) Register(ctx context.Context, scope string, registration Registration) (Session, error) {
+func (s *Store) Register(ctx context.Context, scope string, registration Registration) (_ Session, err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
 	reg, err := NormalizeRegistration(registration)
 	if err != nil {
 		return Session{}, err
@@ -163,7 +165,9 @@ func sameRegistration(existing Session, workerID uuid.UUID, reg Registration) bo
 // transaction commits and its subsequent active-lease counts therefore see that
 // commit. This is why derived counts are safe here and would not be safe as a
 // bare count-then-insert.
-func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (ClaimResult, error) {
+func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ ClaimResult, err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
 	if err := ValidateClaim(req); err != nil {
 		return ClaimResult{}, err
 	}
@@ -432,7 +436,9 @@ func commitNoClaim(ctx context.Context, tx pgx.Tx, disposition ClaimDisposition)
 
 // Start performs the dedicated LEASED -> RUNNING transition. Replaying the
 // exact fence while it remains current is idempotent.
-func (s *Store) Start(ctx context.Context, scope string, fence Fence) error {
+func (s *Store) Start(ctx context.Context, scope string, fence Fence) (err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
 	if err := ValidateFence(fence); err != nil {
 		return err
 	}
@@ -474,7 +480,9 @@ func (s *Store) Start(ctx context.Context, scope string, fence Fence) error {
 
 // Succeed atomically accepts one fenced successful outcome and releases both
 // queue and logical-worker capacity. An exact replay after success is a no-op.
-func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) error {
+func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
 	if err := ValidateFence(fence); err != nil {
 		return err
 	}
@@ -601,4 +609,26 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 
 func rollback(ctx context.Context, tx pgx.Tx) {
 	_ = tx.Rollback(context.WithoutCancel(ctx))
+}
+
+// classifyDatabaseError is the single translation point between a failed
+// database call and the typed deadline sentinel.
+//
+// It inspects only the returned error. pgx wraps context.DeadlineExceeded when
+// it aborts a query on an expiring deadline, so errors.Is is sufficient today;
+// if a driver ever stops wrapping, this is the one function to change. It
+// deliberately never consults ctx.Err(): an unrelated constraint, driver, or
+// state failure that merely finishes after the deadline elapsed must keep its
+// own identity rather than be laundered into a retryable deadline.
+func classifyDatabaseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrDeadlineExceeded) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrDeadlineExceeded, err)
+	}
+	return err
 }

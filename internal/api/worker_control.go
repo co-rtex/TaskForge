@@ -320,25 +320,35 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 	case errors.Is(err, workers.ErrStateConflict):
 		writeError(w, r, s.log, http.StatusConflict, CodeStateConflict,
 			"the requested state transition is no longer valid", nil)
-	case isDeadlineExhausted(r.Context(), err):
-		// The request burned its server-owned deadline waiting on a PostgreSQL
-		// authority-row lock. Nothing was committed, and the caller may retry —
-		// that is availability, not an internal fault, so it must not be a 500.
+	case isDeadlineExhausted(err):
+		// A database call in this request failed because the request's own
+		// deadline elapsed. The outcome is genuinely ambiguous — a deadline
+		// reached during COMMIT may or may not have committed — so the response
+		// promises retryability, not rollback.
 		s.log.Warn("worker control request exhausted its deadline",
 			slog.String("request_id", RequestIDFrom(r.Context())),
 			slog.String("op", op))
 		writeError(w, r, s.log, http.StatusServiceUnavailable, CodeServiceUnavailable,
-			"the request exceeded its deadline waiting on contended database state", nil)
+			"the request exceeded its deadline before the outcome was known; "+
+				"retry with the same worker session and claim request identifiers, "+
+				"or read the job back to observe the durable result", nil)
 	default:
 		s.internalError(w, r, op, err)
 	}
 }
 
-// isDeadlineExhausted reports the one condition mapped to 503: this request's
-// own deadline elapsed. It deliberately does not classify client cancellation,
-// driver faults, or any other dependency failure.
-func isDeadlineExhausted(ctx context.Context, err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+// isDeadlineExhausted reports the one condition mapped to 503, and decides it
+// from the returned error alone.
+//
+// It never consults the request context. Asking whether the deadline has
+// elapsed would misclassify every unrelated failure that merely finished after
+// it — a constraint violation, a driver fault, a bug — as a retryable
+// deadline, hiding real errors behind a 503. The store produces
+// workers.ErrDeadlineExceeded at the failing database call itself; a directly
+// wrapped context.DeadlineExceeded is accepted for any future caller that has
+// not been through that translation.
+func isDeadlineExhausted(err error) bool {
+	return errors.Is(err, workers.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (s *Server) writeWorkerValidation(w http.ResponseWriter, r *http.Request, fields []workers.FieldError) {

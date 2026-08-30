@@ -19,6 +19,12 @@ var (
 	ErrFenceRejected      = errors.New("attempt fence rejected")
 	ErrLeaseExpired       = errors.New("lease expired")
 	ErrStateConflict      = errors.New("state transition conflict")
+	// ErrDeadlineExceeded reports that a database call in this operation failed
+	// because the operation's own deadline elapsed. It is produced only by
+	// classifyDatabaseError, from the failing call's returned error — never from
+	// an ambient context check — so an unrelated failure that merely happens to
+	// coincide with an expired deadline is never reported as this.
+	ErrDeadlineExceeded = errors.New("operation deadline exceeded")
 )
 
 // SessionStatus is the server-owned health state of one process lifetime.
