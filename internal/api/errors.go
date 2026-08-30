@@ -19,6 +19,7 @@ const (
 	CodePayloadTooLarge     = "payload_too_large"
 	CodeMethodNotAllowed    = "method_not_allowed"
 	CodeInternal            = "internal_error"
+	CodeServiceUnavailable  = "service_unavailable"
 	CodeSessionConflict     = "worker_session_conflict"
 	CodeSessionUnavailable  = "worker_session_unavailable"
 	CodeClaimConflict       = "claim_conflict"

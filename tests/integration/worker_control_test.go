@@ -722,10 +722,31 @@ func TestWorkerControl_RequestTimeoutCancelsDatabaseLockWait(t *testing.T) {
 	response, err := (&http.Client{Timeout: 2 * time.Second}).Do(request)
 	require.NoError(t, err)
 	defer response.Body.Close()
-	require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+
+	// A deadline burned on a contended authority-row lock is an availability
+	// condition the caller may retry, not an internal fault.
+	require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	var envelope api.ErrorBody
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&envelope))
+	require.Equal(t, api.CodeServiceUnavailable, envelope.Error.Code)
+	require.Equal(t, "service_unavailable", envelope.Error.Code)
+	require.NotEmpty(t, envelope.Error.Message, "the structured envelope must carry a message")
+	require.NotContains(t, envelope.Error.Message, "SELECT",
+		"the sanitized envelope must never leak SQL")
 	require.Less(t, time.Since(started), time.Second)
+
+	// The worker client keeps treating 5xx as retryable.
+	require.True(t, (&workerruntime.RemoteError{
+		Status: response.StatusCode, Code: envelope.Error.Code,
+	}).Retryable(), "a 503 must stay retryable for the worker client")
+
+	// Nothing durable was mutated by the abandoned transaction.
 	require.Equal(t, 0, countRows(t, "job_attempts"))
 	require.Equal(t, 0, countRows(t, "leases"))
+	var jobStatus string
+	require.NoError(t, testPool.QueryRow(context.Background(),
+		`SELECT status FROM jobs`).Scan(&jobStatus))
+	require.Equal(t, "QUEUED", jobStatus, "the contended job must remain claimable")
 }
 
 func waitForDatabaseLock(t *testing.T, queryFragment string) {
@@ -805,4 +826,247 @@ func TestClaim_RollsBackAttemptWhenLeaseInsertFails(t *testing.T) {
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&status))
 	require.Equal(t, "QUEUED", status)
+}
+
+// registerReplacement boots a new process session for the same logical worker,
+// which fences the prior current session.
+func registerReplacement(t *testing.T, store *workers.Store, previous workers.Registration) workers.Session {
+	t.Helper()
+	replacement := previous
+	replacement.SessionID = uuid.New()
+	return registerWorker(t, store, replacement)
+}
+
+func sessionStatus(t *testing.T, id uuid.UUID) string {
+	t.Helper()
+	var status string
+	require.NoError(t, testPool.QueryRow(context.Background(),
+		`SELECT status FROM worker_sessions WHERE id = $1`, id).Scan(&status))
+	return status
+}
+
+// TestRegisterReplacement_RacingClaimYieldsOnlyValidSerialOutcomes proves that a
+// process boot replacing its predecessor is serialized against that
+// predecessor's in-flight claim. Registration's fencing UPDATE and the claim's
+// worker-session FOR UPDATE contend on the same row, so there is no
+// check-then-update window: the claim either commits before replacement or is
+// rejected afterwards, never both and never partially.
+func TestRegisterReplacement_RacingClaimYieldsOnlyValidSerialOutcomes(t *testing.T) {
+	t.Run("replacement first: the fenced claim commits nothing", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		registration := workerRegistration("race-claim-worker", 1, nil, []string{"demo.echo"})
+		original := registerWorker(t, store, registration)
+		jobID := createJob(t, "race-claim", "demo.echo", 50, nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		// Park the claim on the queue capacity lock, before it reaches the
+		// worker-session row, so replacement is guaranteed to commit first.
+		queueLock, err := testPool.Begin(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
+		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
+		require.NoError(t, err)
+
+		claimErr := make(chan error, 1)
+		go func() {
+			_, err := store.Claim(ctx, testScope, claimRequest(original, "default"))
+			claimErr <- err
+		}()
+		waitForDatabaseLock(t, "SELECT worker_group, max_concurrency")
+
+		replacement := registerReplacement(t, store, registration)
+		require.Equal(t, original.WorkerID, replacement.WorkerID)
+		require.NoError(t, queueLock.Commit(ctx))
+
+		require.ErrorIs(t, <-claimErr, workers.ErrSessionUnavailable,
+			"a claim that waited across replacement must be fenced, not honored")
+		require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
+		require.Equal(t, "HEALTHY", sessionStatus(t, replacement.ID))
+		require.Equal(t, 0, countRows(t, "job_attempts"), "no attempt may survive a fenced claim")
+		require.Equal(t, 0, countRows(t, "leases"), "no lease may survive a fenced claim")
+		var status string
+		require.NoError(t, testPool.QueryRow(context.Background(),
+			`SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&status))
+		require.Equal(t, "QUEUED", status, "the job must stay claimable by the replacement")
+	})
+
+	t.Run("unbarriered race resolves to exactly one valid serial outcome", func(t *testing.T) {
+		const rounds = 12
+		fenced, claimed := 0, 0
+		for round := 0; round < rounds; round++ {
+			reset(t)
+			store := controlStore()
+			registration := workerRegistration("race-claim-loop", 1, nil, []string{"demo.echo"})
+			original := registerWorker(t, store, registration)
+			createJob(t, fmt.Sprintf("race-claim-loop-%02d", round), "demo.echo", 50, nil)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			replacementRegistration := registration
+			replacementRegistration.SessionID = uuid.New()
+
+			start := make(chan struct{})
+			claimErr := make(chan error, 1)
+			registerErr := make(chan error, 1)
+			go func() {
+				<-start
+				_, err := store.Claim(ctx, testScope, claimRequest(original, "default"))
+				claimErr <- err
+			}()
+			go func() {
+				<-start
+				_, err := store.Register(ctx, testScope, replacementRegistration)
+				registerErr <- err
+			}()
+			close(start)
+
+			require.NoError(t, <-registerErr, "replacement registration must always succeed")
+			err := <-claimErr
+			cancel()
+
+			attempts, leases := countRows(t, "job_attempts"), countActiveLeases(t)
+			switch {
+			case err == nil:
+				// The claim committed before replacement fenced the old session.
+				claimed++
+				require.Equal(t, 1, attempts, "a winning claim creates exactly one attempt")
+				require.Equal(t, 1, leases, "a winning claim creates exactly one active lease")
+			default:
+				require.ErrorIs(t, err, workers.ErrSessionUnavailable,
+					"the only valid loss is current-session fencing")
+				fenced++
+				require.Equal(t, 0, attempts, "a fenced claim leaves no attempt behind")
+				require.Equal(t, 0, leases, "a fenced claim leaves no capacity reserved")
+			}
+			require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
+			require.Equal(t, "HEALTHY", sessionStatus(t, replacementRegistration.SessionID))
+			require.LessOrEqual(t, countRows(t, "leases"), 1, "no round may produce a second lease")
+		}
+		t.Logf("valid serial outcomes over %d rounds: claimed-before-replacement=%d fenced-after-replacement=%d",
+			rounds, claimed, fenced)
+	})
+}
+
+// TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes proves the
+// same serialization for an outcome report. A replaced process boot can never
+// commit a stale success, and the rejection mutates nothing.
+func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testing.T) {
+	t.Run("replacement first: the fenced success mutates nothing", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		registration := workerRegistration("race-succeed-worker", 1, nil, []string{"demo.echo"})
+		original := registerWorker(t, store, registration)
+		createJob(t, "race-succeed", "demo.echo", 50, nil)
+		claim, err := store.Claim(context.Background(), testScope, claimRequest(original, "default"))
+		require.NoError(t, err)
+		fence := assignmentFence(claim.Assignment)
+		require.NoError(t, store.Start(context.Background(), testScope, fence))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		queueLock, err := testPool.Begin(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
+		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
+		require.NoError(t, err)
+
+		succeedErr := make(chan error, 1)
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
+
+		replacement := registerReplacement(t, store, registration)
+		require.NoError(t, queueLock.Commit(ctx))
+
+		require.ErrorIs(t, <-succeedErr, workers.ErrFenceRejected,
+			"a replaced boot must never commit an outcome")
+		require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
+		require.Equal(t, "HEALTHY", sessionStatus(t, replacement.ID))
+
+		var jobStatus, attemptStatus, leaseStatus string
+		var finishedAt, releasedAt *time.Time
+		require.NoError(t, testPool.QueryRow(context.Background(), `
+			SELECT j.status, a.status, l.status, a.finished_at, l.released_at
+			FROM jobs j
+			JOIN job_attempts a ON a.job_id = j.id
+			JOIN leases l ON l.attempt_id = a.id
+			WHERE j.id = $1`, fence.JobID).Scan(
+			&jobStatus, &attemptStatus, &leaseStatus, &finishedAt, &releasedAt))
+		require.Equal(t, "RUNNING", jobStatus)
+		require.Equal(t, "RUNNING", attemptStatus)
+		require.Equal(t, "ACTIVE", leaseStatus)
+		require.Nil(t, finishedAt, "a rejected success must not stamp a finish time")
+		require.Nil(t, releasedAt, "a rejected success must not release the lease")
+		require.Equal(t, 1, countRows(t, "job_attempts"))
+		require.Equal(t, 1, countRows(t, "leases"))
+	})
+
+	t.Run("unbarriered race resolves to exactly one valid serial outcome", func(t *testing.T) {
+		const rounds = 12
+		committed, fenced := 0, 0
+		for round := 0; round < rounds; round++ {
+			reset(t)
+			store := controlStore()
+			registration := workerRegistration("race-succeed-loop", 1, nil, []string{"demo.echo"})
+			original := registerWorker(t, store, registration)
+			createJob(t, fmt.Sprintf("race-succeed-loop-%02d", round), "demo.echo", 50, nil)
+			claim, err := store.Claim(context.Background(), testScope, claimRequest(original, "default"))
+			require.NoError(t, err)
+			fence := assignmentFence(claim.Assignment)
+			require.NoError(t, store.Start(context.Background(), testScope, fence))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			replacementRegistration := registration
+			replacementRegistration.SessionID = uuid.New()
+
+			start := make(chan struct{})
+			succeedErr := make(chan error, 1)
+			registerErr := make(chan error, 1)
+			go func() {
+				<-start
+				succeedErr <- store.Succeed(ctx, testScope, fence)
+			}()
+			go func() {
+				<-start
+				_, err := store.Register(ctx, testScope, replacementRegistration)
+				registerErr <- err
+			}()
+			close(start)
+
+			require.NoError(t, <-registerErr, "replacement registration must always succeed")
+			err = <-succeedErr
+			cancel()
+
+			var jobStatus, attemptStatus, leaseStatus string
+			require.NoError(t, testPool.QueryRow(context.Background(), `
+				SELECT j.status, a.status, l.status
+				FROM jobs j
+				JOIN job_attempts a ON a.job_id = j.id
+				JOIN leases l ON l.attempt_id = a.id
+				WHERE j.id = $1`, fence.JobID).Scan(&jobStatus, &attemptStatus, &leaseStatus))
+
+			switch {
+			case err == nil:
+				committed++
+				require.Equal(t, "SUCCEEDED", jobStatus)
+				require.Equal(t, "SUCCEEDED", attemptStatus)
+				require.Equal(t, "COMPLETED", leaseStatus)
+				require.Equal(t, 0, countActiveLeases(t), "a committed success releases capacity")
+			default:
+				require.ErrorIs(t, err, workers.ErrFenceRejected,
+					"the only valid loss is current-session fencing")
+				fenced++
+				require.Equal(t, "RUNNING", jobStatus, "a fenced success must not advance the job")
+				require.Equal(t, "RUNNING", attemptStatus)
+				require.Equal(t, "ACTIVE", leaseStatus)
+				require.Equal(t, 1, countActiveLeases(t), "a fenced success must not release capacity")
+			}
+			require.Equal(t, 1, countRows(t, "job_attempts"), "no round may create a second attempt")
+			require.Equal(t, 1, countRows(t, "leases"), "no round may create a second lease")
+			require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
+		}
+		t.Logf("valid serial outcomes over %d rounds: committed-before-replacement=%d fenced-after-replacement=%d",
+			rounds, committed, fenced)
+	})
 }
