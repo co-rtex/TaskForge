@@ -156,6 +156,100 @@ func TestOpenAPI_Deadline503GuidanceIsPerEndpoint(t *testing.T) {
 				transition+" replays a fence, not a claim identity")
 		})
 	}
+
+	t.Run("heartbeat names its session identity and promises no rollback", func(t *testing.T) {
+		description, _ := describe503(t, doc, "post",
+			"/internal/v1/worker-sessions/{worker_session_id}/heartbeat")
+		lower := strings.ToLower(description)
+		require.Contains(t, lower, "worker_session_id")
+		require.Contains(t, lower, "worker_id")
+		require.NotContains(t, lower, "claim_request_id",
+			"a heartbeat has no claim identity to replay")
+		require.NotContains(t, lower, "attempt fence")
+		// A heartbeat that advances the receipt time a second time is correct
+		// behavior, so the contract must not promise the retry changes nothing.
+		require.Contains(t, lower, "advance",
+			"the contract must say a heartbeat replay may advance the receipt time again")
+		require.Contains(t, lower, "never create a session")
+	})
+
+	// Renewal is the one operation where retrying with a NEW identity would
+	// silently double the caller's authority. The contract has to say so.
+	t.Run("renewal names its full fence, identity, and expected generation", func(t *testing.T) {
+		description, _ := describe503(t, doc, "post", "/internal/v1/leases/{lease_id}/renew")
+		lower := strings.ToLower(description)
+		for _, field := range []string{
+			"lease_id", "job_id", "attempt_id", "worker_id", "worker_session_id",
+			"renewal_request_id", "expected_renewal_version",
+		} {
+			require.Containsf(t, lower, field, "renewal must name %s as part of what to replay", field)
+		}
+		require.Contains(t, flatten(description), "extend the lease twice",
+			"the contract must warn that a fresh renewal identity on a retry double-extends")
+		require.NotContains(t, lower, "claim_request_id",
+			"renewal replays a renewal identity, not a claim identity")
+	})
+}
+
+// TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode keeps the spec from
+// silently falling behind the handlers. AGENTS.md section 8 forbids documenting
+// unbuilt behavior; this is the other direction — built behavior that never made
+// it into the document.
+func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
+	doc := loadOpenAPI(t)
+
+	t.Run("every implemented worker-control route is documented", func(t *testing.T) {
+		for path, method := range map[string]string{
+			"/internal/v1/worker-sessions/{worker_session_id}":           "put",
+			"/internal/v1/worker-sessions/{worker_session_id}/heartbeat": "post",
+			"/internal/v1/claims":                        "post",
+			"/internal/v1/leases/{lease_id}/renew":       "post",
+			"/internal/v1/attempts/{attempt_id}/start":   "post",
+			"/internal/v1/attempts/{attempt_id}/succeed": "post",
+		} {
+			operations, ok := doc.Paths[path]
+			require.Truef(t, ok, "%s is implemented but missing from the spec", path)
+			_, ok = operations[method]
+			require.Truef(t, ok, "%s %s is implemented but missing from the spec", method, path)
+		}
+	})
+
+	// The enum is the client's branching contract, so a code the handlers can
+	// emit but the spec never lists is a broken contract.
+	t.Run("every stable error code appears in the spec enum", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+		require.NoError(t, err)
+		var document struct {
+			Components struct {
+				Schemas struct {
+					Error struct {
+						Properties struct {
+							Error struct {
+								Properties struct {
+									Code struct {
+										Enum []string `yaml:"enum"`
+									} `yaml:"code"`
+								} `yaml:"properties"`
+							} `yaml:"error"`
+						} `yaml:"properties"`
+					} `yaml:"Error"`
+				} `yaml:"schemas"`
+			} `yaml:"components"`
+		}
+		require.NoError(t, yaml.Unmarshal(raw, &document))
+		documented := document.Components.Schemas.Error.Properties.Error.Properties.Code.Enum
+		require.NotEmpty(t, documented)
+
+		for _, code := range []string{
+			CodeValidationFailed, CodeMalformedJSON, CodeUnknownQueue, CodeIdempotencyConflict,
+			CodeNotFound, CodePayloadTooLarge, CodeMethodNotAllowed, CodeInternal,
+			CodeServiceUnavailable, CodeSessionConflict, CodeSessionUnavailable,
+			CodeClaimConflict, CodeFenceRejected, CodeLeaseExpired, CodeStateConflict,
+			CodeRenewalConflict,
+		} {
+			require.Containsf(t, documented, code, "error code %q is emitted but undocumented", code)
+		}
+	})
 }
 
 // TestOpenAPI_Deadline503NeverOverPromises pins the two claims the old contract
@@ -163,20 +257,20 @@ func TestOpenAPI_Deadline503GuidanceIsPerEndpoint(t *testing.T) {
 // and that nothing was committed.
 func TestOpenAPI_Deadline503NeverOverPromises(t *testing.T) {
 	doc := loadOpenAPI(t)
-	operations := map[string]string{
-		"put":  "/internal/v1/worker-sessions/{worker_session_id}",
-		"post": "/internal/v1/claims",
-	}
-	for _, transition := range []string{"start", "succeed"} {
-		operations["post "+transition] = "/internal/v1/attempts/{attempt_id}/" + transition
+	// Every worker-control operation, including the two M3 added. A 503 that
+	// over-promises on one endpoint is exactly as wrong as on any other.
+	operations := []struct{ method, path string }{
+		{"put", "/internal/v1/worker-sessions/{worker_session_id}"},
+		{"post", "/internal/v1/worker-sessions/{worker_session_id}/heartbeat"},
+		{"post", "/internal/v1/claims"},
+		{"post", "/internal/v1/leases/{lease_id}/renew"},
+		{"post", "/internal/v1/attempts/{attempt_id}/start"},
+		{"post", "/internal/v1/attempts/{attempt_id}/succeed"},
 	}
 
-	for label, path := range operations {
-		method := "post"
-		if label == "put" {
-			method = "put"
-		}
-		t.Run(label+" "+path, func(t *testing.T) {
+	for _, operation := range operations {
+		method, path := operation.method, operation.path
+		t.Run(method+" "+path, func(t *testing.T) {
 			description, message := describe503(t, doc, method, path)
 			combined := flatten(description + " " + message)
 
