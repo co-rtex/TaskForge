@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -18,6 +19,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/api"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
 const testScope = "integration-test"
@@ -32,7 +34,7 @@ func newAPI(t *testing.T) *httptest.Server {
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, testPool) },
 		},
-	)
+	).WithWorkerControl(workers.NewStore(testPool, 30*time.Second))
 	s := httptest.NewServer(srv.Handler())
 	t.Cleanup(s.Close)
 	return s

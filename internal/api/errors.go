@@ -20,6 +20,12 @@ const (
 	CodeMethodNotAllowed    = "method_not_allowed"
 	CodeInternal            = "internal_error"
 	CodeServiceUnavailable  = "service_unavailable"
+	CodeSessionConflict     = "worker_session_conflict"
+	CodeSessionUnavailable  = "worker_session_unavailable"
+	CodeClaimConflict       = "claim_conflict"
+	CodeFenceRejected       = "fence_rejected"
+	CodeLeaseExpired        = "lease_expired"
+	CodeStateConflict       = "state_conflict"
 )
 
 // ErrorBody is the single error shape every endpoint returns.

@@ -1,7 +1,7 @@
 // Command taskforge-api serves TaskForge's HTTP API.
 //
-// Milestone M1 exposes durable job ingress only. It has no authentication yet
-// and therefore binds to loopback; see docs/CURRENT_STATE.md.
+// It exposes durable job ingress plus the internal M2 worker control surface.
+// Authentication is still planned for M5, so it binds to loopback only.
 package main
 
 import (
@@ -19,6 +19,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
+	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
 func main() {
@@ -49,13 +50,17 @@ func run() int {
 
 	server := api.NewServer(
 		jobs.NewStore(pool),
-		api.Config{MaxRequestBytes: cfg.MaxRequestBytes, DevScope: cfg.DevScope},
+		api.Config{
+			MaxRequestBytes: cfg.MaxRequestBytes,
+			RequestTimeout:  cfg.APIRequestTimeout,
+			DevScope:        cfg.DevScope,
+		},
 		log,
 		api.ReadinessCheck{
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, pool) },
 		},
-	)
+	).WithWorkerControl(workers.NewStore(pool, cfg.LeaseDuration))
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,

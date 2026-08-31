@@ -1,7 +1,19 @@
 # ADR-0003: Pull-based claim with broker notification
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded
 - **Date:** 2026-08-29
+- **Superseded in part by:**
+  - [ADR-0006](0006-session-bound-worker-eligibility.md) — replaces the clause
+    where a worker presents its capabilities on each claim. Eligibility is now
+    loaded from the durable, immutable process-session row.
+  - [ADR-0007](0007-globally-idempotent-notification-claims.md) — replaces the
+    M2 claim-identity and acknowledgement details. The durable outbox event id
+    is the globally unique claim request id, and acknowledgement is driven by an
+    explicit control-plane disposition.
+
+> The pull-based architecture below — the broker signals only that work may
+> exist, and one PostgreSQL transaction decides who gets which job — remains
+> accepted and in force. Only the two clauses named above are superseded.
 
 ## Context
 

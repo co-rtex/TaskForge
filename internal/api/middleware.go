@@ -112,3 +112,13 @@ func withBodyLimit(limit int64, next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// withTimeout ensures PostgreSQL and every other context-aware dependency sees
+// a bounded request context even when the caller supplied no deadline.
+func withTimeout(timeout time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}

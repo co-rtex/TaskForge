@@ -90,9 +90,7 @@ These are documented as planned work. They are **not** scaffolded as empty code.
 
 ---
 
-## Current milestone — M2: Workers, sessions, and atomic claim
-
-### M2 — Workers, sessions, and atomic claim
+## M2 — Workers, sessions, and atomic claim
 **Objective.** A worker registers a process session, claims a job atomically under
 priority and capability rules, and executes one trusted handler to completion.
 **Deliverables.** `workers`, `worker_sessions`, `leases`, `job_attempts` tables;
@@ -102,11 +100,11 @@ enforcement; `taskforge-worker` with a bounded pool; the `demo.echo` handler.
 under load; a job runs end to end; duplicate broker delivery produces at most one
 active lease.
 **Depends on.** M1 (complete).
-**Status:** not started.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the evidence.
 
 ---
 
-## Remaining V1 milestones
+## Current milestone — M3: Heartbeats, lease renewal, and crash recovery
 
 ### M3 — Heartbeats, lease renewal, and crash recovery
 **Objective.** A killed worker's job is recovered and completed by another worker,
@@ -117,6 +115,11 @@ and the dead worker can never commit an outcome afterward.
 replacement attempt succeeds; a late completion from the dead process is rejected;
 reconciliation is idempotent under repeated and concurrent runs.
 **Depends on.** M2.
+**Status:** not started.
+
+---
+
+## Remaining V1 milestones
 
 ### M4 — Retry, timeout, cancellation, DLQ, replay, delayed jobs
 **Objective.** Complete the job lifecycle.

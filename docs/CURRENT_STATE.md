@@ -1,146 +1,179 @@
-# TaskForge — Current State
+# Current State
 
-Canonical owner of: what is actually implemented, what was actually verified, known
-gaps, and the recommended next milestone.
+This document is the source of truth for what is runnable now and what remains
+planned. It describes the `feat/workers-atomic-claim` branch after Milestone M2,
+based on M1 commit `1cb66cbc922e841d80a9e6318e81e44778555f5d`.
 
-**Update this file at the end of every implementation session. It must match the
-branch head. Never mark planned, scaffolded, or compiled-but-untested work as complete.**
+## Milestone status
 
----
+- **M1 — durable ingress and transactional outbox:** complete.
+- **M2 — worker sessions, atomic claims, and fenced execution:** complete.
+- **M3 — heartbeat, lease renewal, and reconciliation:** not started.
 
-## Snapshot
+## Runnable system
 
-| Field | Value |
-| --- | --- |
-| Branch | `feat/durable-job-ingress` |
-| Base commit | `8d340104f8c43261567f1a518adaf43ac20eca37` (`docs: establish TaskForge repository context`) |
-| Milestone | M1 — Durable job ingress and recoverable outbox |
-| Milestone status | **Complete.** All acceptance criteria in [ROADMAP.md](ROADMAP.md) are met. |
-| Next milestone | M2 — Workers, sessions, and atomic claim. **Not started.** |
+Four binaries build and run:
 
-## What is actually implemented
+- `taskforge-api` accepts idempotent job submissions, job reads, worker-session
+  registration, atomic claims, and fenced start/succeed transitions.
+- `taskforge-outbox` publishes durable work-availability events to ElasticMQ.
+- `taskforge-worker` polls ElasticMQ only while it has capacity and executes the
+  trusted `demo.echo` handler through the control plane.
+- `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-### Runnable components
+The schema consists of migrations `0001` through `0005`. M2 adds stable worker
+identities, boot-scoped immutable sessions, attempts, fixed-duration leases,
+capacity and claim indexes, control-timeline constraints, and globally unique
+notification consumption.
 
-| Binary | What it does |
-| --- | --- |
-| `taskforge-migrate` | Applies embedded SQL migrations. Advisory-locked, checksum-verified, idempotent. |
-| `taskforge-api` | `POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /healthz`, `GET /readyz`. |
-| `taskforge-outbox` | Drains `outbox_events` to the broker. Own `/healthz` and `/readyz`. |
+## Implemented behavior
 
-### Schema (`migrations/0001_initial_job_ingress.sql`)
+- A worker registers a new boot session with immutable worker group, concurrency,
+  capabilities, and trusted handler types. Registering a replacement
+  session fences the old one.
+- A claim transaction locks queue, session, job, attempt, and lease state in a fixed
+  order. It enforces queue and worker capacity, strict job priority, availability,
+  worker group, capabilities, and trusted handler type.
+- PostgreSQL supplies claim, lease, start, and completion time. Lease expiry is a
+  fixed server-side duration in M2.
+- The durable outbox event id is also the claim request id. Exact replay by the
+  owning session returns the existing assignment; another session receives a safe
+  duplicate-notification outcome. A database uniqueness constraint makes this
+  global across sessions and processes.
+- Workers acknowledge broker messages only after a durable assignment, a proven
+  empty queue, or a globally consumed duplicate notification. Other no-match and
+  error outcomes remain unacknowledged.
+- Start and success are fenced by job, attempt, lease, worker session, and state.
+  Successful completion releases durable capacity.
+- The worker converts the database-reported remaining lease duration into a
+  conservative monotonic local deadline and reserves completion time before expiry.
+- Local slots bound polling and execution. Duplicate deliveries are collapsed in
+  process, handler panics are contained, shutdown drains cooperative work, and
+  session loss cancels the runner and removes readiness.
+- A duplicate delivery releases its slot as soon as the durable claim decision is
+  published; it does not wait for the leader's handler. The event's flight entry is
+  still held for the whole leader path, so a duplicate arriving mid-execution joins
+  as a follower and can never lead a second claim, replay Start on a RUNNING
+  attempt, or invoke the handler again. Only `CLAIMED`, `QUEUE_EMPTY`, and
+  `DUPLICATE_NOTIFICATION` release a receipt.
+- API requests have bounded contexts. A worker-control request that exhausts its
+  server-owned deadline returns HTTP 503 `service_unavailable` with the standard
+  error envelope; genuine faults remain 500 `internal_error`. Service binds are
+  loopback-only until control endpoints gain authentication.
 
-`queues`, `jobs`, `idempotency_records`, `outbox_events`, plus `schema_migrations`
-maintained by the runner. Invariants are enforced by database constraints: the
-composite primary key on `(scope, idempotency_key)` is what makes duplicate
-submissions collapse to one job, and a partial index on pending events serves the
-publisher's only scan.
+  That deadline can elapse while acquiring a lock, while executing a statement, or
+  during COMMIT, and a COMMIT cut short leaves the immediate outcome unknown. The
+  503 therefore never promises that nothing committed. It tells the caller to retry
+  the identical request under that operation's existing identity or fence:
 
-`jobs` is **insert-only** in this milestone — nothing transitions a job yet, so
-every row is `QUEUED`. The `CHECK` constraint already covers the whole V1 state
-machine so later milestones do not have to rewrite it.
+  - registration replays its own `worker_session_id` and immutable registration body;
+  - a claim replays its `worker_session_id` and `claim_request_id`;
+  - start and succeed replay their attempt fence.
 
-### Behavior
+  Each of those is idempotent, so a replay returns the already-committed result
+  rather than producing a second one. Per-endpoint retry guidance is documented in
+  [api/openapi.yaml](../api/openapi.yaml); the shared Go message stays
+  endpoint-neutral because one string serves all four operations.
 
-- **Idempotent submission.** Job, idempotency record, and outbox event commit in one
-  transaction. Requests are canonicalized (object keys sorted, capabilities reduced
-  to a sorted set, defaults applied) and hashed into a length-prefixed SHA-256
-  fingerprint. Same key + equivalent request replays with `200`; same key +
-  different request conflicts with `409`.
-- **Transactional outbox.** Claim (commit) → publish (no transaction held) → mark
-  published (commit). `FOR UPDATE SKIP LOCKED` makes publisher replicas safe; the
-  advanced `available_at` acts as a visibility timeout. Publish failures back off
-  exponentially with injected jitter and are never marked terminally failed.
-- **Broker abstraction.** Publish, long-poll receive, acknowledge. One implementation
-  serves ElasticMQ locally and AWS SQS in a deployment. Notifications carry
-  identifiers and routing hints only — never the authoritative job payload.
-- **Validation.** Unknown fields rejected, body size capped, all field problems
-  reported at once, `scheduled_at` refused with an explicit "not implemented"
-  message rather than silently ignored.
-- **Errors.** One structured shape with stable machine-readable codes, including 404
-  and 405. Internal detail never reaches a client; a request id threads back to logs.
-- **Health.** Liveness checks nothing by design; readiness checks real dependencies
-  under a bounded timeout and returns `503` when one is down.
+## Effective handler budget in M2
 
-### Not implemented
+The budget a handler actually gets is the **lesser** of:
 
-Workers · sessions · claims · attempts · leases · heartbeats · scheduler · retries ·
-timeouts · cancellation · DLQ · replay · result storage · API keys · CLI · Python SDK ·
-dashboard · metrics · tracing · Terraform · benchmarks.
+- the job's `timeout_seconds`; and
+- the remaining fixed lease window PostgreSQL reports at claim time, minus a small
+  completion margin reserved for reporting the outcome.
 
-Nothing executes a job. No empty package, table, or service has been created for any
-of the above.
+A `timeout_seconds` larger than `TASKFORGE_LEASE_DURATION` is accepted for forward
+compatibility, but until M3 adds lease renewal it cannot authorize execution beyond
+one fixed lease. The 30-second lease default and the 300-second job-timeout default
+are unchanged, and oversized timeouts are deliberately not rejected.
 
-## What was actually verified
+How that budget is enforced, precisely:
 
-Verified on macOS (darwin/arm64), Go 1.27.0, Docker 28.5.2, PostgreSQL 16-alpine,
-ElasticMQ 1.6.11, at commit `1c25d69`.
+- The worker invokes the handler with a deadline-bearing `context.Context`.
+- When the budget elapses, the worker cancels that context.
+- A cooperative handler is expected to observe the cancellation and return.
+- Go cannot forcibly terminate arbitrary handler code. An uncooperative handler
+  may keep running until it returns on its own or the process exits, and the
+  worker cannot preempt it. Hard cancellation needs isolated process or container
+  execution, which is post-V1.
+- The control-plane guarantee is the durable one: once the lease authority
+  deadline has passed, the worker cannot successfully report completion, because
+  the fenced transition is rejected against PostgreSQL server time. Late work
+  therefore cannot commit an outcome, even though it may still be running.
 
-| Command | Result | Summary |
-| --- | --- | --- |
-| `make lint` | **PASS** | `gofmt` clean; `go vet ./...` clean. |
-| `make build` | **PASS** | Three binaries produced in `./bin`. |
-| `make test-unit` | **PASS** | 5 packages ok; `internal/{api,config,database,jobs,outbox}`. |
-| `make test-integration` | **PASS** | `ok ... 30.9s` against real PostgreSQL and real ElasticMQ. |
-| `make test-race` | **PASS** | Unit clean; integration `ok ... 41.1s`. No data races. |
-| `docker compose config --quiet` | **PASS** | Compose file valid. |
-| `go run ./cmd/taskforge-migrate` (fresh DB) | **PASS** | `migrations complete applied=1`; re-run reports `schema already up to date`. |
-| End-to-end smoke with real binaries | **PASS** | See below. |
+Work that must run longer than one lease is M3 work.
 
-The smoke run submitted a job over HTTP, replayed the key (`200`), conflicted a
-different request on the same key (`409`), read the job back, and observed the real
-broker message:
+## Operating concurrent workers
 
-```json
-{"event_id":"bea09fbf-...","event_type":"work.available","schema_version":1,
- "occurred_at":"2026-08-29T22:57:13.360367Z",
- "data":{"queue":"default","job_id":"1e1f8b9b-..."}}
-```
+A logical worker is `(scope, name)`, and only one process session may be current for
+it. `TASKFORGE_WORKER_NAME=local-worker` is a single-process development default:
+every concurrently running worker must be given its own stable, distinct name.
+Booting a second worker under the same name fences the first, and the fenced process
+exits rather than continuing without authority. Names must also stay stable across
+restarts of the same logical worker.
 
-with the outbox row settling to `status=PUBLISHED, attempts=1`. Both services
-reported `{"status":"ready"}` with every component `ok`.
+## Deliberately not implemented yet
 
-### A real bug this work caught
+- Heartbeats, lease renewal, expired-lease reconciliation, attempt abandonment, and
+  durable capacity repair are M3 work.
+- Retry policy and failed, cancelled, and dead-letter outcomes are M4 work.
+- If a worker crashes or a handler fails after claiming, the M2 lease remains active
+  and consumes capacity. No new execution is authorized automatically.
+- Only `demo.echo` is registered as a production worker handler. Work must fit
+  within the fixed lease; longer work requires M3 renewal.
+- An idle worker discovers replacement of its session on its next control-plane
+  operation. Proactive discovery requires M3 heartbeat.
+- There is no scheduler or re-notification loop. Losing the sole broker notification
+  can strand a durable queued job until M4 adds promotion and re-notification.
+- Cancellation is deferred to M4. Result bodies and richer status APIs are deferred
+  to M5.
+- Authentication, authorization, metrics, tracing, broker-retention policy, and
+  production performance characterization remain future work.
 
-`TestMigrations_AreSafeToRunConcurrently` failed on first run with a duplicate key
-on `pg_type_typname_nsp_index`. `CREATE TABLE IF NOT EXISTS schema_migrations` ran
-**before** the advisory lock, and `IF NOT EXISTS` is not atomic against a concurrent
-creation of the same table. The lock now precedes any DDL. This is why concurrency
-tests exist.
+These omissions are liveness and product gaps. The implemented M2 paths still keep
+PostgreSQL authoritative and reject stale or duplicate mutations.
 
-## Known gaps, limitations, and debt
+## Verification
 
-- **No authentication.** Every request is attributed to the single configured
-  `TASKFORGE_DEV_SCOPE`. The scoping model is correct and already enforced in the
-  schema and every query, but there is no identity behind it. **The services must
-  stay bound to loopback until database-backed API keys land in M5.**
-- **Broker outage is injected at the network layer**, not by stopping the container.
-  This exercises the real AWS SDK client, real error handling, and real recovery
-  deterministically, but it does not cover behavior when the broker's TCP listener
-  disappears entirely, nor ElasticMQ-versus-real-SQS differences in throttling and
-  quota errors. Closing that gap needs a deployment smoke test (M8).
-- **Outbox retention is unbounded.** `outbox_events` keeps published rows forever.
-  A retention or archival policy is needed before any load testing. Debt.
-- **`queues.max_concurrency` is stored but not enforced.** It is part of a queue's
-  definition; enforcement belongs to the claim path in M2.
-- **No metrics or tracing.** Structured logs with correlation ids exist; the
-  observability stack is M6.
-- **No performance data.** The targets in [PROJECT_SPEC.md](PROJECT_SPEC.md) §7
-  remain **unmeasured**, and no benchmark has been run.
-- A stale `CLAUDE.md` for an unrelated project (`Cadence`) sits in the parent
-  directory `~/CLAUDE.md` and may be auto-loaded into sessions started from this
-  path. It does not contradict TaskForge, but it is irrelevant context; this
-  repository's own `CLAUDE.md` and `AGENTS.md` govern this project.
+The M2 tree, including the pre-merge corrective pass, passed these gates on
+2026-08-29:
 
-## Environment notes
+- `make fmt`
+- `make lint`
+- `make build`
+- `make test-unit`
+- `make test-integration`
+- `make test-race` for both unit and integration packages
+- `docker compose config --quiet`
+- `make migrate` against the local database (`schema already up to date`)
+- OpenAPI YAML parsing, cross-checked against the Go error-code contract
+- `git diff --check`
 
-- Go 1.27.0 (`darwin/arm64`), installed via Homebrew during bootstrap. `go.mod`
-  targets 1.24 so contributors are not forced onto the newest toolchain.
-- PostgreSQL is published on host port **5442**, not 5432: 5432 and 5433 were both
-  occupied by other local projects on the development machine.
-- Local PostgreSQL data lives on tmpfs and is destroyed by `make down`.
+The integration suite includes fresh-database migration, migration idempotency and
+concurrency, real seeded M1 data carried through migrations `0001` to `0005` in
+order, composite foreign-key rejection of mismatched attempt/lease bindings,
+contested claims, cross-queue claim-id reuse, queue and logical-worker capacity,
+database-clock expiry, fencing, registration racing both claim and success,
+request-deadline rollback, and API → outbox → ElasticMQ → worker execution.
 
-## Recommended next bounded milestone
+The four built binaries were also exercised together on isolated loopback ports. API,
+outbox, and worker readiness all returned ready; submitted `demo.echo` job
+`91d06416-a506-4c24-9747-187f5a4f7d12` durably reached `SUCCEEDED` with one attempt
+and a `COMPLETED` lease; all three services then stopped cleanly with no error-level
+log lines.
 
-**M2 — Workers, sessions, and atomic claim.** Objective, deliverables, and
-acceptance criteria are in [ROADMAP.md](ROADMAP.md). Not started.
+## Local environment
+
+- Go 1.25 or newer
+- PostgreSQL 16 on `localhost:5442`
+- ElasticMQ on `localhost:9324`
+- Docker Compose and Make
+
+Run `make bootstrap`, `make up`, `make migrate`, and `make build`, then start the
+API, outbox publisher, and worker as shown in the repository README.
+
+## Next objective
+
+M3 will add heartbeat, renewal, lease expiration, stale-state reconciliation, and
+durable capacity recovery without weakening M2 fencing or claim idempotency.

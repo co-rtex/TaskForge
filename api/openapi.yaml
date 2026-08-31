@@ -1,9 +1,10 @@
 openapi: 3.1.0
 info:
   title: TaskForge API
-  version: 0.1.0-m1
+  version: 0.2.0-m2
   description: |
-    Durable job ingress.
+    Durable job ingress plus internal worker registration, atomic claim, and
+    fenced start/success operations.
 
     This document describes **only the endpoints that are implemented**. The rest
     of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing,
@@ -12,9 +13,13 @@ info:
 
     ## Authentication
 
-    None yet. Milestone M1 attributes every request to a single configured
+    None yet. Milestone M2 attributes every request to a single configured
     development scope, and the service therefore binds to loopback only.
     Database-backed API keys are milestone M5. See `docs/CURRENT_STATE.md`.
+
+    Routes under `/internal/v1` are for the trusted, compiled-in worker process.
+    They are not a public user API and must not be exposed off loopback before
+    worker/control scopes land in M5.
 
     ## Idempotency
 
@@ -38,6 +43,7 @@ servers:
 
 tags:
   - name: Jobs
+  - name: Worker Control
   - name: Health
 
 paths:
@@ -159,6 +165,316 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /internal/v1/worker-sessions/{worker_session_id}:
+    put:
+      tags: [Worker Control]
+      summary: Idempotently register one worker process session
+      description: |
+        `worker_session_id` is generated once per process boot and reused when
+        an ambiguous registration response is retried. Reusing it with different
+        immutable registration data conflicts. A new session for the same stable
+        worker name fences the prior session; old active leases remain durable
+        and capacity-consuming until M3 reconciliation.
+      parameters:
+        - name: worker_session_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkerSessionRegistration' }
+      responses:
+        '200':
+          description: The registered or identically replayed process session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerSession' }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: The session id conflicts or the session was already replaced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Invalid registration data.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical registration request on the same
+            `worker_session_id` path with the same immutable registration body.
+            Registration is idempotent under that session identity: a replay
+            that matches returns the already-registered session rather than
+            creating or fencing a second one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/claims:
+    post:
+      tags: [Worker Control]
+      summary: Atomically claim the highest-priority eligible job
+      description: |
+        PostgreSQL locks queue capacity, then worker-session capacity, then one
+        eligible job. In the same transaction it creates the attempt and active
+        lease and moves the job `QUEUED → LEASED`.
+
+        `claim_request_id` is the durable outbox event id for this delivery and
+        is retained across ambiguous HTTP retries and broker redelivery. An exact
+        replay returns the original assignment rather than consuming another slot.
+
+        A worker may acknowledge its broker notification only when
+        `safe_to_acknowledge` is true. Capability, handler, worker-group, and
+        capacity misses deliberately leave it false so another worker can take
+        the still-queued work. A globally consumed duplicate notification is
+        also safe to acknowledge but carries no assignment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClaimRequest' }
+      responses:
+        '200':
+          description: One committed claim decision, including no-claim decisions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClaimResponse' }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Session unavailable or claim request id reused differently.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Invalid identifiers, queue name, or unknown queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the request with the same `worker_session_id` and
+            the same `claim_request_id`. The claim is idempotent under that
+            claim identity: an exact replay by the owning session returns the
+            assignment the first call committed rather than reserving a second
+            job, and a copy presented by another session receives
+            `DUPLICATE_NOTIFICATION`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/attempts/{attempt_id}/start:
+    post:
+      tags: [Worker Control]
+      summary: Fenced attempt start
+      description: |
+        Idempotently moves the exact current job and attempt `LEASED → RUNNING`.
+        PostgreSQL server time must still be before the active lease expiry.
+      parameters:
+        - name: attempt_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FenceRequest' }
+      responses:
+        '204': { description: Started, or an exact already-started replay. }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Fence, state, current session, or lease expiry rejected the transition.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: An identifier was invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical request with the same attempt fence
+            — the `attempt_id` in the path plus the same `job_id`, `lease_id`,
+            `worker_id`, and `worker_session_id`. The start transition is
+            idempotent under that fence: replaying it against an attempt that
+            is already RUNNING succeeds without changing the recorded start
+            time.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/attempts/{attempt_id}/succeed:
+    post:
+      tags: [Worker Control]
+      summary: Fenced successful outcome
+      description: |
+        Idempotently accepts success only for the exact current job, attempt,
+        lease, worker, and process session. Atomically marks job and attempt
+        `SUCCEEDED`, closes the lease, and releases derived capacity. M2 stores
+        no result body; result persistence arrives in M5.
+      parameters:
+        - name: attempt_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FenceRequest' }
+      responses:
+        '204': { description: Accepted, or an exact already-accepted replay. }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Fence, state, current session, or lease expiry rejected the outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: An identifier was invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical request with the same attempt fence
+            — the `attempt_id` in the path plus the same `job_id`, `lease_id`,
+            `worker_id`, and `worker_session_id`. The success transition is
+            idempotent under that fence: replaying it after the outcome
+            committed succeeds without changing the recorded finish time or
+            re-releasing the lease.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
   /healthz:
     get:
       tags: [Health]
@@ -228,6 +544,21 @@ components:
           minimum: 1
           maximum: 86400
           default: 300
+          description: |
+            Requested handler budget. In milestone M2 the effective budget is the
+            LESSER of this value and the remaining fixed lease window PostgreSQL
+            reports at claim time, minus a small completion margin reserved for
+            reporting the outcome. A value larger than the configured lease
+            (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
+            cannot authorize execution beyond one fixed lease until M3 adds lease
+            renewal.
+
+            The worker runs the handler with a deadline-bearing context and
+            cancels it when the budget elapses; a cooperative handler is expected
+            to return. Go cannot forcibly terminate arbitrary handler code, so an
+            uncooperative handler may continue until it returns or the process
+            exits. The durable guarantee is that after the lease authority
+            deadline the worker can no longer successfully report completion.
         scheduled_at:
           type: [string, 'null']
           format: date-time
@@ -256,16 +587,148 @@ components:
           type: string
           enum: [PENDING, QUEUED, LEASED, RUNNING, RETRY_WAIT, CANCEL_REQUESTED, SUCCEEDED, CANCELED, DEAD_LETTERED]
           description: |
-            The full V1 state machine. Only `QUEUED` is produced in this
-            milestone, because nothing transitions a job yet.
+            The full V1 state machine. M2 produces `QUEUED`, `LEASED`,
+            `RUNNING`, and `SUCCEEDED`; the remaining transitions arrive later.
         priority: { type: integer }
         max_attempts: { type: integer }
-        timeout_seconds: { type: integer }
+        timeout_seconds:
+          type: integer
+          description: |
+            Requested handler budget. In milestone M2 the effective budget is the
+            LESSER of this value and the remaining fixed lease window PostgreSQL
+            reports at claim time, minus a small completion margin reserved for
+            reporting the outcome. A value larger than the configured lease
+            (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
+            cannot authorize execution beyond one fixed lease until M3 adds lease
+            renewal.
+
+            The worker runs the handler with a deadline-bearing context and
+            cancels it when the budget elapses; a cooperative handler is expected
+            to return. Go cannot forcibly terminate arbitrary handler code, so an
+            uncooperative handler may continue until it returns or the process
+            exits. The durable guarantee is that after the lease authority
+            deadline the worker can no longer successfully report completion.
         required_capabilities:
           type: array
           items: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    WorkerSessionRegistration:
+      type: object
+      additionalProperties: false
+      required: [worker_name, hostname, worker_group, concurrency_limit, supported_job_types]
+      properties:
+        worker_name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+          description: Stable logical-worker name reused across process boots.
+        hostname: { type: string, minLength: 1, maxLength: 255 }
+        worker_group:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+        concurrency_limit: { type: integer, minimum: 1, maximum: 256 }
+        capabilities:
+          type: array
+          maxItems: 64
+          items: { type: string, pattern: '^[a-z0-9][a-z0-9._-]{0,63}$' }
+        supported_job_types:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { type: string, pattern: '^[a-z0-9][a-z0-9._-]{0,127}$' }
+          description: Trusted handlers compiled into this process.
+
+    WorkerSession:
+      type: object
+      required: [worker_id, worker_session_id, worker_name, hostname, worker_group, concurrency_limit, capabilities, supported_job_types, status, registered_at, last_heartbeat_at]
+      properties:
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+        worker_name: { type: string }
+        hostname: { type: string }
+        worker_group: { type: string }
+        concurrency_limit: { type: integer }
+        capabilities: { type: array, items: { type: string } }
+        supported_job_types: { type: array, items: { type: string } }
+        status: { type: string, enum: [HEALTHY] }
+        registered_at: { type: string, format: date-time }
+        last_heartbeat_at:
+          type: string
+          format: date-time
+          description: Initialized from PostgreSQL time. Heartbeat updates begin in M3.
+
+    ClaimRequest:
+      type: object
+      additionalProperties: false
+      required: [worker_id, worker_session_id, claim_request_id, queue]
+      properties:
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+        claim_request_id: { type: string, format: uuid }
+        queue:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+
+    ClaimResponse:
+      type: object
+      required: [outcome, safe_to_acknowledge, replayed]
+      properties:
+        outcome:
+          type: string
+          enum: [CLAIMED, QUEUE_EMPTY, DUPLICATE_NOTIFICATION, NO_ELIGIBLE_JOB, CAPACITY_EXHAUSTED]
+        safe_to_acknowledge:
+          type: boolean
+          description: True only for `CLAIMED` with an assignment, a PostgreSQL-confirmed `QUEUE_EMPTY`, or `DUPLICATE_NOTIFICATION` already consumed by another session.
+        replayed:
+          type: boolean
+          description: True when this claim request id returned its prior assignment.
+        assignment:
+          oneOf:
+            - { $ref: '#/components/schemas/Assignment' }
+            - { type: 'null' }
+
+    Assignment:
+      type: object
+      required: [job_id, queue, job_type, payload, priority, timeout_seconds, required_capabilities, attempt_id, attempt_number, lease_id, lease_expires_at, lease_remaining_milliseconds, worker_id, worker_session_id]
+      properties:
+        job_id: { type: string, format: uuid }
+        queue: { type: string }
+        job_type: { type: string }
+        payload:
+          type: object
+          description: Authoritative payload read from PostgreSQL, never from the broker.
+        priority: { type: integer }
+        timeout_seconds:
+          type: integer
+          description: |
+            The job's requested budget. The worker applies the lesser of this and
+            `lease_remaining_milliseconds` minus its completion margin as the
+            deadline on the handler's context, and cancels that context when it
+            elapses. An uncooperative handler may still be running afterwards —
+            Go cannot forcibly terminate it — but it can no longer commit an
+            outcome once the lease authority deadline has passed.
+        required_capabilities: { type: array, items: { type: string } }
+        attempt_id: { type: string, format: uuid }
+        attempt_number: { type: integer, minimum: 1 }
+        lease_id: { type: string, format: uuid }
+        lease_expires_at: { type: string, format: date-time }
+        lease_remaining_milliseconds:
+          type: integer
+          minimum: 0
+          description: PostgreSQL-sampled remaining window; workers convert it to a conservative monotonic deadline.
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+
+    FenceRequest:
+      type: object
+      additionalProperties: false
+      required: [job_id, lease_id, worker_id, worker_session_id]
+      properties:
+        job_id: { type: string, format: uuid }
+        lease_id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
 
     Readiness:
       type: object
@@ -294,11 +757,18 @@ components:
                 - payload_too_large
                 - method_not_allowed
                 - internal_error
+                - service_unavailable
+                - worker_session_conflict
+                - worker_session_unavailable
+                - claim_conflict
+                - fence_rejected
+                - lease_expired
+                - state_conflict
               description: Stable machine-readable code. Branch on this, not on `message`.
             message: { type: string }
             details:
               type: array
-              description: Field-level problems. Every problem in a request is reported at once.
+              description: Field-level problems. Semantic validation reports all discovered field problems together.
               items:
                 type: object
                 properties:

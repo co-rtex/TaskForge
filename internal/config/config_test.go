@@ -20,6 +20,8 @@ func TestLoad_DefaultsAreValid(t *testing.T) {
 	require.NoError(t, c.Validate())
 	require.Equal(t, "local-dev", c.DevScope)
 	require.Positive(t, c.MaxRequestBytes)
+	require.Equal(t, 25*time.Second, c.APIRequestTimeout)
+	require.Equal(t, 30*time.Second, c.LeaseDuration)
 }
 
 func TestLoad_ReadsEnvironment(t *testing.T) {
@@ -55,6 +57,10 @@ func TestValidate_RejectsBadConfiguration(t *testing.T) {
 		"empty dev scope":    func(c *Config) { c.DevScope = "" },
 		"empty queue name":   func(c *Config) { c.BrokerQueueName = "" },
 		"tiny body limit":    func(c *Config) { c.MaxRequestBytes = 10 },
+		"tiny api timeout":   func(c *Config) { c.APIRequestTimeout = time.Millisecond },
+		"tiny lease":         func(c *Config) { c.LeaseDuration = time.Millisecond },
+		"public api bind":    func(c *Config) { c.APIAddr = "0.0.0.0:8080" },
+		"public outbox bind": func(c *Config) { c.OutboxAddr = "[::]:8081" },
 		"zero batch size":    func(c *Config) { c.OutboxBatchSize = 0 },
 		"huge batch size":    func(c *Config) { c.OutboxBatchSize = 1001 },
 		"zero poll interval": func(c *Config) { c.OutboxPollInterval = 0 },
@@ -75,6 +81,87 @@ func TestValidate_RejectsBadConfiguration(t *testing.T) {
 			mutate(&c)
 			require.Error(t, c.Validate())
 		})
+	}
+}
+
+func TestLoadWorker_DefaultsAreValid(t *testing.T) {
+	c, err := LoadWorker()
+	require.NoError(t, err)
+	require.NoError(t, c.Validate())
+	require.Equal(t, "local-worker", c.Name)
+	require.Equal(t, []string{"cpu"}, c.Capabilities)
+}
+
+func TestLoadWorker_CanonicalizesCapabilities(t *testing.T) {
+	t.Setenv("TASKFORGE_WORKER_CAPABILITIES", "gpu,cpu,gpu")
+	c, err := LoadWorker()
+	require.NoError(t, err)
+	require.Equal(t, []string{"cpu", "gpu"}, c.Capabilities)
+}
+
+func TestWorkerConfig_ReportsEveryProblem(t *testing.T) {
+	c, err := LoadWorker()
+	require.NoError(t, err)
+	c.APIBaseURL = "not-a-url"
+	c.Name = "Bad Name"
+	c.Concurrency = 0
+	c.PollWait = 0
+
+	err = c.Validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_API_URL")
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_NAME")
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_CONCURRENCY")
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_POLL_WAIT")
+}
+
+// The SQS ReceiveMessage request converts the poll wait to whole seconds, so a
+// sub-second value truncates to 0, disables long polling, and turns every idle
+// slot into a busy receive loop. The bound is inclusive at both ends.
+func TestWorkerConfig_PollWaitMustBeWholeSecondsWithinTheBrokerBound(t *testing.T) {
+	tests := map[string]struct {
+		pollWait time.Duration
+		valid    bool
+	}{
+		"999ms truncates to zero long-poll seconds": {999 * time.Millisecond, false},
+		"1s is the inclusive lower bound":           {time.Second, true},
+		"10s is the shipped default":                {10 * time.Second, true},
+		"20s is the inclusive SQS maximum":          {20 * time.Second, true},
+		"20s001ms exceeds the SQS maximum":          {20*time.Second + time.Millisecond, false},
+		"30s exceeds the SQS maximum":               {30 * time.Second, false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			c, err := LoadWorker()
+			require.NoError(t, err)
+			c.PollWait = test.pollWait
+
+			err = c.Validate()
+			if test.valid {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "TASKFORGE_WORKER_POLL_WAIT must be between 1s and 20s")
+		})
+	}
+}
+
+func TestWorkerConfig_RejectsUnauthenticatedNonLoopbackEndpoints(t *testing.T) {
+	c, err := LoadWorker()
+	require.NoError(t, err)
+	c.APIBaseURL = "http://192.0.2.10:8080"
+	c.HealthAddr = "0.0.0.0:8082"
+
+	err = c.Validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_API_URL")
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_ADDR")
+}
+
+func TestLoopbackValidationAcceptsIPv4IPv6AndLocalhost(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:8080", "[::1]:8080", "localhost:8080"} {
+		require.True(t, isLoopbackBind(address), address)
 	}
 }
 

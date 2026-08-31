@@ -64,8 +64,8 @@ func (s Status) String() string { return string(s) }
 
 // Job is a durable job record.
 //
-// In milestone M1 the jobs table is insert-only: no transition exists yet, so
-// every persisted job is StatusQueued.
+// M2 transitions immediate jobs through QUEUED, LEASED, RUNNING, and SUCCEEDED.
+// Later lifecycle states remain typed here but are not reachable yet.
 type Job struct {
 	ID                   uuid.UUID       `json:"id"`
 	Scope                string          `json:"-"` // never returned to a client
