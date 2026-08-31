@@ -137,6 +137,40 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 		require.Contains(t, def, "WHERE (status = 'ACTIVE'::text)")
 	})
 
+	// Migration 0003 removed this index because M2 had no query that used it.
+	// M3's reconciler scans exactly these columns with exactly this predicate, so
+	// 0007 puts it back — and the test names the query that justifies it.
+	t.Run("expired-lease scan index exists and is partial", func(t *testing.T) {
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'leases_active_expiry_idx'`).Scan(&def))
+		require.Contains(t, def, "expires_at")
+		require.Contains(t, def, "id")
+		require.Contains(t, def, "WHERE (status = 'ACTIVE'::text)")
+	})
+
+	t.Run("stale-heartbeat scan index exists and covers the current-session set", func(t *testing.T) {
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'worker_sessions_current_heartbeat_idx'`).Scan(&def))
+		require.Contains(t, def, "last_heartbeat_at")
+		require.Contains(t, def, "id")
+		// The same three statuses worker_sessions_one_current_per_worker_idx calls
+		// current, so the scan and the uniqueness invariant cannot drift apart.
+		for _, status := range []string{"STARTING", "HEALTHY", "DRAINING"} {
+			require.Contains(t, def, status)
+		}
+	})
+
+	t.Run("renewal identity is globally unique and partial", func(t *testing.T) {
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'leases_last_renewal_request_id_idx'`).Scan(&def))
+		require.Contains(t, def, "UNIQUE")
+		require.Contains(t, def, "last_renewal_request_id")
+		require.Contains(t, def, "IS NOT NULL")
+	})
+
 	t.Run("one current process session per logical worker is enforced", func(t *testing.T) {
 		var def string
 		require.NoError(t, conn.QueryRow(ctx,
@@ -177,8 +211,8 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 	defer cancel()
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, len(migrations), 5)
-	for i, want := range []int{1, 2, 3, 4, 5} {
+	require.GreaterOrEqual(t, len(migrations), 7)
+	for i, want := range []int{1, 2, 3, 4, 5, 6, 7} {
 		require.Equal(t, want, migrations[i].Version, "migration order is versioned and deterministic")
 	}
 
@@ -216,7 +250,7 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 		jobID, createdAt, eventID, secondJobID, laterAt, secondEventID)
 	require.NoError(t, err)
 
-	for _, migration := range migrations[1:5] {
+	for _, migration := range migrations[1:7] {
 		require.NoError(t, execMigration(ctx, conn, migration),
 			"migration %04d must apply to a database holding real M1 data", migration.Version)
 	}
@@ -258,12 +292,12 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 		require.Equal(t, 2, jobCount)
 	})
 
-	t.Run("0003 removed the speculative lease-expiry index", func(t *testing.T) {
-		var present bool
-		require.NoError(t, conn.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'leases_active_expiry_idx')`,
-		).Scan(&present))
-		require.False(t, present, "M2 never scans leases by expiry; M3 adds the index its query justifies")
+	t.Run("0003 dropped the speculative index and 0007 restored it with a real query", func(t *testing.T) {
+		var def string
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT indexdef FROM pg_indexes WHERE indexname = 'leases_active_expiry_idx'`).Scan(&def))
+		require.Contains(t, def, "expires_at")
+		require.Contains(t, def, "WHERE (status = 'ACTIVE'::text)")
 	})
 
 	// The remaining assertions need real M2 rows on top of the upgraded M1 data.
@@ -384,6 +418,86 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 			          now(), now(), now() + interval '5 minutes')`,
 			uuid.New(), secondJobID, otherAttemptID, otherWorkerID, otherSessionID, claimRequestID)
 		require.Error(t, err, "one outbox event may consume at most one claim globally")
+	})
+
+	t.Run("0006 defaults every existing lease to generation zero", func(t *testing.T) {
+		var version int
+		var identity *uuid.UUID
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT renewal_version, last_renewal_request_id FROM leases WHERE id = $1`,
+			leaseID).Scan(&version, &identity))
+		require.Equal(t, 0, version, "a lease that was never renewed is generation 0")
+		require.Nil(t, identity, "generation 0 records no renewal identity")
+	})
+
+	// The constraint, not application code, is what makes "renewed" and "records
+	// who renewed it" inseparable. Either half alone would make a replay
+	// undetectable and let an ambiguous retry extend authority twice.
+	t.Run("0006 rejects inconsistent renewal identity and generation", func(t *testing.T) {
+		for name, statement := range map[string]string{
+			"a generation with no identity": `
+				UPDATE leases SET renewal_version = 1
+				WHERE id = '` + leaseID.String() + `'`,
+			"an identity with no generation": `
+				UPDATE leases SET last_renewal_request_id = '` + uuid.New().String() + `'
+				WHERE id = '` + leaseID.String() + `'`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := conn.Exec(ctx, statement)
+				require.Error(t, err)
+				var pgErr *pgconn.PgError
+				require.ErrorAs(t, err, &pgErr)
+				require.Equal(t, "23514", pgErr.Code)
+				require.Equal(t, "leases_renewal_identity_consistent", pgErr.ConstraintName)
+			})
+		}
+
+		// Positive control: setting both together is accepted, which proves the
+		// rejections above were caused only by the inconsistency.
+		identity := uuid.New()
+		_, err := conn.Exec(ctx, `
+			UPDATE leases SET renewal_version = 1, last_renewal_request_id = '`+identity.String()+`'
+			WHERE id = '`+leaseID.String()+`'`)
+		require.NoError(t, err)
+
+		// And one renewal identity cannot be recorded on two different leases.
+		// This needs a genuine second lease row, on a different job so the
+		// one-active-lease-per-job index is not what rejects it.
+		otherAttempt, otherLease := uuid.New(), uuid.New()
+		_, err = conn.Exec(ctx, `
+			INSERT INTO job_attempts (
+				id, job_id, scope, queue, attempt_number, worker_id, worker_session_id, status
+			) VALUES ('`+otherAttempt.String()+`', '`+secondJobID.String()+`', 'upgrade-test',
+			          'default', 2, '`+workerID.String()+`', '`+sessionID.String()+`', 'LEASED');
+			INSERT INTO leases (
+				id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+				claim_request_id, status, acquired_at, renewed_at, expires_at
+			) VALUES ('`+otherLease.String()+`', '`+secondJobID.String()+`', '`+otherAttempt.String()+`',
+			          'upgrade-test', 'default', '`+workerID.String()+`', '`+sessionID.String()+`',
+			          '`+uuid.New().String()+`', 'ACTIVE', now(), now(), now() + interval '5 minutes')`)
+		require.NoError(t, err)
+
+		_, err = conn.Exec(ctx, `
+			UPDATE leases SET renewal_version = 1, last_renewal_request_id = '`+identity.String()+`'
+			WHERE id = '`+otherLease.String()+`'`)
+		require.Error(t, err, "a renewal identity is globally unique across leases")
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, "23505", pgErr.Code)
+
+		// Positive control: a distinct identity on that same second lease is fine,
+		// so the rejection above was about identity reuse and nothing else.
+		_, err = conn.Exec(ctx, `
+			UPDATE leases SET renewal_version = 1, last_renewal_request_id = '`+uuid.New().String()+`'
+			WHERE id = '`+otherLease.String()+`'`)
+		require.NoError(t, err)
+
+		_, err = conn.Exec(ctx, `
+			DELETE FROM leases WHERE id = '`+otherLease.String()+`';
+			DELETE FROM job_attempts WHERE id = '`+otherAttempt.String()+`';
+			UPDATE leases SET renewal_version = 0, last_renewal_request_id = NULL
+			WHERE id = '`+leaseID.String()+`'`)
+		require.NoError(t, err)
 	})
 
 	t.Run("one active lease per job survives the upgrade", func(t *testing.T) {
