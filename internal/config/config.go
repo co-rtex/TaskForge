@@ -27,6 +27,18 @@ type Config struct {
 	APIRequestTimeout time.Duration
 	LeaseDuration     time.Duration
 
+	// Liveness and lease-renewal timing. These three are shared rather than
+	// worker-only because their relationships must be validated together and
+	// because the reconciler enforces the same staleness threshold the worker is
+	// racing. See Validate for the exact relationships.
+	HeartbeatInterval  time.Duration
+	SessionStaleAfter  time.Duration
+	LeaseRenewInterval time.Duration
+
+	ReconcilerAddr         string
+	ReconcilerPollInterval time.Duration
+	ReconcilerBatchSize    int
+
 	// DevScope is the single authentication scope every request is attributed
 	// to until database-backed API keys land in milestone M5. It exists so the
 	// idempotency and ownership model is already scoped correctly; it is not
@@ -63,6 +75,14 @@ func Load() (Config, error) {
 		LeaseDuration:     envDuration("TASKFORGE_LEASE_DURATION", 30*time.Second),
 		DevScope:          env("TASKFORGE_DEV_SCOPE", "local-dev"),
 
+		HeartbeatInterval:  envDuration("TASKFORGE_HEARTBEAT_INTERVAL", 5*time.Second),
+		SessionStaleAfter:  envDuration("TASKFORGE_SESSION_STALE_AFTER", 15*time.Second),
+		LeaseRenewInterval: envDuration("TASKFORGE_LEASE_RENEW_INTERVAL", 10*time.Second),
+
+		ReconcilerAddr:         env("TASKFORGE_RECONCILER_ADDR", "127.0.0.1:8083"),
+		ReconcilerPollInterval: envDuration("TASKFORGE_RECONCILER_POLL_INTERVAL", 2*time.Second),
+		ReconcilerBatchSize:    envInt("TASKFORGE_RECONCILER_BATCH_SIZE", 50),
+
 		BrokerEndpoint:        env("TASKFORGE_BROKER_ENDPOINT", "http://127.0.0.1:9324"),
 		BrokerQueueName:       env("TASKFORGE_BROKER_QUEUE_NAME", "taskforge-work-available"),
 		BrokerRegion:          env("TASKFORGE_BROKER_REGION", "us-east-1"),
@@ -97,11 +117,15 @@ func (c Config) Validate() error {
 	req("TASKFORGE_BROKER_QUEUE_NAME", c.BrokerQueueName)
 	req("TASKFORGE_BROKER_REGION", c.BrokerRegion)
 	req("TASKFORGE_OUTBOX_ADDR", c.OutboxAddr)
+	req("TASKFORGE_RECONCILER_ADDR", c.ReconcilerAddr)
 	if strings.TrimSpace(c.APIAddr) != "" && !isLoopbackBind(c.APIAddr) {
 		problems = append(problems, "TASKFORGE_API_ADDR must bind to a loopback address until authentication is implemented")
 	}
 	if strings.TrimSpace(c.OutboxAddr) != "" && !isLoopbackBind(c.OutboxAddr) {
 		problems = append(problems, "TASKFORGE_OUTBOX_ADDR must bind to a loopback address until authentication is implemented")
+	}
+	if strings.TrimSpace(c.ReconcilerAddr) != "" && !isLoopbackBind(c.ReconcilerAddr) {
+		problems = append(problems, "TASKFORGE_RECONCILER_ADDR must bind to a loopback address until authentication is implemented")
 	}
 
 	if c.MaxRequestBytes < 1024 {
@@ -112,6 +136,32 @@ func (c Config) Validate() error {
 	}
 	if c.LeaseDuration < time.Second || c.LeaseDuration > 24*time.Hour {
 		problems = append(problems, "TASKFORGE_LEASE_DURATION must be between 1s and 24h")
+	}
+	if c.HeartbeatInterval <= 0 {
+		problems = append(problems, "TASKFORGE_HEARTBEAT_INTERVAL must be positive")
+	}
+	// A worker must get several heartbeats into one staleness window. At exactly
+	// one interval a single lost request would already look like a dead process,
+	// and the reconciler would fence a healthy worker on ordinary jitter.
+	if c.SessionStaleAfter < 3*c.HeartbeatInterval {
+		problems = append(problems,
+			"TASKFORGE_SESSION_STALE_AFTER must be at least 3x TASKFORGE_HEARTBEAT_INTERVAL")
+	}
+	if c.LeaseRenewInterval <= 0 {
+		problems = append(problems, "TASKFORGE_LEASE_RENEW_INTERVAL must be positive")
+	}
+	// Same reasoning one level down: renewal must be able to fail twice and still
+	// succeed before the lease PostgreSQL owns expires. A renewal cadence at or
+	// near the lease duration would make every transient blip an abandoned attempt.
+	if 3*c.LeaseRenewInterval > c.LeaseDuration {
+		problems = append(problems,
+			"TASKFORGE_LEASE_RENEW_INTERVAL must be at most one third of TASKFORGE_LEASE_DURATION")
+	}
+	if c.ReconcilerPollInterval <= 0 {
+		problems = append(problems, "TASKFORGE_RECONCILER_POLL_INTERVAL must be positive")
+	}
+	if c.ReconcilerBatchSize < 1 || c.ReconcilerBatchSize > 1000 {
+		problems = append(problems, "TASKFORGE_RECONCILER_BATCH_SIZE must be between 1 and 1000")
 	}
 	if c.OutboxBatchSize < 1 || c.OutboxBatchSize > 1000 {
 		problems = append(problems, "TASKFORGE_OUTBOX_BATCH_SIZE must be between 1 and 1000")

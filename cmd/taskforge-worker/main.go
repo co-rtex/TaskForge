@@ -71,6 +71,11 @@ func run() int {
 		Queue: workerConfig.Queue, PollWait: workerConfig.PollWait,
 		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond, ErrorBackoff: time.Second,
 		ShutdownTimeout: workerConfig.ShutdownTimeout,
+		// Liveness and renewal cadence come from validated shared configuration,
+		// because the thresholds they race are enforced server-side.
+		HeartbeatInterval: shared.HeartbeatInterval,
+		SessionStaleAfter: shared.SessionStaleAfter,
+		RenewInterval:     shared.LeaseRenewInterval,
 	}, log)
 
 	healthServer := newHealthServer(workerConfig.HealthAddr, runner, control, broker, log)

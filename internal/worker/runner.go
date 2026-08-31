@@ -15,7 +15,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
-// RunnerConfig bounds all local concurrency and retry behavior.
+// RunnerConfig bounds all local concurrency, liveness, and retry behavior.
 type RunnerConfig struct {
 	Registration    workers.Registration
 	Queue           string
@@ -24,6 +24,16 @@ type RunnerConfig struct {
 	RetryDelay      time.Duration
 	ErrorBackoff    time.Duration
 	ShutdownTimeout time.Duration
+
+	// HeartbeatInterval is how often this process proves its session is alive.
+	// SessionStaleAfter is the server-side threshold it is racing; the process
+	// stops accepting work once it has gone that long without a confirmation.
+	HeartbeatInterval time.Duration
+	SessionStaleAfter time.Duration
+	// RenewInterval is how often an executing attempt renews its lease. It must
+	// leave room for several attempts inside one lease window; the relationship
+	// is validated in internal/config.
+	RenewInterval time.Duration
 }
 
 var (
@@ -32,7 +42,8 @@ var (
 	ErrSessionLost = errors.New("worker session is no longer current")
 	// ErrShutdownTimeout means at least one trusted handler did not drain within
 	// the configured process bound. Go cannot forcibly stop that goroutine, so
-	// the process must exit and let durable lease recovery handle it in M3.
+	// the process exits and leaves any unresolved active lease to server-time
+	// expiry and reconciliation.
 	ErrShutdownTimeout = errors.New("worker shutdown drain timed out")
 )
 
@@ -68,6 +79,10 @@ type Runner struct {
 	ready     atomic.Bool
 	flightsMu sync.Mutex
 	flights   map[uuid.UUID]*deliveryFlight
+	// now is injected so deadline arithmetic is testable without a real clock.
+	// It is only ever used for local monotonic reasoning: PostgreSQL remains the
+	// authority for every durable decision.
+	now func() time.Time
 }
 
 func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, cfg RunnerConfig, log *slog.Logger) *Runner {
@@ -77,14 +92,27 @@ func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, cf
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 15 * time.Second
 	}
+	// Defensive fallbacks matching the documented development defaults. A wired
+	// process always supplies these from validated configuration; these exist so
+	// a zero value can never produce a ticker of zero duration.
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = 5 * time.Second
+	}
+	if cfg.SessionStaleAfter <= 0 {
+		cfg.SessionStaleAfter = 15 * time.Second
+	}
+	if cfg.RenewInterval <= 0 {
+		cfg.RenewInterval = 10 * time.Second
+	}
 	return &Runner{
 		control: control, broker: broker, registry: registry, cfg: cfg, log: log,
 		flights: make(map[uuid.UUID]*deliveryFlight),
+		now:     time.Now,
 	}
 }
 
 // Ready reports whether this process registered successfully and its slot loops
-// are accepting work. M3 heartbeats will make current-session loss observable
+// are accepting work. The heartbeat loop makes current-session loss observable
 // even while an idle worker receives no notifications.
 func (r *Runner) Ready() bool { return r.ready.Load() }
 
@@ -118,6 +146,29 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	var slots sync.WaitGroup
 	fatal := make(chan error, 1)
+
+	// The heartbeat runs on the completion context, so it keeps proving liveness
+	// through a graceful drain and only stops when in-flight work is finished or
+	// abandoned. Losing the session immediately removes readiness and stops
+	// intake; the fatal channel then cancels any handler still executing.
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		if err := r.runHeartbeat(completionCtx, session); err != nil {
+			r.ready.Store(false)
+			stopIntake()
+			select {
+			case fatal <- err:
+			default:
+			}
+		}
+	}()
+	// Registered after stopCompletion so it runs first: cancel the loop, then
+	// wait for it, so Run never returns while a heartbeat goroutine is live.
+	defer func() {
+		stopCompletion()
+		<-heartbeatDone
+	}()
 	slotsDone := make(chan struct{})
 	for slot := 0; slot < session.ConcurrencyLimit; slot++ {
 		slots.Add(1)
@@ -289,18 +340,32 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		return nil
 	}
 
-	// Until M3 adds renewal, the client converts PostgreSQL's remaining lease
-	// window into a conservative monotonic deadline measured from before the
-	// claim request, with completion margin reserved for Succeed. This avoids
-	// trusting worker wall-clock alignment with the database.
-	leaseCtx := ctx
-	cancelLease := func() {}
-	if !assignment.ExecutionDeadline.IsZero() {
-		leaseCtx, cancelLease = context.WithDeadline(ctx, assignment.ExecutionDeadline)
+	// Lease authority is a cancelable context rather than a fixed deadline: the
+	// renewal loop owns it and cancels it the moment it can no longer prove this
+	// lease is still ours. The starting deadline is the conservative monotonic
+	// window the client already derived from PostgreSQL's own measurement, so
+	// worker wall-clock alignment with the database is never assumed.
+	authorityDeadline := assignment.ExecutionDeadline
+	if authorityDeadline.IsZero() {
+		authorityDeadline = r.now().Add(executionBudget(assignment.LeaseRemaining))
 	}
+	// A window that is already gone is not something renewal can rescue: the
+	// handler must not run at all, because nothing it produces could be committed.
+	if !r.now().Before(authorityDeadline) {
+		r.log.Error("trusted handler execution window unavailable",
+			fenceLog(fence, slog.String("error", "lease authority window had already elapsed"))...)
+		return nil
+	}
+	leaseCtx, cancelLease := context.WithCancel(ctx)
+	renewal := r.startRenewal(leaseCtx, cancelLease, fence, authorityDeadline)
+
+	// The job's overall budget is measured once, from execution start, and is
+	// deliberately derived from leaseCtx rather than reset by renewal: renewing
+	// extends lease authority, never the handler's timeout_seconds allowance.
 	executionCtx, cancelExecution := context.WithTimeout(leaseCtx, time.Duration(assignment.TimeoutSeconds)*time.Second)
 	if executionErr := executionCtx.Err(); executionErr != nil {
 		cancelExecution()
+		renewal.Stop()
 		cancelLease()
 		r.log.Error("trusted handler execution window unavailable",
 			fenceLog(fence, slog.String("error", executionErr.Error()))...)
@@ -314,14 +379,28 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	// value would let a cooperative timeout that returns nil be marked SUCCEEDED.
 	executionErr := executionCtx.Err()
 	cancelExecution()
+	// Stopping the renewal loop before reporting the outcome is what serializes
+	// renewal against success from this process: exactly one of them is in flight
+	// at a time, and the control plane resolves any remaining race with
+	// reconciliation.
+	authorityLost, fatalErr := renewal.Stop()
 	cancelLease()
-	if handlerErr != nil || executionErr != nil {
+	if fatalErr != nil {
+		// This whole process boot lost its session. Report it as fatal so intake
+		// stops and readiness drops, not just this one attempt.
+		return fatalErr
+	}
+	if handlerErr != nil || executionErr != nil || authorityLost {
 		// Failure classification, retry, timeout, and DLQ transitions belong to
-		// M4. Leaving this lease active is honest; M3 reconciliation will first
-		// make the crashed/error path recoverable.
+		// M4. Leaving this lease active is honest: it expires on server time and
+		// reconciliation abandons the attempt and requeues recoverable work.
 		failure := handlerErr
-		if failure == nil {
+		switch {
+		case failure != nil:
+		case executionErr != nil:
 			failure = executionErr
+		default:
+			failure = errors.New("lease authority was lost before the outcome could be reported")
 		}
 		r.log.Error("trusted handler failed", fenceLog(fence, slog.String("error", failure.Error()))...)
 		return nil

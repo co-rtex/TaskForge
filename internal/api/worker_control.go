@@ -19,7 +19,9 @@ import (
 // WorkerControl is the internal control-plane surface used by a DB-less worker.
 type WorkerControl interface {
 	Register(context.Context, string, workers.Registration) (workers.Session, error)
+	Heartbeat(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
 	Claim(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
+	RenewLease(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
 	Start(context.Context, string, workers.Fence) error
 	Succeed(context.Context, string, workers.Fence) error
 }
@@ -94,6 +96,147 @@ func (s *Server) handleRegisterWorkerSession(w http.ResponseWriter, r *http.Requ
 		slog.String("worker_session_id", session.ID.String()),
 		slog.String("worker_group", session.WorkerGroup))
 	writeJSON(w, s.log, http.StatusOK, toWorkerSessionResponse(session))
+}
+
+type heartbeatRequest struct {
+	WorkerID string `json:"worker_id"`
+}
+
+// HeartbeatResponse reports the PostgreSQL time the control plane accepted.
+//
+// It deliberately echoes a server timestamp rather than answering 204: a worker
+// must be able to confirm that its liveness actually advanced, and it must never
+// substitute its own clock for the answer.
+type HeartbeatResponse struct {
+	WorkerSessionID string    `json:"worker_session_id"`
+	Status          string    `json:"status"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+}
+
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var request heartbeatRequest
+	if !s.decodeControlJSON(w, r, &request) {
+		return
+	}
+	sessionID, sessionErr := uuid.Parse(r.PathValue("worker_session_id"))
+	workerID, workerErr := uuid.Parse(request.WorkerID)
+	var fields []workers.FieldError
+	if sessionErr != nil {
+		fields = append(fields, workers.FieldError{Field: "worker_session_id", Message: "must be a UUID"})
+	}
+	if workerErr != nil {
+		fields = append(fields, workers.FieldError{Field: "worker_id", Message: "must be a UUID"})
+	}
+	if len(fields) > 0 {
+		s.writeWorkerValidation(w, r, fields)
+		return
+	}
+
+	result, err := s.control.Heartbeat(r.Context(), s.cfg.DevScope,
+		workers.HeartbeatRequest{WorkerID: workerID, SessionID: sessionID})
+	if err != nil {
+		s.writeWorkerControlError(w, r, "heartbeat worker session", err)
+		return
+	}
+	writeJSON(w, s.log, http.StatusOK, HeartbeatResponse{
+		WorkerSessionID: result.SessionID.String(),
+		Status:          string(result.Status),
+		LastHeartbeatAt: result.LastHeartbeatAt.UTC(),
+	})
+}
+
+type renewLeaseRequest struct {
+	JobID                  string `json:"job_id"`
+	AttemptID              string `json:"attempt_id"`
+	WorkerID               string `json:"worker_id"`
+	WorkerSessionID        string `json:"worker_session_id"`
+	RenewalRequestID       string `json:"renewal_request_id"`
+	ExpectedRenewalVersion int    `json:"expected_renewal_version"`
+}
+
+// RenewalResponse is one committed renewal window.
+//
+// LeaseRemainingMillis is measured by PostgreSQL after every authority lock. A
+// worker turns it into a conservative monotonic deadline instead of comparing
+// its own wall clock with LeaseExpiresAt.
+type RenewalResponse struct {
+	LeaseID              string    `json:"lease_id"`
+	RenewalVersion       int       `json:"renewal_version"`
+	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
+	LeaseRemainingMillis int64     `json:"lease_remaining_milliseconds"`
+	Replayed             bool      `json:"replayed"`
+}
+
+func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
+	var request renewLeaseRequest
+	if !s.decodeControlJSON(w, r, &request) {
+		return
+	}
+	req, fields := parseRenewalRequest(r.PathValue("lease_id"), request)
+	if len(fields) > 0 {
+		s.writeWorkerValidation(w, r, fields)
+		return
+	}
+
+	result, err := s.control.RenewLease(r.Context(), s.cfg.DevScope, req)
+	if err != nil {
+		s.writeWorkerControlError(w, r, "renew lease", err)
+		return
+	}
+	s.log.Info("lease renewed",
+		slog.String("request_id", RequestIDFrom(r.Context())),
+		slog.String("job_id", req.Fence.JobID.String()),
+		slog.String("attempt_id", req.Fence.AttemptID.String()),
+		slog.String("lease_id", req.Fence.LeaseID.String()),
+		slog.Int("renewal_version", result.RenewalVersion),
+		slog.Bool("replayed", result.Replayed))
+	writeJSON(w, s.log, http.StatusOK, RenewalResponse{
+		LeaseID:              result.LeaseID.String(),
+		RenewalVersion:       result.RenewalVersion,
+		LeaseExpiresAt:       result.ExpiresAt.UTC(),
+		LeaseRemainingMillis: result.Remaining.Milliseconds(),
+		Replayed:             result.Replayed,
+	})
+}
+
+func parseRenewalRequest(leaseID string, request renewLeaseRequest) (workers.RenewalRequest, []workers.FieldError) {
+	inputs := []struct {
+		field string
+		value string
+		dest  *uuid.UUID
+	}{
+		{"lease_id", leaseID, new(uuid.UUID)},
+		{"job_id", request.JobID, new(uuid.UUID)},
+		{"attempt_id", request.AttemptID, new(uuid.UUID)},
+		{"worker_id", request.WorkerID, new(uuid.UUID)},
+		{"worker_session_id", request.WorkerSessionID, new(uuid.UUID)},
+		{"renewal_request_id", request.RenewalRequestID, new(uuid.UUID)},
+	}
+	var fields []workers.FieldError
+	for i := range inputs {
+		id, err := uuid.Parse(inputs[i].value)
+		if err != nil {
+			fields = append(fields, workers.FieldError{Field: inputs[i].field, Message: "must be a UUID"})
+			continue
+		}
+		*inputs[i].dest = id
+	}
+	req := workers.RenewalRequest{
+		Fence: workers.Fence{
+			LeaseID:   *inputs[0].dest,
+			JobID:     *inputs[1].dest,
+			AttemptID: *inputs[2].dest,
+			WorkerID:  *inputs[3].dest,
+			SessionID: *inputs[4].dest,
+		},
+		RenewalRequestID: *inputs[5].dest,
+		ExpectedVersion:  request.ExpectedRenewalVersion,
+	}
+	if request.ExpectedRenewalVersion < 0 {
+		fields = append(fields, workers.FieldError{
+			Field: "expected_renewal_version", Message: "must not be negative"})
+	}
+	return req, fields
 }
 
 type claimRequest struct {
@@ -320,6 +463,10 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 	case errors.Is(err, workers.ErrStateConflict):
 		writeError(w, r, s.log, http.StatusConflict, CodeStateConflict,
 			"the requested state transition is no longer valid", nil)
+	case errors.Is(err, workers.ErrRenewalConflict):
+		writeError(w, r, s.log, http.StatusConflict, CodeRenewalConflict,
+			"the renewal named a generation that is no longer current, or reused a "+
+				"renewal request id for a different lease", nil)
 	case isDeadlineExhausted(err):
 		// A database call in this request failed because the request's own
 		// deadline elapsed. That can happen while acquiring a lock, while

@@ -536,6 +536,11 @@ type fenceState struct {
 	leaseStatus   LeaseStatus
 	expiresAt     time.Time
 	serverNow     time.Time
+	// renewalVersion and lastRenewalRequestID are read under the same locks as
+	// every other authority field so a renewal decision never uses a value that
+	// was true before the transaction waited.
+	renewalVersion       int
+	lastRenewalRequestID *uuid.UUID
 }
 
 // lockFence uses the same queue -> worker session -> job -> attempt -> lease
@@ -582,7 +587,8 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 
 	var state fenceState
 	err = tx.QueryRow(ctx, `
-		SELECT j.status, a.status, l.status, l.expires_at
+		SELECT j.status, a.status, l.status, l.expires_at,
+		       l.renewal_version, l.last_renewal_request_id
 		FROM jobs j
 		JOIN job_attempts a ON a.job_id = j.id
 		JOIN leases l ON l.attempt_id = a.id
@@ -591,7 +597,8 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 		  AND j.scope = $6 AND a.scope = $6 AND l.scope = $6
 		FOR UPDATE OF j, a, l`,
 		fence.JobID, fence.AttemptID, fence.LeaseID, fence.WorkerID, fence.SessionID, scope,
-	).Scan(&state.jobStatus, &state.attemptStatus, &state.leaseStatus, &state.expiresAt)
+	).Scan(&state.jobStatus, &state.attemptStatus, &state.leaseStatus, &state.expiresAt,
+		&state.renewalVersion, &state.lastRenewalRequestID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fail(ErrFenceRejected)
 	}

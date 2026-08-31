@@ -19,7 +19,9 @@ import (
 // ControlPlane is the API surface a DB-less worker needs.
 type ControlPlane interface {
 	Register(context.Context, workers.Registration) (workers.Session, error)
+	Heartbeat(context.Context, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
 	Claim(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
+	RenewLease(context.Context, workers.RenewalRequest) (workers.RenewalResult, error)
 	Start(context.Context, workers.Fence) error
 	Succeed(context.Context, workers.Fence) error
 	Ping(context.Context) error
@@ -70,6 +72,98 @@ func (c *Client) Register(ctx context.Context, registration workers.Registration
 		Status:            workers.SessionStatus(response.Status),
 		RegisteredAt:      response.RegisteredAt,
 		LastHeartbeatAt:   response.LastHeartbeatAt,
+	}, nil
+}
+
+// Heartbeat reports liveness for one process session and returns the server time
+// the control plane accepted. The request carries no timestamp: PostgreSQL
+// receipt time is the only authority for staleness.
+func (c *Client) Heartbeat(ctx context.Context, request workers.HeartbeatRequest) (workers.HeartbeatResult, error) {
+	body := struct {
+		WorkerID string `json:"worker_id"`
+	}{request.WorkerID.String()}
+	var response api.HeartbeatResponse
+	if err := c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/worker-sessions/"+request.SessionID.String()+"/heartbeat", body, &response); err != nil {
+		return workers.HeartbeatResult{}, err
+	}
+	sessionID, err := uuid.Parse(response.WorkerSessionID)
+	if err != nil {
+		return workers.HeartbeatResult{}, fmt.Errorf("control plane returned invalid session id: %w", err)
+	}
+	// A response about a different session, or one that reports a session that is
+	// not healthy, is not a confirmation of this session's liveness.
+	if sessionID != request.SessionID {
+		return workers.HeartbeatResult{}, fmt.Errorf("control plane acknowledged a different worker session")
+	}
+	if workers.SessionStatus(response.Status) != workers.SessionHealthy {
+		return workers.HeartbeatResult{}, fmt.Errorf(
+			"control plane returned a heartbeat for a %s session", response.Status)
+	}
+	if response.LastHeartbeatAt.IsZero() {
+		return workers.HeartbeatResult{}, fmt.Errorf("control plane returned no heartbeat receipt time")
+	}
+	return workers.HeartbeatResult{
+		SessionID:       sessionID,
+		Status:          workers.SessionStatus(response.Status),
+		LastHeartbeatAt: response.LastHeartbeatAt,
+	}, nil
+}
+
+// RenewLease extends one lease window and reports the server-measured remaining
+// duration. Retrying it with the same renewal request id and expected version is
+// safe: the control plane returns the committed result instead of extending the
+// lease a second time.
+func (c *Client) RenewLease(ctx context.Context, request workers.RenewalRequest) (workers.RenewalResult, error) {
+	body := struct {
+		JobID                  string `json:"job_id"`
+		AttemptID              string `json:"attempt_id"`
+		WorkerID               string `json:"worker_id"`
+		WorkerSessionID        string `json:"worker_session_id"`
+		RenewalRequestID       string `json:"renewal_request_id"`
+		ExpectedRenewalVersion int    `json:"expected_renewal_version"`
+	}{
+		request.Fence.JobID.String(), request.Fence.AttemptID.String(),
+		request.Fence.WorkerID.String(), request.Fence.SessionID.String(),
+		request.RenewalRequestID.String(), request.ExpectedVersion,
+	}
+	var response api.RenewalResponse
+	if err := c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/leases/"+request.Fence.LeaseID.String()+"/renew", body, &response); err != nil {
+		return workers.RenewalResult{}, err
+	}
+	return parseRenewal(request, response)
+}
+
+// parseRenewal rejects a renewal response that could not have come from the
+// request that was sent. A renewal that names another lease, moves the
+// generation backwards, or reports a negative window is not something a worker
+// may convert into execution authority.
+func parseRenewal(request workers.RenewalRequest, response api.RenewalResponse) (workers.RenewalResult, error) {
+	leaseID, err := uuid.Parse(response.LeaseID)
+	if err != nil {
+		return workers.RenewalResult{}, fmt.Errorf("control plane returned invalid lease id: %w", err)
+	}
+	if leaseID != request.Fence.LeaseID {
+		return workers.RenewalResult{}, fmt.Errorf("control plane renewed a different lease")
+	}
+	if response.RenewalVersion != request.ExpectedVersion+1 {
+		return workers.RenewalResult{}, fmt.Errorf(
+			"control plane returned renewal version %d for expected version %d",
+			response.RenewalVersion, request.ExpectedVersion)
+	}
+	if response.LeaseRemainingMillis < 0 {
+		return workers.RenewalResult{}, fmt.Errorf("control plane returned a negative lease window")
+	}
+	if response.LeaseExpiresAt.IsZero() {
+		return workers.RenewalResult{}, fmt.Errorf("control plane returned no lease expiry")
+	}
+	return workers.RenewalResult{
+		LeaseID:        leaseID,
+		RenewalVersion: response.RenewalVersion,
+		ExpiresAt:      response.LeaseExpiresAt,
+		Remaining:      time.Duration(response.LeaseRemainingMillis) * time.Millisecond,
+		Replayed:       response.Replayed,
 	}, nil
 }
 

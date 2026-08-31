@@ -1,6 +1,7 @@
 package workers
 
 import (
+	"errors"
 	"regexp"
 	"sort"
 	"strings"
@@ -88,6 +89,43 @@ func ValidateClaim(req ClaimRequest) error {
 	}
 	if !routingNamePattern.MatchString(req.Queue) {
 		fields = append(fields, FieldError{Field: "queue", Message: "must be a valid queue name"})
+	}
+	if len(fields) > 0 {
+		return &ValidationError{Fields: fields}
+	}
+	return nil
+}
+
+// ValidateHeartbeat rejects an incomplete session identity before PostgreSQL is
+// touched. There is deliberately no timestamp to validate.
+func ValidateHeartbeat(req HeartbeatRequest) error {
+	var fields []FieldError
+	if req.WorkerID == uuid.Nil {
+		fields = append(fields, FieldError{Field: "worker_id", Message: "must be a UUID"})
+	}
+	if req.SessionID == uuid.Nil {
+		fields = append(fields, FieldError{Field: "worker_session_id", Message: "must be a UUID"})
+	}
+	if len(fields) > 0 {
+		return &ValidationError{Fields: fields}
+	}
+	return nil
+}
+
+// ValidateRenewal reports every problem in a renewal request at once: the whole
+// fence, the renewal identity, and the expected generation.
+func ValidateRenewal(req RenewalRequest) error {
+	var fields []FieldError
+	var fenceErr *ValidationError
+	if err := ValidateFence(req.Fence); errors.As(err, &fenceErr) {
+		fields = append(fields, fenceErr.Fields...)
+	}
+	if req.RenewalRequestID == uuid.Nil {
+		fields = append(fields, FieldError{Field: "renewal_request_id", Message: "must be a UUID"})
+	}
+	if req.ExpectedVersion < 0 {
+		fields = append(fields, FieldError{
+			Field: "expected_renewal_version", Message: "must not be negative"})
 	}
 	if len(fields) > 0 {
 		return &ValidationError{Fields: fields}
