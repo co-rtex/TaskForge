@@ -42,7 +42,8 @@ request that produced it**:
 - `leases.last_renewal_request_id` records the client-generated id of the renewal
   that produced the current generation. A `CHECK` constraint makes the two
   inseparable: generation 0 has no identity, and every later generation has one.
-  A partial unique index makes that identity globally unique across leases.
+  A partial unique index ensures no two leases hold the same identity at the same
+  time; the scope note below says exactly what that does and does not promise.
 
 A renewal request carries the complete five-part fence plus a
 `renewal_request_id` and the `expected_renewal_version` the caller believes is

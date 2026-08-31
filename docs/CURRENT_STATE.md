@@ -255,7 +255,9 @@ New coverage beyond the M1/M2 suites, all of which still pass unchanged:
 
 **Migrations.** Fresh-database application through `0007`; the two reconciler
 scan indexes exist, are partial, and match the predicates the real scans use; the
-renewal identity index is globally unique and partial; real seeded M1 data
+renewal identity index is partial and prevents two leases from holding the same
+identity at once, with the index's own comment recording that it constrains live
+identities rather than every identity ever used; real seeded M1 data
 upgrades through every migration in order; and the renewal identity/generation
 constraint rejects each half without the other, each with a positive control so
 every rejection is attributable to the constraint under test. No M4+ table is
