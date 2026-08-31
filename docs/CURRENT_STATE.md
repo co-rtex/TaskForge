@@ -163,6 +163,42 @@ outbox, and worker readiness all returned ready; submitted `demo.echo` job
 and a `COMPLETED` lease; all three services then stopped cleanly with no error-level
 log lines.
 
+## Continuous integration
+
+Those gates also run on GitHub-hosted Linux runners.
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is triggered by pull
+requests targeting `main` and by pushes to `main`, and splits the work across
+three parallel jobs so one failure never hides another:
+
+- **Format, lint, build, unit and OpenAPI tests** — an event-ranged
+  `git diff --check`, `make fmt` followed by an assertion that the formatter
+  rewrote no tracked file, `make lint`, `make build`, `make test-unit`, the
+  `TestOpenAPI_*` contract tests invoked by name, and
+  `docker compose config --quiet`.
+- **Migrations and integration tests** — `make up`, `make migrate`,
+  `make test-integration`.
+- **Race detector (unit and integration)** — the same infrastructure lifecycle
+  plus `make test-race`.
+
+Both infrastructure jobs own a complete Compose lifecycle. They start it with
+`make up`, so `scripts/wait-for-infra.sh` gates the tests on PostgreSQL's own
+`pg_isready` probe and a real ElasticMQ `ListQueues` call rather than a sleep,
+and they tear it down under `if: always()`. Bounded container status and
+non-colored service logs are captured and uploaded only when a job failed, with
+three-day retention.
+
+The workflow needs no repository secret and no cloud credential. It reuses the
+committed loopback PostgreSQL and ElasticMQ configuration, creates no `.env`,
+grants only `contents: read`, does not persist checkout credentials, and pins
+every action to a full commit SHA. The Go toolchain is resolved from `go.mod`
+through `actions/setup-go`, which reported `go1.25.0` on the run below.
+
+The first hosted run, on the pull request that adds the workflow, finished
+`success` at 2026-08-31T00:42Z — fast checks 51s, integration 1m16s, race 1m52s:
+<https://github.com/co-rtex/TaskForge/actions/runs/33345255301>. The failure path
+— diagnostic capture and artifact upload — has not yet been exercised by a real
+hosted failure.
+
 ## Local environment
 
 - Go 1.25 or newer

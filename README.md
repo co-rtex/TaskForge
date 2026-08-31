@@ -1,5 +1,7 @@
 # TaskForge
 
+[![CI](https://github.com/co-rtex/TaskForge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/co-rtex/TaskForge/actions/workflows/ci.yml?query=branch%3Amain)
+
 **Durable distributed job processing, scheduling, and reliability platform.**
 
 TaskForge implements the hard parts of a production job system directly — durable job
@@ -93,6 +95,9 @@ make test-race   # both, under the race detector
 
 `make test-integration` runs against the real PostgreSQL and the real broker started
 by `make up`. It fails rather than skipping when they are not running.
+
+The same gates run on GitHub-hosted runners for every pull request targeting `main`
+and every push to `main` — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Documentation
 
