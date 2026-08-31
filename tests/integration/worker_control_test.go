@@ -865,6 +865,20 @@ var replacementSessionID = uuid.New()
 // queue behind it.
 func gateOnAdvisoryLock(t *testing.T, key int64, triggerName, timing, table string) func() {
 	t.Helper()
+	return gateOnAdvisoryLockWhen(t, key, triggerName, timing, table, "")
+}
+
+// gateOnAdvisoryLockWhen is the same barrier restricted to the rows a WHEN
+// clause selects.
+//
+// Renewal, a successful outcome, and reconciliation all UPDATE the same lease
+// row, so an unconditional gate on that table parks whichever of them arrives
+// first — which is exactly the nondeterminism these barriers exist to remove.
+// A WHEN clause naming the column each operation actually changes gates one
+// operation and lets the others through, so "this one committed first" becomes
+// a fact about the test rather than a hope about the scheduler.
+func gateOnAdvisoryLockWhen(t *testing.T, key int64, triggerName, timing, table, when string) func() {
+	t.Helper()
 	ctx := context.Background()
 
 	holder, err := testPool.Acquire(ctx)
@@ -878,9 +892,13 @@ func gateOnAdvisoryLock(t *testing.T, key int64, triggerName, timing, table stri
 		CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN PERFORM pg_advisory_xact_lock(%d); RETURN NEW; END $$`, function, key))
 	require.NoError(t, err)
+	condition := ""
+	if when != "" {
+		condition = " WHEN (" + when + ")"
+	}
 	_, err = testPool.Exec(ctx, fmt.Sprintf(
-		`CREATE TRIGGER %s %s ON %s FOR EACH ROW EXECUTE FUNCTION %s()`,
-		triggerName, timing, table, function))
+		`CREATE TRIGGER %s %s ON %s FOR EACH ROW%s EXECUTE FUNCTION %s()`,
+		triggerName, timing, table, condition, function))
 	require.NoError(t, err)
 
 	var once sync.Once

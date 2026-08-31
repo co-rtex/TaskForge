@@ -424,6 +424,13 @@ func TestReconcile_ConcurrentReconcilersProduceOneRepair(t *testing.T) {
 // TestReconcile_FaultBeforeCommitRollsBackEveryChange proves the whole repair is
 // one transaction. A trigger fails the recovery notification insert, which is
 // the last write, so everything before it must vanish too.
+//
+// The outcome here is certain, not ambiguous: a BEFORE INSERT trigger raises
+// before COMMIT is ever attempted, so PostgreSQL always rolls the transaction
+// back and the caller's error is truthful. This test therefore proves atomicity
+// and nothing more. The genuinely unknown case — a COMMIT that succeeded whose
+// result the caller never learned — is
+// TestReconcile_RerunAfterAnUnobservedCommitIsSafe below.
 func TestReconcile_FaultBeforeCommitRollsBackEveryChange(t *testing.T) {
 	reset(t)
 	store := controlStore()
@@ -459,8 +466,8 @@ func TestReconcile_FaultBeforeCommitRollsBackEveryChange(t *testing.T) {
 	require.Equal(t, 1, countActiveLeases(t), "no capacity may be released by a rolled-back repair")
 	require.Empty(t, newPendingOutbox(t, outboxBefore))
 
-	// Rerunning after the fault clears repairs it. This is the "ambiguous commit,
-	// then rerun" recovery path: reconciliation is safe to simply try again.
+	// Rerunning after the fault clears repairs it, which is what makes a failed
+	// pass a non-event: reconciliation is safe to simply try again.
 	dropTrigger()
 	result, err := newReconciler(t, store, time.Minute).RunOnce(context.Background())
 	require.NoError(t, err)
@@ -470,11 +477,119 @@ func TestReconcile_FaultBeforeCommitRollsBackEveryChange(t *testing.T) {
 	require.Len(t, newPendingOutbox(t, outboxBefore), 1)
 }
 
+// TestReconcile_RerunAfterAnUnobservedCommitIsSafe covers the case the trigger
+// test above cannot: a reconciliation that genuinely COMMITTED, whose result the
+// caller never observed.
+//
+// That is the real shape of an ambiguous commit. A reconciler can die between
+// PostgreSQL committing and the process learning it did — the deadline elapses
+// during COMMIT, the connection drops, the container is killed — and the
+// restarted process, or a second replica, then reruns from a view of the world
+// that predates the commit. Nothing may produce a second abandonment, a second
+// capacity release, or a duplicate recovery notification.
+//
+// The barrier makes that ordering a fact rather than a race: the second pass's
+// candidate scan provably runs while the first pass is parked mid-transaction,
+// so its snapshot is stale by construction. The first pass's returned result is
+// then deliberately discarded, exactly as a process that died after COMMIT would
+// have discarded it.
+func TestReconcile_RerunAfterAnUnobservedCommitIsSafe(t *testing.T) {
+	reset(t)
+	store := controlStore()
+	session := registerWorker(t, store,
+		workerRegistration("reconcile-unobserved-commit", 1, nil, []string{"demo.echo"}))
+	fence := claimedAndRunning(t, store, session, "reconcile-unobserved-commit")
+	expireLease(t, fence.LeaseID)
+	outboxBefore := pendingOutboxIDs(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	release := gateOnAdvisoryLockWhen(t, gateUnobservedCommitKey,
+		"taskforge_test_gate_unobserved_commit", "BEFORE UPDATE", "leases", whenExpiring)
+
+	// Pass one: parked mid-transaction, holding every authority row.
+	firstErr := make(chan error, 1)
+	go func() {
+		// The result is intentionally dropped. This process is modelling one that
+		// commits and then dies before it can record or report what it did.
+		_, err := store.ReconcileExpiredLeases(ctx, 10)
+		firstErr <- err
+	}()
+	waitForDatabaseLock(t, fragmentExpire)
+
+	// Pass two: its candidate scan runs now, against the pre-commit world, then
+	// blocks on the queue lock pass one is holding.
+	secondResult := make(chan workers.ReconcileStats, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		stats, err := store.ReconcileExpiredLeases(ctx, 10)
+		secondResult <- stats
+		secondErr <- err
+	}()
+	waitForDatabaseLock(t, fragmentQueueLock)
+
+	release()
+	require.NoError(t, <-firstErr, "the first pass held authority and must commit")
+	require.NoError(t, <-secondErr, "a rerun over committed work is a no-op, not an error")
+
+	stats := <-secondResult
+	require.Zero(t, stats.ExpiredLeases,
+		"the rerun must not repair a lease the unobserved commit already repaired")
+	require.Zero(t, stats.RequeuedJobs)
+	require.Zero(t, stats.DeadLetteredJobs)
+	require.Equal(t, 1, stats.Skipped, "the stale candidate must be revalidated and skipped")
+
+	// Exactly one repair survives, and exactly one notification.
+	state := readState(t, fence)
+	require.Equal(t, "QUEUED", state.job)
+	require.Equal(t, "ABANDONED", state.attempt)
+	require.Equal(t, "EXPIRED", state.lease)
+	require.Equal(t, 1, countRows(t, "job_attempts"), "no second attempt may be abandoned")
+	require.Equal(t, 0, countActiveLeases(t))
+	require.Len(t, newPendingOutbox(t, outboxBefore), 1,
+		"an unobserved commit followed by a rerun must still produce one recovery event")
+
+	// A third pass, now with a fresh view, is equally a no-op.
+	third, err := newReconciler(t, store, time.Minute).RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, third.ExpiredLeases)
+	require.Len(t, newPendingOutbox(t, outboxBefore), 1)
+}
+
 // --- contention: every pair, in both lock orderings ------------------------
 //
-// Each of these arranges the race deliberately with an advisory-lock gate rather
-// than leaving it to the scheduler, so "this operation acquired authority first"
-// is a fact about the test, not a hope.
+// Renewal, a successful outcome, and reconciliation all UPDATE the same lease
+// row, so each subtest gates the operation that must win on the exact column it
+// changes, and parks the loser on the queue lock the winner already holds. The
+// winner is therefore established by the barrier, not by the scheduler, and the
+// loser's outcome is asserted exactly rather than as "either is acceptable".
+//
+// Where the losing operation is rejected for a reason that would also hold
+// without the race — a reconciler can only act on an already-expired lease, so a
+// renewal or completion arriving afterwards was doomed regardless — the comment
+// says so. What the gate establishes there is the ordering and that the loser
+// committed nothing, not the cause of its rejection.
+
+const (
+	gateRenewFirstKey         int64 = 7710010005
+	gateSucceedFirstKey       int64 = 7710010006
+	gateRenewBeforeReconKey   int64 = 7710010007
+	gateReconBeforeRenewKey   int64 = 7710010008
+	gateSucceedBeforeReconKey int64 = 7710010009
+	gateReconBeforeSucceedKey int64 = 7710010010
+	gateUnobservedCommitKey   int64 = 7710010011
+)
+
+// The three WHEN clauses that tell one operation's lease UPDATE from another's.
+const (
+	whenRenewing      = "NEW.renewal_version IS DISTINCT FROM OLD.renewal_version"
+	whenCompleting    = "NEW.status = 'COMPLETED'"
+	whenExpiring      = "NEW.status = 'EXPIRED'"
+	fragmentRenewing  = "SET renewed_at"
+	fragmentComplete  = "status = 'COMPLETED'"
+	fragmentExpire    = "status = 'EXPIRED'"
+	fragmentQueueLock = "SELECT name FROM queues WHERE name"
+)
 
 // TestContention_RenewalVersusSuccess proves the two operations a live worker
 // can issue concurrently serialize into exactly one valid outcome.
@@ -488,30 +603,30 @@ func TestContention_RenewalVersusSuccess(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		// Park the renewal at its own UPDATE, after lockFence took queue, session,
-		// job, attempt, and lease.
-		release := gateOnAdvisoryLock(t, renewGateKey,
-			"taskforge_test_gate_renew", "BEFORE UPDATE", "leases")
+		release := gateOnAdvisoryLockWhen(t, gateRenewFirstKey,
+			"taskforge_test_gate_renew_first", "BEFORE UPDATE", "leases", whenRenewing)
 
 		renewErr := make(chan error, 1)
 		go func() {
 			_, err := store.RenewLease(ctx, testScope, renewalRequest(fence, 0))
 			renewErr <- err
 		}()
-		waitForDatabaseLock(t, "UPDATE leases")
+		waitForDatabaseLock(t, fragmentRenewing)
 
 		succeedErr := make(chan error, 1)
 		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
-		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
+		waitForDatabaseLock(t, fragmentQueueLock)
 
 		release()
 		require.NoError(t, <-renewErr, "the renewal held authority first and must commit")
-		require.NoError(t, <-succeedErr, "success after a renewal is still valid")
+		require.NoError(t, <-succeedErr, "success after a committed renewal is still valid")
 
 		state := readState(t, fence)
 		require.Equal(t, "SUCCEEDED", state.job)
 		require.Equal(t, "SUCCEEDED", state.attempt)
 		require.Equal(t, "COMPLETED", state.lease)
+		_, _, _, version := leaseRow(t, fence.LeaseID)
+		require.Equal(t, 1, version, "exactly one renewal committed")
 		require.Equal(t, 0, countActiveLeases(t))
 	})
 
@@ -524,39 +639,36 @@ func TestContention_RenewalVersusSuccess(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		queueLock, err := testPool.Begin(ctx)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
-		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
-		require.NoError(t, err)
+		// Gate the success at its own lease UPDATE, so it provably holds every
+		// authority row while the renewal queues up behind it.
+		release := gateOnAdvisoryLockWhen(t, gateSucceedFirstKey,
+			"taskforge_test_gate_succeed_first", "BEFORE UPDATE", "leases", whenCompleting)
 
-		// Park the renewal on the queue lock, then let success commit ahead of it.
+		succeedErr := make(chan error, 1)
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		waitForDatabaseLock(t, fragmentComplete)
+
 		renewErr := make(chan error, 1)
 		go func() {
 			_, err := store.RenewLease(ctx, testScope, renewalRequest(fence, 0))
 			renewErr <- err
 		}()
-		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
+		waitForDatabaseLock(t, fragmentQueueLock)
 
-		require.NoError(t, queueLock.Commit(ctx))
-
-		// Whichever of the two acquires the released queue lock first, the durable
-		// end state must be a single successful outcome with no second extension.
-		require.NoError(t, store.Succeed(context.Background(), testScope, fence))
-		if err := <-renewErr; err != nil {
-			require.True(t,
-				errorIsAny(err, workers.ErrLeaseExpired, workers.ErrStateConflict),
-				"a renewal that lost to success must be a stable rejection, got %v", err)
-		}
+		release()
+		require.NoError(t, <-succeedErr, "the outcome held authority first and must commit")
+		// The lease is COMPLETED before the renewal ever gets its locks, and the
+		// lease window itself has not lapsed, so this rejection is caused by the
+		// ordering and nothing else.
+		require.ErrorIs(t, <-renewErr, workers.ErrLeaseExpired,
+			"a renewal that lost to a committed success must be rejected, not accepted")
 
 		state := readState(t, fence)
 		require.Equal(t, "SUCCEEDED", state.job)
 		require.Equal(t, "SUCCEEDED", state.attempt)
 		require.Equal(t, "COMPLETED", state.lease)
-
-		// After success, renewal is definitively closed.
-		_, err = store.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
-		require.ErrorIs(t, err, workers.ErrLeaseExpired)
+		_, _, _, version := leaseRow(t, fence.LeaseID)
+		require.Equal(t, 0, version, "the rejected renewal must not have advanced the generation")
 	})
 }
 
@@ -570,18 +682,38 @@ func TestContention_RenewalVersusReconciliation(t *testing.T) {
 		session := registerWorker(t, store,
 			workerRegistration("renew-then-reconcile", 1, nil, []string{"demo.echo"}))
 		fence := claimedAndRunning(t, store, session, "renew-then-reconcile")
-		expireLease(t, fence.LeaseID)
+		outboxBefore := pendingOutboxIDs(t)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		queueLock, err := testPool.Begin(ctx)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
-		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
-		require.NoError(t, err)
+		// A window that is about to lapse. The renewal must reach its decision
+		// while the lease is still valid — renewing an expired lease is refused,
+		// and that rule is covered by TestRenewal_WaitingAcrossExpiry — but the
+		// reconciler's candidate scan must run after it lapses, or there is no
+		// candidate to skip. Crossing the boundary between the two is the only
+		// arrangement in which both paths are the real ones.
+		var expiresAt time.Time
+		require.NoError(t, testPool.QueryRow(ctx, `
+			UPDATE leases SET expires_at = clock_timestamp() + interval '750 milliseconds'
+			WHERE id = $1
+			RETURNING expires_at`, fence.LeaseID).Scan(&expiresAt))
 
-		// The reconciler has already chosen this lease as a candidate and is now
-		// parked before it can take authority. Its snapshot is deliberately stale.
+		release := gateOnAdvisoryLockWhen(t, gateRenewBeforeReconKey,
+			"taskforge_test_gate_renew_before_recon", "BEFORE UPDATE", "leases", whenRenewing)
+
+		renewErr := make(chan error, 1)
+		go func() {
+			_, err := store.RenewLease(ctx, testScope, renewalRequest(fence, 0))
+			renewErr <- err
+		}()
+		// Parked at its UPDATE, holding every authority row, with its expiry check
+		// already passed against a pre-lapse sample.
+		waitForDatabaseLock(t, fragmentRenewing)
+		waitForServerTime(t, expiresAt.Add(50*time.Millisecond))
+
+		// The reconciler's candidate scan runs now. It reads committed data, so it
+		// sees the lapsed window and selects this lease, then blocks on the queue
+		// lock the renewal holds. Its decision is stale by construction.
 		reconcileResult := make(chan workers.ReconcileStats, 1)
 		reconcileErr := make(chan error, 1)
 		go func() {
@@ -589,20 +721,10 @@ func TestContention_RenewalVersusReconciliation(t *testing.T) {
 			reconcileResult <- stats
 			reconcileErr <- err
 		}()
-		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
+		waitForDatabaseLock(t, fragmentQueueLock)
 
-		// Move the expiry forward out of band, exactly as a committed renewal
-		// would. The renewal path itself is proven elsewhere; what is under test
-		// here is that reconciliation resamples and yields.
-		_, err = testPool.Exec(ctx, `
-			UPDATE leases SET renewed_at = clock_timestamp(),
-			                  expires_at = clock_timestamp() + interval '5 minutes',
-			                  renewal_version = renewal_version + 1,
-			                  last_renewal_request_id = $2
-			WHERE id = $1`, fence.LeaseID, uuid.New())
-		require.NoError(t, err)
-		require.NoError(t, queueLock.Commit(ctx))
-
+		release()
+		require.NoError(t, <-renewErr, "the renewal held authority first and must commit")
 		require.NoError(t, <-reconcileErr)
 		stats := <-reconcileResult
 		require.Zero(t, stats.ExpiredLeases, "a renewed lease must not be expired")
@@ -613,6 +735,8 @@ func TestContention_RenewalVersusReconciliation(t *testing.T) {
 		require.Equal(t, "RUNNING", state.attempt)
 		require.Equal(t, "ACTIVE", state.lease)
 		require.Equal(t, 1, countActiveLeases(t))
+		require.Empty(t, newPendingOutbox(t, outboxBefore),
+			"a skipped candidate must not produce a recovery notification")
 	})
 
 	t.Run("reconciliation first: the later renewal is rejected and mutates nothing", func(t *testing.T) {
@@ -625,29 +749,33 @@ func TestContention_RenewalVersusReconciliation(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		queueLock, err := testPool.Begin(ctx)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
-		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
-		require.NoError(t, err)
+		release := gateOnAdvisoryLockWhen(t, gateReconBeforeRenewKey,
+			"taskforge_test_gate_recon_before_renew", "BEFORE UPDATE", "leases", whenExpiring)
 
-		// Park the renewal, let reconciliation commit ahead of it.
+		reconcileResult := make(chan workers.ReconcileStats, 1)
+		reconcileErr := make(chan error, 1)
+		go func() {
+			stats, err := store.ReconcileExpiredLeases(ctx, 10)
+			reconcileResult <- stats
+			reconcileErr <- err
+		}()
+		waitForDatabaseLock(t, fragmentExpire)
+
 		renewErr := make(chan error, 1)
 		go func() {
 			_, err := store.RenewLease(ctx, testScope, renewalRequest(fence, 0))
 			renewErr <- err
 		}()
-		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
-		require.NoError(t, queueLock.Commit(ctx))
+		waitForDatabaseLock(t, fragmentQueueLock)
 
-		stats, err := store.ReconcileExpiredLeases(context.Background(), 10)
-		require.NoError(t, err)
-		require.Equal(t, 1, stats.ExpiredLeases)
-
-		if err := <-renewErr; err != nil {
-			require.True(t, errorIsAny(err, workers.ErrLeaseExpired, workers.ErrStateConflict),
-				"a renewal that lost to reconciliation must be a stable rejection, got %v", err)
-		}
+		release()
+		require.NoError(t, <-reconcileErr)
+		stats := <-reconcileResult
+		require.Equal(t, 1, stats.ExpiredLeases, "reconciliation held authority first and must commit")
+		// Over-determined on purpose: a reconciler can only act on an
+		// already-expired lease, so this renewal was doomed either way. The gate
+		// proves the ordering and that the loser committed nothing.
+		require.ErrorIs(t, <-renewErr, workers.ErrLeaseExpired)
 
 		state := readState(t, fence)
 		require.Equal(t, "QUEUED", state.job)
@@ -655,6 +783,7 @@ func TestContention_RenewalVersusReconciliation(t *testing.T) {
 		require.Equal(t, "EXPIRED", state.lease)
 		_, _, _, version := leaseRow(t, fence.LeaseID)
 		require.Equal(t, 0, version, "a rejected renewal must not have advanced the generation")
+		require.Equal(t, 0, countActiveLeases(t))
 	})
 }
 
@@ -668,18 +797,28 @@ func TestContention_SuccessVersusReconciliation(t *testing.T) {
 		session := registerWorker(t, store,
 			workerRegistration("succeed-then-reconcile", 1, nil, []string{"demo.echo"}))
 		fence := claimedAndRunning(t, store, session, "succeed-then-reconcile")
+		outboxBefore := pendingOutboxIDs(t)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		queueLock, err := testPool.Begin(ctx)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
-		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
-		require.NoError(t, err)
+		// Same boundary crossing as above, for the same reason: a fenced success
+		// is refused at or after expiry, while the reconciler only selects a lease
+		// that has already lapsed. The worker's outcome report wins the race by
+		// deciding just before the window closes.
+		var expiresAt time.Time
+		require.NoError(t, testPool.QueryRow(ctx, `
+			UPDATE leases SET expires_at = clock_timestamp() + interval '750 milliseconds'
+			WHERE id = $1
+			RETURNING expires_at`, fence.LeaseID).Scan(&expiresAt))
 
-		// The reconciler selected this lease before success committed. Expire it so
-		// the candidate scan genuinely picks it up.
-		expireLease(t, fence.LeaseID)
+		release := gateOnAdvisoryLockWhen(t, gateSucceedBeforeReconKey,
+			"taskforge_test_gate_succeed_before_recon", "BEFORE UPDATE", "leases", whenCompleting)
+
+		succeedErr := make(chan error, 1)
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		waitForDatabaseLock(t, fragmentComplete)
+		waitForServerTime(t, expiresAt.Add(50*time.Millisecond))
+
 		reconcileResult := make(chan workers.ReconcileStats, 1)
 		reconcileErr := make(chan error, 1)
 		go func() {
@@ -687,21 +826,10 @@ func TestContention_SuccessVersusReconciliation(t *testing.T) {
 			reconcileResult <- stats
 			reconcileErr <- err
 		}()
-		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
+		waitForDatabaseLock(t, fragmentQueueLock)
 
-		// Commit the success out of band, which is what a worker that beat the
-		// reconciler by a hair would have done.
-		_, err = testPool.Exec(ctx,
-			`UPDATE jobs SET status = 'SUCCEEDED', updated_at = clock_timestamp() WHERE id = $1`, fence.JobID)
-		require.NoError(t, err)
-		_, err = testPool.Exec(ctx,
-			`UPDATE job_attempts SET status = 'SUCCEEDED', finished_at = clock_timestamp() WHERE id = $1`, fence.AttemptID)
-		require.NoError(t, err)
-		_, err = testPool.Exec(ctx,
-			`UPDATE leases SET status = 'COMPLETED', released_at = clock_timestamp() WHERE id = $1`, fence.LeaseID)
-		require.NoError(t, err)
-		require.NoError(t, queueLock.Commit(ctx))
-
+		release()
+		require.NoError(t, <-succeedErr, "the outcome held authority first and must commit")
 		require.NoError(t, <-reconcileErr)
 		stats := <-reconcileResult
 		require.Zero(t, stats.ExpiredLeases, "a completed lease is not reconciled")
@@ -711,6 +839,8 @@ func TestContention_SuccessVersusReconciliation(t *testing.T) {
 		require.Equal(t, "SUCCEEDED", state.job, "terminal success is never overwritten")
 		require.Equal(t, "SUCCEEDED", state.attempt)
 		require.Equal(t, "COMPLETED", state.lease)
+		require.Empty(t, newPendingOutbox(t, outboxBefore),
+			"a skipped candidate must not produce a recovery notification")
 	})
 
 	t.Run("reconciliation first: the late success is rejected and mutates nothing", func(t *testing.T) {
@@ -723,25 +853,29 @@ func TestContention_SuccessVersusReconciliation(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		queueLock, err := testPool.Begin(ctx)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = queueLock.Rollback(context.Background()) })
-		_, err = queueLock.Exec(ctx, `SELECT name FROM queues WHERE name = 'default' FOR UPDATE`)
-		require.NoError(t, err)
+		release := gateOnAdvisoryLockWhen(t, gateReconBeforeSucceedKey,
+			"taskforge_test_gate_recon_before_succeed", "BEFORE UPDATE", "leases", whenExpiring)
+
+		reconcileResult := make(chan workers.ReconcileStats, 1)
+		reconcileErr := make(chan error, 1)
+		go func() {
+			stats, err := store.ReconcileExpiredLeases(ctx, 10)
+			reconcileResult <- stats
+			reconcileErr <- err
+		}()
+		waitForDatabaseLock(t, fragmentExpire)
 
 		succeedErr := make(chan error, 1)
 		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
-		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
-		require.NoError(t, queueLock.Commit(ctx))
+		waitForDatabaseLock(t, fragmentQueueLock)
 
-		stats, err := store.ReconcileExpiredLeases(context.Background(), 10)
-		require.NoError(t, err)
-		require.Equal(t, 1, stats.ExpiredLeases)
-
-		if err := <-succeedErr; err != nil {
-			require.True(t, errorIsAny(err, workers.ErrLeaseExpired, workers.ErrStateConflict),
-				"a success that lost to reconciliation must be a stable rejection, got %v", err)
-		}
+		release()
+		require.NoError(t, <-reconcileErr)
+		stats := <-reconcileResult
+		require.Equal(t, 1, stats.ExpiredLeases, "reconciliation held authority first and must commit")
+		// Over-determined for the same reason as above: the lease had to be
+		// expired for reconciliation to act at all.
+		require.ErrorIs(t, <-succeedErr, workers.ErrLeaseExpired)
 
 		state := readState(t, fence)
 		require.Equal(t, "QUEUED", state.job)
