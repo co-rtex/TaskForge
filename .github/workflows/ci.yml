@@ -1,0 +1,300 @@
+# Hosted continuous integration for TaskForge.
+#
+# This workflow runs the gates that AGENTS.md section 4 already defines for local
+# development, on GitHub-hosted Linux runners, against the same PostgreSQL and
+# ElasticMQ described by compose.yaml. It adds no CI-only infrastructure, no
+# CI-only credentials, and no second source of truth for the toolchain version.
+name: CI
+
+on:
+  # Gate every change that wants to land on main.
+  pull_request:
+    branches: [main]
+  # And re-check main itself, so a merge result is verified even though each
+  # parent was green in isolation.
+  push:
+    branches: [main]
+  #
+  # pull_request_target is deliberately absent: it evaluates the workflow from
+  # the base branch while checking out untrusted head code, and nothing here
+  # needs base-repository privileges.
+
+# Least privilege. No job writes to the repository, publishes a package, or
+# comments on a pull request, so the read grant is the whole grant.
+permissions:
+  contents: read
+
+# One live run per pull request, or per ref for pushes to main. Superseded runs
+# are cancelled rather than left holding runners for a commit nobody is waiting
+# on any more.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # bash --noprofile --norc -eo pipefail: a failing command in the middle of a
+    # pipeline fails the step instead of being masked by the last command's
+    # status.
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fast gates: nothing here needs PostgreSQL or the broker.
+  # ---------------------------------------------------------------------------
+  checks:
+    name: Format, lint, build, unit and OpenAPI tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the whitespace gate below diffs against a real base
+          # commit, which a depth-1 checkout would not contain.
+          fetch-depth: 0
+          # Nothing in this job pushes or calls git against the API, so the
+          # checkout token must not be left behind in .git/config.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # go.mod is the single declaration of the language version
+          # (AGENTS.md section 2). Never restate it here.
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Report the resolved toolchain
+        run: |
+          set -euo pipefail
+          go version
+          go env GOVERSION GOMODCACHE GOCACHE
+
+      - name: Check for whitespace errors and conflict markers
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # `git diff --check` with no revisions inspects the working tree, which
+          # is always clean on a fresh checkout: it would pass without having
+          # examined a single changed line. The range has to come from the event.
+          # `:-` guards `set -u`: an expression that evaluates to nothing still
+          # defines the variable, but the empty branch must not depend on that.
+          case "${EVENT_NAME}" in
+            pull_request)
+              # base.sha is the base-branch tip when the event fired, and it is a
+              # parent of the merge commit checked out above, so this range is
+              # exactly what the pull request would introduce.
+              base="${PR_BASE_SHA:-}"
+              if [ -z "${base}" ]; then
+                echo "::error::pull_request event carried no base sha"
+                exit 1
+              fi
+              ;;
+            push)
+              # `before` is all zeroes when the ref was just created, and can name
+              # a commit that no longer exists once history has been rewritten.
+              base="${PUSH_BEFORE_SHA:-}"
+              if [ -z "${base}" ] \
+                || [ "${base}" = "0000000000000000000000000000000000000000" ] \
+                || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+                if git rev-parse --verify --quiet "${HEAD_SHA}^" >/dev/null; then
+                  base="$(git rev-parse "${HEAD_SHA}^")"
+                else
+                  # Root commit: compare against the empty tree.
+                  base="$(git hash-object -t tree /dev/null)"
+                fi
+              fi
+              ;;
+            *)
+              echo "::error::unsupported event ${EVENT_NAME}; refusing to guess a diff range"
+              exit 1
+              ;;
+          esac
+
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null \
+            && [ "${base}" != "$(git hash-object -t tree /dev/null)" ]; then
+            echo "::error::base ${base} is not present locally; the checkout is too shallow"
+            exit 1
+          fi
+
+          echo "checking ${base}..${HEAD_SHA}"
+          git --no-pager diff --stat "${base}" "${HEAD_SHA}"
+          git diff --check "${base}" "${HEAD_SHA}"
+
+      - name: Formatting is already applied
+        run: |
+          set -euo pipefail
+          # Run the repository's own formatter, then fail if it changed anything.
+          # `make lint` also checks gofmt, but this proves the committed tree is
+          # byte-identical to the formatter's output rather than trusting a
+          # second implementation of the same check.
+          make fmt
+          if ! git diff --quiet --exit-code; then
+            echo "::error::gofmt rewrote tracked files; run 'make fmt' and commit the result"
+            git --no-pager diff --stat
+            git --no-pager diff
+            exit 1
+          fi
+          echo "gofmt made no changes"
+
+      - name: Lint
+        run: make lint
+
+      - name: Build
+        run: make build
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: OpenAPI parsing and contract tests
+        run: |
+          set -euo pipefail
+          # The repository already parses api/openapi.yaml in Go, with the real
+          # YAML dependency from go.mod, and cross-checks it against the error
+          # contract the handlers emit. Invoking those tests by name keeps the
+          # OpenAPI gate visible as its own step instead of buried inside
+          # `make test-unit`, and adds no second parser or dependency.
+          go test -list '^TestOpenAPI_' ./internal/api/ > "${RUNNER_TEMP}/openapi-tests.txt"
+          names="$(grep '^TestOpenAPI_' "${RUNNER_TEMP}/openapi-tests.txt" || true)"
+          if [ -z "${names}" ]; then
+            echo "::error::no TestOpenAPI_* test matched in ./internal/api; this gate would pass vacuously"
+            exit 1
+          fi
+          echo "matched:"
+          echo "${names}"
+          go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/
+
+      - name: Validate the Compose file
+        run: docker compose config --quiet
+
+  # ---------------------------------------------------------------------------
+  # Integration gates: real PostgreSQL and a real broker, started the same way a
+  # developer starts them.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Migrations and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Start local infrastructure
+        # `make up` runs `docker compose up -d` and then scripts/wait-for-infra.sh,
+        # which blocks on PostgreSQL's own pg_isready probe and on a real
+        # ElasticMQ ListQueues call, each with its own bounded deadline. No sleep
+        # substitutes for those probes.
+        run: make up
+
+      - name: Apply migrations to a fresh database
+        # compose.yaml puts PGDATA on tmpfs, so this runner's PostgreSQL has
+        # never seen a migration before this step.
+        run: make migrate
+
+      - name: Integration tests
+        run: make test-integration
+
+      - name: Collect failure diagnostics
+        if: failure()
+        continue-on-error: true
+        run: |
+          # Best effort on purpose: no probe here may stop the teardown below.
+          set -uo pipefail
+          out="${RUNNER_TEMP}/taskforge-ci-diagnostics"
+          mkdir -p "${out}"
+          docker compose ps --all > "${out}/compose-ps.txt" 2>&1 || true
+          docker compose logs --no-color --tail 400 postgres > "${out}/postgres.log" 2>&1 || true
+          docker compose logs --no-color --tail 400 elasticmq > "${out}/elasticmq.log" 2>&1 || true
+          # Echo the container inventory so the usual case needs no download.
+          cat "${out}/compose-ps.txt" || true
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          # Container status and bounded service logs only. Never .env, never an
+          # environment dump, never a database dump or request payloads.
+          path: ${{ runner.temp }}/taskforge-ci-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Tear down local infrastructure
+        # Runs after success, after failure, and after cancellation, so a runner
+        # is never left holding this job's containers or volumes.
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # Race detector. Separated from the integration job because it is the slowest
+  # gate and its failures read very differently.
+  # ---------------------------------------------------------------------------
+  race:
+    name: Race detector (unit and integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Start local infrastructure
+        # This job owns its own Compose lifecycle: `make test-race` runs the
+        # integration package under the race detector, so it needs its own
+        # PostgreSQL and broker rather than sharing the integration job's.
+        run: make up
+
+      - name: Apply migrations to a fresh database
+        run: make migrate
+
+      - name: Race tests
+        run: make test-race
+
+      - name: Collect failure diagnostics
+        if: failure()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/taskforge-ci-diagnostics"
+          mkdir -p "${out}"
+          docker compose ps --all > "${out}/compose-ps.txt" 2>&1 || true
+          docker compose logs --no-color --tail 400 postgres > "${out}/postgres.log" 2>&1 || true
+          docker compose logs --no-color --tail 400 elasticmq > "${out}/elasticmq.log" 2>&1 || true
+          cat "${out}/compose-ps.txt" || true
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: race-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/taskforge-ci-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Tear down local infrastructure
+        if: always()
+        run: docker compose down -v --remove-orphans
