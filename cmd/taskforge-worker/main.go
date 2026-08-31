@@ -41,6 +41,11 @@ func run() int {
 		log.Error("worker configuration invalid", slog.String("error", workerErr.Error()))
 		return 1
 	}
+	// Each surface is valid on its own; this is the check neither can make alone.
+	if err := config.ValidateWorkerTimings(shared, workerConfig); err != nil {
+		log.Error("worker timing configuration invalid", slog.String("error", err.Error()))
+		return 1
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

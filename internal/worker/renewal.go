@@ -41,27 +41,49 @@ func (r *Runner) runHeartbeat(ctx context.Context, session workers.Session) erro
 		case <-ticker.C:
 		}
 
-		_, err := r.control.Heartbeat(ctx, request)
-		if err == nil {
-			lastConfirmed = r.now()
-			continue
+		// The request may not outlive the liveness it is trying to prove.
+		//
+		// Without this bound a hung control-plane call would sit here holding the
+		// loop, so neither this check nor the ticker could run, and the worker
+		// would keep taking work long past the point where the reconciler may
+		// already have fenced its session. TASKFORGE_WORKER_REQUEST_TIMEOUT is a
+		// transport setting and can be configured longer than the staleness
+		// window; safety must not depend on it.
+		staleAt := lastConfirmed.Add(r.cfg.SessionStaleAfter)
+		if !r.now().Before(staleAt) {
+			return fmt.Errorf("%w after %s", ErrHeartbeatStale, r.cfg.SessionStaleAfter)
 		}
+		callCtx, cancelCall := context.WithDeadline(ctx, staleAt)
+		_, err := r.control.Heartbeat(callCtx, request)
+		cancelCall()
+
 		if ctx.Err() != nil {
 			return nil
+		}
+		if err == nil {
+			// A response that arrives at or after the window it was racing proves
+			// nothing: the control plane may already have marked this session stale,
+			// so a late success must not restore local liveness.
+			if !r.now().Before(staleAt) {
+				return fmt.Errorf("%w after %s", ErrHeartbeatStale, r.cfg.SessionStaleAfter)
+			}
+			lastConfirmed = r.now()
+			continue
 		}
 		// A definitive fence is fatal: this boot has been replaced or marked
 		// unhealthy, and nothing it does afterwards can be accepted.
 		if isSessionLost(err) {
 			return fmt.Errorf("%w: %v", ErrSessionLost, err)
 		}
-		// Transport faults and 5xx are ambiguous, so they are retried on the next
-		// tick rather than treated as loss. What is not ambiguous is the clock: once
-		// the staleness threshold has passed without a confirmation, the control
-		// plane may already consider this session stale.
+		// Transport faults, 5xx, and this call's own deadline are ambiguous, so
+		// they are retried on the next tick rather than treated as loss. What is
+		// not ambiguous is the clock: once the staleness threshold has passed
+		// without a confirmation, the control plane may already consider this
+		// session stale.
 		r.log.Warn("worker heartbeat failed",
 			slog.String("worker_session_id", session.ID.String()),
 			slog.String("error", err.Error()))
-		if r.now().Sub(lastConfirmed) >= r.cfg.SessionStaleAfter {
+		if !r.now().Before(staleAt) {
 			return fmt.Errorf("%w after %s", ErrHeartbeatStale, r.cfg.SessionStaleAfter)
 		}
 	}
@@ -137,6 +159,14 @@ func (r *Runner) startRenewal(
 		authority := time.NewTimer(time.Until(deadline))
 		defer authority.Stop()
 
+		// lose ends the loop, cancels execution, and records why. Every exit that
+		// gives up authority goes through it, so cancellation can never be skipped.
+		lose := func(reason string, fatal error, attrs ...slog.Attr) {
+			r.log.Warn(reason, fenceLog(fence, attrs...)...)
+			loop.markLost(fatal)
+			cancelAuthority()
+		}
+
 		version := 0
 		var pending *pendingRenewal
 		for {
@@ -149,42 +179,65 @@ func (r *Runner) startRenewal(
 				// Renewal kept failing transiently and the conservative deadline
 				// arrived. Execution is cancelled and no outcome is reported; durable
 				// recovery is left to server-time expiry and reconciliation.
-				r.log.Warn("lease authority deadline reached without a confirmed renewal",
-					fenceLog(fence)...)
-				loop.markLost(nil)
-				cancelAuthority()
+				lose("lease authority deadline reached without a confirmed renewal", nil)
 				return
 			case <-ticker.C:
 			}
 
+			// The request may not outlive the authority it is trying to extend.
+			//
+			// Without this bound a hung control-plane call would sit here holding
+			// the loop, so the authority timer above could not be selected and the
+			// handler would keep running with no provable lease.
+			// TASKFORGE_WORKER_REQUEST_TIMEOUT is a transport setting and can be
+			// configured longer than the lease window; safety must not depend on it.
+			if !r.now().Before(deadline) {
+				lose("lease authority deadline reached without a confirmed renewal", nil)
+				return
+			}
 			if pending == nil {
 				pending = &pendingRenewal{id: uuid.New(), expected: version}
 			}
 			// Captured before the request, so the local deadline can never assume
 			// time that was consumed by the round trip itself.
 			requestStarted := r.now()
-			result, err := r.control.RenewLease(ctx, workers.RenewalRequest{
+			callCtx, cancelCall := context.WithDeadline(ctx, deadline)
+			result, err := r.control.RenewLease(callCtx, workers.RenewalRequest{
 				Fence: fence, RenewalRequestID: pending.id, ExpectedVersion: pending.expected,
 			})
+			cancelCall()
+			if ctx.Err() != nil {
+				return
+			}
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
 				if isAuthorityLost(err) {
-					r.log.Warn("lease renewal rejected", fenceLog(fence, slog.String("error", err.Error()))...)
-					loop.markLost(escalateSessionLoss(err))
-					cancelAuthority()
+					lose("lease renewal rejected", escalateSessionLoss(err), slog.String("error", err.Error()))
 					return
 				}
-				// Ambiguous: keep the same renewal identity and expected generation so
-				// the retry is recognized as a replay if the first attempt committed.
+				// Ambiguous, including this call's own deadline: keep the same renewal
+				// identity and expected generation so the retry is recognized as a
+				// replay if the first attempt committed.
 				r.log.Warn("lease renewal failed", fenceLog(fence, slog.String("error", err.Error()))...)
+				if !r.now().Before(deadline) {
+					lose("lease authority deadline reached without a confirmed renewal", nil)
+					return
+				}
 				continue
+			}
+			// A response that arrives at or after the deadline it was racing cannot
+			// restore authority that has already lapsed locally. Accepting it would
+			// let a slow round trip silently un-expire a window the handler already
+			// outlived.
+			renewedUntil := requestStarted.Add(executionBudget(result.Remaining))
+			if !r.now().Before(deadline) || !r.now().Before(renewedUntil) {
+				lose("lease renewal confirmed too late to extend local authority", nil)
+				return
 			}
 			pending = nil
 			version = result.RenewalVersion
+			deadline = renewedUntil
 			authority.Stop()
-			authority.Reset(time.Until(requestStarted.Add(executionBudget(result.Remaining))))
+			authority.Reset(time.Until(deadline))
 		}
 	}()
 	return loop

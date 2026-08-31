@@ -482,3 +482,182 @@ func TestHeartbeat_ContinuesThroughAGracefulDrain(t *testing.T) {
 	require.GreaterOrEqual(t, beatsDuringDrain.Load(), int32(2),
 		"heartbeats must keep proving liveness while in-flight work drains")
 }
+
+// --- blocking control calls -------------------------------------------------
+//
+// The tests above return their failures immediately, so they never exercise the
+// case that actually matters: a control-plane call that does not come back. A
+// hung call used to hold the loop, so neither the staleness timer nor the lease
+// authority timer could be selected, and the worker kept going with no provable
+// authority. Each test below therefore blocks until its call's own context is
+// cancelled — if the call were not bounded by the safety deadline, nothing would
+// ever cancel it and the test would hang rather than fail.
+
+// blockingCall records that a call arrived, then blocks until its context is
+// cancelled. Returning ctx.Err() is what a real transport does when the caller's
+// deadline elapses mid-request.
+type blockingCall struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func newBlockingCall() *blockingCall {
+	return &blockingCall{entered: make(chan struct{})}
+}
+
+func (b *blockingCall) enter(ctx context.Context) error {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestHeartbeat_AHungCallCannotOutliveTheStalenessWindow(t *testing.T) {
+	session := testSession(1)
+	blocked := newBlockingCall()
+	control := &fakeControl{
+		register: func(context.Context, workers.Registration) (workers.Session, error) {
+			return session, nil
+		},
+		heartbeat: func(ctx context.Context, _ workers.HeartbeatRequest) (workers.HeartbeatResult, error) {
+			return workers.HeartbeatResult{}, blocked.enter(ctx)
+		},
+	}
+	runner := renewingRunner(control, &fakeBroker{messages: make(chan queue.Message)}, NewRegistry(),
+		RunnerConfig{HeartbeatInterval: 2 * time.Millisecond, SessionStaleAfter: 40 * time.Millisecond})
+
+	done := make(chan error, 1)
+	// The runner context is deliberately never cancelled: only the per-call
+	// deadline can release this heartbeat.
+	go func() { done <- runner.Run(context.Background()) }()
+
+	select {
+	case <-blocked.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the heartbeat loop never issued a call")
+	}
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, ErrHeartbeatStale,
+			"a heartbeat that cannot complete inside the staleness window must stop the worker")
+	case <-time.After(10 * time.Second):
+		t.Fatal("a hung heartbeat outlived the staleness window without stopping the worker")
+	}
+	require.False(t, runner.Ready())
+}
+
+func TestRenewal_AHungCallCannotOutliveTheAuthorityDeadline(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+	assignment.LeaseRemaining = 60 * time.Millisecond
+	assignment.ExecutionDeadline = time.Now().Add(60 * time.Millisecond)
+
+	blocked := newBlockingCall()
+	var canceled, succeeded atomic.Bool
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		start: func(context.Context, workers.Fence) error { return nil },
+		renew: func(ctx context.Context, _ workers.RenewalRequest) (workers.RenewalResult, error) {
+			return workers.RenewalResult{}, blocked.enter(ctx)
+		},
+		succeed: func(context.Context, workers.Fence) error {
+			succeeded.Store(true)
+			return nil
+		},
+	}
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", HandlerFunc(func(ctx context.Context, _ Execution) (json.RawMessage, error) {
+		<-ctx.Done() // released only when the renewal loop cancels authority
+		canceled.Store(true)
+		return nil, nil
+	})))
+
+	runner := renewingRunner(control, &fakeBroker{}, registry, RunnerConfig{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.processMessage(context.Background(), session,
+			queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")})
+	}()
+
+	select {
+	case <-blocked.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the renewal loop never issued a call")
+	}
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a hung renewal outlived the authority deadline without cancelling the handler")
+	}
+	require.True(t, canceled.Load(), "a hung renewal must still cancel the cooperative handler")
+	require.False(t, succeeded.Load(),
+		"work that could not prove its lease must never report success")
+}
+
+// TestRenewal_ALateSuccessCannotRestoreExpiredLocalAuthority is the other half.
+// The call is cancelled at the deadline, but the fake answers anyway with a
+// perfectly valid renewal — exactly what a slow round trip looks like when the
+// response finally lands. Accepting it would silently un-expire a window the
+// handler has already outlived.
+func TestRenewal_ALateSuccessCannotRestoreExpiredLocalAuthority(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+	assignment.LeaseRemaining = 60 * time.Millisecond
+	assignment.ExecutionDeadline = time.Now().Add(60 * time.Millisecond)
+
+	entered := make(chan struct{})
+	var once sync.Once
+	var renewals atomic.Int32
+	var canceled, succeeded atomic.Bool
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		start: func(context.Context, workers.Fence) error { return nil },
+		renew: func(ctx context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
+			renewals.Add(1)
+			once.Do(func() { close(entered) })
+			<-ctx.Done() // the call is cancelled at the authority deadline
+			// ...and the control plane answers successfully anyway, late.
+			return workers.RenewalResult{
+				LeaseID: req.Fence.LeaseID, RenewalVersion: req.ExpectedVersion + 1,
+				ExpiresAt: time.Now().Add(time.Hour), Remaining: time.Hour,
+			}, nil
+		},
+		succeed: func(context.Context, workers.Fence) error {
+			succeeded.Store(true)
+			return nil
+		},
+	}
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", HandlerFunc(func(ctx context.Context, _ Execution) (json.RawMessage, error) {
+		<-ctx.Done()
+		canceled.Store(true)
+		return nil, nil
+	})))
+
+	runner := renewingRunner(control, &fakeBroker{}, registry, RunnerConfig{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.processMessage(context.Background(), session,
+			queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")})
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the renewal loop never issued a call")
+	}
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a late renewal success restored authority instead of ending the attempt")
+	}
+	require.Positive(t, renewals.Load())
+	require.True(t, canceled.Load())
+	require.False(t, succeeded.Load(),
+		"a renewal confirmed after the deadline it was racing must not authorize success")
+}

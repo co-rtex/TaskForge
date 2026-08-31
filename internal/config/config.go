@@ -292,6 +292,37 @@ func (c WorkerConfig) Validate() error {
 	return nil
 }
 
+// ValidateWorkerTimings reports settings that are each individually valid but
+// unsafe in combination.
+//
+// It exists because the transport timeout and the safety windows live in
+// different configuration surfaces: TASKFORGE_WORKER_REQUEST_TIMEOUT is a
+// worker-process setting, while the staleness threshold and the lease the worker
+// is racing are server-owned. Nothing in either surface alone can see that a
+// single control call has been allowed to consume a whole safety window.
+//
+// The worker also bounds every heartbeat and renewal call by its own local
+// safety deadline, so correctness does not depend on this check. This turns a
+// configuration that would make every hung call burn a full window into a
+// startup error instead of a silent loss of throughput.
+func ValidateWorkerTimings(shared Config, worker WorkerConfig) error {
+	var problems []string
+	if worker.RequestTimeout > shared.SessionStaleAfter {
+		problems = append(problems,
+			"TASKFORGE_WORKER_REQUEST_TIMEOUT must not exceed TASKFORGE_SESSION_STALE_AFTER; "+
+				"one hung control call would otherwise consume the whole staleness window")
+	}
+	if worker.RequestTimeout > shared.LeaseRenewInterval {
+		problems = append(problems,
+			"TASKFORGE_WORKER_REQUEST_TIMEOUT must not exceed TASKFORGE_LEASE_RENEW_INTERVAL; "+
+				"one hung control call would otherwise consume a whole renewal cadence")
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("invalid worker timing configuration: %s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
 // LoadDotEnv reads KEY=VALUE lines from path into the environment without
 // overriding variables that are already set, so a real environment always wins
 // over a developer's local file. A missing file is not an error.
