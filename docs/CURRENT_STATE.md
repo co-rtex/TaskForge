@@ -294,6 +294,13 @@ lease history `[EXPIRED, COMPLETED]`. Every late heartbeat, renewal, and success
 from worker A is then rejected and mutates nothing. No recovery state is
 hand-written; the real reconciler produces all of it.
 
+**Binary smoke test.** `taskforge-reconciler` was also run on its own from
+`./bin`, on an isolated loopback port. `GET /healthz` returned
+`{"status":"alive"}` and `GET /readyz` returned HTTP 200 with
+`{"components":{"postgres":"ok"},"status":"ready"}`. It logged
+`reconciler started` with the validated defaults (poll 2s, stale 15s, batch 50),
+then stopped cleanly on SIGTERM with exit status 0 and no error-level log lines.
+
 **No performance or recovery-time claim is made.** Recovery latency in the tests
 is a function of deliberately short test-only thresholds and proves correctness,
 not speed. The benchmark table in
