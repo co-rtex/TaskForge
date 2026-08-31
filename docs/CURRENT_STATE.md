@@ -1,8 +1,9 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It describes the `feat/workers-atomic-claim` branch after Milestone M2,
-based on M1 commit `1cb66cbc922e841d80a9e6318e81e44778555f5d`.
+planned. Milestones M1 and M2 are merged into `main`, and this document records
+the implemented state through M2 together with the hosted CI verification
+described below. M3 has not started.
 
 ## Milestone status
 
