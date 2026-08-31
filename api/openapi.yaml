@@ -748,20 +748,20 @@ components:
           maximum: 86400
           default: 300
           description: |
-            Requested handler budget. In milestone M2 the effective budget is the
-            LESSER of this value and the remaining fixed lease window PostgreSQL
-            reports at claim time, minus a small completion margin reserved for
-            reporting the outcome. A value larger than the configured lease
-            (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
-            cannot authorize execution beyond one fixed lease until M3 adds lease
-            renewal.
+            Handler budget for one execution, measured once from execution start.
+            It is **not** limited by the lease: a running attempt renews its lease,
+            so cooperative work may span many lease windows for as long as renewal
+            keeps succeeding, and renewal never extends this budget. A value larger
+            than `TASKFORGE_LEASE_DURATION` is therefore meaningful.
 
-            The worker runs the handler with a deadline-bearing context and
-            cancels it when the budget elapses; a cooperative handler is expected
-            to return. Go cannot forcibly terminate arbitrary handler code, so an
-            uncooperative handler may continue until it returns or the process
-            exits. The durable guarantee is that after the lease authority
-            deadline the worker can no longer successfully report completion.
+            The worker runs the handler with a deadline-bearing context and cancels
+            it when this budget elapses, or as soon as it can no longer prove it
+            still holds the lease. A cooperative handler is expected to return. Go
+            cannot forcibly terminate arbitrary handler code, so an uncooperative
+            handler may continue until it returns or the process exits. The durable
+            guarantee is that once lease authority is gone the worker can no longer
+            report completion — and the reconciler abandons that attempt and hands
+            the job to another worker.
         scheduled_at:
           type: [string, 'null']
           format: date-time
@@ -797,20 +797,20 @@ components:
         timeout_seconds:
           type: integer
           description: |
-            Requested handler budget. In milestone M2 the effective budget is the
-            LESSER of this value and the remaining fixed lease window PostgreSQL
-            reports at claim time, minus a small completion margin reserved for
-            reporting the outcome. A value larger than the configured lease
-            (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
-            cannot authorize execution beyond one fixed lease until M3 adds lease
-            renewal.
+            Handler budget for one execution, measured once from execution start.
+            It is **not** limited by the lease: a running attempt renews its lease,
+            so cooperative work may span many lease windows for as long as renewal
+            keeps succeeding, and renewal never extends this budget. A value larger
+            than `TASKFORGE_LEASE_DURATION` is therefore meaningful.
 
-            The worker runs the handler with a deadline-bearing context and
-            cancels it when the budget elapses; a cooperative handler is expected
-            to return. Go cannot forcibly terminate arbitrary handler code, so an
-            uncooperative handler may continue until it returns or the process
-            exits. The durable guarantee is that after the lease authority
-            deadline the worker can no longer successfully report completion.
+            The worker runs the handler with a deadline-bearing context and cancels
+            it when this budget elapses, or as soon as it can no longer prove it
+            still holds the lease. A cooperative handler is expected to return. Go
+            cannot forcibly terminate arbitrary handler code, so an uncooperative
+            handler may continue until it returns or the process exits. The durable
+            guarantee is that once lease authority is gone the worker can no longer
+            report completion — and the reconciler abandons that attempt and hands
+            the job to another worker.
         required_capabilities:
           type: array
           items: { type: string }
@@ -859,7 +859,9 @@ components:
         last_heartbeat_at:
           type: string
           format: date-time
-          description: Initialized from PostgreSQL time. Heartbeat updates begin in M3.
+          description: |
+            PostgreSQL receipt time, initialized at registration and advanced by
+            `POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat`.
 
     HeartbeatRequest:
       type: object

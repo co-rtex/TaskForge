@@ -124,7 +124,7 @@ func TestWorkerRegistration_IsIdempotentAndReplacementFencesTheOldBoot(t *testin
 	require.Equal(t, "ACTIVE", leaseStatus)
 
 	// The old boot's lease is not transferred or forgotten. It continues to
-	// consume this logical worker's one slot until M3 reconciliation.
+	// consume this logical worker's one slot until it expires and is reconciled.
 	createJob(t, "replacement-two", "demo.echo", 50, nil)
 	blocked, err := store.Claim(context.Background(), testScope, claimRequest(replacement, "default"))
 	require.NoError(t, err)

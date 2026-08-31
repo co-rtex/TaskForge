@@ -75,8 +75,8 @@ func (s *Store) Register(ctx context.Context, scope string, registration Registr
 		return Session{}, fmt.Errorf("read existing worker session: %w", err)
 	}
 	// A process boot replaces the prior current boot. Its active leases remain
-	// durable and consume logical-worker capacity until M3 reconciliation; they
-	// are not silently transferred to this session.
+	// durable and consume logical-worker capacity until they expire and are
+	// reconciled; they are not silently transferred to this session.
 	if _, err := tx.Exec(ctx, `
 		UPDATE worker_sessions
 		SET status = 'OFFLINE', ended_at = clock_timestamp()
@@ -270,8 +270,8 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 	}
 
 	// Count by logical worker, not just process session. Leases held by a
-	// replaced boot remain reservations until M3 reconciliation and cannot be
-	// bypassed by restarting the process.
+	// replaced boot remain reservations until they expire and are reconciled,
+	// and cannot be bypassed by restarting the process.
 	var activeForWorker int
 	if err := tx.QueryRow(ctx,
 		`SELECT count(*) FROM leases WHERE worker_id = $1 AND status = 'ACTIVE'`,
