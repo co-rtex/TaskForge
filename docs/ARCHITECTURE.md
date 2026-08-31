@@ -551,15 +551,18 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0007`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0008`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
 `job_attempts`, and `leases`, plus `schema_migrations` maintained by the runner.
 M2 adds immediate eligibility time, worker-group routing, constrained session/
 attempt/lease bindings, one current session per logical worker, one active lease per
 job, globally unique notification claims, active-capacity indexes, and timeline-order
-constraints. M3 adds renewal generation and identity on `leases`, with a check
-constraint tying them together and a partial unique index making the identity
-globally unique, plus the two partial indexes the reconciler's scans use.
+constraints. M3 adds renewal generation and identity on `leases`, with a check constraint
+tying them together and a partial unique index ensuring no two leases hold the
+same renewal identity at the same time, plus the two partial indexes the
+reconciler's scans use. That index constrains live identities rather than every
+identity ever used; the exact scope is recorded on the index itself and in
+[ADR-0008](adr/0008-fenced-idempotent-lease-renewal.md).
 
 **Planned:** `results`, `dlq_entries`, `api_keys`, `audit_events`.
 

@@ -387,9 +387,10 @@ func TestRenewal_StaleAndCompetingGenerationsMutateNothing(t *testing.T) {
 	require.True(t, renewedAt.Equal(renewalAtTwo))
 }
 
-// Reusing one renewal identity against a different lease must be a deterministic
-// domain conflict, not a leaked uniqueness error from the index that enforces it.
-func TestRenewal_IdentityReuseAcrossLeasesIsADomainConflict(t *testing.T) {
+// Reusing a renewal identity that is currently recorded on another lease must be
+// a deterministic domain conflict, not a leaked uniqueness error from the index
+// that enforces it.
+func TestRenewal_LiveIdentityReuseAcrossLeasesIsADomainConflict(t *testing.T) {
 	reset(t)
 	store := controlStore()
 	session := registerWorker(t, store,
@@ -417,6 +418,77 @@ func TestRenewal_IdentityReuseAcrossLeasesIsADomainConflict(t *testing.T) {
 
 	_, _, _, version := leaseRow(t, secondFence.LeaseID)
 	require.Equal(t, 0, version, "the second lease must be untouched")
+}
+
+// TestRenewal_ASupersededIdentityIsNotRetainedAndIsHarmless pins the exact edge
+// of the guarantee, so the schema, ADR-0008, OpenAPI, and CURRENT_STATE cannot
+// drift back into promising lifetime uniqueness.
+//
+// Only each lease's current renewal identity is stored. Once a lease renews
+// again, the previous id leaves the partial unique index and another lease may
+// use it. That is deliberate and safe: an identity authorizes nothing by itself,
+// extension is decided by the per-lease expected-generation check under the full
+// fence, and the superseded id no longer works as a replay against the lease that
+// originally used it.
+func TestRenewal_ASupersededIdentityIsNotRetainedAndIsHarmless(t *testing.T) {
+	reset(t)
+	store := controlStore()
+	session := registerWorker(t, store,
+		workerRegistration("renew-superseded-worker", 2, nil, []string{"demo.echo"}))
+	createJob(t, "renew-superseded-one", "demo.echo", 50, nil)
+	createJob(t, "renew-superseded-two", "demo.echo", 50, nil)
+
+	firstClaim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	secondClaim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	first := assignmentFence(firstClaim.Assignment)
+	second := assignmentFence(secondClaim.Assignment)
+
+	// Lease one renews twice, so its first identity is superseded.
+	superseded := uuid.New()
+	_, err = store.RenewLease(context.Background(), testScope, workers.RenewalRequest{
+		Fence: first, RenewalRequestID: superseded, ExpectedVersion: 0})
+	require.NoError(t, err)
+	_, err = store.RenewLease(context.Background(), testScope, workers.RenewalRequest{
+		Fence: first, RenewalRequestID: uuid.New(), ExpectedVersion: 1})
+	require.NoError(t, err)
+	_, _, _, firstVersion := leaseRow(t, first.LeaseID)
+	require.Equal(t, 2, firstVersion)
+
+	t.Run("the superseded identity no longer works as a replay on its own lease", func(t *testing.T) {
+		_, err := store.RenewLease(context.Background(), testScope, workers.RenewalRequest{
+			Fence: first, RenewalRequestID: superseded, ExpectedVersion: 0})
+		require.ErrorIs(t, err, workers.ErrRenewalConflict,
+			"the generation moved on, so this is a conflict rather than a recognized replay")
+		_, _, _, unchanged := leaseRow(t, first.LeaseID)
+		require.Equal(t, 2, unchanged)
+	})
+
+	t.Run("another lease may reuse it, and its own fence still governs", func(t *testing.T) {
+		// This is the documented boundary: the index constrains live identities,
+		// not every identity ever used.
+		result, err := store.RenewLease(context.Background(), testScope, workers.RenewalRequest{
+			Fence: second, RenewalRequestID: superseded, ExpectedVersion: 0})
+		require.NoError(t, err,
+			"a superseded identity is not retained, so reusing it elsewhere is accepted")
+		require.Equal(t, 1, result.RenewalVersion)
+
+		// Harmless: it extended exactly one lease, exactly once, and only because
+		// the caller satisfied that lease's own fence and generation.
+		_, _, _, secondVersion := leaseRow(t, second.LeaseID)
+		require.Equal(t, 1, secondVersion)
+		_, _, _, firstUnchanged := leaseRow(t, first.LeaseID)
+		require.Equal(t, 2, firstUnchanged, "lease one is untouched by the reuse")
+
+		// And it cannot be replayed a second time to extend again.
+		replay, err := store.RenewLease(context.Background(), testScope, workers.RenewalRequest{
+			Fence: second, RenewalRequestID: superseded, ExpectedVersion: 0})
+		require.NoError(t, err)
+		require.True(t, replay.Replayed, "the reused identity now guards lease two's replay")
+		_, _, _, stillOne := leaseRow(t, second.LeaseID)
+		require.Equal(t, 1, stillOne, "a replay must not extend a second time")
+	})
 }
 
 // TestRenewal_TwoConcurrentRenewalsForOneGenerationHaveExactlyOneWinner uses

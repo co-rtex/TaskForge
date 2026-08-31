@@ -359,8 +359,16 @@ paths:
           returns the stored window unchanged and moves nothing;
         - a delayed older generation, or a second distinct request for the same
           generation, mutates nothing and returns `409 renewal_conflict`;
-        - reusing one `renewal_request_id` against a different lease returns the
-          same stable `renewal_conflict`, never a leaked uniqueness error.
+        - reusing a `renewal_request_id` that is currently recorded on a different
+          lease returns the same stable `renewal_conflict`, never a leaked
+          uniqueness error.
+
+        Only each lease's current renewal identity is retained, so that last rule
+        constrains identities that are in force, not every identity ever used.
+        Once a lease renews again its previous id is free, and reusing it on
+        another lease renews that lease normally. Nothing is weakened by this: an
+        identity authorizes nothing on its own, and whether a lease is extended is
+        decided by its own fence and `expected_renewal_version`.
 
         Renewal never resurrects an expired, completed, released, or reconciled
         lease. PostgreSQL time is resampled after every authority lock, so a

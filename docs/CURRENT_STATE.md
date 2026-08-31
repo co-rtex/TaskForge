@@ -28,11 +28,13 @@ Five binaries build and run:
   dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0007`. M2 added stable worker
+The schema consists of migrations `0001` through `0008`. M2 added stable worker
 identities, boot-scoped immutable sessions, attempts, leases, capacity and claim
 indexes, control-timeline constraints, and globally unique notification
-consumption. M3 adds lease renewal generation and identity, and the two partial
-indexes its reconciliation scans use.
+consumption. M3 adds lease renewal generation and identity, the two partial indexes its
+reconciliation scans use, and a forward-only comment migration that records on
+the index itself exactly what renewal-identity uniqueness does and does not
+promise.
 
 ## Implemented behavior
 
@@ -69,11 +71,23 @@ Everything recorded for M2 still holds. What M3 adds:
   `expires_at` from that sample, increments the generation, and records the
   identity that produced it.
 - An exact replay of the committed renewal returns the stored window unchanged,
-  so an ambiguous response cannot extend authority twice. A delayed older
-  generation, a competing request for the same generation, and a generation from
-  the future all mutate nothing and return a stable conflict. Reusing one renewal
-  identity against a different lease returns that same domain conflict, never a
-  leaked uniqueness error.
+  so an ambiguous response cannot extend authority twice — but only while the
+  lease is still live authority. Current lease status, expiry, and executing
+  job/attempt state are validated *before* a replay is recognized, so a replay
+  against a completed, expired, or reconciled lease is rejected rather than
+  answered with a stale window.
+- A delayed older generation, a competing request for the same generation, and a
+  generation from the future all mutate nothing and return a stable conflict.
+  Reusing a renewal identity that is **currently recorded on a different lease**
+  returns that same domain conflict, never a leaked uniqueness error.
+- Only each lease's current renewal identity is retained, so that last rule
+  constrains identities in force, not every identity ever used. Once a lease
+  renews again its previous id is free and another lease may use it. Nothing is
+  weakened: an identity authorizes nothing on its own, extension is decided by
+  the per-lease expected-generation check under the full fence, and replaying a
+  superseded id against its original lease is still refused because the
+  generation no longer matches. See
+  [ADR-0008](adr/0008-fenced-idempotent-lease-renewal.md)'s scope note.
 - Renewal never resurrects an expired, completed, released, or reconciled lease,
   and a renewal that waits across the expiry boundary is rejected against the
   fresh post-lock sample.
@@ -266,8 +280,10 @@ start, or succeed, and a late heartbeat never revives it; heartbeat racing
 session replacement has only valid serial outcomes; renewal is fenced by all five
 identifiers; an exact replay returns the committed window without a second
 extension; two distinct renewals for one generation have exactly one winner; a
-renewal waiting across expiry is rejected without mutation; identity reuse across
-leases is a domain conflict; an expired lease is reconciled even when its session
+renewal waiting across expiry is rejected without mutation; a replay against a
+lease that has since completed, been reconciled, or lapsed is rejected instead of
+answered with a stale window; reuse of a live identity across leases is a domain
+conflict while reuse of a superseded one is accepted and harmless; an expired lease is reconciled even when its session
 is healthy; attempts are abandoned from both `LEASED` and `RUNNING`; expiry
 closes the lease, stamps the attempt, and releases queue and logical-worker
 capacity atomically; recovery produces exactly one fresh pending event and a

@@ -162,13 +162,26 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 		}
 	})
 
-	t.Run("renewal identity is globally unique and partial", func(t *testing.T) {
+	t.Run("renewal identity uniqueness is partial and scoped to live identities", func(t *testing.T) {
 		var def string
 		require.NoError(t, conn.QueryRow(ctx,
 			`SELECT indexdef FROM pg_indexes WHERE indexname = 'leases_last_renewal_request_id_idx'`).Scan(&def))
 		require.Contains(t, def, "UNIQUE")
 		require.Contains(t, def, "last_renewal_request_id")
 		require.Contains(t, def, "IS NOT NULL")
+
+		// Migration 0008 attaches the precise guarantee to the index itself, so an
+		// operator reading the schema cannot be misled by 0006's original wording,
+		// which is immutable and overstated it as lifetime uniqueness.
+		var comment string
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT obj_description(c.oid, 'pg_class')
+			FROM pg_class c
+			WHERE c.relname = 'leases_last_renewal_request_id_idx'`).Scan(&comment))
+		require.Contains(t, comment, "AT THE SAME TIME",
+			"the index must record that it constrains live identities, not all of history")
+		require.Contains(t, comment, "expected_renewal_version",
+			"and must name what actually decides whether a lease is extended")
 	})
 
 	t.Run("one current process session per logical worker is enforced", func(t *testing.T) {
@@ -211,8 +224,8 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 	defer cancel()
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, len(migrations), 7)
-	for i, want := range []int{1, 2, 3, 4, 5, 6, 7} {
+	require.GreaterOrEqual(t, len(migrations), 8)
+	for i, want := range []int{1, 2, 3, 4, 5, 6, 7, 8} {
 		require.Equal(t, want, migrations[i].Version, "migration order is versioned and deterministic")
 	}
 
@@ -250,7 +263,7 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 		jobID, createdAt, eventID, secondJobID, laterAt, secondEventID)
 	require.NoError(t, err)
 
-	for _, migration := range migrations[1:7] {
+	for _, migration := range migrations[1:8] {
 		require.NoError(t, execMigration(ctx, conn, migration),
 			"migration %04d must apply to a database holding real M1 data", migration.Version)
 	}
@@ -480,7 +493,8 @@ func TestMigrations_CarryRealM1DataThroughEveryM2Migration(t *testing.T) {
 		_, err = conn.Exec(ctx, `
 			UPDATE leases SET renewal_version = 1, last_renewal_request_id = '`+identity.String()+`'
 			WHERE id = '`+otherLease.String()+`'`)
-		require.Error(t, err, "a renewal identity is globally unique across leases")
+		require.Error(t, err,
+			"two leases may not hold the same renewal identity at the same time")
 		var pgErr *pgconn.PgError
 		require.ErrorAs(t, err, &pgErr)
 		require.Equal(t, "23505", pgErr.Code)

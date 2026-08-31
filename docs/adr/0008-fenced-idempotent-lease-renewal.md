@@ -52,8 +52,10 @@ lock order, with PostgreSQL time sampled after every lock:
 - **Exact replay** — the stored identity equals the request's and the generation
   is exactly one past the expected one: return the committed window unchanged.
   Nothing moves. This is what makes an ambiguous response safe to retry.
-- **Identity reuse against another lease**: a deterministic domain conflict,
-  looked up under the same locks so callers never see a raw uniqueness error.
+- **Reuse of a live identity against another lease** — the id is currently
+  recorded on a different lease: a deterministic domain conflict, looked up under
+  the same locks so callers never see a raw uniqueness error. Only identities
+  that are currently in force are constrained; see the scope note below.
 - **Stale, competing, or future generation**: no mutation, stable conflict.
 - **Lease not `ACTIVE`, or PostgreSQL time already at or past expiry**: rejected.
   Renewal never resurrects an expired, completed, released, or reconciled lease.
@@ -117,3 +119,41 @@ column pair and one extra index on `leases`.
 an identity two generations old is a stable conflict rather than a recognized
 replay. That is the correct answer — the caller's view of the world is stale
 either way — but it means the replay window is one generation, not unbounded.
+
+## Scope note: what identity uniqueness does and does not promise
+
+Added after review, because the original wording of this record promised more
+than migration 0006 enforces.
+
+`leases_last_renewal_request_id_idx` is a partial unique index over each lease's
+**current** `last_renewal_request_id`. It therefore guarantees:
+
+> No two leases hold the same renewal identity at the same time.
+
+It does **not** guarantee that a renewal identity is unique for all time. Once a
+lease renews again, its previous identity is no longer stored, leaves the index,
+and a different lease could reuse it and be renewed normally.
+
+That narrower guarantee is sufficient, and the difference is not a gap in
+fencing:
+
+- A renewal identity authorizes nothing by itself. Whether a lease is extended is
+  decided by the per-lease `expected_renewal_version` check, under the full
+  five-part fence. A caller that reuses a superseded id on another lease still
+  has to satisfy that lease's own fence and generation, so it can extend only the
+  lease it legitimately holds, once.
+- Replay detection is per-lease and compares against that lease's current
+  identity, so reuse elsewhere cannot make a replay look like a first attempt, or
+  a first attempt look like a replay.
+- Replaying a superseded identity against its original lease is still refused
+  deterministically: the generation no longer matches.
+- No raw uniqueness error can escape in any of these cases, which was the failure
+  mode this decision set out to prevent.
+
+Enforcing lifetime uniqueness would require retaining every renewal in a
+`lease_renewals` table — the alternative rejected above — with its own unbounded
+growth and retention policy, in exchange for rejecting a request that is already
+harmless. That trade is not worth making, so the guarantee is stated narrowly
+here, in migration 0006, in the OpenAPI description, and in `CURRENT_STATE.md`,
+and the boundary is pinned by
+`TestRenewal_ASupersededIdentityIsNotRetainedAndIsHarmless`.
