@@ -97,7 +97,10 @@ func (s *Store) Heartbeat(ctx context.Context, scope string, req HeartbeatReques
 // current. That extra pair is what makes renewal safe to retry:
 //
 //   - an exact replay of the just-committed renewal returns the stored result and
-//     moves nothing, so an ambiguous response cannot extend authority twice;
+//     moves nothing, so an ambiguous response cannot extend authority twice — but
+//     only while the lease is still ACTIVE, unexpired, and backed by an executing
+//     job and attempt. Current authority is validated before a replay is even
+//     recognized;
 //   - a delayed older generation, or a second distinct request for the same
 //     generation, performs no mutation and returns ErrRenewalConflict;
 //   - reusing one renewal identity against a different lease is a domain
@@ -125,9 +128,28 @@ func (s *Store) RenewLease(ctx context.Context, scope string, req RenewalRequest
 	}
 	defer rollback(ctx, tx)
 
-	// An exact replay of the renewal that produced the current generation. The
-	// stored window is returned unchanged; remaining is measured from the fresh
-	// server sample, so a replay never reports more time than actually remains.
+	// Current authority is validated FIRST, before any replay is recognized.
+	//
+	// Order matters here and used to be wrong. Recognizing a replay before these
+	// checks let a lease that had been renewed once and then completed, expired,
+	// or reconciled answer a replayed renewal with 200 and a positive remaining
+	// window — authority for a lease that no longer exists. ADR-0008 says renewal
+	// never resurrects an expired, completed, released, or reconciled lease, and
+	// that has to bind the replay path exactly as it binds a first attempt.
+	if state.leaseStatus != LeaseActive || !state.serverNow.Before(state.expiresAt) {
+		return RenewalResult{}, ErrLeaseExpired
+	}
+	// Renewal authorizes continued execution, so the attempt must still be the
+	// one executing. Both LEASED and RUNNING are accepted because a renewal may
+	// legitimately race the start transition.
+	if !isExecutingJobStatus(state.jobStatus) || !isExecutingAttemptStatus(state.attemptStatus) {
+		return RenewalResult{}, ErrStateConflict
+	}
+
+	// An exact replay of the renewal that produced the current generation, on a
+	// lease that is still live. The stored window is returned unchanged; remaining
+	// is measured from the fresh server sample, so a replay never reports more
+	// time than actually remains.
 	if state.lastRenewalRequestID != nil && *state.lastRenewalRequestID == req.RenewalRequestID {
 		if state.renewalVersion != req.ExpectedVersion+1 {
 			return RenewalResult{}, ErrRenewalConflict
@@ -144,9 +166,14 @@ func (s *Store) RenewLease(ctx context.Context, scope string, req RenewalRequest
 		}
 		return result, nil
 	}
-	// Reusing one renewal identity for a different lease is a caller error with a
-	// deterministic answer. Checking it under the same locks turns what would
-	// otherwise surface as a raw unique-violation into a stable domain conflict.
+	// Reusing a renewal identity that is currently recorded on a different lease
+	// is a caller error with a deterministic answer. Checking it under the same
+	// locks turns what would otherwise surface as a raw unique-violation into a
+	// stable domain conflict.
+	//
+	// Only the current generation's identity is retained per lease, so this
+	// rejects reuse of a live identity, not of one a lease has already superseded.
+	// See ADR-0008's scope note for why the narrower guarantee is sufficient.
 	var identityOwner uuid.UUID
 	err = tx.QueryRow(ctx,
 		`SELECT id FROM leases WHERE last_renewal_request_id = $1`, req.RenewalRequestID).Scan(&identityOwner)
@@ -157,15 +184,6 @@ func (s *Store) RenewLease(ctx context.Context, scope string, req RenewalRequest
 		return RenewalResult{}, fmt.Errorf("read renewal identity owner: %w", err)
 	}
 
-	if state.leaseStatus != LeaseActive || !state.serverNow.Before(state.expiresAt) {
-		return RenewalResult{}, ErrLeaseExpired
-	}
-	// Renewal authorizes continued execution, so the attempt must still be the
-	// one executing. Both LEASED and RUNNING are accepted because a renewal may
-	// legitimately race the start transition.
-	if !isExecutingJobStatus(state.jobStatus) || !isExecutingAttemptStatus(state.attemptStatus) {
-		return RenewalResult{}, ErrStateConflict
-	}
 	if state.renewalVersion != req.ExpectedVersion {
 		return RenewalResult{}, ErrRenewalConflict
 	}

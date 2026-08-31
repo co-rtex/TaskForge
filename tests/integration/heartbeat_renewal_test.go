@@ -514,8 +514,99 @@ func TestRenewal_WaitingAcrossExpiryIsRejectedWithoutMutation(t *testing.T) {
 	require.Equal(t, 0, version)
 }
 
+// TestRenewal_ReplayOnATerminalLeaseIsRejected is the regression test for the
+// ordering defect where replay recognition ran before any authority check.
+//
+// A lease that has been renewed once records the identity that renewed it. If
+// that lease then reaches a terminal state, a replay of the very same renewal
+// used to match the stored identity and return 200 with a positive remaining
+// window — authority for a lease that no longer exists. ADR-0008 says renewal
+// never resurrects an expired, completed, released, or reconciled lease, and the
+// replay path is bound by that exactly as a first attempt is.
+//
+// TestRenewal_NeverResurrectsAClosedLease below covers the same rule for a lease
+// that was never renewed, which takes the other branch entirely and therefore
+// could not have caught this.
+func TestRenewal_ReplayOnATerminalLeaseIsRejected(t *testing.T) {
+	// Each case renews once (so a replay identity exists), then drives the lease
+	// terminal by a different route, then replays the committed renewal.
+	terminate := map[string]struct {
+		drive     func(t *testing.T, store *workers.Store, fence workers.Fence)
+		wantLease string
+		wantJob   string
+	}{
+		"completed by a successful outcome": {
+			drive: func(t *testing.T, store *workers.Store, fence workers.Fence) {
+				require.NoError(t, store.Succeed(context.Background(), testScope, fence))
+			},
+			wantLease: "COMPLETED", wantJob: "SUCCEEDED",
+		},
+		"expired by reconciliation": {
+			drive: func(t *testing.T, store *workers.Store, fence workers.Fence) {
+				expireLease(t, fence.LeaseID)
+				stats, err := store.ReconcileExpiredLeases(context.Background(), 10)
+				require.NoError(t, err)
+				require.Equal(t, 1, stats.ExpiredLeases)
+			},
+			wantLease: "EXPIRED", wantJob: "QUEUED",
+		},
+		"lapsed on server time while still ACTIVE": {
+			drive: func(t *testing.T, store *workers.Store, fence workers.Fence) {
+				expireLease(t, fence.LeaseID)
+			},
+			wantLease: "ACTIVE", wantJob: "RUNNING",
+		},
+	}
+
+	for name, test := range terminate {
+		t.Run(name, func(t *testing.T) {
+			reset(t)
+			store := controlStore()
+			session := registerWorker(t, store,
+				workerRegistration("renew-replay-terminal", 1, nil, []string{"demo.echo"}))
+			createJob(t, "renew-replay-terminal", "demo.echo", 50, nil)
+			claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
+			require.NoError(t, err)
+			fence := assignmentFence(claim.Assignment)
+			require.NoError(t, store.Start(context.Background(), testScope, fence))
+
+			// One committed renewal, so the lease now carries a replay identity.
+			request := renewalRequest(fence, 0)
+			renewed, err := store.RenewLease(context.Background(), testScope, request)
+			require.NoError(t, err)
+			require.Equal(t, 1, renewed.RenewalVersion)
+			require.False(t, renewed.Replayed)
+
+			test.drive(t, store, fence)
+
+			_, expiresAt, _, versionBefore := leaseRow(t, fence.LeaseID)
+
+			// The exact replay of that committed renewal must now be refused.
+			replay, err := store.RenewLease(context.Background(), testScope, request)
+			require.ErrorIs(t, err, workers.ErrLeaseExpired,
+				"a replay must not resurrect a lease that is no longer live authority")
+			require.Zero(t, replay.Remaining,
+				"a rejected replay must never hand back a positive remaining window")
+			require.False(t, replay.Replayed)
+
+			status, expiresAfter, _, versionAfter := leaseRow(t, fence.LeaseID)
+			require.Equal(t, test.wantLease, status)
+			require.Equal(t, versionBefore, versionAfter,
+				"a rejected replay must not advance the generation")
+			require.True(t, expiresAfter.Equal(expiresAt),
+				"a rejected replay must not move the expiry")
+
+			var jobStatus string
+			require.NoError(t, testPool.QueryRow(context.Background(),
+				`SELECT status FROM jobs WHERE id = $1`, fence.JobID).Scan(&jobStatus))
+			require.Equal(t, test.wantJob, jobStatus)
+		})
+	}
+}
+
 // A lease that has already reached a terminal state is never resurrected by a
-// renewal that arrives afterwards.
+// renewal that arrives afterwards. This covers the never-renewed lease, which
+// carries no replay identity and therefore takes the non-replay branch.
 func TestRenewal_NeverResurrectsAClosedLease(t *testing.T) {
 	reset(t)
 	store := controlStore()
