@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,6 +201,44 @@ func (s *succeedStaller) release() {
 
 func (s *succeedStaller) URL() string { return s.server.URL }
 
+// createIsolatedBrokerQueue gives this test a broker queue of its own.
+//
+// Every other test in this package shares one queue and drains it in reset().
+// That is fine for tests whose consumers live and die inside the test, but this
+// one runs real worker processes: a worker that is SIGKILLed or SIGTERMed while
+// long-polling leaves a message in flight, and reset() cannot drain what is not
+// visible. Rather than make every later test tolerate that, this test consumes
+// from a queue nobody else touches.
+func createIsolatedBrokerQueue(t *testing.T) string {
+	t.Helper()
+	name := "taskforge-crash-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+
+	response, err := http.PostForm(brokerEndpoint()+"/", url.Values{
+		"Action": {"CreateQueue"}, "QueueName": {name}, "Version": {"2012-11-05"},
+	})
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 8*1024))
+	require.NoError(t, err)
+	require.Equalf(t, http.StatusOK, response.StatusCode, "CreateQueue failed: %s", body)
+
+	queueURL := queueURLPattern.FindStringSubmatch(string(body))
+	require.Lenf(t, queueURL, 2, "CreateQueue returned no queue url: %s", body)
+
+	t.Cleanup(func() {
+		deleted, err := http.PostForm(brokerEndpoint()+"/", url.Values{
+			"Action": {"DeleteQueue"}, "QueueUrl": {queueURL[1]}, "Version": {"2012-11-05"},
+		})
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(deleted.Body, 8*1024))
+			_ = deleted.Body.Close()
+		}
+	})
+	return name
+}
+
+var queueURLPattern = regexp.MustCompile(`<QueueUrl>([^<]+)</QueueUrl>`)
+
 // TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries is the roadmap's
 // literal acceptance story, at the process boundary.
 //
@@ -211,6 +251,7 @@ func (s *succeedStaller) URL() string { return s.server.URL }
 func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) {
 	reset(t)
 	binDir := buildBinaries(t)
+	brokerQueue := createIsolatedBrokerQueue(t)
 
 	apiPort, outboxPort := freePort(t), freePort(t)
 	reconcilerPort := freePort(t)
@@ -221,7 +262,7 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 		"TASKFORGE_DATABASE_URL":             dsn(),
 		"TASKFORGE_DEV_SCOPE":                testScope,
 		"TASKFORGE_BROKER_ENDPOINT":          brokerEndpoint(),
-		"TASKFORGE_BROKER_QUEUE_NAME":        defaultBrokerQueueName,
+		"TASKFORGE_BROKER_QUEUE_NAME":        brokerQueue,
 		"TASKFORGE_BROKER_REGION":            "us-east-1",
 		"TASKFORGE_BROKER_ACCESS_KEY_ID":     "local",
 		"TASKFORGE_BROKER_SECRET_ACCESS_KEY": "local",
