@@ -11,18 +11,42 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
+
+// StoreConfig is the server-owned policy a worker-control store enforces. None
+// of it is ever supplied by a worker.
+type StoreConfig struct {
+	// LeaseDuration is the window issued at claim and reissued by each renewal.
+	LeaseDuration time.Duration
+	// RetryPolicy governs both worker-reported retryable failures and
+	// reconciler-detected timeouts, so a job cannot learn a different cadence
+	// depending on whether its worker managed to report the failure.
+	RetryPolicy lifecycle.RetryPolicy
+	// Jitter must be independently seeded per process in production, or replicas
+	// recovering from one outage would compute identical retry instants. A nil
+	// source disables jitter, which is only appropriate in a test asserting exact
+	// exponential growth.
+	Jitter lifecycle.JitterSource
+}
 
 // Store serializes worker-control operations through PostgreSQL.
 type Store struct {
 	pool          *pgxpool.Pool
 	leaseDuration time.Duration
+	retryPolicy   lifecycle.RetryPolicy
+	jitter        lifecycle.JitterSource
 }
 
-// NewStore builds a worker control-plane store. Lease duration is a
-// server-owned setting; a worker never supplies its own expiry.
-func NewStore(pool *pgxpool.Pool, leaseDuration time.Duration) *Store {
-	return &Store{pool: pool, leaseDuration: leaseDuration}
+// NewStore builds a worker control-plane store.
+func NewStore(pool *pgxpool.Pool, cfg StoreConfig) *Store {
+	return &Store{
+		pool:          pool,
+		leaseDuration: cfg.LeaseDuration,
+		retryPolicy:   cfg.RetryPolicy,
+		jitter:        cfg.Jitter,
+	}
 }
 
 // Register creates or reuses the logical worker and idempotently registers one
@@ -434,48 +458,98 @@ func commitNoClaim(ctx context.Context, tx pgx.Tx, disposition ClaimDisposition)
 	return ClaimResult{Disposition: disposition}, nil
 }
 
-// Start performs the dedicated LEASED -> RUNNING transition. Replaying the
-// exact fence while it remains current is idempotent.
-func (s *Store) Start(ctx context.Context, scope string, fence Fence) (err error) {
+// Start performs the dedicated LEASED -> RUNNING transition and stamps the
+// attempt's persisted execution deadline.
+//
+// The deadline is written here, once, and never again. That single fact is what
+// makes the rest of the timeout story work:
+//
+//   - An ambiguous Start retry returns the ORIGINAL started_at and timeout_at.
+//     Recomputing them would hand a worker a fresh budget every time a response
+//     was lost, which is the one way a "timeout" could never fire.
+//   - Lease renewal cannot touch it. Renewal extends lease authority; the job's
+//     timeout_seconds budget is measured once from execution start (ADR-0008).
+//   - Reconciliation has something durable to scan, so a timeout is detected
+//     even if the worker's process is gone.
+//
+// Remaining is measured from the same post-lock PostgreSQL sample, so the worker
+// derives its conservative local deadline from a server-measured duration rather
+// than from comparing clocks.
+func (s *Store) Start(ctx context.Context, scope string, fence Fence) (_ StartResult, err error) {
 	defer func() { err = classifyDatabaseError(err) }()
 
 	if err := ValidateFence(fence); err != nil {
-		return err
+		return StartResult{}, err
 	}
 	tx, state, err := s.lockFence(ctx, scope, fence)
 	if err != nil {
-		return err
+		return StartResult{}, err
 	}
 	defer rollback(ctx, tx)
 
-	if state.leaseStatus != LeaseActive || !state.serverNow.Before(state.expiresAt) {
-		return ErrLeaseExpired
+	if !state.leaseUsable() {
+		return StartResult{}, ErrLeaseExpired
 	}
+	// An exact replay of a start that already committed. The stored window is
+	// returned unchanged, and remaining is measured against the fresh sample so a
+	// replay never reports more budget than actually remains.
 	if state.jobStatus == "RUNNING" && state.attemptStatus == AttemptRunning {
-		return tx.Commit(ctx)
+		var startedAt time.Time
+		var timeoutAt *time.Time
+		if err := tx.QueryRow(ctx,
+			`SELECT started_at, timeout_at FROM job_attempts WHERE id = $1`,
+			fence.AttemptID).Scan(&startedAt, &timeoutAt); err != nil {
+			return StartResult{}, fmt.Errorf("read replayed attempt start: %w", err)
+		}
+		if timeoutAt == nil {
+			// Only reachable for an attempt started before migration 0009 added
+			// the column. Report it rather than inventing a deadline, because
+			// inventing one would extend a budget that is already running.
+			return StartResult{}, fmt.Errorf(
+				"%w: attempt has no persisted execution deadline", ErrStateConflict)
+		}
+		result := StartResult{
+			AttemptID: fence.AttemptID, StartedAt: startedAt, TimeoutAt: *timeoutAt,
+			Remaining: remainingUntil(*timeoutAt, state.serverNow), Replayed: true,
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return StartResult{}, fmt.Errorf("commit replayed attempt start: %w", err)
+		}
+		return result, nil
 	}
 	if state.jobStatus != "LEASED" || state.attemptStatus != AttemptLeased {
-		return ErrStateConflict
+		return StartResult{}, ErrStateConflict
 	}
 
+	var timeoutSeconds int
+	if err := tx.QueryRow(ctx,
+		`SELECT timeout_seconds FROM jobs WHERE id = $1`, fence.JobID).Scan(&timeoutSeconds); err != nil {
+		return StartResult{}, fmt.Errorf("read attempt timeout budget: %w", err)
+	}
+	timeoutAt := state.serverNow.Add(time.Duration(timeoutSeconds) * time.Second)
+
 	if tag, err := tx.Exec(ctx, `
-		UPDATE job_attempts SET status = 'RUNNING', started_at = $2
-		WHERE id = $1 AND status = 'LEASED'`, fence.AttemptID, state.serverNow); err != nil {
-		return fmt.Errorf("start attempt: %w", err)
+		UPDATE job_attempts SET status = 'RUNNING', started_at = $2, timeout_at = $3
+		WHERE id = $1 AND status = 'LEASED'`,
+		fence.AttemptID, state.serverNow, timeoutAt); err != nil {
+		return StartResult{}, fmt.Errorf("start attempt: %w", err)
 	} else if tag.RowsAffected() != 1 {
-		return ErrStateConflict
+		return StartResult{}, ErrStateConflict
 	}
 	if tag, err := tx.Exec(ctx, `
 		UPDATE jobs SET status = 'RUNNING', updated_at = $2
 		WHERE id = $1 AND status = 'LEASED'`, fence.JobID, state.serverNow); err != nil {
-		return fmt.Errorf("start job: %w", err)
+		return StartResult{}, fmt.Errorf("start job: %w", err)
 	} else if tag.RowsAffected() != 1 {
-		return ErrStateConflict
+		return StartResult{}, ErrStateConflict
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit attempt start: %w", err)
+		return StartResult{}, fmt.Errorf("commit attempt start: %w", err)
 	}
-	return nil
+	return StartResult{
+		AttemptID: fence.AttemptID, StartedAt: state.serverNow, TimeoutAt: timeoutAt,
+		Remaining: time.Duration(timeoutSeconds) * time.Second,
+	}, nil
 }
 
 // Succeed atomically accepts one fenced successful outcome and releases both
@@ -495,9 +569,23 @@ func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err err
 	if state.jobStatus == "SUCCEEDED" && state.attemptStatus == AttemptSucceeded && state.leaseStatus == LeaseCompleted {
 		return tx.Commit(ctx)
 	}
-	if state.leaseStatus != LeaseActive || !state.serverNow.Before(state.expiresAt) {
+	if !state.leaseUsable() {
 		return ErrLeaseExpired
 	}
+	// The persisted deadline is checked against the SAME post-lock sample that
+	// every other authority decision in this transaction uses. A success that
+	// waited across the deadline while holding no locks would otherwise commit on
+	// a stale reading of the clock, and the timeout it outlived would be a
+	// timeout that never happened.
+	//
+	// Lock order is what resolves timeout-versus-success: whichever transaction
+	// reaches these rows first commits, and the loser re-reads a state its
+	// precondition no longer matches.
+	if state.timedOut() {
+		return ErrAttemptTimedOut
+	}
+	// CANCEL_REQUESTED lands here as a state conflict, which is the point: once
+	// cancellation has durably won, no later success from this attempt commits.
 	if state.jobStatus != "RUNNING" || state.attemptStatus != AttemptRunning {
 		return ErrStateConflict
 	}
@@ -531,6 +619,8 @@ func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err err
 }
 
 type fenceState struct {
+	queue         string
+	scope         string
 	jobStatus     string
 	attemptStatus AttemptStatus
 	leaseStatus   LeaseStatus
@@ -541,12 +631,59 @@ type fenceState struct {
 	// was true before the transaction waited.
 	renewalVersion       int
 	lastRenewalRequestID *uuid.UUID
+
+	// Attempt budget and the persisted execution deadline. Both are read under
+	// the same locks for the same reason: a retry decision taken against a count
+	// that was true before this transaction waited would be a decision about a
+	// state that no longer exists.
+	attemptNumber int
+	maxAttempts   int
+	timeoutAt     *time.Time
+
+	// The committed terminal outcome, if this attempt already has one. These are
+	// what an exact replay is answered from, so an ambiguous report returns the
+	// decision that committed rather than a freshly computed one.
+	outcomeRequestID *uuid.UUID
+	failureClass     *string
+	errorCode        *string
+	errorMessage     *string
+	retryDelayMillis *int64
+	retryAt          *time.Time
+}
+
+// timedOut reports whether PostgreSQL time has reached this attempt's persisted
+// execution deadline.
+//
+// An attempt with no deadline never times out here: legacy attempts started
+// before migration 0009 carry none, and a LEASED attempt has not started its
+// budget yet.
+func (s fenceState) timedOut() bool {
+	return s.timeoutAt != nil && !s.serverNow.Before(*s.timeoutAt)
+}
+
+// leaseUsable reports whether the lease can still authorize a transition.
+func (s fenceState) leaseUsable() bool {
+	return s.leaseStatus == LeaseActive && s.serverNow.Before(s.expiresAt)
 }
 
 // lockFence uses the same queue -> worker session -> job -> attempt -> lease
 // order as Claim. The first lease read is only an immutable routing hint; every
 // authority field is revalidated after all rows are locked.
+//
+// It requires the worker session to still be current and healthy, because every
+// caller is a trusted worker asserting authority it must still hold.
+// Reconciliation uses lockFenceForReconciliation instead, which takes the same
+// rows in the same order without that requirement.
 func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.Tx, fenceState, error) {
+	return s.lockAuthorityRows(ctx, scope, fence, true)
+}
+
+func (s *Store) lockAuthorityRows(
+	ctx context.Context,
+	scope string,
+	fence Fence,
+	requireHealthySession bool,
+) (pgx.Tx, fenceState, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fenceState{}, fmt.Errorf("begin fenced transition: %w", err)
@@ -578,17 +715,20 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 		SELECT status FROM worker_sessions
 		WHERE id = $1 AND worker_id = $2 AND scope = $3
 		FOR UPDATE`, fence.SessionID, fence.WorkerID, scope).Scan(&sessionStatus)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && sessionStatus != SessionHealthy) {
+	if errors.Is(err, pgx.ErrNoRows) ||
+		(err == nil && requireHealthySession && sessionStatus != SessionHealthy) {
 		return fail(ErrFenceRejected)
 	}
 	if err != nil {
 		return fail(fmt.Errorf("lock worker session for fenced transition: %w", err))
 	}
 
-	var state fenceState
+	state := fenceState{queue: queue, scope: scope}
 	err = tx.QueryRow(ctx, `
-		SELECT j.status, a.status, l.status, l.expires_at,
-		       l.renewal_version, l.last_renewal_request_id
+		SELECT j.status, j.max_attempts, a.status, a.attempt_number, a.timeout_at,
+		       a.outcome_request_id, a.failure_class, a.error_code, a.error_message,
+		       a.retry_delay_ms, a.retry_at,
+		       l.status, l.expires_at, l.renewal_version, l.last_renewal_request_id
 		FROM jobs j
 		JOIN job_attempts a ON a.job_id = j.id
 		JOIN leases l ON l.attempt_id = a.id
@@ -597,7 +737,10 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 		  AND j.scope = $6 AND a.scope = $6 AND l.scope = $6
 		FOR UPDATE OF j, a, l`,
 		fence.JobID, fence.AttemptID, fence.LeaseID, fence.WorkerID, fence.SessionID, scope,
-	).Scan(&state.jobStatus, &state.attemptStatus, &state.leaseStatus, &state.expiresAt,
+	).Scan(&state.jobStatus, &state.maxAttempts, &state.attemptStatus, &state.attemptNumber,
+		&state.timeoutAt, &state.outcomeRequestID, &state.failureClass, &state.errorCode,
+		&state.errorMessage, &state.retryDelayMillis, &state.retryAt,
+		&state.leaseStatus, &state.expiresAt,
 		&state.renewalVersion, &state.lastRenewalRequestID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fail(ErrFenceRejected)

@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 // Config is the shared configuration surface for the API, outbox, migration,
@@ -38,6 +40,19 @@ type Config struct {
 	ReconcilerAddr         string
 	ReconcilerPollInterval time.Duration
 	ReconcilerBatchSize    int
+
+	SchedulerAddr          string
+	SchedulerPollInterval  time.Duration
+	SchedulerBatchSize     int
+	SchedulerRenotifyAfter time.Duration
+
+	// Durable job retry policy. Shared by worker-reported failures and
+	// reconciler-detected timeouts, so a job cannot learn a different cadence
+	// depending on whether its worker managed to report the failure.
+	JobRetryBase       time.Duration
+	JobRetryMax        time.Duration
+	JobRetryMultiplier float64
+	JobRetryJitter     float64
 
 	// DevScope is the single authentication scope every request is attributed
 	// to until database-backed API keys land in milestone M5. It exists so the
@@ -83,6 +98,16 @@ func Load() (Config, error) {
 		ReconcilerPollInterval: envDuration("TASKFORGE_RECONCILER_POLL_INTERVAL", 2*time.Second),
 		ReconcilerBatchSize:    envInt("TASKFORGE_RECONCILER_BATCH_SIZE", 50),
 
+		SchedulerAddr:          env("TASKFORGE_SCHEDULER_ADDR", "127.0.0.1:8084"),
+		SchedulerPollInterval:  envDuration("TASKFORGE_SCHEDULER_POLL_INTERVAL", 2*time.Second),
+		SchedulerBatchSize:     envInt("TASKFORGE_SCHEDULER_BATCH_SIZE", 50),
+		SchedulerRenotifyAfter: envDuration("TASKFORGE_SCHEDULER_RENOTIFY_AFTER", 60*time.Second),
+
+		JobRetryBase:       envDuration("TASKFORGE_JOB_RETRY_BASE", time.Second),
+		JobRetryMax:        envDuration("TASKFORGE_JOB_RETRY_MAX", 5*time.Minute),
+		JobRetryMultiplier: envFloat("TASKFORGE_JOB_RETRY_MULTIPLIER", 2.0),
+		JobRetryJitter:     envFloat("TASKFORGE_JOB_RETRY_JITTER", 0.2),
+
 		BrokerEndpoint:        env("TASKFORGE_BROKER_ENDPOINT", "http://127.0.0.1:9324"),
 		BrokerQueueName:       env("TASKFORGE_BROKER_QUEUE_NAME", "taskforge-work-available"),
 		BrokerRegion:          env("TASKFORGE_BROKER_REGION", "us-east-1"),
@@ -118,6 +143,7 @@ func (c Config) Validate() error {
 	req("TASKFORGE_BROKER_REGION", c.BrokerRegion)
 	req("TASKFORGE_OUTBOX_ADDR", c.OutboxAddr)
 	req("TASKFORGE_RECONCILER_ADDR", c.ReconcilerAddr)
+	req("TASKFORGE_SCHEDULER_ADDR", c.SchedulerAddr)
 	if strings.TrimSpace(c.APIAddr) != "" && !isLoopbackBind(c.APIAddr) {
 		problems = append(problems, "TASKFORGE_API_ADDR must bind to a loopback address until authentication is implemented")
 	}
@@ -126,6 +152,9 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.ReconcilerAddr) != "" && !isLoopbackBind(c.ReconcilerAddr) {
 		problems = append(problems, "TASKFORGE_RECONCILER_ADDR must bind to a loopback address until authentication is implemented")
+	}
+	if strings.TrimSpace(c.SchedulerAddr) != "" && !isLoopbackBind(c.SchedulerAddr) {
+		problems = append(problems, "TASKFORGE_SCHEDULER_ADDR must bind to a loopback address until authentication is implemented")
 	}
 
 	if c.MaxRequestBytes < 1024 {
@@ -163,6 +192,40 @@ func (c Config) Validate() error {
 	if c.ReconcilerBatchSize < 1 || c.ReconcilerBatchSize > 1000 {
 		problems = append(problems, "TASKFORGE_RECONCILER_BATCH_SIZE must be between 1 and 1000")
 	}
+	if c.SchedulerPollInterval <= 0 {
+		problems = append(problems, "TASKFORGE_SCHEDULER_POLL_INTERVAL must be positive")
+	}
+	if c.SchedulerBatchSize < 1 || c.SchedulerBatchSize > 1000 {
+		problems = append(problems, "TASKFORGE_SCHEDULER_BATCH_SIZE must be between 1 and 1000")
+	}
+	// Re-notification is a repair for a notification that was genuinely lost, so
+	// its interval must be long enough that an ordinary delivery has already had
+	// several chances to happen. At or near one polling cadence, a scheduler
+	// would re-notify work whose first notification is simply still on its way.
+	if c.SchedulerRenotifyAfter < 3*c.SchedulerPollInterval {
+		problems = append(problems,
+			"TASKFORGE_SCHEDULER_RENOTIFY_AFTER must be at least 3x TASKFORGE_SCHEDULER_POLL_INTERVAL")
+	}
+	// And it must be at least the outbox claim timeout. A claimed-but-unpublished
+	// event is invisible to the pending-event check for exactly that window, so a
+	// shorter interval would let the scheduler decide an event was lost while a
+	// publisher was still in the middle of publishing it.
+	if c.SchedulerRenotifyAfter < c.OutboxClaimTimeout {
+		problems = append(problems,
+			"TASKFORGE_SCHEDULER_RENOTIFY_AFTER must be >= TASKFORGE_OUTBOX_CLAIM_TIMEOUT")
+	}
+	if c.JobRetryBase <= 0 {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_BASE must be positive")
+	}
+	if c.JobRetryMax < c.JobRetryBase {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_MAX must be >= TASKFORGE_JOB_RETRY_BASE")
+	}
+	if c.JobRetryMultiplier < 1 {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_MULTIPLIER must be >= 1")
+	}
+	if c.JobRetryJitter < 0 || c.JobRetryJitter > 1 {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_JITTER must be between 0 and 1")
+	}
 	if c.OutboxBatchSize < 1 || c.OutboxBatchSize > 1000 {
 		problems = append(problems, "TASKFORGE_OUTBOX_BATCH_SIZE must be between 1 and 1000")
 	}
@@ -191,6 +254,19 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid configuration: %s", strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// RetryPolicy renders the validated job retry settings as the shared policy the
+// control plane enforces. It is a method rather than four fields copied at each
+// call site so no process can accidentally build a different policy from the
+// same environment.
+func (c Config) RetryPolicy() lifecycle.RetryPolicy {
+	return lifecycle.RetryPolicy{
+		Base:       c.JobRetryBase,
+		Max:        c.JobRetryMax,
+		Multiplier: c.JobRetryMultiplier,
+		Jitter:     c.JobRetryJitter,
+	}
 }
 
 // WorkerConfig contains settings used only by taskforge-worker. Keeping these

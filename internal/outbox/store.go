@@ -19,26 +19,65 @@ type Store struct {
 // NewStore builds a Store over an existing pool.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
-// InsertTx writes an outbox event inside a caller-supplied transaction.
+// InsertWorkAvailableTx writes one work-availability notification inside a
+// caller-supplied transaction.
 //
 // Taking pgx.Tx rather than a pool is the whole point of this package: the event
 // must commit atomically with the state change that caused it. There is no
 // pool-based insert on purpose — offering one would make the dual-write bug easy
 // to reintroduce.
-func InsertTx(ctx context.Context, tx pgx.Tx, eventType string, schemaVersion int, data any) (uuid.UUID, error) {
-	raw, err := json.Marshal(data)
+//
+// generation is the job's notification generation at the moment this event is
+// written. It is stored in a real column, alongside a real job reference,
+// because the scheduler has to decide whether the CURRENT eligibility
+// transition still has an unpublished notification — and a hint buried in the
+// published JSON envelope is not something a correctness decision may rest on.
+// The wire contract is unchanged: neither column is serialized to the broker.
+func InsertWorkAvailableTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+	queue string,
+	generation int,
+) (uuid.UUID, error) {
+	if generation < 1 {
+		return uuid.Nil, fmt.Errorf("work.available notification generation must be at least 1, got %d", generation)
+	}
+	raw, err := json.Marshal(WorkAvailableData{Queue: queue, JobID: jobID.String()})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("marshal outbox data: %w", err)
 	}
 	id := uuid.New()
 	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox_events (id, event_type, schema_version, payload)
-		VALUES ($1, $2, $3, $4)`,
-		id, eventType, schemaVersion, raw)
+		INSERT INTO outbox_events (
+			id, event_type, schema_version, payload, job_id, notification_generation
+		) VALUES ($1, $2, $3, $4, $5, $6)`,
+		id, EventWorkAvailable, WorkAvailableSchemaVersion, raw, jobID, generation)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("insert outbox event: %w", err)
 	}
 	return id, nil
+}
+
+// HasPendingWorkAvailableTx reports whether an unpublished work.available event
+// already exists for this job's given notification generation.
+//
+// This is the check that keeps bounded re-notification from multiplying events,
+// and the reason the generation is part of it rather than just the job id: a
+// stale event left behind by the publish-before-mark window belongs to an
+// earlier generation, so it correctly fails to satisfy the current one and
+// cannot suppress the notification a new eligibility transition requires.
+func HasPendingWorkAvailableTx(ctx context.Context, tx pgx.Tx, jobID uuid.UUID, generation int) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM outbox_events
+			WHERE job_id = $1 AND notification_generation = $2 AND status = 'PENDING'
+		)`, jobID, generation).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check pending work notification: %w", err)
+	}
+	return exists, nil
 }
 
 // ClaimDue atomically claims up to limit due pending events.

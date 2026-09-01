@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 const (
@@ -126,6 +128,58 @@ func ValidateRenewal(req RenewalRequest) error {
 	if req.ExpectedVersion < 0 {
 		fields = append(fields, FieldError{
 			Field: "expected_renewal_version", Message: "must not be negative"})
+	}
+	if len(fields) > 0 {
+		return &ValidationError{Fields: fields}
+	}
+	return nil
+}
+
+// ValidateFailureReport reports every problem in a failure report at once: the
+// whole fence, the outcome identity, and the bounded safe error detail.
+//
+// The classification check is not a formality. TIMED_OUT, CANCELED, and
+// ABANDONED are server-authoritative outcomes, so a worker declaring one about
+// itself is rejected here rather than being allowed to overwrite a decision only
+// PostgreSQL may make.
+func ValidateFailureReport(report FailureReport) error {
+	var fields []FieldError
+	var fenceErr *ValidationError
+	if err := ValidateFence(report.Fence); errors.As(err, &fenceErr) {
+		fields = append(fields, fenceErr.Fields...)
+	}
+	if report.OutcomeRequestID == uuid.Nil {
+		fields = append(fields, FieldError{Field: "outcome_request_id", Message: "must be a UUID"})
+	}
+	if !report.Class.ReportableByHandler() {
+		fields = append(fields, FieldError{
+			Field:   "failure_class",
+			Message: "must be RETRYABLE or PERMANENT; timeout, cancellation, and abandonment are server-authoritative",
+		})
+	}
+	if err := lifecycle.ValidateErrorCode(report.ErrorCode); err != nil {
+		fields = append(fields, FieldError{Field: "error_code", Message: err.Error()})
+	}
+	if err := lifecycle.ValidateErrorMessage(report.ErrorMessage); err != nil {
+		fields = append(fields, FieldError{Field: "error_message", Message: err.Error()})
+	}
+	if len(fields) > 0 {
+		return &ValidationError{Fields: fields}
+	}
+	return nil
+}
+
+// ValidateCancelAcknowledgment rejects an incomplete cooperative cancellation
+// acknowledgment. It carries no classification or error detail: cancellation is
+// not a failure, and the reason is already recorded on the job.
+func ValidateCancelAcknowledgment(ack CancelAcknowledgment) error {
+	var fields []FieldError
+	var fenceErr *ValidationError
+	if err := ValidateFence(ack.Fence); errors.As(err, &fenceErr) {
+		fields = append(fields, fenceErr.Fields...)
+	}
+	if ack.OutcomeRequestID == uuid.Nil {
+		fields = append(fields, FieldError{Field: "outcome_request_id", Message: "must be a UUID"})
 	}
 	if len(fields) > 0 {
 		return &ValidationError{Fields: fields}

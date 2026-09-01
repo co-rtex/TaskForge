@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 // Stable domain errors exposed to the HTTP boundary.
@@ -32,6 +34,21 @@ var (
 	// an ambient context check — so an unrelated failure that merely happens to
 	// coincide with an expired deadline is never reported as this.
 	ErrDeadlineExceeded = errors.New("operation deadline exceeded")
+	// ErrAttemptTimedOut reports that PostgreSQL time has reached the attempt's
+	// persisted execution deadline, so this attempt may no longer commit
+	// anything. It is distinct from ErrLeaseExpired: the lease may still be
+	// perfectly valid and freshly renewed. Renewal extends lease authority; it
+	// never extends the job's timeout_seconds budget.
+	//
+	// The transition to TIMED_OUT is owned by reconciliation, not by the caller
+	// that received this error. A worker cannot declare its own timeout.
+	ErrAttemptTimedOut = errors.New("attempt execution deadline reached")
+	// ErrOutcomeConflict reports that a terminal outcome request id was reused
+	// for a different attempt, or replayed against its own attempt with a
+	// different classification, code, or message. Outcome identities are retained
+	// for the lifetime of attempt history, so this is a stable domain conflict
+	// rather than a leaked uniqueness error.
+	ErrOutcomeConflict = errors.New("outcome request id reused for a different outcome")
 )
 
 // SessionStatus is the server-owned health state of one process lifetime.
@@ -176,10 +193,96 @@ type HeartbeatRequest struct {
 
 // HeartbeatResult reports the PostgreSQL time the control plane accepted, so a
 // caller can confirm a heartbeat actually advanced rather than assuming it did.
+//
+// It also carries this session's outstanding cancellation directives. Delivering
+// them here rather than on a work notification is deliberate: the heartbeat loop
+// already runs unconditionally, while idle and through a graceful drain, so
+// cancellation reaches a worker that is busy executing and one that is waiting
+// on an empty broker queue alike. Nothing about cancellation delivery depends on
+// the broker.
 type HeartbeatResult struct {
 	SessionID       uuid.UUID
 	Status          SessionStatus
 	LastHeartbeatAt time.Time
+	Cancellations   []CancellationDirective
+}
+
+// CancellationDirective tells one worker session that a specific attempt it may
+// still be executing has been canceled.
+//
+// It is advisory in exactly the way a broker notification is: the durable
+// decision already committed when the job moved to CANCEL_REQUESTED, and the
+// worker cannot make anything true by acting or failing to act on it. What it
+// buys is cooperative termination — the handler gets its context canceled and a
+// chance to stop — instead of waiting out lease expiry.
+type CancellationDirective struct {
+	JobID             uuid.UUID
+	AttemptID         uuid.UUID
+	LeaseID           uuid.UUID
+	CancelRequestedAt time.Time
+}
+
+// StartResult is the committed LEASED -> RUNNING transition.
+//
+// It replaces M2's empty response because the attempt's execution deadline is
+// now durable state a worker must be told about rather than recompute. A worker
+// that derived its own deadline from timeout_seconds after the response arrived
+// would silently grant itself the round trip's duration back, and an ambiguous
+// Start retry would restart the clock entirely.
+type StartResult struct {
+	AttemptID uuid.UUID
+	StartedAt time.Time
+	// TimeoutAt is the persisted per-attempt deadline. Lease renewal never moves
+	// it.
+	TimeoutAt time.Time
+	// Remaining is measured by PostgreSQL after every authority lock. A DB-less
+	// worker converts it into a conservative monotonic local deadline instead of
+	// comparing its own wall clock with TimeoutAt.
+	Remaining time.Duration
+	// Replayed is true when this attempt was already RUNNING. The original
+	// started_at and timeout_at are returned unchanged; a replay never restarts
+	// the timeout.
+	Replayed bool
+}
+
+// FailureReport is one fenced terminal failure from a trusted worker.
+//
+// OutcomeRequestID is generated once per logical outcome and reused by every
+// retry of it, exactly as a renewal identity is. Retaining it on the attempt for
+// the lifetime of history is what makes an ambiguous failure response safe:
+// the replay returns the decision that already committed rather than consuming
+// another attempt, drawing fresh jitter, or creating a second DLQ entry.
+type FailureReport struct {
+	Fence            Fence
+	OutcomeRequestID uuid.UUID
+	Class            lifecycle.FailureClass
+	ErrorCode        string
+	ErrorMessage     string
+}
+
+// CancelAcknowledgment is a worker confirming it stopped a canceled attempt.
+type CancelAcknowledgment struct {
+	Fence            Fence
+	OutcomeRequestID uuid.UUID
+}
+
+// OutcomeResult is the committed decision for one terminal attempt outcome.
+type OutcomeResult struct {
+	JobID uuid.UUID
+	// JobStatus and AttemptStatus are the states this outcome produced. They are
+	// returned so a worker can log what actually happened rather than assume, and
+	// so an exact replay can prove it saw the same answer.
+	JobStatus     string
+	AttemptStatus AttemptStatus
+	// RetryAt and RetryDelay are set when the job entered RETRY_WAIT. They are
+	// read back from the attempt on a replay, never recomputed: recomputing would
+	// draw fresh jitter and answer a different instant every time.
+	RetryAt    *time.Time
+	RetryDelay *time.Duration
+	// DeadLetterReason is set when the job entered DEAD_LETTERED.
+	DeadLetterReason lifecycle.DLQReason
+	// Replayed is true when this outcome identity had already committed.
+	Replayed bool
 }
 
 // RenewalRequest extends one lease's authority window.
@@ -213,14 +316,34 @@ type RenewalResult struct {
 
 // ReconcileStats counts what one reconciliation pass durably changed.
 type ReconcileStats struct {
-	StaleSessions    int
-	ExpiredLeases    int
+	StaleSessions int
+	ExpiredLeases int
+	// TimedOutAttempts counts attempts recorded TIMED_OUT, whether by the
+	// dedicated due-timeout scan or by the expired-lease scan recognizing that a
+	// lapsed lease's attempt had in fact already timed out.
+	TimedOutAttempts int
+	// CanceledAttempts counts cancellations finalized by reconciliation after a
+	// worker failed to acknowledge one cooperatively.
+	CanceledAttempts int
 	RequeuedJobs     int
+	RetryWaitingJobs int
 	DeadLetteredJobs int
 	// Skipped counts candidates that no longer qualified once their authority
 	// rows were locked and PostgreSQL time was resampled — a renewal moved the
 	// expiry forward, or another reconciler got there first.
 	Skipped int
+}
+
+// Add accumulates one scan's counts into another's.
+func (s *ReconcileStats) Add(other ReconcileStats) {
+	s.StaleSessions += other.StaleSessions
+	s.ExpiredLeases += other.ExpiredLeases
+	s.TimedOutAttempts += other.TimedOutAttempts
+	s.CanceledAttempts += other.CanceledAttempts
+	s.RequeuedJobs += other.RequeuedJobs
+	s.RetryWaitingJobs += other.RetryWaitingJobs
+	s.DeadLetteredJobs += other.DeadLetteredJobs
+	s.Skipped += other.Skipped
 }
 
 // FieldError is one registration or control-request validation problem.

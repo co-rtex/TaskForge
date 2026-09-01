@@ -120,8 +120,9 @@ func reset(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := testPool.Exec(ctx, `
-		TRUNCATE leases, job_attempts, worker_sessions, workers,
-		         idempotency_records, outbox_events, jobs, queues CASCADE`)
+		TRUNCATE dlq_replays, dlq_entries, leases, job_attempts,
+		         worker_sessions, workers, idempotency_records,
+		         outbox_events, jobs, queues CASCADE`)
 	require.NoError(t, err)
 	_, err = testPool.Exec(ctx, `
 		INSERT INTO queues (name, worker_group, max_concurrency)

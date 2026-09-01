@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -69,6 +70,16 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 	// Rollback is a no-op once the transaction has committed.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
+	// PostgreSQL decides whether the requested schedule is still in the future.
+	// A worker- or client-supplied clock is never authoritative for eligibility
+	// (ADR-0001), so "is this delayed job due yet" is answered by the database
+	// even at submission time, where a caller's clock skew would otherwise decide
+	// whether the job is immediately claimable.
+	var serverNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&serverNow); err != nil {
+		return SubmitResult{}, fmt.Errorf("read submission time: %w", err)
+	}
+
 	job := &Job{
 		ID:                   uuid.New(),
 		Scope:                scope,
@@ -80,16 +91,38 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 		MaxAttempts:          req.MaxAttempts,
 		TimeoutSeconds:       req.TimeoutSeconds,
 		RequiredCapabilities: req.RequiredCapabilities,
+		ScheduledAt:          req.ScheduledAt,
+		AvailableAt:          serverNow,
+	}
+	// An absent, null, or already-due schedule is an immediate submission and is
+	// notified now. A future one is durable but not yet eligible, and gets NO
+	// outbox event: publishing a notification for work no worker may claim yet
+	// would make every delayed job a wasted broker round trip, and the scheduler
+	// is what creates the event when the job actually becomes claimable.
+	notificationGeneration := 1
+	var lastNotificationAt *time.Time
+	if req.ScheduledAt != nil && req.ScheduledAt.After(serverNow) {
+		job.Status = StatusPending
+		job.AvailableAt = *req.ScheduledAt
+		notificationGeneration = 0
+	} else {
+		lastNotificationAt = &serverNow
 	}
 
+	// created_at and updated_at deliberately keep their DEFAULT now(), which is
+	// the transaction's own start time and therefore identical to the outbox
+	// event's. That shared timestamp is what makes "these two rows committed
+	// together" observable in the database rather than merely asserted in prose.
 	err = tx.QueryRow(ctx, `
 		INSERT INTO jobs (
 			id, scope, queue, job_type, payload, status,
-			priority, max_attempts, timeout_seconds, required_capabilities
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			priority, max_attempts, timeout_seconds, required_capabilities,
+			scheduled_at, available_at, notification_generation, last_notification_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING created_at, updated_at`,
 		job.ID, job.Scope, job.Queue, job.Type, job.Payload, string(job.Status),
 		job.Priority, job.MaxAttempts, job.TimeoutSeconds, job.RequiredCapabilities,
+		job.ScheduledAt, job.AvailableAt, notificationGeneration, lastNotificationAt,
 	).Scan(&job.CreatedAt, &job.UpdatedAt)
 	if err != nil {
 		return SubmitResult{}, fmt.Errorf("insert job: %w", err)
@@ -115,10 +148,13 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 		return SubmitResult{}, fmt.Errorf("insert idempotency record: %w", err)
 	}
 
-	// Same transaction as the job: this is the whole point of the outbox.
-	if _, err := outbox.InsertTx(ctx, tx, outbox.EventWorkAvailable, outbox.WorkAvailableSchemaVersion,
-		outbox.WorkAvailableData{Queue: job.Queue, JobID: job.ID.String()}); err != nil {
-		return SubmitResult{}, err
+	// Same transaction as the job: this is the whole point of the outbox. A
+	// delayed job deliberately gets no event here; the scheduler writes one, also
+	// transactionally, when it promotes the job to QUEUED.
+	if job.Status == StatusQueued {
+		if _, err := outbox.InsertWorkAvailableTx(ctx, tx, job.ID, job.Queue, notificationGeneration); err != nil {
+			return SubmitResult{}, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -164,15 +200,25 @@ func (s *Store) Get(ctx context.Context, scope string, id uuid.UUID) (*Job, erro
 }
 
 func (s *Store) getByID(ctx context.Context, scope string, id uuid.UUID) (*Job, error) {
+	return scanJob(s.pool.QueryRow(ctx, jobSelect+`
+		WHERE id = $1 AND scope = $2`, id, scope))
+}
+
+// jobSelect is the one column list every job read uses, so a new column cannot
+// be returned by one path and silently missing from another.
+const jobSelect = `
+	SELECT id, scope, queue, job_type, payload, status,
+	       priority, max_attempts, timeout_seconds, required_capabilities,
+	       scheduled_at, available_at, cancel_requested_at, replayed_from_job_id,
+	       created_at, updated_at
+	FROM jobs
+`
+
+func scanJob(row pgx.Row) (*Job, error) {
 	var j Job
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, scope, queue, job_type, payload, status,
-		       priority, max_attempts, timeout_seconds, required_capabilities,
-		       created_at, updated_at
-		FROM jobs
-		WHERE id = $1 AND scope = $2`, id, scope,
-	).Scan(&j.ID, &j.Scope, &j.Queue, &j.Type, &j.Payload, &j.Status,
+	err := row.Scan(&j.ID, &j.Scope, &j.Queue, &j.Type, &j.Payload, &j.Status,
 		&j.Priority, &j.MaxAttempts, &j.TimeoutSeconds, &j.RequiredCapabilities,
+		&j.ScheduledAt, &j.AvailableAt, &j.CancelRequestedAt, &j.ReplayedFromJobID,
 		&j.CreatedAt, &j.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

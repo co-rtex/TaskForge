@@ -13,17 +13,24 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
 // WorkerControl is the internal control-plane surface used by a DB-less worker.
+//
+// There is deliberately no generic "set attempt status" operation and no
+// worker-authoritative timeout: each transition is its own named method with its
+// own preconditions, and TIMED_OUT is reachable only through reconciliation.
 type WorkerControl interface {
 	Register(context.Context, string, workers.Registration) (workers.Session, error)
 	Heartbeat(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
 	Claim(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
 	RenewLease(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
-	Start(context.Context, string, workers.Fence) error
+	Start(context.Context, string, workers.Fence) (workers.StartResult, error)
 	Succeed(context.Context, string, workers.Fence) error
+	Fail(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
+	AcknowledgeCancellation(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 }
 
 type registerWorkerSessionRequest struct {
@@ -111,6 +118,19 @@ type HeartbeatResponse struct {
 	WorkerSessionID string    `json:"worker_session_id"`
 	Status          string    `json:"status"`
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+	// Cancellations are this session's outstanding cancellation directives.
+	// Delivering them on the heartbeat rather than on a work notification is
+	// what makes cancellation reach an idle worker and a draining one, with no
+	// broker delivery involved.
+	Cancellations []CancellationDirectiveResponse `json:"cancellations"`
+}
+
+// CancellationDirectiveResponse names one attempt this session should stop.
+type CancellationDirectiveResponse struct {
+	JobID             string    `json:"job_id"`
+	AttemptID         string    `json:"attempt_id"`
+	LeaseID           string    `json:"lease_id"`
+	CancelRequestedAt time.Time `json:"cancel_requested_at"`
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -138,10 +158,20 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.writeWorkerControlError(w, r, "heartbeat worker session", err)
 		return
 	}
+	directives := make([]CancellationDirectiveResponse, 0, len(result.Cancellations))
+	for _, directive := range result.Cancellations {
+		directives = append(directives, CancellationDirectiveResponse{
+			JobID:             directive.JobID.String(),
+			AttemptID:         directive.AttemptID.String(),
+			LeaseID:           directive.LeaseID.String(),
+			CancelRequestedAt: directive.CancelRequestedAt.UTC(),
+		})
+	}
 	writeJSON(w, s.log, http.StatusOK, HeartbeatResponse{
 		WorkerSessionID: result.SessionID.String(),
 		Status:          string(result.Status),
 		LastHeartbeatAt: result.LastHeartbeatAt.UTC(),
+		Cancellations:   directives,
 	})
 }
 
@@ -349,12 +379,199 @@ type fenceRequest struct {
 	WorkerSessionID string `json:"worker_session_id"`
 }
 
+// StartResponse is the committed LEASED -> RUNNING transition.
+//
+// It replaces M2's empty 204 because the attempt's execution deadline is durable
+// state a worker must be told, not recompute. AttemptTimeoutRemainingMillis is
+// measured by PostgreSQL after every authority lock, so a worker converts a
+// server-measured duration into a conservative monotonic deadline rather than
+// starting a fresh timer from timeout_seconds once the response lands.
+type StartResponse struct {
+	AttemptID                     string    `json:"attempt_id"`
+	StartedAt                     time.Time `json:"started_at"`
+	AttemptTimeoutAt              time.Time `json:"attempt_timeout_at"`
+	AttemptTimeoutRemainingMillis int64     `json:"attempt_timeout_remaining_milliseconds"`
+	// Replayed is true when the attempt was already RUNNING. The original
+	// deadline is returned; a replay never restarts the timeout.
+	Replayed bool `json:"replayed"`
+}
+
 func (s *Server) handleStartAttempt(w http.ResponseWriter, r *http.Request) {
-	s.handleFencedTransition(w, r, "start attempt", s.control.Start)
+	var request fenceRequest
+	if !s.decodeControlJSON(w, r, &request) {
+		return
+	}
+	fence, fields := parseFence(r.PathValue("attempt_id"), request)
+	if len(fields) > 0 {
+		s.writeWorkerValidation(w, r, fields)
+		return
+	}
+	result, err := s.control.Start(r.Context(), s.cfg.DevScope, fence)
+	if err != nil {
+		s.writeWorkerControlError(w, r, "start attempt", err)
+		return
+	}
+	s.log.Info("start attempt",
+		append(fenceLogAttrs(fence),
+			slog.Time("attempt_timeout_at", result.TimeoutAt.UTC()),
+			slog.Bool("replayed", result.Replayed))...)
+	writeJSON(w, s.log, http.StatusOK, StartResponse{
+		AttemptID:                     result.AttemptID.String(),
+		StartedAt:                     result.StartedAt.UTC(),
+		AttemptTimeoutAt:              result.TimeoutAt.UTC(),
+		AttemptTimeoutRemainingMillis: result.Remaining.Milliseconds(),
+		Replayed:                      result.Replayed,
+	})
 }
 
 func (s *Server) handleSucceedAttempt(w http.ResponseWriter, r *http.Request) {
 	s.handleFencedTransition(w, r, "succeed attempt", s.control.Succeed)
+}
+
+type failAttemptRequest struct {
+	JobID            string `json:"job_id"`
+	LeaseID          string `json:"lease_id"`
+	WorkerID         string `json:"worker_id"`
+	WorkerSessionID  string `json:"worker_session_id"`
+	OutcomeRequestID string `json:"outcome_request_id"`
+	FailureClass     string `json:"failure_class"`
+	ErrorCode        string `json:"error_code"`
+	ErrorMessage     string `json:"error_message"`
+}
+
+type cancelAttemptRequest struct {
+	JobID            string `json:"job_id"`
+	LeaseID          string `json:"lease_id"`
+	WorkerID         string `json:"worker_id"`
+	WorkerSessionID  string `json:"worker_session_id"`
+	OutcomeRequestID string `json:"outcome_request_id"`
+}
+
+// OutcomeResponse is the committed decision for one terminal attempt outcome.
+//
+// RetryAt and RetryDelayMillis are read back from what was persisted, never
+// recomputed. That is the visible half of the promise that an ambiguous failure
+// response never redraws jitter: a replay returns the same instant.
+type OutcomeResponse struct {
+	JobID            string     `json:"job_id"`
+	JobStatus        string     `json:"job_status"`
+	AttemptStatus    string     `json:"attempt_status"`
+	RetryAt          *time.Time `json:"retry_at"`
+	RetryDelayMillis *int64     `json:"retry_delay_milliseconds"`
+	DeadLetterReason *string    `json:"dead_letter_reason"`
+	Replayed         bool       `json:"replayed"`
+}
+
+func toOutcomeResponse(result workers.OutcomeResult) OutcomeResponse {
+	response := OutcomeResponse{
+		JobID:         result.JobID.String(),
+		JobStatus:     result.JobStatus,
+		AttemptStatus: string(result.AttemptStatus),
+		Replayed:      result.Replayed,
+	}
+	if result.RetryAt != nil {
+		utc := result.RetryAt.UTC()
+		response.RetryAt = &utc
+	}
+	if result.RetryDelay != nil {
+		millis := result.RetryDelay.Milliseconds()
+		response.RetryDelayMillis = &millis
+	}
+	if result.DeadLetterReason != "" {
+		reason := result.DeadLetterReason.String()
+		response.DeadLetterReason = &reason
+	}
+	return response
+}
+
+// handleFailAttempt records one fenced terminal failure.
+//
+// The body carries a client-generated outcome_request_id, and repeating an
+// ambiguous request MUST reuse it. A fresh identity would be a second failure
+// report for the same attempt, which is exactly what the retained identity
+// exists to make impossible.
+func (s *Server) handleFailAttempt(w http.ResponseWriter, r *http.Request) {
+	var request failAttemptRequest
+	if !s.decodeControlJSON(w, r, &request) {
+		return
+	}
+	fence, fields := parseFence(r.PathValue("attempt_id"), fenceRequest{
+		JobID: request.JobID, LeaseID: request.LeaseID,
+		WorkerID: request.WorkerID, WorkerSessionID: request.WorkerSessionID,
+	})
+	outcomeID, err := uuid.Parse(request.OutcomeRequestID)
+	if err != nil {
+		fields = append(fields, workers.FieldError{Field: "outcome_request_id", Message: "must be a UUID"})
+	}
+	if len(fields) > 0 {
+		s.writeWorkerValidation(w, r, fields)
+		return
+	}
+
+	report := workers.FailureReport{
+		Fence:            fence,
+		OutcomeRequestID: outcomeID,
+		Class:            lifecycle.FailureClass(request.FailureClass),
+		ErrorCode:        request.ErrorCode,
+		ErrorMessage:     request.ErrorMessage,
+	}
+	result, err := s.control.Fail(r.Context(), s.cfg.DevScope, report)
+	if err != nil {
+		s.writeWorkerControlError(w, r, "fail attempt", err)
+		return
+	}
+	// The error code is a stable token by construction; the safe message is
+	// deliberately absent from the log line, because a bounded value is still
+	// caller-supplied text and the code is what an operator groups by.
+	s.log.Info("attempt failed",
+		append(fenceLogAttrs(fence),
+			slog.String("failure_class", request.FailureClass),
+			slog.String("error_code", request.ErrorCode),
+			slog.String("job_status", result.JobStatus),
+			slog.Bool("replayed", result.Replayed))...)
+	writeJSON(w, s.log, http.StatusOK, toOutcomeResponse(result))
+}
+
+// handleCancelAttempt records a worker's cooperative acknowledgment that it
+// stopped a canceled attempt.
+func (s *Server) handleCancelAttempt(w http.ResponseWriter, r *http.Request) {
+	var request cancelAttemptRequest
+	if !s.decodeControlJSON(w, r, &request) {
+		return
+	}
+	fence, fields := parseFence(r.PathValue("attempt_id"), fenceRequest{
+		JobID: request.JobID, LeaseID: request.LeaseID,
+		WorkerID: request.WorkerID, WorkerSessionID: request.WorkerSessionID,
+	})
+	outcomeID, err := uuid.Parse(request.OutcomeRequestID)
+	if err != nil {
+		fields = append(fields, workers.FieldError{Field: "outcome_request_id", Message: "must be a UUID"})
+	}
+	if len(fields) > 0 {
+		s.writeWorkerValidation(w, r, fields)
+		return
+	}
+
+	result, err := s.control.AcknowledgeCancellation(r.Context(), s.cfg.DevScope,
+		workers.CancelAcknowledgment{Fence: fence, OutcomeRequestID: outcomeID})
+	if err != nil {
+		s.writeWorkerControlError(w, r, "acknowledge attempt cancellation", err)
+		return
+	}
+	s.log.Info("attempt cancellation acknowledged",
+		append(fenceLogAttrs(fence), slog.Bool("replayed", result.Replayed))...)
+	writeJSON(w, s.log, http.StatusOK, toOutcomeResponse(result))
+}
+
+func fenceLogAttrs(fence workers.Fence, extra ...any) []any {
+	attrs := []any{
+		slog.String("job_id", fence.JobID.String()),
+		slog.String("attempt_id", fence.AttemptID.String()),
+		slog.String("lease_id", fence.LeaseID.String()),
+		slog.String("worker_id", fence.WorkerID.String()),
+		slog.String("worker_session_id", fence.SessionID.String()),
+	}
+	return append(attrs, extra...)
 }
 
 func (s *Server) handleFencedTransition(
@@ -467,6 +684,14 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 		writeError(w, r, s.log, http.StatusConflict, CodeRenewalConflict,
 			"the renewal named a generation that is no longer current, or reused a "+
 				"renewal request id for a different lease", nil)
+	case errors.Is(err, workers.ErrAttemptTimedOut):
+		writeError(w, r, s.log, http.StatusConflict, CodeAttemptTimedOut,
+			"the attempt reached its persisted execution deadline; reconciliation "+
+				"owns the TIMED_OUT outcome and no worker-reported outcome is accepted", nil)
+	case errors.Is(err, workers.ErrOutcomeConflict):
+		writeError(w, r, s.log, http.StatusConflict, CodeOutcomeConflict,
+			"the outcome request id was already used for a different attempt, or "+
+				"replayed with a different classification, code, or message", nil)
 	case isDeadlineExhausted(err):
 		// A database call in this request failed because the request's own
 		// deadline elapsed. That can happen while acquiring a lock, while

@@ -418,7 +418,10 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 	require.Positive(t, staller.stalled.Load())
 
 	// Worker A cannot come back. Its session is fenced and its lease is closed.
-	control := workers.NewStore(testPool, 6*time.Second)
+	control := workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: 6 * time.Second,
+		RetryPolicy:   integrationRetryPolicy(),
+	})
 	_, err = control.Heartbeat(context.Background(), testScope,
 		workers.HeartbeatRequest{WorkerID: fence.WorkerID, SessionID: sessionA})
 	require.ErrorIs(t, err, workers.ErrSessionUnavailable)

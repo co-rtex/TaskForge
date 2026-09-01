@@ -18,6 +18,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
@@ -48,6 +49,15 @@ func run() int {
 	}
 	defer pool.Close()
 
+	// Independently crypto-seeded per process. Two API replicas that shared a
+	// deterministic seed would compute identical retry instants for jobs failing
+	// at the same moment, which is exactly the stampede jitter exists to prevent.
+	jitter, err := lifecycle.NewCryptoSeededJitter()
+	if err != nil {
+		log.Error("seed retry jitter", slog.String("error", err.Error()))
+		return 1
+	}
+
 	server := api.NewServer(
 		jobs.NewStore(pool),
 		api.Config{
@@ -60,7 +70,11 @@ func run() int {
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, pool) },
 		},
-	).WithWorkerControl(workers.NewStore(pool, cfg.LeaseDuration))
+	).WithWorkerControl(workers.NewStore(pool, workers.StoreConfig{
+		LeaseDuration: cfg.LeaseDuration,
+		RetryPolicy:   cfg.RetryPolicy(),
+		Jitter:        jitter,
+	}))
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,

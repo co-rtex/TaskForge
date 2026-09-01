@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
@@ -79,6 +80,10 @@ type Runner struct {
 	ready     atomic.Bool
 	flightsMu sync.Mutex
 	flights   map[uuid.UUID]*deliveryFlight
+	// attempts is the concurrency-safe registry that lets a cancellation
+	// directive delivered on the heartbeat loop reach the handler goroutine
+	// executing that attempt.
+	attempts *attemptRegistry
 	// now is injected so deadline arithmetic is testable without a real clock.
 	// It is only ever used for local monotonic reasoning: PostgreSQL remains the
 	// authority for every durable decision.
@@ -106,8 +111,9 @@ func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, cf
 	}
 	return &Runner{
 		control: control, broker: broker, registry: registry, cfg: cfg, log: log,
-		flights: make(map[uuid.UUID]*deliveryFlight),
-		now:     time.Now,
+		flights:  make(map[uuid.UUID]*deliveryFlight),
+		attempts: newAttemptRegistry(),
+		now:      time.Now,
 	}
 }
 
@@ -330,7 +336,24 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		LeaseID: assignment.LeaseID, WorkerID: assignment.WorkerID,
 		SessionID: assignment.SessionID,
 	}
-	if err := r.retry(ctx, func() error { return r.control.Start(ctx, fence) }); err != nil {
+	// Registered BEFORE Start, so a cancellation that wins in the window between
+	// the claim committing and the handler being invoked is retained rather than
+	// dropped. Unregistering is deferred to the end of the whole outcome path,
+	// including outcome reporting, so a directive that arrives while the report
+	// is in flight is still observable.
+	r.attempts.register(fence)
+	defer r.attempts.unregister(fence.AttemptID)
+
+	// Captured before the Start round trip, so the local deadline derived from
+	// the server-measured remaining budget cannot silently include time the round
+	// trip itself consumed.
+	timeoutStarted := r.now()
+	var start workers.StartResult
+	if err := r.retry(ctx, func() error {
+		var err error
+		start, err = r.control.Start(ctx, fence)
+		return err
+	}); err != nil {
 		if isSessionLost(err) {
 			// The claim decision was already published; this session-loss is the
 			// leader's own fatal signal and does not change any follower's ack.
@@ -356,53 +379,99 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 			fenceLog(fence, slog.String("error", "lease authority window had already elapsed"))...)
 		return nil
 	}
-	leaseCtx, cancelLease := context.WithCancel(ctx)
-	renewal := r.startRenewal(leaseCtx, cancelLease, fence, authorityDeadline)
+	leaseCtx, cancelLease := context.WithCancelCause(ctx)
+	renewal := r.startRenewal(leaseCtx, func() { cancelLease(errAuthorityLost) }, fence, authorityDeadline)
 
-	// The job's overall budget is measured once, from execution start, and is
-	// deliberately derived from leaseCtx rather than reset by renewal: renewing
-	// extends lease authority, never the handler's timeout_seconds allowance.
-	executionCtx, cancelExecution := context.WithTimeout(leaseCtx, time.Duration(assignment.TimeoutSeconds)*time.Second)
+	// The attempt's execution budget comes from the server-measured remaining
+	// duration Start returned, NOT from a fresh timeout_seconds timer started
+	// once the response landed. Two things depend on that:
+	//
+	//   - the round trip is not silently given back to the handler; and
+	//   - an ambiguous Start retry inherits the ORIGINAL deadline, because the
+	//     control plane returns the deadline it stamped the first time.
+	//
+	// The local deadline is conservative — a margin earlier than the server's —
+	// so a cooperative handler is asked to stop before the instant at which
+	// nothing it produces could commit. PostgreSQL remains authoritative:
+	// reconciliation, not this timer, records TIMED_OUT.
+	//
+	// It is derived from leaseCtx and is never reset by renewal. Renewal extends
+	// lease authority; the job's timeout_seconds budget is measured once.
+	timeoutDeadline := timeoutStarted.Add(executionBudget(start.Remaining))
+	executionCtx, cancelExecution := context.WithDeadlineCause(leaseCtx, timeoutDeadline, errAttemptTimedOut)
 	if executionErr := executionCtx.Err(); executionErr != nil {
 		cancelExecution()
 		renewal.Stop()
-		cancelLease()
+		cancelLease(errAuthorityLost)
 		r.log.Error("trusted handler execution window unavailable",
 			fenceLog(fence, slog.String("error", executionErr.Error()))...)
 		return nil
 	}
-	_, handlerErr := invokeHandler(executionCtx, handler, Execution{
+
+	// A separate cancellable layer under the deadline, so a cancellation
+	// directive can stop the handler with its own distinguishable cause.
+	handlerCtx, cancelHandler := context.WithCancelCause(executionCtx)
+	r.attempts.bind(fence.AttemptID, cancelHandler)
+
+	_, handlerErr := invokeHandler(handlerCtx, handler, Execution{
 		JobID: assignment.JobID, AttemptID: assignment.AttemptID, Payload: assignment.Payload,
 	})
-	// Capture expiry before canceling the derived contexts: canceling them first
-	// would make every successful handler look canceled, while ignoring the
-	// value would let a cooperative timeout that returns nil be marked SUCCEEDED.
-	executionErr := executionCtx.Err()
+	// Captured before the derived contexts are cancelled: cancelling first would
+	// make every successful handler look cancelled, while ignoring the value
+	// would let a cooperative timeout that returns nil be reported as success.
+	cause := context.Cause(handlerCtx)
+	canceled := r.attempts.wasCanceled(fence.AttemptID)
+	cancelHandler(nil)
 	cancelExecution()
 	// Stopping the renewal loop before reporting the outcome is what serializes
-	// renewal against success from this process: exactly one of them is in flight
-	// at a time, and the control plane resolves any remaining race with
+	// renewal against a terminal report from this process: exactly one of them is
+	// in flight at a time, and the control plane resolves any remaining race with
 	// reconciliation.
 	authorityLost, fatalErr := renewal.Stop()
-	cancelLease()
+	cancelLease(errAuthorityLost)
 	if fatalErr != nil {
 		// This whole process boot lost its session. Report it as fatal so intake
 		// stops and readiness drops, not just this one attempt.
 		return fatalErr
 	}
-	if handlerErr != nil || executionErr != nil || authorityLost {
-		// Failure classification, retry, timeout, and DLQ transitions belong to
-		// M4. Leaving this lease active is honest: it expires on server time and
-		// reconciliation abandons the attempt and requeues recoverable work.
-		failure := handlerErr
-		switch {
-		case failure != nil:
-		case executionErr != nil:
-			failure = executionErr
-		default:
-			failure = errors.New("lease authority was lost before the outcome could be reported")
-		}
-		r.log.Error("trusted handler failed", fenceLog(fence, slog.String("error", failure.Error()))...)
+
+	// Precedence. Engine-owned causes outrank whatever the handler returned,
+	// because a handler cancelled by a timeout is very likely to return an error
+	// of its own and that error is not what happened.
+	switch {
+	case canceled || errors.Is(cause, errUserCanceled):
+		// Cooperative cancellation. One outcome identity is generated here and
+		// reused by every retry, so an ambiguous acknowledgment cannot become two.
+		r.acknowledgeCancellation(ctx, fence)
+		return nil
+
+	case errors.Is(cause, errAttemptTimedOut):
+		// The attempt outlived its budget. Report NOTHING: only reconciliation
+		// may record TIMED_OUT, and sending an ordinary failure here would
+		// mislabel the attempt. If the handler was uncooperative and is still
+		// running, it cannot commit anything either — the deadline is persisted
+		// and every fenced operation checks it.
+		r.log.Warn("trusted handler exceeded its attempt deadline",
+			fenceLog(fence, slog.String("outcome", "left to timeout reconciliation"))...)
+		return nil
+
+	case authorityLost || errors.Is(cause, errAuthorityLost):
+		// The lease, session, or generation stopped being provable, and nobody
+		// canceled this job. Report nothing and let M3 recovery happen: the lease
+		// expires on server time and reconciliation abandons the attempt.
+		r.log.Warn("lease authority lost before an outcome could be reported",
+			fenceLog(fence)...)
+		return nil
+
+	case ctx.Err() != nil && handlerErr != nil:
+		// Shutdown, not cancellation. Reporting this as either a failure or a
+		// cancellation would attribute a local process decision to the job.
+		r.log.Warn("handler interrupted by worker shutdown",
+			fenceLog(fence, slog.String("cause", errWorkerShutdown.Error()))...)
+		return nil
+
+	case handlerErr != nil:
+		r.reportFailure(ctx, fence, handlerErr)
 		return nil
 	}
 
@@ -417,6 +486,80 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	}
 	r.log.Info("job succeeded", fenceLog(fence)...)
 	return nil
+}
+
+// reportFailure classifies a handler error and reports it under ONE outcome
+// identity that every retry reuses.
+//
+// The identity is generated before the retry loop, not inside it. Generating a
+// fresh one per attempt is precisely the bug the retained identity exists to
+// prevent: a committed-but-lost failure response would then consume a second
+// place in the attempt budget and draw fresh jitter for a different retry
+// instant.
+func (r *Runner) reportFailure(ctx context.Context, fence workers.Fence, handlerErr error) {
+	report := workers.FailureReport{
+		Fence:            fence,
+		OutcomeRequestID: uuid.New(),
+	}
+	report.Class, report.ErrorCode, report.ErrorMessage = classifyHandlerError(handlerErr)
+
+	var result workers.OutcomeResult
+	if err := r.retry(ctx, func() error {
+		var err error
+		result, err = r.control.Fail(ctx, report)
+		return err
+	}); err != nil {
+		// Nothing else to do: the lease stays as it is and expires on server
+		// time, and reconciliation recovers the attempt. The raw handler error is
+		// deliberately absent from this line — only the classification and the
+		// stable code are logged.
+		r.log.Warn("report failed outcome",
+			fenceLog(fence,
+				slog.String("failure_class", string(report.Class)),
+				slog.String("error_code", report.ErrorCode),
+				slog.String("error", err.Error()))...)
+		return
+	}
+	r.log.Info("job attempt failed",
+		fenceLog(fence,
+			slog.String("failure_class", string(report.Class)),
+			slog.String("error_code", report.ErrorCode),
+			slog.String("job_status", result.JobStatus))...)
+}
+
+// acknowledgeCancellation reports the dedicated fenced cancellation outcome,
+// reusing one identity across retries for the same reason a failure report does.
+func (r *Runner) acknowledgeCancellation(ctx context.Context, fence workers.Fence) {
+	ack := workers.CancelAcknowledgment{Fence: fence, OutcomeRequestID: uuid.New()}
+	if err := r.retry(ctx, func() error {
+		_, err := r.control.AcknowledgeCancellation(ctx, ack)
+		return err
+	}); err != nil {
+		// A rejection here is not a problem to solve locally. The job is already
+		// CANCEL_REQUESTED, the lease will lapse, and reconciliation finalizes the
+		// cancellation without this worker's help.
+		r.log.Warn("acknowledge cancellation",
+			fenceLog(fence, slog.String("error", err.Error()))...)
+		return
+	}
+	r.log.Info("job attempt canceled", fenceLog(fence)...)
+}
+
+// classifyHandlerError turns a handler error into bounded, safe, typed failure
+// detail.
+//
+// A trusted handler may declare its own classification, stable code, and safe
+// message through Retryable or Permanent. Anything else — a plain error, a
+// wrapped dependency error, a recovered panic — becomes a generic retryable
+// failure with a generic message, and its raw text is neither stored, returned,
+// nor logged. That text is the one place payload fragments, credentials, driver
+// output, and stack traces reliably show up.
+func classifyHandlerError(err error) (lifecycle.FailureClass, string, string) {
+	var failure *FailureError
+	if errors.As(err, &failure) && failure.Class.ReportableByHandler() {
+		return failure.Class, failure.Code, lifecycle.SafeMessage(failure.Message)
+	}
+	return lifecycle.ClassRetryable, lifecycle.CodeHandlerError, lifecycle.MessageHandlerError
 }
 
 func (r *Runner) beginDelivery(eventID uuid.UUID) (*deliveryFlight, bool) {

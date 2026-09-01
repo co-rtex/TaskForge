@@ -214,7 +214,7 @@ func TestStaleSession_CanDoNothingAtAll(t *testing.T) {
 	claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 
 	// Age the heartbeat past the threshold, then let the reconciler fence it.
 	_, err = testPool.Exec(context.Background(), `
@@ -245,7 +245,7 @@ func TestStaleSession_CanDoNothingAtAll(t *testing.T) {
 	_, err = store.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
 	require.ErrorIs(t, err, workers.ErrFenceRejected)
 
-	require.ErrorIs(t, store.Start(context.Background(), testScope, fence), workers.ErrFenceRejected)
+	require.ErrorIs(t, startError(store, fence), workers.ErrFenceRejected)
 	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence), workers.ErrFenceRejected)
 
 	// Marking it again changes nothing.
@@ -280,7 +280,7 @@ func TestRenewal_ExtendsTheWindowUnderTheCompleteFence(t *testing.T) {
 	claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 
 	_, originalExpiry, _, originalVersion := leaseRow(t, fence.LeaseID)
 	require.Equal(t, 0, originalVersion, "a claimed lease starts at generation 0")
@@ -550,7 +550,7 @@ func TestRenewal_WaitingAcrossExpiryIsRejectedWithoutMutation(t *testing.T) {
 	claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -640,7 +640,7 @@ func TestRenewal_ReplayOnATerminalLeaseIsRejected(t *testing.T) {
 			claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 			require.NoError(t, err)
 			fence := assignmentFence(claim.Assignment)
-			require.NoError(t, store.Start(context.Background(), testScope, fence))
+			startAttempt(t, store, fence)
 
 			// One committed renewal, so the lease now carries a replay identity.
 			request := renewalRequest(fence, 0)
@@ -688,7 +688,7 @@ func TestRenewal_NeverResurrectsAClosedLease(t *testing.T) {
 	claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 	require.NoError(t, store.Succeed(context.Background(), testScope, fence))
 
 	_, err = store.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
