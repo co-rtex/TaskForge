@@ -14,28 +14,33 @@ Implementation status lives in [CURRENT_STATE.md](CURRENT_STATE.md).
 - **[PLANNED]** — designed but not built. Nothing here works yet.
 
 Milestones M1 (durable ingress/outbox), M2 (workers, sessions, and atomic claim),
-and M3 (heartbeats, lease renewal, and crash recovery) are built. Never promote a
-marker without a passing test.
+M3 (heartbeats, lease renewal, and crash recovery), and M4 (the complete job
+lifecycle) are built. Never promote a marker without a passing test.
 
-**Implemented today:** durable submission and outbox delivery; the advisory broker
-contract; logical-worker and process-session registration; immutable session
-eligibility; globally idempotent notification consumption; strict-priority atomic
-claim with queue/worker capacity; attempts and renewable leases; fenced
-start/success; server-timed session heartbeat; fenced, generation-versioned lease
-renewal; stale-session detection; expired-lease reconciliation with attempt
-abandonment, capacity release, and transactional re-notification; and bounded
-`demo.echo` execution. Failure classification, retry, timeout outcomes,
-cancellation, delayed scheduling, the DLQ API, and result storage remain planned.
+**Implemented today:** durable immediate and delayed submission with outbox
+delivery; the advisory broker contract; logical-worker and process-session
+registration; immutable session eligibility; globally idempotent notification
+consumption; strict-priority atomic claim with queue/worker capacity; attempts
+and renewable leases; fenced start with a persisted per-attempt execution
+deadline; fenced success, failure, and cooperative cancellation acknowledgment
+under a retained outcome identity; server-timed session heartbeat carrying
+cancellation directives; fenced, generation-versioned lease renewal;
+stale-session detection; reconciliation of due attempt timeouts, unacknowledged
+cancellations, and expired leases; durable retry with bounded exponential
+backoff and injected jitter; public cancellation; the authoritative logical DLQ
+with listing, replay, and operator retry; scheduler promotion of due delayed and
+retry-waiting work; bounded recovery of stranded queued jobs; and bounded
+`demo.echo` execution. Result storage, authentication, the CLI, the SDK, and the
+dashboard remain planned.
 
 ---
 
-## 1. Model: PostgreSQL-authoritative, pull-based claim — [PARTIAL]
+## 1. Model: PostgreSQL-authoritative, pull-based claim — [IMPLEMENTED]
 
-Steps 1, 2, and 5-9 are implemented. Step 10 is implemented for start, renewal,
-`demo.echo`, and successful outcome; failure outcomes are planned. Step 11 is
-implemented for start/success/renewal fencing. Step 12 is implemented for expired
-leases and stale sessions; cancellation finalization and general drift repair are
-planned. Steps 3 and 4 are planned.
+Every step of the flow below is implemented as of M4. Step 12's general drift
+repair beyond timeouts, cancellations, expired leases, and stale sessions
+remains open-ended by design: the reconciler repairs the specific conditions it
+can define, not everything that might one day be wrong.
 
 TaskForge is a **pull-based** system with a **PostgreSQL-authoritative** control
 plane. The broker signals only that work may exist; PostgreSQL decides atomically
@@ -79,23 +84,23 @@ single outbox publisher · a single reconciler instance.
 
 ---
 
-## 2. Components — [PARTIAL]
+## 2. Components — [IMPLEMENTED]
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `taskforge-api` | Validate and durably accept submissions; serve read APIs; serve internal worker control operations. | **Built** for submission/read plus registration, heartbeat, claim, fenced renewal, fenced start, and fenced success. |
+| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations. | **Built** |
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
-| `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. | Planned (M4) |
-| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, and report fenced outcomes. | **Built** for heartbeat, renewable leases, and `demo.echo`; failure reporting planned (M4). |
-| `taskforge-reconciler` | Expire leases, abandon stale attempts, release capacity, finalize cancellation, repair drift. | **Built** for stale sessions and expired leases; cancellation finalization is M4 and general drift repair is later. |
+| `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |
+| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, and report fenced outcomes including failures and cooperative cancellation. | **Built** for `demo.echo`; result persistence is M5. |
+| `taskforge-reconciler` | Mark stale sessions, record due attempt timeouts, finalize unacknowledged cancellations, expire leases, abandon their attempts, and release capacity. | **Built**; general drift repair beyond these is later. |
 | `taskforge-cli` | Operator and developer command-line interface. | Planned (M5) |
 
 Every component is safe to run with N replicas.
 
 ---
 
-## 3. Data ownership — [IMPLEMENTED] for the tables that exist
+## 3. Data ownership — [IMPLEMENTED]
 
 **PostgreSQL is authoritative** for job, attempt, lease, worker-session, idempotency,
 outbox, and logical DLQ state. See [ADR-0001](adr/0001-postgresql-as-authoritative-state.md).
@@ -114,16 +119,11 @@ Two distinct dead-letter concepts exist and must not be conflated:
 
 ---
 
-## 4. Job state machine — [PARTIAL]
+## 4. Job state machine — [IMPLEMENTED]
 
-The full state set is enforced by a `CHECK` constraint. M2 implements the successful
-path `QUEUED → LEASED → RUNNING → SUCCEEDED` with dedicated, fenced operations. M3
-adds the recovery transitions reconciliation performs on an expired lease:
-`LEASED | RUNNING → QUEUED` when attempt budget remains, and `LEASED | RUNNING →
-DEAD_LETTERED` when the abandoned attempt consumed it
-([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)). Every
-other transition in the V1 diagram remains planned; `RETRY_WAIT`,
-`CANCEL_REQUESTED`, and `CANCELED` are still unreachable.
+The full state set is enforced by a `CHECK` constraint, and as of M4 every state
+in it is reachable. Each transition has its own dedicated, fenced operation;
+there is no generic "set status" path anywhere.
 
 ```
 PENDING ──► QUEUED ──► LEASED ──► RUNNING ──► SUCCEEDED
@@ -156,31 +156,63 @@ not a job outcome. Permanent and exhausted failure are represented by
 Attempt statuses are separate: `LEASED`, `RUNNING`, `SUCCEEDED`, `FAILED`,
 `TIMED_OUT`, `CANCELED`, `ABANDONED`.
 
+### The transition matrix
+
+Every row is decided under the established lock order against one
+`clock_timestamp()` sample taken after those locks.
+
+| Case | Preconditions under locks | Job | Attempt | Lease | Durable side effects |
+| --- | --- | --- | --- | --- | --- |
+| Successful completion | Current healthy session, exact fence, `RUNNING`, active unexpired lease, server time before `timeout_at` | `RUNNING → SUCCEEDED` | `RUNNING → SUCCEEDED` | `ACTIVE → COMPLETED` | Finish and release timestamps; an exact replay is a no-op |
+| Retryable failure, budget remaining | Exact live fence, before the deadline, `RETRYABLE`, attempts used `< max_attempts` | `RUNNING → RETRY_WAIT` | `RUNNING → FAILED` | `ACTIVE → RELEASED` | Safe error metadata, outcome identity, persisted jittered delay and `retry_at`, `available_at = retry_at`; **no** outbox event |
+| Permanent failure | Exact live fence, before the deadline, `PERMANENT` | `RUNNING → DEAD_LETTERED` | `RUNNING → FAILED` | `ACTIVE → RELEASED` | Exactly one DLQ entry, `PERMANENT_FAILURE` |
+| Attempts exhausted | A retryable failure, timeout, or abandonment consumes the final budget | executing → `DEAD_LETTERED` | truthful `FAILED`, `TIMED_OUT`, or `ABANDONED` | `RELEASED`, or `EXPIRED` when the lease had lapsed | Exactly one DLQ entry, `ATTEMPTS_EXHAUSTED` |
+| Timeout | `RUNNING`, persisted `timeout_at <=` post-lock server time | `RUNNING → RETRY_WAIT` or `DEAD_LETTERED` | `RUNNING → TIMED_OUT` | `ACTIVE → RELEASED` or `EXPIRED` | A retry decision, or exactly one DLQ entry |
+| Cancellation before claim | `PENDING`, `QUEUED`, or `RETRY_WAIT` | source → `CANCELED` | none created | none active | `cancel_requested_at`; no new outbox event |
+| Cancellation while executing | `LEASED` or `RUNNING` | source → `CANCEL_REQUESTED` | unchanged for now | stays active for now | Heartbeat directive; start, success, failure, and renewal all stop committing |
+| Cooperative cancellation | `CANCEL_REQUESTED`, exact fence, active lease | `CANCEL_REQUESTED → CANCELED` | `LEASED \| RUNNING → CANCELED` | `ACTIVE → RELEASED` | Outcome identity stored; a duplicate is harmless |
+| Fallback cancellation | `CANCEL_REQUESTED`, lease expired | `CANCEL_REQUESTED → CANCELED` | `LEASED \| RUNNING → CANCELED` | `ACTIVE → EXPIRED` | Reconciler-owned and idempotent |
+| Abandonment | Lease expired, no cancellation, no due deadline | `LEASED \| RUNNING → QUEUED` or `DEAD_LETTERED` | `→ ABANDONED` | `ACTIVE → EXPIRED` | Immediate requeue with a fresh generation and event, or one DLQ entry ([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)) |
+| Delayed submission | Valid future `scheduled_at` | insert as `PENDING` | none | none | `available_at = scheduled_at`; no outbox event |
+| Retry or delayed eligibility | `PENDING` or `RETRY_WAIT`, `available_at <=` post-lock server time | source → `QUEUED` | prior history unchanged | prior leases unchanged | New notification generation and exactly one fresh transactional event |
+| Replay / operator retry | Original stays `DEAD_LETTERED` with a DLQ entry | original unchanged; insert a new `QUEUED` job | original history unchanged | original leases unchanged | New job linked by `replayed_from_job_id`, replay identity record, fresh outbox event |
+
 ### Race semantics
 
-Completion and cancellation form a transactionally ordered race. Exactly one
-state-changing operation wins:
-
-- Valid success commits first → a later cancel returns conflict.
-- Cancel commits first → a later success is rejected.
-
-The same rule applies to two concurrent completions, completion vs. lease
-expiration, completion vs. retry transition, duplicate cancellation, and duplicate
-lease renewal. These are enforced with row locks, transaction predicates,
-constraints, and affected-row checks — never with check-then-update application
+Every one of these forms a transactionally ordered race, and exactly one
+state-changing operation wins. Enforcement is row locks, transaction predicates,
+constraints, and affected-row checks — never check-then-update application
 logic.
 
-A job in `LEASED` or `RUNNING` is never marked terminally `CANCELED` while its lease
-could still submit a valid completion. If the worker disappears, reconciliation
-finalizes cancellation only after the lease can no longer commit.
+- **Cancel versus success.** Success first makes a later cancel a stable
+  conflict; cancel first makes a later success a state conflict.
+- **Timeout versus success.** Whichever transaction reaches the authority rows
+  first commits. A success that waited across the deadline is rejected against
+  the fresh post-lock sample, with `attempt_timed_out` rather than
+  `lease_expired`, because the deadline is the specific cause.
+- **Failure versus renewal.** A failure under a freshly renewed lease commits;
+  a renewal after the lease was released is rejected.
+- **Cancellation versus renewal.** Once cancellation wins, renewal is refused —
+  which is precisely what makes the lease lapse so reconciliation can finalize
+  an uncooperative worker's attempt.
+- **Promotion versus cancellation, and re-notification versus claim.** Both pairs
+  serialize on the job row; the loser re-reads a state its predicate no longer
+  matches and does nothing.
+
+A job in `LEASED` or `RUNNING` is never marked terminally `CANCELED` while its
+lease could still submit a valid completion. That is why cancellation of an
+executing job produces `CANCEL_REQUESTED` rather than `CANCELED`, and why
+finalization waits for the worker's acknowledgment or for the lease to lapse.
+
+Precedence among terminal outcomes is stated rather than incidental:
+cancellation, then a due deadline, then abandonment. See
+[ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md).
 
 ---
 
 ## 5. Domain model — [PARTIAL]
 
-Job submission plus the successful lifecycle are implemented, as are heartbeat
-updates, lease renewal, attempt abandonment, and crash recovery. Failure
-classification, bounded error detail, and result references remain planned.
+Everything below is implemented except result references, which are M5.
 
 ### Job
 Id · auth scope · queue · job type · canonical immutable payload · status · priority
@@ -190,11 +222,28 @@ optional `replayed_from_job_id`.
 
 ### Attempt
 Attempt id · job id · monotonically increasing attempt number (unique per job) ·
-worker id · **worker-session id** · typed status · start and finish times. The lease
-references the attempt through a constrained one-to-one binding. Failure
-classification, bounded error detail, result reference, and trace id are planned.
+worker id · **worker-session id** · typed status · start and finish times ·
+persisted execution deadline · retained outcome request identity · failure class
+· bounded error code and safe message · persisted retry delay and `retry_at`.
+The lease references the attempt through a constrained one-to-one binding. A
+result reference and a trace id are planned.
 
 Attempt history is preserved. The last error is never overwritten in place.
+
+The execution deadline is stamped once, when the attempt's start transition
+commits, and lease renewal never moves it. The outcome identity is unique for
+the lifetime of attempt history, which is what makes an ambiguous failure or
+cancellation report safe to retry. Recognizing a committed outcome is separate
+from exercising live authority, so an exact replay still returns its stored
+result after the session was replaced or the lease closed — the ordinary
+consequences of the failure that lost the response — while a first-time outcome
+from a fenced boot is still refused. All of this is
+[ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md).
+
+Failure detail is bounded and safe by contract, in the schema as well as in Go:
+a lowercase code of at most 64 bytes and a message of at most 512 bytes with no
+control characters. Raw handler text, driver errors, panic values, stack traces,
+and payload contents are never stored, returned, or logged.
 
 ### Worker and process session
 Logical worker identity is separate from one process boot:
@@ -303,13 +352,24 @@ expressed through visibility timeout.
 
 ---
 
-## 8. Scheduling and claim — [PARTIAL]
+## 8. Scheduling and claim — [IMPLEMENTED]
 
-**Implemented:** immediate-job claim. **Planned (M4):** a scheduler that promotes due
-`PENDING` and `RETRY_WAIT` jobs using PostgreSQL server time, creates notification
-outbox events transactionally, and re-notifies stranded queued work under a bounded,
-rate-limited policy. Until that scheduler exists, a lost sole notification can strand
-a queued job.
+`taskforge-scheduler` promotes due `PENDING` and `RETRY_WAIT` jobs using
+PostgreSQL server time, creates the notification outbox event in the same
+transaction as the promotion, and re-notifies stranded queued work under a
+bounded, rate-limited, generation-aware policy. It holds no broker connection.
+See [ADR-0011](adr/0011-notification-generations-and-bounded-renotification.md).
+
+A job carries a monotonic notification generation identifying one eligibility
+transition, and `last_notification_at`. Both are what let bounded re-notification
+tell "the current transition still has an unpublished notification" from "a stale
+event belonging to an attempt that is already over" — so an old
+publish-before-mark event can never suppress the fresh event a new transition
+requires.
+
+Delayed and retry-waiting jobs deliberately carry no notification while they
+wait. Advertising work no worker may claim yet is a wasted round trip a worker
+must then decline to acknowledge.
 
 The claim operation, in one transaction:
 
@@ -335,11 +395,13 @@ property, and is tested. Weighted fairness and aging are post-V1.
 
 ---
 
-## 9. Concurrency control — [IMPLEMENTED] for M1/M2/M3 operations
+## 9. Concurrency control — [IMPLEMENTED]
 
-Submission idempotency, outbox publishing, notification consumption, queue capacity,
-logical-worker capacity, claim, heartbeat, renewal, start, success, and
-reconciliation are serialized in PostgreSQL.
+Submission idempotency, outbox publishing, notification consumption, queue
+capacity, logical-worker capacity, claim, heartbeat, renewal, start, success,
+failure, cancellation, cancellation acknowledgment, timeout, scheduler
+promotion, bounded re-notification, dead-lettering, and replay are all
+serialized in PostgreSQL.
 
 - Queue-level global concurrency locks the queue row before counting active leases.
   Counting active rows without preventing concurrent claims is insufficient and is
@@ -355,9 +417,37 @@ M2 claims first take a transaction-scoped advisory lock derived from the global 
 request id, then use queue → current worker session → job → attempt → lease row order.
 The identity lock makes same-id requests serialize even when they name different
 queues; a hash collision only over-serializes. Fenced transitions, including renewal,
-use the same row order without the identity lock. Queue capacity counts active leases
-by queue. Worker capacity counts by stable logical worker, so restarting a process
-cannot evade a lease held by its old session.
+failure, and cancellation acknowledgment, use the same row order without the identity
+lock. Queue capacity counts active leases by queue. Worker capacity counts by stable
+logical worker, so restarting a process cannot evade a lease held by its old session.
+
+M4's operations take the applicable prefix or subsequence of that same order,
+never a different one:
+
+- Public cancellation, scheduler promotion, bounded re-notification, and replay
+  take `queue → job`. Both start with the queue row, so none can jump ahead of a
+  fenced transition already holding it.
+- Failure, cancellation acknowledgment, and timeout finalization take the full
+  order. Reconciliation takes it without requiring a healthy session, because
+  the whole point is repairing state whose worker is gone.
+- `dlq_entries` and `dlq_replays` extend the order at the **end**, after every
+  authority row is already held.
+
+For each of these, a pre-read may supply immutable routing hints only — a job's
+queue, a lease's binding — and every mutable field is re-read and revalidated
+under the locks, against a `clock_timestamp()` sampled afterwards. A candidate
+scan is never authority.
+
+The identities each operation is idempotent under: submission uses scope plus
+`Idempotency-Key`; claim uses the globally unique outbox event id; renewal uses
+the full fence plus a renewal request id and expected generation; success uses
+the full fence; failure and cancellation acknowledgment use the full fence plus
+a lifetime-retained outcome request id; public cancellation uses scope plus job
+id; timeout uses the attempt id, its persisted deadline, and the locked state,
+with no client clock or client identity involved; scheduler promotion uses the
+job id plus the locked expected status and generation; re-notification adds the
+absence of a pending current-generation event; DLQ insertion uses the unique
+terminal job id; and replay uses scope, original job id, and `Idempotency-Key`.
 
 Heartbeat and stale-session marking lock only the worker-session row, which is a
 prefix of that order. Lease reconciliation takes the full order and deliberately does
@@ -369,30 +459,123 @@ sampled afterwards.
 
 ---
 
-## 10. Retry, timeout, DLQ, replay — [PLANNED]
+## 10. Retry, timeout, cancellation, DLQ, replay — [IMPLEMENTED]
 
-Bounded exponential backoff with injected jitter exists, but only for outbox *publication*. Job retry is planned.
+### Failure classes
 
-Failure classes: **retryable**, **permanent**, **timeout**, **canceled**.
+`RETRYABLE` · `PERMANENT` · `TIMED_OUT` · `CANCELED` · `ABANDONED`.
 
-A retryable failure with remaining budget moves the job to `RETRY_WAIT` with a
-durable next-eligibility time. Backoff is configurable exponential with initial
-delay, multiplier, maximum, and bounded jitter. The random source is injected. The
-scheduler never sleeps inside domain logic.
+A trusted handler may declare only the first two, through a typed error carrying
+a stable code and a safe message. The other three are server-authoritative: a
+worker that presents one is rejected. A plain error or a recovered panic becomes
+a generic retryable failure whose raw text never travels.
 
-Permanent failure or an exhausted attempt budget moves the job to `DEAD_LETTERED`.
-M3 already reaches `DEAD_LETTERED` for one narrow case: an abandoned attempt that
-consumed the total budget, which would otherwise leave a job no worker could ever
-claim. That is the only terminal consequence M3 implements — no failure classes, no
-backoff, no `dlq_entries`, no listing, no replay. See
-[ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md).
+`EXHAUSTED` is deliberately **not** an attempt status. The final attempt keeps
+its truthful `FAILED`, `TIMED_OUT`, or `ABANDONED`, and why the job ended is
+recorded once on its dead-letter entry.
 
-DLQ replay preserves terminal history by creating a **new** job linked through
-`replayed_from_job_id`. The relationship between operator "retry" and "replay" is
-defined explicitly rather than implemented ambiguously; see
-[ROADMAP.md](ROADMAP.md) for the milestone that settles it.
+### Retry
 
----
+One policy governs worker-reported failures and reconciler-detected timeouts
+alike, so a job cannot learn a different cadence depending on whether its worker
+managed to report the failure:
+
+```text
+nominal = min(max_delay, base_delay * multiplier^(n-1))
+factor  = 1 + jitter_fraction * (2r - 1)
+delay   = clamp(nominal * factor, 0, max_delay)
+retry_at = post-lock clock_timestamp() + delay
+```
+
+Both the chosen delay and the instant it produced are persisted on the terminal
+attempt, and the job's `available_at` is set to the same `retry_at`. The job
+moves to `RETRY_WAIT` and **no** notification is created until scheduler
+promotion. The random source is injected: seeded in tests, independently
+crypto-seeded in each API and reconciler process so replicas recovering from one
+outage do not compute identical retry instants. An ambiguous failure response
+returns the previously persisted decision and never recomputes jitter.
+
+Overflow is handled before the conversion to a duration, not after: a large
+attempt number makes the nominal delay `+Inf`, and with full jitter and the
+lowest factor `+Inf * 0` is `NaN`, which compares false against every bound.
+
+### Timeout
+
+`timeout_seconds` is a **per-attempt execution budget**, not a whole-job
+wall-clock deadline. It starts once when that attempt's start transition commits
+and is persisted as `job_attempts.timeout_at`. Lease renewal never resets or
+extends it.
+
+Start returns a typed result: the start time, the persisted deadline, the
+PostgreSQL-measured remaining milliseconds, and whether the response is an exact
+replay. A replay returns the ORIGINAL deadline — recomputing it would hand a
+worker a fresh budget every time a response was lost, which is the one way a
+timeout could never fire. The worker converts the server-measured remaining
+duration into a conservative monotonic local deadline; PostgreSQL stays
+authoritative.
+
+There is no worker-authoritative timeout endpoint. The worker cancels its
+handler locally at the conservative deadline, and only a PostgreSQL transaction
+driven by reconciliation may record `TIMED_OUT`. Every fenced operation that
+could otherwise extend or finish the work checks the persisted deadline against
+the same post-lock sample, so a success or failure that waited across it is
+rejected rather than committed on a stale clock reading.
+
+If an expired-lease scan finds a running attempt whose deadline is already due,
+it uses the timeout path rather than misclassifying the attempt as `ABANDONED`.
+That distinction is load-bearing: abandonment requeues immediately with no
+backoff and no failure detail, so a job whose handler reliably takes too long
+would otherwise loop through its whole budget at full speed.
+
+### Cancellation
+
+Public cancellation is keyed idempotently by scope plus job id and needs no
+request identity: cancelling twice is one decision observed twice.
+
+`PENDING`, `QUEUED`, and `RETRY_WAIT` go straight to terminal `CANCELED` with no
+attempt created. `LEASED` and `RUNNING` go to `CANCEL_REQUESTED`, which
+immediately stops start, success, failure, and renewal from committing while
+leaving attempt and lease history intact. `SUCCEEDED` and `DEAD_LETTERED` return
+a stable conflict.
+
+Delivery rides the **heartbeat**, not a work notification. The heartbeat loop
+already runs unconditionally — while idle and through a graceful drain — so
+cancellation reaches a busy worker and one waiting on an empty broker queue
+alike, with no broker delivery involved. The response carries a bounded list of
+directives naming the job, attempt, and lease.
+
+A cooperative worker acknowledges through a dedicated fenced operation carrying
+its own retained outcome identity: job `CANCEL_REQUESTED → CANCELED`, attempt
+`CANCELED`, lease `RELEASED`. An attempt canceled between claim and start
+truthfully has no start time, which is why migration 0009 revised the timeline
+constraint.
+
+A cancellation that wins before Start reaches the control plane is refused with
+its own code, `cancellation_requested`, rather than a generic state conflict.
+The distinction is load-bearing: every other conflict Start can report means the
+worker no longer holds the attempt, so dropping it is right, while this one
+means the worker still holds it and is the only party that can end it promptly.
+The directive may never have reached that process, so Start's answer has to be
+sufficient on its own. If the worker is gone or uncooperative, renewal is already refused,
+the lease lapses, and reconciliation finalizes the same transition with the
+lease recorded `EXPIRED`.
+
+Cancellation never produces a retry and never creates a dead-letter entry.
+
+### Logical DLQ and replay
+
+One `dlq_entries` row per dead-lettered job, unique by job id, inserted through
+one shared transactional helper by every path that reaches `DEAD_LETTERED`.
+Listing is scope-filtered, keyset-paginated on `(created_at DESC, id DESC)`
+behind an opaque cursor, and carries bounded metadata but never a payload.
+
+Replay creates a **new** job linked through `replayed_from_job_id` and leaves
+the original job, attempts, leases, failure metadata, and DLQ entry exactly as
+they are. `POST /v1/jobs/{job_id}/retry` and `POST /v1/dlq/{job_id}/replay` are
+the same operation with one idempotency namespace, keyed by scope, original job
+id, and `Idempotency-Key`. Different keys deliberately create different
+replacement jobs. See
+[ADR-0012](adr/0012-logical-dlq-and-replay-as-a-new-job.md).
 
 ## 11. Heartbeats, leases, and crash recovery — [IMPLEMENTED]
 
@@ -423,23 +606,32 @@ authority only; the job's `timeout_seconds` budget is measured once from executi
 start. If renewal loses the fence, or cannot be confirmed before the conservative
 deadline, the worker cancels its cooperative handler and reports nothing.
 
-**Reconciliation.** Session staleness and lease expiry are related but distinct
-scans, and both are needed. A session can stop heartbeating while its lease is
-still valid, and a lease can expire while its session is perfectly healthy — the
-worker deliberately leaves a lease active after a handler error and keeps
-heartbeating — so requiring both conditions would strand exactly the case this
-exists to recover.
+**Reconciliation.** Three distinct scans, in a deliberate order. A session can
+stop heartbeating while its lease is still valid, and a lease can expire while
+its session is perfectly healthy — the worker leaves a lease active after a
+handler error and keeps heartbeating — so requiring several conditions at once
+would strand exactly the cases this exists to recover.
 
 1. Stale current sessions are marked `UNHEALTHY` with an `ended_at` stamp, from
    server time. `OFFLINE` stays reserved for replacement and explicit shutdown.
-2. For each expired `ACTIVE` lease, **one transaction**: acquire authority rows in
-   the established order, sample PostgreSQL time afterwards, revalidate that the
-   lease is still active and actually expired and that the job/attempt binding and
-   states still qualify, set the lease `EXPIRED` with a `released_at`, set the
-   attempt `ABANDONED` with a `finished_at` (from `LEASED` or `RUNNING` alike),
-   and either return the job to `QUEUED` with a **fresh** `work.available` outbox
-   event or mark it `DEAD_LETTERED` if that abandonment consumed the total attempt
-   budget ([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)).
+2. Running attempts whose persisted `timeout_at` is due are recorded
+   `TIMED_OUT`, **while their leases may still be live**. Running this before the
+   expired-lease scan is what makes a timed-out attempt a timeout rather than
+   something that waits for its lease to lapse first.
+3. For each expired `ACTIVE` lease, **one transaction**: acquire authority rows
+   in the established order, sample PostgreSQL time afterwards, revalidate every
+   mutable field, and then apply precedence —
+   `CANCEL_REQUESTED` finalizes the cancellation (attempt `CANCELED`, lease
+   `EXPIRED`); an already-due deadline finalizes a timeout; otherwise the
+   attempt becomes `ABANDONED` with a `finished_at` (from `LEASED` or `RUNNING`
+   alike) and the job either returns to `QUEUED` with a **fresh**
+   `work.available` outbox event on a new generation, or becomes
+   `DEAD_LETTERED` if that abandonment consumed the total attempt budget
+   ([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)).
+
+Repeated and concurrent passes never produce a duplicate timeout outcome, a
+duplicate cancellation finalization, a duplicate retry decision, a duplicate
+capacity release, a duplicate dead-letter entry, or a duplicate recovery event.
 
 Capacity is released solely by the lease ceasing to be `ACTIVE`; there is no
 counter to decrement. The recovery event gets a new id because the original event
@@ -455,13 +647,13 @@ plus the transactional recovery event are the record of what happened; a dedicat
 
 ---
 
-## 12. Reliability invariants — [PARTIAL]
+## 12. Reliability invariants — [IMPLEMENTED]
 
-Each of these must have an automated test. Invariants 1, 3-12, and 15-18 are
-implemented and tested for the M1/M2/M3 operations that exist, and 16 is now
-covered by real reconciliation rather than being a target. Invariant 2 holds for
-every terminal state M3 can reach. Invariants 13 and 14 remain targets for M4,
-which owns retry scheduling and cancellation.
+Each of these must have an automated test. All eighteen are implemented and
+tested as of M4. Invariants 13 and 14 were M4's to close: retry scheduling is
+durable PostgreSQL state that no process holds, and a canceled job cannot later
+become successful because `CANCEL_REQUESTED` stops success from committing and
+terminal `CANCELED` is never left.
 
 1. PostgreSQL is authoritative for all control-plane state.
 2. A terminal job never returns to a non-terminal state.
@@ -484,15 +676,20 @@ which owns retry scheduling and cancellation.
 
 ---
 
-## 13. Failure model — [PARTIAL]
+## 13. Failure model — [IMPLEMENTED]
 
 | Failure | Response |
 | --- | --- |
 | Broker unavailable after DB commit | Job stays durable; outbox event stays pending and retries. No loss. |
 | Broker duplicates a notification | Globally idempotent event-id consumption admits one claim; another session gets a safe duplicate outcome. |
-| Broker loses a notification | Scheduler re-notification is planned for M4. In M2, loss of the only notification can strand a queued job. |
+| Broker loses a notification | The scheduler re-notifies a stranded queued job once the bounded interval elapses, using a new event id on the job's current notification generation. Reachability is repaired; nothing was ever at risk of corruption. |
 | Publisher crashes mid-publish | Event republished after the claim timeout/visibility window lapses. Documented at-least-once window. |
 | Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). |
+| Handler returns an error | The worker reports a fenced failure under a retained outcome identity. With budget remaining the job enters `RETRY_WAIT` with a persisted jittered delay; a permanent classification or an exhausted budget dead-letters it with exactly one DLQ entry. |
+| Handler outlives its execution budget | The worker cancels it locally at a conservative deadline and reports nothing. Reconciliation records `TIMED_OUT` against the persisted deadline and applies the same retry policy. |
+| Handler ignores cancellation entirely | Go cannot terminate it. Reconciliation finalizes the cancellation once the lease lapses, and every fenced operation refuses whatever the handler eventually produces. |
+| Operator cancels a running job | The job moves to `CANCEL_REQUESTED`, which immediately stops start, success, failure, and renewal from committing. The worker learns of it on its next heartbeat and acknowledges; if it never does, reconciliation finalizes it. |
+| Scheduler crashes mid-promotion | The transaction rolls back, so there is neither a promotion nor an event, and a later pass promotes it. An ambiguous commit is safe to rerun: the locked status and generation show it already happened. |
 | Worker stops renewing but keeps heartbeating | The lease still expires on server time and is reconciled anyway. Reconciliation never requires both conditions. |
 | Worker returns after expiry | Heartbeat, renewal, start, and completion are all rejected by session + lease fencing, and mutate nothing. |
 | Reconciler crashes mid-repair | The transaction rolls back; the old state is intact and a later pass repairs it. Repeated and concurrent passes are idempotent. |
@@ -551,9 +748,10 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0008`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0011`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
-`job_attempts`, and `leases`, plus `schema_migrations` maintained by the runner.
+`job_attempts`, `leases`, `dlq_entries`, and `dlq_replays`, plus
+`schema_migrations` maintained by the runner.
 M2 adds immediate eligibility time, worker-group routing, constrained session/
 attempt/lease bindings, one current session per logical worker, one active lease per
 job, globally unique notification claims, active-capacity indexes, and timeline-order
@@ -564,12 +762,42 @@ reconciler's scans use. That index constrains live identities rather than every
 identity ever used; the exact scope is recorded on the index itself and in
 [ADR-0008](adr/0008-fenced-idempotent-lease-renewal.md).
 
-**Planned:** `results`, `dlq_entries`, `api_keys`, `audit_events`.
+M4 adds scheduling, cancellation, replay linkage, and notification-generation
+columns to `jobs`; a persisted execution deadline, a lifetime-unique outcome
+identity, and bounded typed failure detail to `job_attempts`; relational job and
+generation metadata to `outbox_events`; and the two DLQ tables. It also replaces
+the attempt timeline constraint forward-only, so a claimed-but-never-started
+attempt may be `CANCELED` — inventing a start time to satisfy the old rule would
+have put a lie in attempt history. Migration 0010 backfills every M3
+`DEAD_LETTERED` job into `dlq_entries`, because ADR-0009 made that state
+reachable one milestone before the DLQ that reads it.
+
+Migration 0011 corrects three things 0009 and 0010 got wrong, forward-only,
+because a published migration has been applied somewhere by definition and
+editing one breaks the runner's checksum enforcement on every database that
+already ran it (AGENTS.md section 6). It replaces the `outbox_events`
+notification-metadata `CHECK`, which accepted the exact unpaired row it existed
+to refuse because a `CHECK` rejects only `FALSE` and `NULL >= 1` is `NULL`. It
+reconstructs notification generations and `last_notification_at` from the real
+ordering of historical `work.available` events instead of from job creation
+time, which was only correct for a job that was never requeued — and it does so
+only on a database still carrying 0009's exact fingerprint, so it can never
+rewrite generations M4 has since moved. And it makes the DLQ and replay
+relationships database-enforced through composite foreign keys: a dead-letter
+entry's terminal attempt must belong to that exact job, a replay's original and
+replacement must both belong to the recorded scope, `replayed_from_job_id`
+cannot cross scopes, and a `dlq_replays` row and its replacement job must name
+the same original, so the two records of one replay cannot disagree.
+
+**Planned:** `results`, `api_keys`, `audit_events`.
 
 Tables are created in the milestone that puts working behavior on them, not in
 advance. Every index exists because an implemented query orders by exactly its
-columns and filters by exactly its predicate: eligibility and priority scans, queue
-and status filters, idempotency lookup, pending outbox scans, active queue/worker
-capacity, expiring active leases, and stale current-session heartbeats. Indexes for
-attempt history and dashboard queries arrive only with the queries that justify
-them.
+columns and filters by exactly its predicate: eligibility and priority scans,
+queue and status filters, idempotency lookup, pending outbox scans, active
+queue/worker capacity, expiring active leases, stale current-session heartbeats,
+due promotion of `PENDING` and `RETRY_WAIT` jobs, stranded queued
+re-notification, due running-attempt timeouts, a session's executing attempts
+for cancellation delivery, pending work events by job and generation, DLQ
+scope/keyset listing, and replay identity lookup. Indexes for attempt history
+and dashboard queries arrive only with the queries that justify them.

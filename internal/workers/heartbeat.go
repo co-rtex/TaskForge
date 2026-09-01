@@ -84,10 +84,78 @@ func (s *Store) Heartbeat(ctx context.Context, scope string, req HeartbeatReques
 		return HeartbeatResult{}, fmt.Errorf("record worker heartbeat: %w", err)
 	}
 
+	// Cancellation rides the heartbeat rather than a work notification, and it is
+	// read in the same transaction that just proved this session is current. That
+	// pairing matters: a directive handed to a session the control plane has
+	// already fenced would be advice to a process whose outcome can no longer
+	// commit anyway.
+	//
+	// Reading it here needs no additional lock. The directives are advisory — the
+	// durable decision committed when the job reached CANCEL_REQUESTED — so a
+	// directive that is one transaction stale simply arrives on the next tick,
+	// and one that arrives for an attempt already finalized is ignored by the
+	// worker's registry.
+	result.Cancellations, err = cancellationDirectives(ctx, tx, req.SessionID, maxCancellationDirectives)
+	if err != nil {
+		return HeartbeatResult{}, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return HeartbeatResult{}, fmt.Errorf("commit worker heartbeat: %w", err)
 	}
 	return result, nil
+}
+
+// maxCancellationDirectives bounds one heartbeat response.
+//
+// A worker's concurrency limit is at most 256, so it can hold at most 256
+// cancellable attempts and this cap can never truncate a real backlog. It exists
+// so the response stays bounded even if a future change makes that untrue.
+const maxCancellationDirectives = 256
+
+// cancellationDirectives lists the attempts this session may still be executing
+// whose jobs have been canceled.
+//
+// The lease join is not decoration. An attempt whose lease is no longer ACTIVE
+// has already lost authority, so telling its worker to cancel cooperatively
+// would be pointless — reconciliation owns that case and finalizes it without
+// the worker's help.
+func cancellationDirectives(
+	ctx context.Context,
+	tx pgx.Tx,
+	sessionID uuid.UUID,
+	limit int,
+) ([]CancellationDirective, error) {
+	// Matches job_attempts_session_executing_idx.
+	rows, err := tx.Query(ctx, `
+		SELECT a.job_id, a.id, l.id, j.cancel_requested_at
+		FROM job_attempts a
+		JOIN jobs j ON j.id = a.job_id
+		JOIN leases l ON l.attempt_id = a.id
+		WHERE a.worker_session_id = $1
+		  AND a.status IN ('LEASED', 'RUNNING')
+		  AND j.status = 'CANCEL_REQUESTED'
+		  AND l.status = 'ACTIVE'
+		ORDER BY j.cancel_requested_at, a.id
+		LIMIT $2`, sessionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read cancellation directives: %w", err)
+	}
+	defer rows.Close()
+
+	var directives []CancellationDirective
+	for rows.Next() {
+		var directive CancellationDirective
+		if err := rows.Scan(&directive.JobID, &directive.AttemptID,
+			&directive.LeaseID, &directive.CancelRequestedAt); err != nil {
+			return nil, fmt.Errorf("scan cancellation directive: %w", err)
+		}
+		directives = append(directives, directive)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cancellation directives: %w", err)
+	}
+	return directives, nil
 }
 
 // RenewLease extends one lease's authority window without resurrecting anything.
@@ -138,12 +206,28 @@ func (s *Store) RenewLease(ctx context.Context, scope string, req RenewalRequest
 	// window — authority for a lease that no longer exists. ADR-0008 says renewal
 	// never resurrects an expired, completed, released, or reconciled lease, and
 	// that has to bind the replay path exactly as it binds a first attempt.
-	if state.leaseStatus != LeaseActive || !state.serverNow.Before(state.expiresAt) {
+	if !state.leaseUsable() {
 		return RenewalResult{}, ErrLeaseExpired
+	}
+	// Renewal extends lease authority, and lease authority only exists to let
+	// work that is still allowed to run keep running. Once the attempt's
+	// persisted execution deadline has passed, nothing this attempt does can
+	// commit, so extending its window would only delay the reconciler's timeout
+	// while the handler kept burning resources under an authority that can never
+	// be used.
+	//
+	// This is also where the M3 invariant is enforced from the other side:
+	// renewal never resets timeout_at, so a deadline that has arrived stays
+	// arrived no matter how many renewals succeeded before it.
+	if state.timedOut() {
+		return RenewalResult{}, ErrAttemptTimedOut
 	}
 	// Renewal authorizes continued execution, so the attempt must still be the
 	// one executing. Both LEASED and RUNNING are accepted because a renewal may
-	// legitimately race the start transition.
+	// legitimately race the start transition. CANCEL_REQUESTED is deliberately
+	// not executing: once cancellation has durably won, refusing renewal is what
+	// makes the lease lapse so reconciliation can finalize an uncooperative
+	// worker's attempt.
 	if !isExecutingJobStatus(state.jobStatus) || !isExecutingAttemptStatus(state.attemptStatus) {
 		return RenewalResult{}, ErrStateConflict
 	}

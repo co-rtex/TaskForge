@@ -1,19 +1,23 @@
 openapi: 3.1.0
 info:
   title: TaskForge API
-  version: 0.3.0-m3
+  version: 0.4.0-m4
   description: |
-    Durable job ingress plus internal worker registration, session heartbeat,
-    atomic claim, fenced lease renewal, and fenced start/success operations.
+    The complete durable job lifecycle: idempotent submission including delayed
+    submission, job reads, cancellation, the logical dead-letter queue with
+    replay and operator retry, plus the internal worker-control surface —
+    registration, session heartbeat with cancellation delivery, atomic claim,
+    fenced lease renewal, and the fenced start, success, failure, and
+    cancellation-acknowledgment transitions.
 
     This document describes **only the endpoints that are implemented**. The rest
-    of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing,
-    cancellation, retry, DLQ, workers, queues — arrives with the milestone that
-    makes it real. An endpoint is never documented here before it works.
+    of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing, workers,
+    queues, result retrieval — arrives with the milestone that makes it real. An
+    endpoint is never documented here before it works.
 
     ## Authentication
 
-    None yet. Milestone M3 attributes every request to a single configured
+    None yet. Milestone M4 attributes every request to a single configured
     development scope, and the service therefore binds to loopback only.
     Database-backed API keys are milestone M5. See `docs/CURRENT_STATE.md`.
 
@@ -33,6 +37,27 @@ info:
     "Equivalent" means equivalent after normalization: reordering JSON keys,
     stating a default explicitly, or repeating a required capability all describe
     the same job. Numeric spelling (`1` versus `1.0`) is treated as a difference.
+    A `scheduled_at` is normalized to UTC first, so two equivalent offsets naming
+    one instant are the same request; an omitted `scheduled_at` and an explicit
+    `null` are also the same request, and hash exactly as they did before this
+    milestone.
+
+    `POST /v1/dlq/{job_id}/replay` and `POST /v1/jobs/{job_id}/retry` are the
+    same operation and require an `Idempotency-Key` too. They share ONE identity
+    namespace — scope, original job id, and key — so the same identity presented
+    through either route returns the same replacement job rather than creating a
+    second one. Different keys deliberately create different replacement jobs.
+
+    ## Cancellation and outcome identities
+
+    Cancellation is keyed by scope plus job id and needs no request identity:
+    cancelling twice is the same decision observed twice.
+
+    Failure reporting and cooperative cancellation acknowledgment are different.
+    Each carries a client-generated `outcome_request_id` that is retained for the
+    lifetime of attempt history, and **retrying an ambiguous response must reuse
+    it**. A fresh identity would consume a second place in the attempt budget and
+    draw fresh jitter for a different retry instant.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -43,6 +68,7 @@ servers:
 
 tags:
   - name: Jobs
+  - name: DLQ
   - name: Worker Control
   - name: Health
 
@@ -55,6 +81,16 @@ paths:
         Durably accepts a job. The job, its idempotency record, and the broker
         notification are written in one PostgreSQL transaction, so a success
         response means the job is durable.
+
+        A `scheduled_at` in the future is accepted as `PENDING`: durable, not yet
+        eligible, and deliberately carrying NO notification, because advertising
+        work no worker may claim yet is a wasted broker round trip. The scheduler
+        creates exactly one event, transactionally, when PostgreSQL says the job
+        has become due. An absent, null, or already-due `scheduled_at` is an
+        immediate submission and is `QUEUED` with its notification now.
+
+        Whether a schedule is still in the future is decided by PostgreSQL, not
+        by the caller''s clock.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -121,20 +157,21 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: |
-            The body was valid JSON but the request was invalid — including a
-            non-null `scheduled_at`, which is not implemented in this milestone.
+            The body was valid JSON but the request was invalid — an unknown
+            queue, an out-of-range field, or a `scheduled_at` that is not an
+            RFC 3339 timestamp.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
               examples:
-                scheduledNotImplemented:
+                malformedSchedule:
                   value:
                     error:
                       code: validation_failed
                       message: the request was rejected by validation
                       details:
                         - field: scheduled_at
-                          message: delayed execution is not implemented in this milestone; send null or omit the field
+                          message: must be an RFC 3339 timestamp, for example 2026-09-01T12:00:00Z
                       request_id: 6a1f...
         '500':
           description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
@@ -161,6 +198,335 @@ paths:
           description: |
             No such job in the caller's scope. A malformed id also answers 404,
             so a caller cannot distinguish an invalid id from someone else's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/jobs/{job_id}/cancel:
+    post:
+      tags: [Jobs]
+      summary: Cancel a job
+      description: |
+        Cancels a job, or begins withdrawing authority from the attempt that is
+        executing it. Identity is scope plus job id and nothing else: cancelling
+        twice is not two cancellations, it is one decision observed twice, so
+        this needs no request identity to be idempotent.
+
+        Two shapes, decided under the job row lock:
+
+        - `PENDING`, `QUEUED`, or `RETRY_WAIT` — no attempt exists and no lease
+          can commit, so the job becomes terminal `CANCELED` immediately and **no
+          attempt is created**. An advisory notification already on the broker
+          stays harmless: the claim predicate simply finds no queued job.
+        - `LEASED` or `RUNNING` — an attempt still holds authority that could
+          commit a success, so the job becomes `CANCEL_REQUESTED` and attempt and
+          lease history are untouched for now. What changes immediately is that
+          start, success, failure, and renewal all stop committing. The attempt is
+          finalized either by the worker acknowledging cooperatively — it learns
+          of the cancellation on its next heartbeat — or by reconciliation once
+          the lease lapses.
+
+        Cancellation never produces a retry and never creates a dead-letter
+        entry.
+
+        Cancel racing a success is resolved by lock order: whichever transaction
+        reaches the authority rows first commits, and the loser is rejected.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The committed cancellation decision, including an idempotent repeat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cancellation' }
+        '404':
+          description: |
+            No such job in the caller's scope. A malformed id also answers 404,
+            so a caller cannot distinguish an invalid id from someone else's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The job already reached `SUCCEEDED` or `DEAD_LETTERED`. Code
+            `job_not_cancelable`. A terminal job never returns to a non-terminal
+            state, and never changes which terminal state it is in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed — the cancellation may already have been recorded.
+
+            **Retry:** repeat the identical cancellation request for the same
+            `job_id`. Cancellation carries no request identity because it needs
+            none: it is keyed by scope and job id alone, so a repeat returns
+            whichever decision is durably recorded and never cancels twice. If
+            the first request did commit, the repeat answers `200` with
+            `already_requested: true` and the original `cancel_requested_at`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome
+                    was known; repeat the identical cancellation request for the
+                    same job id; cancellation is keyed by scope and job id alone,
+                    so a repeat returns the current decision and never cancels
+                    twice
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/jobs/{job_id}/retry:
+    post:
+      tags: [DLQ]
+      summary: Operator retry — the same operation as DLQ replay
+      description: |
+        Identical to `POST /v1/dlq/{job_id}/replay`: one service, one
+        idempotency namespace. Two routes exist because operators reach for both
+        names, not because there are two operations. The same
+        `Idempotency-Key` presented through either route returns the same
+        replacement job.
+
+        See `POST /v1/dlq/{job_id}/replay` for the full semantics.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 255 }
+      responses:
+        '201':
+          description: The replacement job was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Replay' }
+        '200':
+          description: This replay identity had already created the replacement.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Replay' }
+        '404':
+          description: No such job in the caller's scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: The job is not dead-lettered. Code `job_not_dead_lettered`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: The `Idempotency-Key` header was missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed — the replacement job may already exist.
+
+            **Retry:** repeat the complete identical request on the same path,
+            with the same `job_id` and the same `Idempotency-Key`. Presenting a
+            fresh key after an ambiguous response is **forbidden**: a key is the
+            replay identity, so a different one is a different replay and
+            silently creates a SECOND replacement job for the same failure. If
+            the first request did commit, the repeat answers `200` with
+            `replayed: true` and the replacement that already exists.
+
+            `/v1/jobs/{job_id}/retry` and `/v1/dlq/{job_id}/replay` share one
+            identity namespace, so an ambiguous response from either may be
+            retried through either.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome
+                    was known; repeat the identical request on the same path with
+                    the same Idempotency-Key; a fresh key after an ambiguous
+                    response is forbidden, because it is a different replay
+                    identity and would create a second replacement job
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/dlq:
+    get:
+      tags: [DLQ]
+      summary: List dead-lettered jobs
+      description: |
+        One bounded, scope-filtered page of TaskForge's own logical dead-letter
+        queue, newest first. This is authoritative PostgreSQL state, not the
+        broker's infrastructure DLQ for unprocessable notification messages.
+
+        Pagination is keyset on `(created_at DESC, id DESC)`, not OFFSET. Two
+        jobs can dead-letter in the same instant, so ordering by timestamp alone
+        is not a total order, and OFFSET over a growing table skips and repeats
+        rows. The composite comparison is a real total order, so a page boundary
+        can neither duplicate nor omit an entry.
+
+        A full page is not proof that more exist; the presence of `next_cursor`
+        is. The cursor is opaque: it is a position, not an authorization, and
+        encoding it keeps the ordering columns out of the public contract.
+
+        Entries deliberately carry no job payload. A list endpoint that returned
+        payloads would let one request pull an unbounded amount of user data; a
+        single job is still readable through `GET /v1/jobs/{job_id}`.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+          description: The `next_cursor` from a previous page of this endpoint.
+      responses:
+        '200':
+          description: One bounded page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DLQPage' }
+        '422':
+          description: |
+            The limit was out of range, or the cursor was not one this endpoint
+            issued. Codes `validation_failed` and `invalid_cursor`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/dlq/{job_id}/replay:
+    post:
+      tags: [DLQ]
+      summary: Replay a dead-lettered job
+      description: |
+        Creates a NEW job from a dead-lettered one. It deliberately does not
+        resurrect the original: a terminal job never returns to a non-terminal
+        state, and its attempts, leases, failure metadata, and dead-letter entry
+        are the durable record of what happened. All of that is left exactly as
+        it is, and the replacement is linked back through
+        `replayed_from_job_id`.
+
+        The replacement copies the original's queue, job type, canonical payload,
+        priority, attempt budget, timeout, and capabilities. It is immediately
+        eligible — `scheduled_at` is null and `available_at` is server time —
+        because a replay is an operator saying "run this now". It gets a fresh
+        attempt budget and a fresh notification generation, and its notification
+        is written in the same transaction as the job and the replay identity.
+
+        Idempotency is enforced by the database, keyed by scope, original job id,
+        and `Idempotency-Key`. Concurrent identical requests create exactly one
+        replacement; retrying after an ambiguous response returns the committed
+        one with `200`. Different keys deliberately create different replacement
+        jobs — that is how an operator replays the same failure twice on purpose.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 255 }
+      responses:
+        '201':
+          description: The replacement job was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Replay' }
+        '200':
+          description: This replay identity had already created the replacement.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Replay' }
+        '404':
+          description: No such job in the caller's scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The job is not dead-lettered, so there is nothing to replay. Code
+            `job_not_dead_lettered`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: The `Idempotency-Key` header was missing or invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed — the replacement job may already exist.
+
+            **Retry:** repeat the complete identical request on the same path,
+            with the same `job_id` and the same `Idempotency-Key`. Presenting a
+            fresh key after an ambiguous response is **forbidden**: a key is the
+            replay identity, so a different one is a different replay and
+            silently creates a SECOND replacement job for the same failure. If
+            the first request did commit, the repeat answers `200` with
+            `replayed: true` and the replacement that already exists.
+
+            `/v1/jobs/{job_id}/retry` and `/v1/dlq/{job_id}/replay` share one
+            identity namespace, so an ambiguous response from either may be
+            retried through either.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome
+                    was known; repeat the identical request on the same path with
+                    the same Idempotency-Key; a fresh key after an ambiguous
+                    response is forbidden, because it is a different replay
+                    identity and would create a second replacement job
+        '500':
+          description: Sanitized internal error.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -265,6 +631,18 @@ paths:
         Repeating a heartbeat is harmless. It may advance the stored timestamp
         again — that is what a heartbeat is for — but it can never create a
         session or revive a fenced one.
+
+        The response also carries this session's outstanding cancellation
+        directives. Delivering them here rather than on a work notification is
+        deliberate: the heartbeat loop already runs unconditionally, while the
+        worker is idle and through a graceful drain, so cancellation reaches a
+        busy worker and one waiting on an empty broker queue alike. Nothing about
+        cancellation delivery depends on the broker.
+
+        A directive is advisory in exactly the way a broker notification is: the
+        durable decision committed when the job reached `CANCEL_REQUESTED`, and a
+        worker cannot make anything true by acting or failing to act on it. What
+        it buys is cooperative termination instead of waiting out lease expiry.
       parameters:
         - name: worker_session_id
           in: path
@@ -543,8 +921,26 @@ paths:
       tags: [Worker Control]
       summary: Fenced attempt start
       description: |
-        Idempotently moves the exact current job and attempt `LEASED → RUNNING`.
-        PostgreSQL server time must still be before the active lease expiry.
+        Idempotently moves the exact current job and attempt `LEASED → RUNNING`
+        and stamps the attempt's persisted execution deadline. PostgreSQL server
+        time must still be before the active lease expiry.
+
+        The deadline is written here, once, and never again. That single fact is
+        what makes the rest of the timeout story work:
+
+        - an ambiguous retry returns the ORIGINAL `started_at` and
+          `attempt_timeout_at`. Recomputing them would hand a worker a fresh
+          budget every time a response was lost, which is the one way a timeout
+          could never fire;
+        - lease renewal cannot touch it. Renewal extends lease authority; the
+          job's `timeout_seconds` budget is measured once from execution start;
+        - reconciliation has something durable to scan, so a timeout is detected
+          even when the worker's process is gone.
+
+        `attempt_timeout_remaining_milliseconds` is measured by PostgreSQL after
+        every authority lock. A worker converts it into a conservative monotonic
+        deadline rather than starting a fresh timer from `timeout_seconds` once
+        this response lands — which would silently give the round trip back.
       parameters:
         - name: attempt_id
           in: path
@@ -556,17 +952,41 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/FenceRequest' }
       responses:
-        '204': { description: Started, or an exact already-started replay. }
+        '200':
+          description: |
+            The committed transition, or an exact already-started replay carrying
+            the original deadline.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttemptStart' }
         '400':
           description: Malformed JSON or an unknown field.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: Fence, state, current session, or lease expiry rejected the transition.
+          description: |
+            Fence, state, current session, or lease expiry rejected the
+            transition.
+
+            One of these conflicts is not a reason to drop the attempt.
+            Code `cancellation_requested` means a cancellation directive won
+            before this attempt started: the job is `CANCEL_REQUESTED`, this
+            worker still holds the attempt, and the correct response is to
+            acknowledge through `POST /internal/v1/attempts/{attempt_id}/cancel`
+            with the same fence rather than to abandon the attempt and wait for
+            the lease to lapse. It is a distinct code precisely because every
+            other 409 here means the opposite.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: cancellation_requested
+                  message: >-
+                    cancellation was requested before this attempt started;
+                    acknowledge it through POST
+                    /internal/v1/attempts/{attempt_id}/cancel
         '413':
           description: The body exceeded the configured size limit.
           content:
@@ -618,8 +1038,24 @@ paths:
       description: |
         Idempotently accepts success only for the exact current job, attempt,
         lease, worker, and process session. Atomically marks job and attempt
-        `SUCCEEDED`, closes the lease, and releases derived capacity. M2 stores
-        no result body; result persistence arrives in M5.
+        `SUCCEEDED`, closes the lease, and releases derived capacity. No result
+        body is stored; result persistence arrives in M5.
+
+        Two additional preconditions, both checked against the same post-lock
+        PostgreSQL sample as every other authority decision:
+
+        - server time must still be before the attempt's persisted
+          `timeout_at`, or the response is `409 attempt_timed_out`. A success
+          that waited across the deadline would otherwise commit on a stale
+          reading of the clock, and the timeout it outlived would be a timeout
+          that never happened;
+        - the job must still be `RUNNING`. A job that has moved to
+          `CANCEL_REQUESTED` answers `409 state_conflict`: once cancellation has
+          durably won, no later success from this attempt commits.
+
+        Timeout-versus-success and cancel-versus-success are both resolved by
+        lock order — whichever transaction reaches the authority rows first
+        commits, and the loser finds a state its precondition no longer matches.
       parameters:
         - name: attempt_id
           in: path
@@ -674,6 +1110,240 @@ paths:
             idempotent under that fence: replaying it after the outcome
             committed succeeds without changing the recorded finish time or
             re-releasing the lease.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/attempts/{attempt_id}/fail:
+    post:
+      tags: [Worker Control]
+      summary: Fenced terminal failure
+      description: |
+        Records one fenced terminal failure and decides what it does to the job.
+
+        Fenced by the complete five-part fence — `attempt_id` in the path plus
+        `job_id`, `lease_id`, `worker_id`, and `worker_session_id` — and
+        additionally by a client-generated `outcome_request_id` that is retained
+        for the lifetime of attempt history.
+
+        That identity is what makes an ambiguous response safe. The decision is
+        computed exactly once and persisted on the attempt: classification, safe
+        code and message, the chosen delay, and `retry_at`. A replay returns
+        those stored values unchanged rather than consuming a second place in the
+        attempt budget, drawing fresh jitter for a different retry instant, or —
+        at the end of the budget — creating a second dead-letter entry.
+
+        Outcomes, decided under the authority locks against one fresh PostgreSQL
+        sample:
+
+        - `RETRYABLE` with attempt budget remaining → attempt `FAILED`, lease
+          `RELEASED`, job `RETRY_WAIT` with a persisted jittered delay and
+          `available_at` set to the same `retry_at`. **No notification is created
+          here**: the job is durable and scheduled, and the scheduler creates
+          exactly one event when it actually becomes eligible.
+        - `RETRYABLE` with the budget consumed → attempt `FAILED`, job
+          `DEAD_LETTERED`, exactly one dead-letter entry with reason
+          `ATTEMPTS_EXHAUSTED`.
+        - `PERMANENT` → attempt `FAILED`, job `DEAD_LETTERED`, exactly one entry
+          with reason `PERMANENT_FAILURE`. Remaining budget is deliberately
+          ignored: retrying could not change the answer.
+
+        `failure_class` accepts only `RETRYABLE` or `PERMANENT`. `TIMED_OUT`,
+        `CANCELED`, and `ABANDONED` are server-authoritative and are rejected
+        with `422` — a worker cannot decide any of them about itself.
+
+        A request observed at or after the attempt's persisted deadline answers
+        `409 attempt_timed_out` and records nothing. The truthful outcome there is
+        `TIMED_OUT`, and only reconciliation may write it; letting this request
+        write `FAILED` would mislabel the attempt and let a handler's own
+        classification override a server-authoritative one.
+
+        `error_code` and `error_message` are bounded and safe by contract. Raw
+        handler text, driver errors, panic values, stack traces, and payload
+        contents must never be sent: a plain handler error becomes a generic
+        retryable code, and its raw text is neither stored nor logged.
+      parameters:
+        - name: attempt_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FailureReport' }
+      responses:
+        '200':
+          description: The committed decision, or an exact replay of it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Outcome' }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The fence, the current session, the lease state, the attempt
+            deadline, or the outcome identity rejected the report. Codes
+            `fence_rejected`, `worker_session_unavailable`, `lease_expired`,
+            `state_conflict`, `attempt_timed_out`, or `outcome_conflict`. None of
+            them mutates anything.
+
+            `outcome_conflict` means the identity already belongs to a different
+            attempt, or was replayed against its own attempt with a different
+            classification, code, or message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            An identifier was invalid, the failure class was not `RETRYABLE` or
+            `PERMANENT`, or the error code or message exceeded its bounds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the COMPLETE identical request — the same attempt
+            fence (`attempt_id` in the path plus the same `job_id`, `lease_id`,
+            `worker_id`, and `worker_session_id`), the same
+            `outcome_request_id`, and the same `failure_class`, `error_code`,
+            and `error_message`. Generating a fresh outcome request id after an
+            ambiguous response is **forbidden**: it would consume a second place
+            in the attempt budget and draw fresh jitter for a different retry
+            instant. Changing the body under the original identity is a
+            `409 outcome_conflict`, not a replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/attempts/{attempt_id}/cancel:
+    post:
+      tags: [Worker Control]
+      summary: Fenced cooperative cancellation acknowledgment
+      description: |
+        Records that a worker cooperatively stopped an attempt whose job is
+        `CANCEL_REQUESTED`.
+
+        It is a dedicated operation rather than a flavor of failure reporting
+        because cancellation is not a failure: it never retries, never
+        dead-letters, and never consults the attempt budget. It also deliberately
+        does not check the attempt's execution deadline — once cancellation has
+        durably won, it is the outcome, and a job canceled while it happened to
+        be running long is canceled, not timed out.
+
+        On success: job `CANCEL_REQUESTED → CANCELED`, attempt
+        `LEASED | RUNNING → CANCELED`, lease `ACTIVE → RELEASED`.
+
+        The attempt may be `LEASED` rather than `RUNNING`. Cancellation can win
+        after a claim but before start, and the honest record of that is a
+        canceled attempt with no start time.
+
+        If the worker never acknowledges — because it is gone or uncooperative —
+        nothing is lost: renewal is already refused for a `CANCEL_REQUESTED` job,
+        so the lease lapses and reconciliation finalizes the same transition with
+        the lease recorded `EXPIRED` instead of `RELEASED`.
+      parameters:
+        - name: attempt_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelAcknowledgment' }
+      responses:
+        '200':
+          description: The committed cancellation, or an exact replay of it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Outcome' }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The fence, the current session, the lease state, or the outcome
+            identity rejected the acknowledgment, or the job was not
+            `CANCEL_REQUESTED`. Codes `fence_rejected`,
+            `worker_session_unavailable`, `lease_expired`, `state_conflict`, or
+            `outcome_conflict`. None of them mutates anything.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: An identifier was invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the COMPLETE identical request — the same attempt
+            fence (`attempt_id` in the path plus the same `job_id`, `lease_id`,
+            `worker_id`, and `worker_session_id`) and the same
+            `outcome_request_id`. Generating a fresh outcome request id after an
+            ambiguous response is **forbidden**: the identity is what makes the
+            replay recognizable, and a new one would be a second outcome report
+            for the same attempt.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -775,8 +1445,14 @@ components:
           format: date-time
           default: null
           description: |
-            Not implemented in this milestone. Must be null or omitted; a
-            non-null value is rejected with 422 rather than silently ignored.
+            Earliest execution instant, RFC 3339. Null or omitted means
+            immediate, and the two are equivalent for idempotency. The value is
+            canonicalized to UTC, so two equivalent offsets naming one instant
+            are the same request.
+
+            PostgreSQL decides whether it is still in the future. A future value
+            makes the job `PENDING` until the scheduler promotes it; an
+            already-due value is submitted as `QUEUED` immediately.
         required_capabilities:
           type: array
           maxItems: 16
@@ -788,7 +1464,7 @@ components:
 
     Job:
       type: object
-      required: [id, queue, job_type, payload, status, priority, max_attempts, timeout_seconds, required_capabilities, created_at, updated_at]
+      required: [id, queue, job_type, payload, status, priority, max_attempts, timeout_seconds, required_capabilities, scheduled_at, available_at, cancel_requested_at, replayed_from_job_id, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         queue: { type: string }
@@ -798,8 +1474,35 @@ components:
           type: string
           enum: [PENDING, QUEUED, LEASED, RUNNING, RETRY_WAIT, CANCEL_REQUESTED, SUCCEEDED, CANCELED, DEAD_LETTERED]
           description: |
-            The full V1 state machine. M2 produces `QUEUED`, `LEASED`,
-            `RUNNING`, and `SUCCEEDED`; the remaining transitions arrive later.
+            The full V1 state machine, every state of which is reachable as of
+            milestone M4. There is deliberately no job-level `FAILED`: one failed
+            attempt is not a job outcome, so permanent and exhausted failure are
+            `DEAD_LETTERED` and individual failures stay in attempt history.
+        scheduled_at:
+          type: [string, 'null']
+          format: date-time
+          description: The requested earliest execution instant, in UTC. Null for an immediate submission.
+        available_at:
+          type: string
+          format: date-time
+          description: |
+            The authoritative eligibility time PostgreSQL orders and filters
+            claims by. It starts at the schedule, or at submission time, and is
+            moved forward by retry backoff.
+        cancel_requested_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Set from the moment cancellation wins, including while a worker is
+            still being asked to stop cooperatively.
+        replayed_from_job_id:
+          type: [string, 'null']
+          format: uuid
+          description: |
+            The terminal job this one replaces. Replay never resurrects a
+            terminal job; it creates a new one linked back to it. Attempt
+            history and results are deliberately absent from this endpoint — a
+            rich history API is milestone M5.
         priority: { type: integer }
         max_attempts: { type: integer }
         timeout_seconds:
@@ -883,8 +1586,14 @@ components:
 
     Heartbeat:
       type: object
-      required: [worker_session_id, status, last_heartbeat_at]
+      required: [worker_session_id, status, last_heartbeat_at, cancellations]
       properties:
+        cancellations:
+          type: array
+          description: |
+            This session's outstanding cancellation directives, bounded by the
+            worker's own concurrency limit. Empty is the normal case.
+          items: { $ref: '#/components/schemas/CancellationDirective' }
         worker_session_id: { type: string, format: uuid }
         status:
           type: string
@@ -1015,6 +1724,192 @@ components:
         worker_id: { type: string, format: uuid }
         worker_session_id: { type: string, format: uuid }
 
+    CancellationDirective:
+      type: object
+      required: [job_id, attempt_id, lease_id, cancel_requested_at]
+      description: |
+        One attempt this session should stop. It names the lease the worker is
+        expected to hold, so a stale directive for a previous lease on the same
+        attempt is not authority to stop the current one.
+      properties:
+        job_id: { type: string, format: uuid }
+        attempt_id: { type: string, format: uuid }
+        lease_id: { type: string, format: uuid }
+        cancel_requested_at: { type: string, format: date-time }
+
+    AttemptStart:
+      type: object
+      required: [attempt_id, started_at, attempt_timeout_at, attempt_timeout_remaining_milliseconds, replayed]
+      properties:
+        attempt_id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        attempt_timeout_at:
+          type: string
+          format: date-time
+          description: |
+            The persisted per-attempt execution deadline, stamped once. Lease
+            renewal never moves it.
+        attempt_timeout_remaining_milliseconds:
+          type: integer
+          minimum: 0
+          description: |
+            PostgreSQL-measured remaining budget, sampled after every authority
+            lock. Workers convert it to a conservative monotonic deadline.
+        replayed:
+          type: boolean
+          description: |
+            True when the attempt was already RUNNING. The original deadline is
+            returned; a replay never restarts the timeout.
+
+    FailureReport:
+      type: object
+      additionalProperties: false
+      required: [job_id, lease_id, worker_id, worker_session_id, outcome_request_id, failure_class, error_code]
+      properties:
+        job_id: { type: string, format: uuid }
+        lease_id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+        outcome_request_id:
+          type: string
+          format: uuid
+          description: |
+            Generated once per logical outcome and reused by every retry of it.
+            A fresh id on a retry would consume a second place in the attempt
+            budget and draw fresh jitter.
+        failure_class:
+          type: string
+          enum: [RETRYABLE, PERMANENT]
+          description: |
+            Only these two are reportable by a worker. `TIMED_OUT`, `CANCELED`,
+            and `ABANDONED` are server-authoritative.
+        error_code:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_.-]{0,63}$'
+          description: Stable lowercase token an operator can group by.
+        error_message:
+          type: string
+          maxLength: 512
+          description: |
+            Optional prose the handler asserts is safe. No control characters, no
+            line breaks. Never a raw error string, a stack trace, a panic value,
+            or payload content.
+
+    CancelAcknowledgment:
+      type: object
+      additionalProperties: false
+      required: [job_id, lease_id, worker_id, worker_session_id, outcome_request_id]
+      properties:
+        job_id: { type: string, format: uuid }
+        lease_id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+        outcome_request_id:
+          type: string
+          format: uuid
+          description: Generated once per logical acknowledgment and reused by every retry of it.
+
+    Outcome:
+      type: object
+      required: [job_id, job_status, attempt_status, retry_at, retry_delay_milliseconds, dead_letter_reason, replayed]
+      properties:
+        job_id: { type: string, format: uuid }
+        job_status:
+          type: string
+          enum: [QUEUED, RETRY_WAIT, CANCELED, DEAD_LETTERED]
+        attempt_status:
+          type: string
+          enum: [FAILED, TIMED_OUT, CANCELED, ABANDONED]
+        retry_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Read back from what was persisted, never recomputed. That is the
+            visible half of the promise that an ambiguous response never redraws
+            jitter: a replay returns the same instant.
+        retry_delay_milliseconds:
+          type: [integer, 'null']
+          minimum: 0
+        dead_letter_reason:
+          type: [string, 'null']
+          enum: [PERMANENT_FAILURE, ATTEMPTS_EXHAUSTED, null]
+        replayed:
+          type: boolean
+          description: True when this outcome identity had already committed.
+
+    Cancellation:
+      type: object
+      required: [job_id, status, cancel_requested_at, already_requested]
+      properties:
+        job_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [CANCELED, CANCEL_REQUESTED]
+          description: |
+            `CANCELED` means it is over. `CANCEL_REQUESTED` means an attempt
+            still holds authority that is being withdrawn.
+        cancel_requested_at: { type: string, format: date-time }
+        already_requested:
+          type: boolean
+          description: True when the job was already cancelling or canceled.
+
+    DLQEntry:
+      type: object
+      required: [id, job_id, queue, job_type, priority, max_attempts, reason, created_at, replay_count]
+      properties:
+        id: { type: string, format: uuid }
+        job_id: { type: string, format: uuid }
+        queue: { type: string }
+        job_type: { type: string }
+        priority: { type: integer }
+        max_attempts: { type: integer }
+        reason:
+          type: string
+          enum: [PERMANENT_FAILURE, ATTEMPTS_EXHAUSTED]
+        created_at:
+          type: string
+          format: date-time
+          description: The instant the job became DEAD_LETTERED, and the keyset pagination key.
+        terminal_attempt_id: { type: [string, 'null'], format: uuid }
+        attempt_number: { type: [integer, 'null'] }
+        attempt_status: { type: [string, 'null'] }
+        failure_class: { type: [string, 'null'] }
+        error_code: { type: [string, 'null'] }
+        error_message: { type: [string, 'null'] }
+        replay_count:
+          type: integer
+          minimum: 0
+          description: |
+            How many replacement jobs this entry has produced. Different
+            idempotency keys deliberately create different replacements, so this
+            can legitimately exceed one.
+
+    DLQPage:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/DLQEntry' }
+        next_cursor:
+          type: string
+          description: |
+            Absent on the last page. A full page is not proof more exist; the
+            presence of this cursor is.
+
+    Replay:
+      type: object
+      required: [original_job_id, replacement, replayed]
+      properties:
+        original_job_id:
+          type: string
+          format: uuid
+          description: The terminal job, which this operation never mutates.
+        replacement: { $ref: '#/components/schemas/Job' }
+        replayed:
+          type: boolean
+          description: True when this replay identity had already created the replacement.
+
     Readiness:
       type: object
       properties:
@@ -1050,6 +1945,12 @@ components:
                 - lease_expired
                 - state_conflict
                 - renewal_conflict
+                - attempt_timed_out
+                - outcome_conflict
+                - job_not_cancelable
+                - job_not_dead_lettered
+                - invalid_cursor
+                - cancellation_requested
               description: Stable machine-readable code. Branch on this, not on `message`.
             message: { type: string }
             details:

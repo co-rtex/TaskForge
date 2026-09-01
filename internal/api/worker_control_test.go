@@ -24,8 +24,10 @@ type fakeWorkerControl struct {
 	heartbeat func(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
 	claim     func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
 	renew     func(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
-	start     func(context.Context, string, workers.Fence) error
+	start     func(context.Context, string, workers.Fence) (workers.StartResult, error)
 	succeed   func(context.Context, string, workers.Fence) error
+	fail      func(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
+	cancelAck func(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 }
 
 func (f *fakeWorkerControl) Register(ctx context.Context, scope string, req workers.Registration) (workers.Session, error) {
@@ -40,11 +42,17 @@ func (f *fakeWorkerControl) Claim(ctx context.Context, scope string, req workers
 func (f *fakeWorkerControl) RenewLease(ctx context.Context, scope string, req workers.RenewalRequest) (workers.RenewalResult, error) {
 	return f.renew(ctx, scope, req)
 }
-func (f *fakeWorkerControl) Start(ctx context.Context, scope string, fence workers.Fence) error {
+func (f *fakeWorkerControl) Start(ctx context.Context, scope string, fence workers.Fence) (workers.StartResult, error) {
 	return f.start(ctx, scope, fence)
 }
 func (f *fakeWorkerControl) Succeed(ctx context.Context, scope string, fence workers.Fence) error {
 	return f.succeed(ctx, scope, fence)
+}
+func (f *fakeWorkerControl) Fail(ctx context.Context, scope string, report workers.FailureReport) (workers.OutcomeResult, error) {
+	return f.fail(ctx, scope, report)
+}
+func (f *fakeWorkerControl) AcknowledgeCancellation(ctx context.Context, scope string, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+	return f.cancelAck(ctx, scope, ack)
 }
 
 func newWorkerControlHandler(control WorkerControl) http.Handler {
@@ -111,8 +119,8 @@ func TestWorkerControl_MapsSessionAndFenceConflictsToStableCodes(t *testing.T) {
 		claim: func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{}, workers.ErrSessionUnavailable
 		},
-		start: func(context.Context, string, workers.Fence) error {
-			return workers.ErrFenceRejected
+		start: func(context.Context, string, workers.Fence) (workers.StartResult, error) {
+			return workers.StartResult{}, workers.ErrFenceRejected
 		},
 	}
 	handler := newWorkerControlHandler(control)
@@ -137,11 +145,15 @@ func TestWorkerControl_MapsSessionAndFenceConflictsToStableCodes(t *testing.T) {
 
 func TestWorkerControl_TransitionUsesThePathAttemptID(t *testing.T) {
 	attemptID := uuid.New()
+	startedAt := time.Now().UTC().Truncate(time.Millisecond)
 	var got workers.Fence
 	control := &fakeWorkerControl{
-		start: func(_ context.Context, _ string, fence workers.Fence) error {
+		start: func(_ context.Context, _ string, fence workers.Fence) (workers.StartResult, error) {
 			got = fence
-			return nil
+			return workers.StartResult{
+				AttemptID: fence.AttemptID, StartedAt: startedAt,
+				TimeoutAt: startedAt.Add(30 * time.Second), Remaining: 30 * time.Second,
+			}, nil
 		},
 	}
 	body := `{"job_id":"` + uuid.NewString() + `","lease_id":"` + uuid.NewString() +
@@ -149,8 +161,16 @@ func TestWorkerControl_TransitionUsesThePathAttemptID(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	newWorkerControlHandler(control).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost,
 		"/internal/v1/attempts/"+attemptID.String()+"/start", strings.NewReader(body)))
-	require.Equal(t, http.StatusNoContent, recorder.Code)
+	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, attemptID, got.AttemptID)
+
+	// Start is no longer an empty 204: the persisted execution deadline is
+	// durable state a worker must be told rather than recompute.
+	var response StartResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Equal(t, attemptID.String(), response.AttemptID)
+	require.Equal(t, startedAt.Add(30*time.Second), response.AttemptTimeoutAt)
+	require.EqualValues(t, 30_000, response.AttemptTimeoutRemainingMillis)
 }
 
 var _ WorkerControl = (*fakeWorkerControl)(nil)

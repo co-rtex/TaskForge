@@ -92,15 +92,18 @@ func TestSubmit_RejectsOversizedBody(t *testing.T) {
 	require.Equal(t, CodePayloadTooLarge, decodeError(t, rec).Error.Code)
 }
 
-func TestSubmit_RejectsScheduledAtAsNotImplemented(t *testing.T) {
+// A well-formed delayed submission now reaches the store, which is why this
+// asserts the validation boundary with a MALFORMED timestamp: this server has no
+// database, so a valid one would fail later for an unrelated reason.
+func TestSubmit_RejectsAMalformedScheduledAt(t *testing.T) {
 	rec := post(t, newTestServer(t),
-		`{"queue":"default","job_type":"demo.echo","payload":{},"scheduled_at":"2030-01-01T00:00:00Z"}`,
+		`{"queue":"default","job_type":"demo.echo","payload":{},"scheduled_at":"2030-01-01"}`,
 		map[string]string{"Idempotency-Key": "k1"})
 	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
 
 	body := decodeError(t, rec)
 	require.Equal(t, "scheduled_at", body.Error.Details[0].Field)
-	require.Contains(t, body.Error.Details[0].Message, "not implemented")
+	require.Contains(t, body.Error.Details[0].Message, "RFC 3339")
 }
 
 func TestErrorsCarryRequestID(t *testing.T) {

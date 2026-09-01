@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -22,8 +23,10 @@ type ControlPlane interface {
 	Heartbeat(context.Context, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
 	Claim(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
 	RenewLease(context.Context, workers.RenewalRequest) (workers.RenewalResult, error)
-	Start(context.Context, workers.Fence) error
+	Start(context.Context, workers.Fence) (workers.StartResult, error)
 	Succeed(context.Context, workers.Fence) error
+	Fail(context.Context, workers.FailureReport) (workers.OutcomeResult, error)
+	AcknowledgeCancellation(context.Context, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 	Ping(context.Context) error
 }
 
@@ -103,11 +106,49 @@ func (c *Client) Heartbeat(ctx context.Context, request workers.HeartbeatRequest
 	if response.LastHeartbeatAt.IsZero() {
 		return workers.HeartbeatResult{}, fmt.Errorf("control plane returned no heartbeat receipt time")
 	}
+	directives, err := parseCancellationDirectives(response.Cancellations)
+	if err != nil {
+		return workers.HeartbeatResult{}, err
+	}
 	return workers.HeartbeatResult{
 		SessionID:       sessionID,
 		Status:          workers.SessionStatus(response.Status),
 		LastHeartbeatAt: response.LastHeartbeatAt,
+		Cancellations:   directives,
 	}, nil
+}
+
+// parseCancellationDirectives rejects a directive that is not fully identified.
+//
+// A directive is acted on by cancelling a running handler, so a malformed one is
+// not something to interpret generously: the worker would either cancel nothing
+// or, worse, be unable to tell which attempt it was told about.
+func parseCancellationDirectives(
+	responses []api.CancellationDirectiveResponse,
+) ([]workers.CancellationDirective, error) {
+	if len(responses) == 0 {
+		return nil, nil
+	}
+	directives := make([]workers.CancellationDirective, 0, len(responses))
+	for _, response := range responses {
+		jobID, err := uuid.Parse(response.JobID)
+		if err != nil {
+			return nil, fmt.Errorf("control plane returned an invalid cancellation job id: %w", err)
+		}
+		attemptID, err := uuid.Parse(response.AttemptID)
+		if err != nil {
+			return nil, fmt.Errorf("control plane returned an invalid cancellation attempt id: %w", err)
+		}
+		leaseID, err := uuid.Parse(response.LeaseID)
+		if err != nil {
+			return nil, fmt.Errorf("control plane returned an invalid cancellation lease id: %w", err)
+		}
+		directives = append(directives, workers.CancellationDirective{
+			JobID: jobID, AttemptID: attemptID, LeaseID: leaseID,
+			CancelRequestedAt: response.CancelRequestedAt,
+		})
+	}
+	return directives, nil
 }
 
 // RenewLease extends one lease window and reports the server-measured remaining
@@ -279,23 +320,158 @@ func executionBudget(remaining time.Duration) time.Duration {
 	return remaining - margin
 }
 
-func (c *Client) Start(ctx context.Context, fence workers.Fence) error {
-	return c.transition(ctx, "start", fence)
+// Start moves the attempt to RUNNING and returns its persisted execution
+// deadline.
+//
+// The remaining budget comes from PostgreSQL, measured after every authority
+// lock. The worker must derive its local deadline from that value rather than
+// starting a fresh timer from timeout_seconds once this response lands, or it
+// would silently grant itself the round trip back on every attempt — and on
+// every ambiguous retry, the whole budget again.
+func (c *Client) Start(ctx context.Context, fence workers.Fence) (workers.StartResult, error) {
+	body := fenceBody(fence)
+	var response api.StartResponse
+	if err := c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/attempts/"+fence.AttemptID.String()+"/start", body, &response); err != nil {
+		return workers.StartResult{}, err
+	}
+	return parseStartResult(fence, response)
+}
+
+func parseStartResult(fence workers.Fence, response api.StartResponse) (workers.StartResult, error) {
+	attemptID, err := uuid.Parse(response.AttemptID)
+	if err != nil {
+		return workers.StartResult{}, fmt.Errorf("control plane returned invalid attempt id: %w", err)
+	}
+	// A response about a different attempt is not an answer to this request, and
+	// converting it into an execution deadline would run one attempt's handler
+	// against another attempt's budget.
+	if attemptID != fence.AttemptID {
+		return workers.StartResult{}, fmt.Errorf("control plane started a different attempt")
+	}
+	if response.AttemptTimeoutRemainingMillis < 0 {
+		return workers.StartResult{}, fmt.Errorf("control plane returned a negative attempt timeout window")
+	}
+	if response.AttemptTimeoutAt.IsZero() || response.StartedAt.IsZero() {
+		return workers.StartResult{}, fmt.Errorf("control plane returned no attempt execution deadline")
+	}
+	return workers.StartResult{
+		AttemptID: attemptID,
+		StartedAt: response.StartedAt,
+		TimeoutAt: response.AttemptTimeoutAt,
+		Remaining: time.Duration(response.AttemptTimeoutRemainingMillis) * time.Millisecond,
+		Replayed:  response.Replayed,
+	}, nil
 }
 
 func (c *Client) Succeed(ctx context.Context, fence workers.Fence) error {
 	return c.transition(ctx, "succeed", fence)
 }
 
-func (c *Client) transition(ctx context.Context, operation string, fence workers.Fence) error {
+// Fail reports one fenced terminal failure.
+//
+// Retrying an ambiguous response MUST reuse the same outcome request id, class,
+// code, and message. A fresh identity would consume a second place in the
+// attempt budget and draw fresh jitter for a different retry instant.
+func (c *Client) Fail(ctx context.Context, report workers.FailureReport) (workers.OutcomeResult, error) {
 	body := struct {
+		JobID            string `json:"job_id"`
+		LeaseID          string `json:"lease_id"`
+		WorkerID         string `json:"worker_id"`
+		WorkerSessionID  string `json:"worker_session_id"`
+		OutcomeRequestID string `json:"outcome_request_id"`
+		FailureClass     string `json:"failure_class"`
+		ErrorCode        string `json:"error_code"`
+		ErrorMessage     string `json:"error_message"`
+	}{
+		report.Fence.JobID.String(), report.Fence.LeaseID.String(),
+		report.Fence.WorkerID.String(), report.Fence.SessionID.String(),
+		report.OutcomeRequestID.String(), string(report.Class),
+		report.ErrorCode, report.ErrorMessage,
+	}
+	var response api.OutcomeResponse
+	if err := c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/attempts/"+report.Fence.AttemptID.String()+"/fail", body, &response); err != nil {
+		return workers.OutcomeResult{}, err
+	}
+	return parseOutcome(report.Fence, response)
+}
+
+// AcknowledgeCancellation confirms this worker stopped a canceled attempt.
+func (c *Client) AcknowledgeCancellation(ctx context.Context, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+	body := struct {
+		JobID            string `json:"job_id"`
+		LeaseID          string `json:"lease_id"`
+		WorkerID         string `json:"worker_id"`
+		WorkerSessionID  string `json:"worker_session_id"`
+		OutcomeRequestID string `json:"outcome_request_id"`
+	}{
+		ack.Fence.JobID.String(), ack.Fence.LeaseID.String(),
+		ack.Fence.WorkerID.String(), ack.Fence.SessionID.String(),
+		ack.OutcomeRequestID.String(),
+	}
+	var response api.OutcomeResponse
+	if err := c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/attempts/"+ack.Fence.AttemptID.String()+"/cancel", body, &response); err != nil {
+		return workers.OutcomeResult{}, err
+	}
+	return parseOutcome(ack.Fence, response)
+}
+
+// parseOutcome rejects an outcome response that could not have answered the
+// request that was sent.
+//
+// The retry decision is checked as strictly as the identifiers, because it is
+// the part a worker would otherwise report onward as fact: a response naming
+// another job, or claiming a retry with no instant to retry at, is not something
+// to log as though it were the committed decision.
+func parseOutcome(fence workers.Fence, response api.OutcomeResponse) (workers.OutcomeResult, error) {
+	jobID, err := uuid.Parse(response.JobID)
+	if err != nil {
+		return workers.OutcomeResult{}, fmt.Errorf("control plane returned invalid job id: %w", err)
+	}
+	if jobID != fence.JobID {
+		return workers.OutcomeResult{}, fmt.Errorf("control plane reported an outcome for a different job")
+	}
+	if response.JobStatus == "" || response.AttemptStatus == "" {
+		return workers.OutcomeResult{}, fmt.Errorf("control plane returned no outcome status")
+	}
+	if (response.RetryAt == nil) != (response.RetryDelayMillis == nil) {
+		return workers.OutcomeResult{}, fmt.Errorf("control plane returned an incomplete retry decision")
+	}
+	if response.RetryAt != nil && response.JobStatus != "RETRY_WAIT" && response.JobStatus != "QUEUED" {
+		return workers.OutcomeResult{}, fmt.Errorf(
+			"control plane returned a retry decision for a %s job", response.JobStatus)
+	}
+	result := workers.OutcomeResult{
+		JobID:         jobID,
+		JobStatus:     response.JobStatus,
+		AttemptStatus: workers.AttemptStatus(response.AttemptStatus),
+		RetryAt:       response.RetryAt,
+		Replayed:      response.Replayed,
+	}
+	if response.RetryDelayMillis != nil {
+		delay := time.Duration(*response.RetryDelayMillis) * time.Millisecond
+		result.RetryDelay = &delay
+	}
+	if response.DeadLetterReason != nil {
+		result.DeadLetterReason = lifecycle.DLQReason(*response.DeadLetterReason)
+	}
+	return result, nil
+}
+
+func (c *Client) transition(ctx context.Context, operation string, fence workers.Fence) error {
+	return c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/attempts/"+fence.AttemptID.String()+"/"+operation, fenceBody(fence), nil)
+}
+
+func fenceBody(fence workers.Fence) any {
+	return struct {
 		JobID           string `json:"job_id"`
 		LeaseID         string `json:"lease_id"`
 		WorkerID        string `json:"worker_id"`
 		WorkerSessionID string `json:"worker_session_id"`
 	}{fence.JobID.String(), fence.LeaseID.String(), fence.WorkerID.String(), fence.SessionID.String()}
-	return c.doJSON(ctx, http.MethodPost,
-		"/internal/v1/attempts/"+fence.AttemptID.String()+"/"+operation, body, nil)
 }
 
 func (c *Client) Ping(ctx context.Context) error {

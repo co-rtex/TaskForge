@@ -27,6 +27,25 @@ const (
 	CodeLeaseExpired        = "lease_expired"
 	CodeStateConflict       = "state_conflict"
 	CodeRenewalConflict     = "renewal_conflict"
+	// CodeAttemptTimedOut is distinct from lease_expired on purpose. The lease may
+	// be perfectly valid and freshly renewed; what has run out is the attempt's
+	// own execution budget, which renewal never extends.
+	CodeAttemptTimedOut = "attempt_timed_out"
+	// CodeOutcomeConflict reports a terminal outcome identity reused for a
+	// different attempt, or replayed with a different body.
+	CodeOutcomeConflict = "outcome_conflict"
+	// CodeNotCancelable reports a cancellation or replay refused because the job
+	// is in the wrong terminal state for it.
+	CodeNotCancelable = "job_not_cancelable"
+	// CodeNotDeadLettered reports a replay of a job that is not in the DLQ.
+	CodeNotDeadLettered = "job_not_dead_lettered"
+	// CodeInvalidCursor reports a pagination cursor this API did not issue.
+	CodeInvalidCursor = "invalid_cursor"
+	// CodeCancellationRequested reports that cancellation won before the attempt
+	// could start. It is separate from state_conflict because the worker's
+	// correct response differs: acknowledge the cancellation rather than drop
+	// the attempt.
+	CodeCancellationRequested = "cancellation_requested"
 )
 
 // ErrorBody is the single error shape every endpoint returns.
