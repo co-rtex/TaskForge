@@ -35,7 +35,7 @@ Six binaries build and run:
   or dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0010`. M4 adds two:
+The schema consists of migrations `0001` through `0011`. M4 adds three:
 
 - `0009_job_lifecycle.sql` — scheduling, cancellation, replay linkage, and
   notification bookkeeping on `jobs`; a persisted execution deadline, a
@@ -46,6 +46,25 @@ The schema consists of migrations `0001` through `0010`. M4 adds two:
 - `0010_logical_dlq_and_replay.sql` — `dlq_entries` (unique per job) and
   `dlq_replays` (keyed by scope, original job, and idempotency key), plus a
   backfill of every existing `DEAD_LETTERED` job into the DLQ.
+- `0011_lifecycle_integrity_and_truthful_backfill.sql` — three corrections to
+  what `0009` and `0010` shipped, carried forward rather than edited into them,
+  because a published migration has been applied somewhere by definition and
+  editing one breaks the runner's checksum enforcement on every database that
+  already ran it:
+  - the `outbox_events` notification-metadata `CHECK` is replaced with one that
+    states `notification_generation IS NOT NULL` explicitly. A `CHECK` rejects
+    only `FALSE`, so `notification_generation >= 1` evaluated to `NULL` and was
+    accepted, leaving a job id paired with no generation.
+  - `jobs.notification_generation` and `jobs.last_notification_at`, and every
+    `work.available` event's generation, are reconstructed from the actual
+    ordering of historical events rather than from job creation time. The
+    reconstruction runs only on a database still carrying `0009`'s exact
+    fingerprint, so it can never rewrite generations M4 has since moved.
+  - composite foreign keys make the DLQ and replay relationships
+    database-enforced: a dead-letter entry's terminal attempt must belong to
+    that exact job, a replay's original and replacement must both belong to the
+    recorded scope, a job's `replayed_from_job_id` cannot cross scopes, and a
+    `dlq_replays` row and its replacement job must name the same original.
 
 ## Implemented behavior
 
@@ -102,6 +121,17 @@ Everything recorded for M1, M2, and M3 still holds. What M4 adds:
   released when a lease renews again. An outcome identity is the permanent record
   of one terminal decision, so nothing releases it. See
   [ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md).
+- Recognizing committed history is separate from exercising live authority. An
+  exact replay of a committed `Succeed`, `Fail`, or cancellation acknowledgment
+  returns its stored result **after session replacement, after lease closure, and
+  after lease expiry** — the ordinary consequences of the network failure that
+  lost the response in the first place. The complete stored job, attempt, lease,
+  worker, and session fence and the exact identity and body are verified before
+  history is returned; a changed body is `outcome_conflict`, and a foreign
+  identity or a different fence is `fence_rejected`.
+- A first-time outcome still requires current authority. From a replaced boot,
+  `Start`, `Succeed`, `Fail`, and cancellation acknowledgment are all
+  `fence_rejected` when nothing has committed for that attempt yet.
 
 ### Per-attempt execution deadlines
 
@@ -153,6 +183,13 @@ Everything recorded for M1, M2, and M3 still holds. What M4 adds:
 - The worker registers an attempt in a cancellation registry **before** Start, so
   a directive that wins the window between a claim committing and the handler
   being invoked is retained rather than dropped.
+- A cancellation that wins before Start is refused by the control plane with its
+  own stable code, `cancellation_requested`, distinct from `state_conflict`.
+  Every other conflict Start can report means the worker no longer holds the
+  attempt, so dropping it is right; this one means the opposite. The worker
+  acknowledges with the full five-part fence and one reusable outcome identity,
+  and only then unregisters the attempt. The directive may never have reached
+  that process, so Start's own answer has to be sufficient on its own.
 - A cooperative worker acknowledges through a dedicated fenced operation: job
   `CANCEL_REQUESTED → CANCELED`, attempt `CANCELED`, lease `RELEASED`. An attempt
   canceled between claim and start truthfully has no start time.
@@ -288,12 +325,24 @@ into domain logic. See [.env.example](../.env.example).
 | `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` | `60s` | ≥ 3 × poll interval, and ≥ `TASKFORGE_OUTBOX_CLAIM_TIMEOUT` |
 | `TASKFORGE_JOB_RETRY_BASE` | `1s` | must be positive |
 | `TASKFORGE_JOB_RETRY_MAX` | `5m` | ≥ `TASKFORGE_JOB_RETRY_BASE` |
-| `TASKFORGE_JOB_RETRY_MULTIPLIER` | `2.0` | ≥ 1 |
-| `TASKFORGE_JOB_RETRY_JITTER` | `0.2` | between 0 and 1 |
+| `TASKFORGE_JOB_RETRY_MULTIPLIER` | `2.0` | finite, and ≥ 1 |
+| `TASKFORGE_JOB_RETRY_JITTER` | `0.2` | finite, and between 0 and 1 |
 
 The two re-notification rules exist so a repair cannot fire before an ordinary
 delivery has had several chances, and cannot decide an event was lost while a
 publisher is still in the middle of publishing it.
+
+Every float setting is checked for finiteness separately from, and before, its
+range. `strconv.ParseFloat` accepts `NaN`, `Inf`, `+Inf`, and `-Infinity`
+without error, and a `NaN` compares false against every bound, so a range check
+alone admits one. The same applies to `TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER` and
+`TASKFORGE_OUTBOX_BACKOFF_JITTER`. There are three defences: parsing falls back
+to the documented default, `Config.Validate` and `RetryPolicy.Validate` both
+reject a non-finite value by name, and `RetryPolicy.Delay` clamps a non-finite
+sample from the injected jitter source. The last matters because converting a
+`NaN` to a `time.Duration` is architecture-dependent — amd64 yields the most
+negative `int64`, arm64 saturates to zero — so the same policy would otherwise
+schedule differently on different machines.
 
 ## API surface added in M4
 
@@ -309,10 +358,27 @@ response gains typed cancellation directives. There is deliberately no generic
 "set status" endpoint and no worker-authoritative timeout endpoint.
 
 New stable error codes: `attempt_timed_out`, `outcome_conflict`,
-`job_not_cancelable`, `job_not_dead_lettered`, `invalid_cursor`.
+`job_not_cancelable`, `job_not_dead_lettered`, `invalid_cursor`,
+`cancellation_requested`.
 [api/openapi.yaml](../api/openapi.yaml) is version `0.4.0-m4` and documents only
 implemented behavior, including a per-endpoint ambiguity contract that forbids a
 fresh outcome identity after a `503`.
+
+The three public mutating routes — `POST /v1/jobs/{job_id}/cancel`,
+`POST /v1/jobs/{job_id}/retry`, and `POST /v1/dlq/{job_id}/replay` — classify a
+deadline that elapsed inside the operation and answer a sanitized `503`
+`service_unavailable` with endpoint-specific guidance, rather than a `500` that
+tells an operator nothing about whether to try again. Only the error the
+operation returned is classified; `ctx.Err()` is never consulted, so an
+unrelated failure that merely finished after a deadline elapsed keeps its own
+identity. Cancellation's guidance is to repeat the identical request for the
+same job id, because scope plus job id is its whole identity. Retry and replay
+share one identity namespace, so their guidance is to repeat the complete
+identical request on the same path with the same `Idempotency-Key`; a fresh key
+after an ambiguous response is forbidden, because it is a different replay
+identity and silently creates a second replacement job. No message claims
+nothing was committed — a deadline can land during COMMIT, and that is
+genuinely ambiguous.
 
 ## Verification
 
@@ -344,6 +410,19 @@ revised timeline rule is pinned in both directions: a claimed-but-never-started
 attempt may be `CANCELED`, while `SUCCEEDED`, `FAILED`, and `TIMED_OUT` still
 require a start time.
 
+Migrations `0009` and `0010` are pinned to the checksums of their first
+published bytes, so an edit to a shipped file fails here rather than only on a
+database that already applied it.
+
+Every relationship migration `0011` adds is checked negatively as well as
+positively: a dead-letter entry naming another job's attempt, or another
+tenant's attempt; a job whose replay source lives in another scope; a replay row
+whose original or replacement belongs to another scope; and lineage connecting
+two unrelated jobs — a replacement that is nobody's, and one that is somebody
+else's. Every rejection is paired with a positive control differing only in the
+field under test, and the same invariants are checked once more against a replay
+the production path actually wrote.
+
 The upgrade rehearsal seeds a database at migration `0008` with what a running
 M3 deployment actually holds — queued work, a running attempt under a renewed
 lease, an abandoned attempt, an ADR-0009 dead-lettered job, and both a pending
@@ -354,6 +433,19 @@ that a mid-flight attempt gains no invented deadline, that outbox events resolve
 from their payload hint or resolve to nothing rather than to something invented,
 and that a rerun changes nothing. A separate test proves an idempotency
 fingerprint recorded before this milestone still replays its original job.
+
+A second upgrade rehearsal covers what one notification per job gets wrong. It
+seeds jobs that were abandoned and requeued, with two and three historical
+`work.available` events each and both pending and published states among them,
+and proves that after the upgrade generations follow the real order the events
+were created, the newest transition is the job's current generation, and
+`last_notification_at` is when the job was last advertised rather than when it
+was created. It then runs the real scheduler query against the upgraded
+database: a job advertised thirty seconds ago is not re-notified and not
+restamped; a stale pending event from a transition that is over no longer
+suppresses the repair of the current one; a pending event **at** the current
+generation still does; and a plainly stranded job is still repaired, which is
+what makes the first result a real answer rather than an inert pass.
 
 **Unit and contract.** Backoff grows exponentially, clamps at the maximum, and
 stays bounded at attempt numbers where `math.Pow` returns `+Inf` — including the
@@ -378,8 +470,23 @@ a malformed cancellation directive.
 
 OpenAPI parses with every implemented public and internal route, every stable
 error code, a per-endpoint ambiguous-retry contract for all eight worker-control
-operations, the shared replay identity namespace, and the two cancellation facts
+operations and all three public mutating operations, the shared replay identity
+namespace, the typed cancel-first Start refusal, and the two cancellation facts
 a spec most easily loses.
+
+Configuration and retry-policy tests cover every non-finite float: `NaN`, `Inf`,
+`+Inf`, `-Inf`, and `Infinity` from the environment fall back to the documented
+default; `Config.Validate` and `RetryPolicy.Validate` both reject one by name
+rather than by range; and `Delay` stays inside `[0, Max]` for every sample an
+injected jitter source can physically return, including `NaN`, both infinities,
+and values outside the `[0, 1)` contract.
+
+Worker-runner tests cover the cancel-first Start refusal with no directive
+delivered at all — as the typed sentinel and as the `cancellation_requested`
+code a DB-less worker actually receives over HTTP — and prove the acknowledgment
+carries the full five-part fence, reuses one outcome identity across an
+ambiguous retry, and unregisters the attempt only afterwards. Four unrelated
+Start refusals are the control: none of them may produce an acknowledgment.
 
 **PostgreSQL integration.** Retry enters `RETRY_WAIT` with both the chosen delay
 and the instant it produced persisted, with no notification until promotion.
@@ -390,6 +497,15 @@ same helper. A replayed failure returns the committed decision without moving a
 stored field, consuming budget again, or creating a second entry; reusing an
 outcome identity for another attempt, or replaying it with a changed body, is a
 stable conflict.
+
+Success, failure, and cancellation-acknowledgment replays are each proved to
+return their stored result after the worker session was replaced **and** after
+the lease expired, changing nothing durable. The same tests pin the boundary
+from the other side: a changed classification, code, or message is
+`outcome_conflict`; a fresh identity or any of the five fence parts being wrong
+is refused; and from a replaced boot with nothing yet committed, `Start`,
+`Succeed`, `Fail`, and acknowledgment are all `fence_rejected` with the attempt
+left exactly as it was.
 
 Start stamps a PostgreSQL-measured deadline once and an ambiguous retry returns
 the original; renewal never moves it and is refused once it passes; a due
@@ -424,6 +540,19 @@ identical requests on separate connections create exactly one replacement and
 leave no orphan; and `/retry` and `/replay` share one identity namespace through
 the real HTTP surface.
 
+Each of the three public mutating routes is driven into a genuine deadline —
+its write parked behind an advisory-lock gate while the API's own request
+timeout elapses — and must answer `503 service_unavailable` with its own
+guidance rather than `500`. The control is the other direction: a live job that
+is not replayable and a terminal job that is not cancelable keep their stable
+`409`s, on the wire and in the store, and neither carries the deadline
+sentinel. A committed-but-response-unknown test then follows each route's
+printed guidance: repeating the identical cancellation returns the same decision
+with the same instant and creates no attempt, and repeating a replay with the
+same key through either route returns the replacement that already exists —
+while a fresh key creates a second one, which is exactly why the guidance
+forbids it.
+
 **Contention.** Timeout versus success, cancel versus success, failure versus
 renewal, cancellation versus renewal, cancellation versus start, promotion
 versus cancellation, re-notification versus claim, and re-notification versus
@@ -434,7 +563,7 @@ reported under a freshly renewed lease commits, and cancelling a job whose lease
 was just renewed commits. Asserting only the rejections would have made the
 suite agree with an implementation that refused valid work.
 
-**End-to-end, against real PostgreSQL and real ElasticMQ.** Seven tests wire the
+**End-to-end, against real PostgreSQL and real ElasticMQ.** Eight tests wire the
 real API, the real outbox publisher, the real scheduler, the real reconciler, and
 real DB-less workers, and assert durable state rather than status codes: retry
 recovering through the scheduler and broker; a delayed job promoted and executed,
@@ -445,6 +574,16 @@ with the broker drained first; a timeout recorded while an uncooperative handler
 is still running, followed by that handler failing to commit anything when it
 finally returns; and a permanent failure listed in the DLQ, replayed through the
 public API, and completed as a new job.
+
+The eighth is the cancel-first race, run through the whole chain. A transparent
+proxy in front of the real API holds the worker's Start request — and its
+heartbeats, so no directive can reach the worker that way — long enough for a
+real operator cancellation to commit through the public API. It then asserts the
+control plane answered `409 cancellation_requested`, that no heartbeat completed
+in the window, and that the worker acknowledged: the attempt is `CANCELED` with
+no start time, the handler never ran, and the lease is `RELEASED` rather than
+left to lapse to `EXPIRED`. Nothing is faked; only the arrival time of one HTTP
+request is controlled, because the window is otherwise too short to observe.
 
 These tests consume from a broker queue of their own. Their workers legitimately
 decline to acknowledge notifications for work another attempt already took, and

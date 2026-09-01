@@ -233,7 +233,11 @@ Attempt history is preserved. The last error is never overwritten in place.
 The execution deadline is stamped once, when the attempt's start transition
 commits, and lease renewal never moves it. The outcome identity is unique for
 the lifetime of attempt history, which is what makes an ambiguous failure or
-cancellation report safe to retry. Both are
+cancellation report safe to retry. Recognizing a committed outcome is separate
+from exercising live authority, so an exact replay still returns its stored
+result after the session was replaced or the lease closed — the ordinary
+consequences of the failure that lost the response — while a first-time outcome
+from a fenced boot is still refused. All of this is
 [ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md).
 
 Failure detail is bounded and safe by contract, in the schema as well as in Go:
@@ -544,7 +548,15 @@ A cooperative worker acknowledges through a dedicated fenced operation carrying
 its own retained outcome identity: job `CANCEL_REQUESTED → CANCELED`, attempt
 `CANCELED`, lease `RELEASED`. An attempt canceled between claim and start
 truthfully has no start time, which is why migration 0009 revised the timeline
-constraint. If the worker is gone or uncooperative, renewal is already refused,
+constraint.
+
+A cancellation that wins before Start reaches the control plane is refused with
+its own code, `cancellation_requested`, rather than a generic state conflict.
+The distinction is load-bearing: every other conflict Start can report means the
+worker no longer holds the attempt, so dropping it is right, while this one
+means the worker still holds it and is the only party that can end it promptly.
+The directive may never have reached that process, so Start's answer has to be
+sufficient on its own. If the worker is gone or uncooperative, renewal is already refused,
 the lease lapses, and reconciliation finalizes the same transition with the
 lease recorded `EXPIRED`.
 
@@ -736,7 +748,7 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0010`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0011`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
 `job_attempts`, `leases`, `dlq_entries`, and `dlq_replays`, plus
 `schema_migrations` maintained by the runner.
@@ -759,6 +771,23 @@ attempt may be `CANCELED` — inventing a start time to satisfy the old rule wou
 have put a lie in attempt history. Migration 0010 backfills every M3
 `DEAD_LETTERED` job into `dlq_entries`, because ADR-0009 made that state
 reachable one milestone before the DLQ that reads it.
+
+Migration 0011 corrects three things 0009 and 0010 got wrong, forward-only,
+because a published migration has been applied somewhere by definition and
+editing one breaks the runner's checksum enforcement on every database that
+already ran it (AGENTS.md section 6). It replaces the `outbox_events`
+notification-metadata `CHECK`, which accepted the exact unpaired row it existed
+to refuse because a `CHECK` rejects only `FALSE` and `NULL >= 1` is `NULL`. It
+reconstructs notification generations and `last_notification_at` from the real
+ordering of historical `work.available` events instead of from job creation
+time, which was only correct for a job that was never requeued — and it does so
+only on a database still carrying 0009's exact fingerprint, so it can never
+rewrite generations M4 has since moved. And it makes the DLQ and replay
+relationships database-enforced through composite foreign keys: a dead-letter
+entry's terminal attempt must belong to that exact job, a replay's original and
+replacement must both belong to the recorded scope, `replayed_from_job_id`
+cannot cross scopes, and a `dlq_replays` row and its replacement job must name
+the same original, so the two records of one replay cannot disagree.
 
 **Planned:** `results`, `api_keys`, `audit_events`.
 

@@ -68,6 +68,59 @@ Server-detected outcomes — timeout and abandonment — carry no identity, beca
 nobody requested them. Their idempotency comes from the attempt no longer being
 `LEASED` or `RUNNING` once the transition commits.
 
+### Recognizing committed history is separate from exercising live authority
+
+Reporting an outcome for the first time is a mutation, and a mutation requires
+current authority: the worker session must be `HEALTHY` and the lease must still
+be in force, or a replaced boot could overwrite work its replacement is doing.
+Recognizing an outcome that has **already committed** is not a mutation. It
+reads immutable history and returns what is stored.
+
+These are two different questions, and answering them with one check made the
+retained identity useless in exactly the cases it exists for. A response is lost
+precisely when the network is bad; the worker then reconnects, and reconnecting
+is what replaces its session and lapses its lease. A replay refused because the
+fence is no longer live is a replay refused in every situation it was built for.
+
+So the authority rows are read and validated first, and the liveness of the
+session is recorded rather than enforced. If the stored job, attempt, and lease
+states are exactly the ones this outcome produced, and the retained identity and
+the reported body match exactly, the stored result is returned — after a session
+replacement, after lease closure, and after lease expiry. Only if that
+recognition does not apply is live authority required, and a first-time outcome
+from a fenced boot is still `fence_rejected`.
+
+Recognition is exact, not lenient. A different fence, a different retained
+identity, or a changed classification, code, or message is a deterministic
+conflict whether or not the session is healthy. `Succeed` has no body and no
+identity, so its recognition is the committed triple itself — job `SUCCEEDED`,
+attempt `SUCCEEDED`, lease `COMPLETED` — under the same fence.
+
+### A cancellation that wins before Start is a typed refusal
+
+Cancellation can win in the window between a claim committing and the worker's
+`Start` reaching the control plane. `Start` then refuses, and the refusal must
+be distinguishable from every other reason `Start` can refuse.
+
+Every other conflict — a replaced session, an expired lease, an attempt that is
+no longer `LEASED` — means this worker no longer holds the attempt, so dropping
+it is correct. A cancellation that won means the opposite: the worker still
+holds the attempt, and it is the only party that can end it promptly. A worker
+that cannot tell the two apart drops the attempt, and the job sits in
+`CANCEL_REQUESTED` until its lease lapses with a cooperative worker right
+there — the exact wait the acknowledgment exists to avoid.
+
+`Start` therefore returns a dedicated error, rendered as the stable API code
+`cancellation_requested`, and the worker acknowledges with the full five-part
+fence and one reusable outcome identity before unregistering the attempt. The
+directive may never have reached that process at all, so `Start`'s own answer
+has to be sufficient on its own.
+
+This applies to `Start` and to nothing else. By the time a worker reports a
+success or a failure it has been executing, and a running attempt learns of a
+cancellation over its own heartbeat; `Start` is the one transition where the
+control plane is the worker's only possible source of truth.
+
 ### Precedence is fixed and stated
 
 Under the authority locks, against one post-lock `clock_timestamp()` sample:
@@ -162,7 +215,9 @@ it.
 carries one more UUID per terminal outcome for as long as attempt history is
 kept. That is the cost of making the replay window unbounded rather than
 one-generation-wide as renewal's is, and it is the right trade for a decision
-that is permanent.
+that is permanent. "Unbounded" now means what it says: the replay survives
+session replacement and lease closure, because those are the ordinary
+consequences of the network failure that lost the response in the first place.
 
 Nothing here changes ADR-0009. An abandoned attempt still consumes the attempt
 budget and still requeues immediately with no backoff; only the budget
