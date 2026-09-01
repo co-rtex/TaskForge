@@ -560,14 +560,28 @@ func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err err
 	if err := ValidateFence(fence); err != nil {
 		return err
 	}
-	tx, state, err := s.lockFence(ctx, scope, fence)
+	// lockAuthorityRows rather than lockFence: recognizing a success that already
+	// committed is a read of immutable history, and history does not stop being
+	// true when the reporting process is replaced. The mutation below still
+	// requires live authority.
+	tx, state, err := s.lockAuthorityRows(ctx, scope, fence)
 	if err != nil {
 		return err
 	}
 	defer rollback(ctx, tx)
 
+	// An exact replay. There is no separate outcome identity here because for
+	// success the complete fence IS the identity: lockAuthorityRows matched
+	// lease, job, attempt, worker, session, and scope together, so reaching this
+	// point with the committed terminal triple means this exact caller's exact
+	// outcome is what is stored.
 	if state.jobStatus == "SUCCEEDED" && state.attemptStatus == AttemptSucceeded && state.leaseStatus == LeaseCompleted {
 		return tx.Commit(ctx)
+	}
+	// Everything past here mutates, so it is an assertion of live authority and
+	// a replaced session must be refused.
+	if !state.sessionHealthy {
+		return ErrFenceRejected
 	}
 	// The persisted deadline is checked against the SAME post-lock sample that
 	// every other authority decision in this transaction uses. A success that
@@ -656,6 +670,17 @@ type fenceState struct {
 	errorMessage     *string
 	retryDelayMillis *int64
 	retryAt          *time.Time
+
+	// sessionHealthy is reported rather than enforced, because the two kinds of
+	// caller need different answers from the same locked rows.
+	//
+	// A transition that MUTATES state is an assertion of live authority and must
+	// be refused once the session has been replaced. Recognizing a terminal
+	// outcome that already committed is not: that outcome is immutable history,
+	// and refusing to repeat it would tell a retrying worker its report never
+	// landed when it did — leaving it no recourse but to send the same identity
+	// forever.
+	sessionHealthy bool
 }
 
 // timedOut reports whether PostgreSQL time has reached this attempt's persisted
@@ -682,14 +707,28 @@ func (s fenceState) leaseUsable() bool {
 // Reconciliation uses lockFenceForReconciliation instead, which takes the same
 // rows in the same order without that requirement.
 func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.Tx, fenceState, error) {
-	return s.lockAuthorityRows(ctx, scope, fence, true)
+	tx, state, err := s.lockAuthorityRows(ctx, scope, fence)
+	if err != nil {
+		return nil, fenceState{}, err
+	}
+	if !state.sessionHealthy {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, fenceState{}, ErrFenceRejected
+	}
+	return tx, state, nil
 }
 
+// lockAuthorityRows takes the same rows in the same order and reports session
+// health rather than enforcing it, leaving the decision to the caller.
+//
+// The complete fence is still verified here: the routing read below matches
+// lease, job, attempt, worker, session, and scope together, so a caller that
+// gets a transaction back has already proven it named the exact binding that
+// exists. What it has NOT proven is that the binding is still live authority.
 func (s *Store) lockAuthorityRows(
 	ctx context.Context,
 	scope string,
 	fence Fence,
-	requireHealthySession bool,
 ) (pgx.Tx, fenceState, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -722,15 +761,15 @@ func (s *Store) lockAuthorityRows(
 		SELECT status FROM worker_sessions
 		WHERE id = $1 AND worker_id = $2 AND scope = $3
 		FOR UPDATE`, fence.SessionID, fence.WorkerID, scope).Scan(&sessionStatus)
-	if errors.Is(err, pgx.ErrNoRows) ||
-		(err == nil && requireHealthySession && sessionStatus != SessionHealthy) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return fail(ErrFenceRejected)
 	}
 	if err != nil {
 		return fail(fmt.Errorf("lock worker session for fenced transition: %w", err))
 	}
+	sessionHealthy := sessionStatus == SessionHealthy
 
-	state := fenceState{queue: queue, scope: scope}
+	state := fenceState{queue: queue, scope: scope, sessionHealthy: sessionHealthy}
 	err = tx.QueryRow(ctx, `
 		SELECT j.status, j.max_attempts, a.status, a.attempt_number, a.timeout_at,
 		       a.outcome_request_id, a.failure_class, a.error_code, a.error_message,

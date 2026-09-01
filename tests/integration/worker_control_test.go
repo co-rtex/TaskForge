@@ -1226,9 +1226,24 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
 		require.Equal(t, "HEALTHY", sessionStatus(t, replacementSessionID))
 
-		// The fenced old boot still cannot mutate anything after replacement.
-		require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence),
-			workers.ErrFenceRejected)
+		// Replacement does not retract history. The success is committed, so an
+		// exact replay of it still recognizes the committed triple and answers
+		// the same way, which is what makes a lost response safe to retry across
+		// a worker restart.
+		require.NoError(t, store.Succeed(context.Background(), testScope, fence),
+			"a committed success replays after its session was replaced")
+		require.Equal(t, "SUCCEEDED", readState(t, fence).job, "the replay changed nothing")
+		require.Equal(t, 1, countRows(t, "job_attempts"))
+		require.Equal(t, 0, countActiveLeases(t))
+
+		// Recognizing history is not authority. A first-time outcome from the
+		// same fenced boot -- a failure that never committed -- is still refused
+		// at the fence.
+		_, failErr := store.Fail(context.Background(), testScope,
+			failureReport(fence, lifecycle.ClassRetryable, "late", "after replacement"))
+		require.ErrorIs(t, failErr, workers.ErrFenceRejected,
+			"a fenced boot cannot commit a new outcome after replacement")
+		require.Equal(t, "SUCCEEDED", readState(t, fence).attempt)
 	})
 
 }

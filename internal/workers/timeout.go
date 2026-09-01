@@ -168,5 +168,5 @@ func (s *Store) finalizeTimeout(
 // reconciliation serializes against registration, heartbeat, claim, and every
 // fenced transition on that row.
 func (s *Store) lockFenceForReconciliation(ctx context.Context, scope string, fence Fence) (pgx.Tx, fenceState, error) {
-	return s.lockAuthorityRows(ctx, scope, fence, false)
+	return s.lockAuthorityRows(ctx, scope, fence)
 }

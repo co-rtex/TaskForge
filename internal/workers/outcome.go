@@ -41,7 +41,17 @@ func (s *Store) Fail(ctx context.Context, scope string, report FailureReport) (_
 		return OutcomeResult{}, err
 	}
 
-	tx, state, err := s.lockFence(ctx, scope, report.Fence)
+	// lockAuthorityRows, not lockFence: an exact replay is a read of immutable
+	// terminal history and must survive everything that ends live authority —
+	// the lease closing, its window lapsing, and the worker session being
+	// replaced. lockFence would refuse a replaced session before the replay was
+	// even considered, which is how a retrying worker ends up being told its
+	// report never landed when it did.
+	//
+	// The complete fence is still verified: lockAuthorityRows matched lease,
+	// job, attempt, worker, session, and scope together, so a replay is only
+	// recognized for the exact binding that committed it.
+	tx, state, err := s.lockAuthorityRows(ctx, scope, report.Fence)
 	if err != nil {
 		return OutcomeResult{}, err
 	}
@@ -51,9 +61,9 @@ func (s *Store) Fail(ctx context.Context, scope string, report FailureReport) (_
 	// ordering is the opposite of renewal's on purpose. Renewal replays return
 	// live authority, so they must be refused once the lease is gone. A failure
 	// replay returns a decision that is already durable history; refusing it
-	// because the lease has since lapsed would tell a retrying worker its report
-	// never landed when it did, and the worker's only recourse would be to send
-	// the same identity again forever.
+	// because the lease has since lapsed, or because this process boot has been
+	// replaced, would leave the worker no recourse but to send the same identity
+	// forever.
 	if state.outcomeRequestID != nil && *state.outcomeRequestID == report.OutcomeRequestID {
 		result, err := replayedOutcome(state, report)
 		if err != nil {
@@ -71,6 +81,13 @@ func (s *Store) Fail(ctx context.Context, scope string, report FailureReport) (_
 	// otherwise surface as a raw unique violation into a stable domain conflict.
 	if err := s.rejectForeignOutcomeIdentity(ctx, tx, report.OutcomeRequestID, report.Fence.AttemptID); err != nil {
 		return OutcomeResult{}, err
+	}
+
+	// Everything past here mutates, so it is an assertion of live authority and
+	// a replaced session must be refused. Recognizing the replay above needed no
+	// such assertion; recording a FIRST outcome does.
+	if !state.sessionHealthy {
+		return OutcomeResult{}, ErrFenceRejected
 	}
 
 	// A failure observed at or after the deadline must NOT become an ordinary
@@ -141,7 +158,10 @@ func (s *Store) AcknowledgeCancellation(
 		return OutcomeResult{}, err
 	}
 
-	tx, state, err := s.lockFence(ctx, scope, ack.Fence)
+	// lockAuthorityRows for the same reason Fail uses it: an acknowledgment that
+	// already committed is immutable history, and a worker retrying an ambiguous
+	// response must get the stored answer even after its session was replaced.
+	tx, state, err := s.lockAuthorityRows(ctx, scope, ack.Fence)
 	if err != nil {
 		return OutcomeResult{}, err
 	}
@@ -162,6 +182,12 @@ func (s *Store) AcknowledgeCancellation(
 	}
 	if err := s.rejectForeignOutcomeIdentity(ctx, tx, ack.OutcomeRequestID, ack.Fence.AttemptID); err != nil {
 		return OutcomeResult{}, err
+	}
+
+	// Recording a first acknowledgment mutates state, so it asserts live
+	// authority and a replaced session must be refused.
+	if !state.sessionHealthy {
+		return OutcomeResult{}, ErrFenceRejected
 	}
 
 	// A lapsed lease is a real rejection here, unlike in the replay path above:
