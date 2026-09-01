@@ -78,6 +78,12 @@ type RetryPolicy struct {
 }
 
 // Validate reports every unusable setting at once.
+//
+// The finiteness checks are separate from the range checks, and they have to
+// be: NaN compares false against everything, so `p.Multiplier < 1` and
+// `p.Jitter < 0 || p.Jitter > 1` both accept NaN, and `+Inf` sails through the
+// multiplier's lower bound. A policy carrying either would validate cleanly and
+// then compute a delay of NaN, which converts to a nonsensical Duration.
 func (p RetryPolicy) Validate() error {
 	var problems []string
 	if p.Base <= 0 {
@@ -86,10 +92,14 @@ func (p RetryPolicy) Validate() error {
 	if p.Max < p.Base {
 		problems = append(problems, "maximum delay must be at least the base delay")
 	}
-	if p.Multiplier < 1 {
+	if !isFinite(p.Multiplier) {
+		problems = append(problems, "multiplier must be a finite number")
+	} else if p.Multiplier < 1 {
 		problems = append(problems, "multiplier must be at least 1")
 	}
-	if p.Jitter < 0 || p.Jitter > 1 {
+	if !isFinite(p.Jitter) {
+		problems = append(problems, "jitter must be a finite number")
+	} else if p.Jitter < 0 || p.Jitter > 1 {
 		problems = append(problems, "jitter must be between 0 and 1")
 	}
 	if len(problems) > 0 {
@@ -97,6 +107,15 @@ func (p RetryPolicy) Validate() error {
 	}
 	return nil
 }
+
+// IsFinite reports whether v is a real number rather than NaN or an infinity.
+//
+// It is exported because configuration loading needs the same test at the
+// boundary where a float first enters the process, and two implementations of
+// "is this a usable number" would eventually disagree.
+func IsFinite(v float64) bool { return isFinite(v) }
+
+func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // Delay returns how long attempt number n should wait before its replacement
 // becomes eligible. n is 1-based and counts total attempts, so the first
@@ -134,12 +153,29 @@ func (p RetryPolicy) Delay(attemptNumber int, jitter JitterSource) time.Duration
 		delay = float64(max)
 	}
 
-	if jitter != nil && p.Jitter > 0 {
+	// A non-finite fraction is dropped rather than applied. Validate rejects one
+	// at startup, but Delay is also reachable from a policy built in code, and a
+	// NaN fraction here would silently turn every delay into NaN.
+	if jitter != nil && isFinite(p.Jitter) && p.Jitter > 0 {
 		fraction := p.Jitter
 		if fraction > 1 {
 			fraction = 1
 		}
-		delay *= 1 + fraction*(2*jitter.Float64()-1)
+		// The sample comes from an injected interface, so it is input rather
+		// than something this package controls. A NaN or infinite sample would
+		// poison the multiply below and reach the Duration conversion, so it is
+		// clamped into the [0, 1) contract instead of trusted.
+		sample := jitter.Float64()
+		if !isFinite(sample) {
+			sample = 0
+		}
+		if sample < 0 {
+			sample = 0
+		}
+		if sample >= 1 {
+			sample = math.Nextafter(1, 0)
+		}
+		delay *= 1 + fraction*(2*sample-1)
 	}
 
 	if delay < 0 {

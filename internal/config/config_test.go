@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -297,4 +298,75 @@ func TestRetryPolicy_MirrorsTheValidatedSettings(t *testing.T) {
 	// The defaults must themselves be a usable policy, not merely individually
 	// in range.
 	require.NoError(t, baseConfig().RetryPolicy().Validate())
+}
+
+// TestLoad_NonFiniteFloatEnvironmentValuesFallBackToTheDefault covers the first
+// of two independent defences.
+//
+// strconv.ParseFloat accepts "NaN", "Inf", "+Inf", "-Inf", and "Infinity"
+// without error, so a templating accident or a typo puts a non-finite float
+// into the process rather than failing loudly. A NaN then compares false
+// against every bound, so a range check alone lets it straight through into
+// retry arithmetic. Parsing keeps the documented default instead.
+func TestLoad_NonFiniteFloatEnvironmentValuesFallBackToTheDefault(t *testing.T) {
+	for _, raw := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "Infinity", "-Infinity"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", raw)
+			t.Setenv("TASKFORGE_JOB_RETRY_JITTER", raw)
+			t.Setenv("TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER", raw)
+			t.Setenv("TASKFORGE_OUTBOX_BACKOFF_JITTER", raw)
+
+			c, err := Load()
+			require.NoError(t, err, "a non-finite value must not become a usable setting")
+			require.InDelta(t, 2.0, c.JobRetryMultiplier, 1e-9)
+			require.InDelta(t, 0.2, c.JobRetryJitter, 1e-9)
+			require.InDelta(t, 2.0, c.OutboxBackoffMultiplier, 1e-9)
+			require.InDelta(t, 0.2, c.OutboxBackoffJitter, 1e-9)
+			require.NoError(t, c.RetryPolicy().Validate())
+		})
+	}
+}
+
+// TestValidate_RejectsNonFiniteFloats covers the second defence, for a Config
+// built in code rather than parsed from the environment — which is how every
+// test, and every future embedding of this package, constructs one.
+func TestValidate_RejectsNonFiniteFloats(t *testing.T) {
+	nan := math.NaN()
+	posInf := math.Inf(1)
+	negInf := math.Inf(-1)
+
+	for name, mutate := range map[string]func(*Config){
+		"NaN job retry multiplier":  func(c *Config) { c.JobRetryMultiplier = nan },
+		"+Inf job retry multiplier": func(c *Config) { c.JobRetryMultiplier = posInf },
+		"-Inf job retry multiplier": func(c *Config) { c.JobRetryMultiplier = negInf },
+		"NaN job retry jitter":      func(c *Config) { c.JobRetryJitter = nan },
+		"+Inf job retry jitter":     func(c *Config) { c.JobRetryJitter = posInf },
+		"-Inf job retry jitter":     func(c *Config) { c.JobRetryJitter = negInf },
+		"NaN outbox multiplier":     func(c *Config) { c.OutboxBackoffMultiplier = nan },
+		"+Inf outbox multiplier":    func(c *Config) { c.OutboxBackoffMultiplier = posInf },
+		"-Inf outbox multiplier":    func(c *Config) { c.OutboxBackoffMultiplier = negInf },
+		"NaN outbox jitter":         func(c *Config) { c.OutboxBackoffJitter = nan },
+		"+Inf outbox jitter":        func(c *Config) { c.OutboxBackoffJitter = posInf },
+		"-Inf outbox jitter":        func(c *Config) { c.OutboxBackoffJitter = negInf },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := baseConfig()
+			mutate(&c)
+			err := c.Validate()
+			require.Error(t, err, "a non-finite float must never validate")
+			require.Contains(t, err.Error(), "finite",
+				"it must be rejected as non-finite rather than as an out-of-range value")
+		})
+	}
+}
+
+// TestRetryPolicy_CannotCarryANonFiniteFloatPastValidation is the join between
+// the two: a configuration that validates must produce a policy that validates,
+// so no path exists from the environment to non-finite retry arithmetic.
+func TestRetryPolicy_CannotCarryANonFiniteFloatPastValidation(t *testing.T) {
+	c := baseConfig()
+	c.JobRetryMultiplier = math.NaN()
+	require.Error(t, c.Validate())
+	require.Error(t, c.RetryPolicy().Validate(),
+		"the policy must reject what the configuration rejected")
 }

@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -250,3 +251,91 @@ func TestRetryPolicy_OverflowTimesTheLowestJitterFactorIsStillBounded(t *testing
 			"attempt %d exceeded the configured maximum", attempt)
 	}
 }
+
+// TestRetryPolicy_ValidateRejectsNonFiniteFloats covers the values that pass a
+// range check by accident.
+//
+// A NaN compares false against every bound, so `Multiplier < 1` and
+// `Jitter < 0 || Jitter > 1` both admit it. An infinity passes the multiplier
+// bound outright. Both then reach arithmetic that produces a NaN delay and a
+// Duration conversion whose result is architecture-dependent — amd64 yields the
+// most negative int64, arm64 saturates to zero — so the same policy would
+// schedule differently on different machines. They are rejected by name, before
+// any comparison against a bound.
+func TestRetryPolicy_ValidateRejectsNonFiniteFloats(t *testing.T) {
+	nan := math.NaN()
+	posInf := math.Inf(1)
+	negInf := math.Inf(-1)
+
+	for name, policy := range map[string]RetryPolicy{
+		"NaN multiplier":            {Base: time.Second, Max: time.Minute, Multiplier: nan, Jitter: 0.2},
+		"+Inf multiplier":           {Base: time.Second, Max: time.Minute, Multiplier: posInf, Jitter: 0.2},
+		"-Inf multiplier":           {Base: time.Second, Max: time.Minute, Multiplier: negInf, Jitter: 0.2},
+		"NaN jitter":                {Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: nan},
+		"+Inf jitter":               {Base: time.Second, Max: time.Minute, Multiplier: posInf, Jitter: posInf},
+		"-Inf jitter":               {Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: negInf},
+		"NaN multiplier and jitter": {Base: time.Second, Max: time.Minute, Multiplier: nan, Jitter: nan},
+	} {
+		err := policy.Validate()
+		require.Errorf(t, err, "%s must be rejected", name)
+		require.Containsf(t, err.Error(), "finite",
+			"%s must be rejected as non-finite rather than as an out-of-range value", name)
+	}
+}
+
+// TestIsFinite_MatchesTheOnlyValuesArithmeticCanUse pins the shared predicate
+// configuration loading and policy validation both call, so the two boundaries
+// can never disagree about what a usable number is.
+func TestIsFinite_MatchesTheOnlyValuesArithmeticCanUse(t *testing.T) {
+	for _, usable := range []float64{0, 1, -1, 0.5, 2, math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64} {
+		require.Truef(t, IsFinite(usable), "%v is a real number", usable)
+	}
+	for _, unusable := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		require.Falsef(t, IsFinite(unusable), "%v is not a real number", unusable)
+	}
+}
+
+// TestRetryPolicy_DelaySurvivesANonFiniteInjectedJitterSample is the defense one
+// layer below Validate.
+//
+// The sample comes from an injected interface, so it is input this package does
+// not control even when the policy itself validated. A NaN sample multiplied
+// into the delay reaches the Duration conversion, and that conversion is
+// undefined for NaN. The delay must stay inside [0, Max] for every sample a
+// source can physically return.
+func TestRetryPolicy_DelaySurvivesANonFiniteInjectedJitterSample(t *testing.T) {
+	policy := RetryPolicy{Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: 0.5}
+
+	for name, sample := range map[string]float64{
+		"NaN":              math.NaN(),
+		"+Inf":             math.Inf(1),
+		"-Inf":             math.Inf(-1),
+		"below the range":  -0.25,
+		"at the range top": 1,
+		"above the range":  4,
+	} {
+		for attempt := 1; attempt <= 4; attempt++ {
+			delay := policy.Delay(attempt, constantJitter(sample))
+			require.GreaterOrEqualf(t, delay, time.Duration(0),
+				"%s sample produced a negative delay on attempt %d", name, attempt)
+			require.LessOrEqualf(t, delay, policy.Max,
+				"%s sample produced a delay past Max on attempt %d", name, attempt)
+		}
+	}
+}
+
+// TestRetryPolicy_DelayIgnoresANonFiniteJitterFraction covers a policy built in
+// code rather than loaded from configuration, which never passed Validate.
+func TestRetryPolicy_DelayIgnoresANonFiniteJitterFraction(t *testing.T) {
+	for _, fraction := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		policy := RetryPolicy{Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: fraction}
+		require.Equal(t, time.Second, policy.Delay(1, constantJitter(0.9)),
+			"a non-finite jitter fraction must be dropped, leaving the nominal delay")
+	}
+}
+
+// constantJitter is a source that returns one value forever, including values
+// outside the [0, 1) contract a real source promises.
+type constantJitter float64
+
+func (c constantJitter) Float64() float64 { return float64(c) }

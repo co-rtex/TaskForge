@@ -220,10 +220,18 @@ func (c Config) Validate() error {
 	if c.JobRetryMax < c.JobRetryBase {
 		problems = append(problems, "TASKFORGE_JOB_RETRY_MAX must be >= TASKFORGE_JOB_RETRY_BASE")
 	}
-	if c.JobRetryMultiplier < 1 {
+	// Finiteness is checked before the range, and separately from it. NaN
+	// compares false against every bound, so a bare `< 1` accepts it; +Inf
+	// satisfies a lower bound outright. Either would validate cleanly here and
+	// then produce a NaN delay at runtime.
+	if !lifecycle.IsFinite(c.JobRetryMultiplier) {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_MULTIPLIER must be a finite number")
+	} else if c.JobRetryMultiplier < 1 {
 		problems = append(problems, "TASKFORGE_JOB_RETRY_MULTIPLIER must be >= 1")
 	}
-	if c.JobRetryJitter < 0 || c.JobRetryJitter > 1 {
+	if !lifecycle.IsFinite(c.JobRetryJitter) {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_JITTER must be a finite number")
+	} else if c.JobRetryJitter < 0 || c.JobRetryJitter > 1 {
 		problems = append(problems, "TASKFORGE_JOB_RETRY_JITTER must be between 0 and 1")
 	}
 	if c.OutboxBatchSize < 1 || c.OutboxBatchSize > 1000 {
@@ -244,10 +252,14 @@ func (c Config) Validate() error {
 	if c.OutboxBackoffMax < c.OutboxBackoffBase {
 		problems = append(problems, "TASKFORGE_OUTBOX_BACKOFF_MAX must be >= TASKFORGE_OUTBOX_BACKOFF_BASE")
 	}
-	if c.OutboxBackoffMultiplier < 1 {
+	if !lifecycle.IsFinite(c.OutboxBackoffMultiplier) {
+		problems = append(problems, "TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER must be a finite number")
+	} else if c.OutboxBackoffMultiplier < 1 {
 		problems = append(problems, "TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER must be >= 1")
 	}
-	if c.OutboxBackoffJitter < 0 || c.OutboxBackoffJitter > 1 {
+	if !lifecycle.IsFinite(c.OutboxBackoffJitter) {
+		problems = append(problems, "TASKFORGE_OUTBOX_BACKOFF_JITTER must be a finite number")
+	} else if c.OutboxBackoffJitter < 0 || c.OutboxBackoffJitter > 1 {
 		problems = append(problems, "TASKFORGE_OUTBOX_BACKOFF_JITTER must be between 0 and 1")
 	}
 	if len(problems) > 0 {
@@ -454,8 +466,17 @@ func envInt64(key string, def int64) int64 {
 	return def
 }
 
+// envFloat reads a float setting, falling back to the default when the value is
+// absent, unparseable, or not a real number.
+//
+// strconv.ParseFloat accepts "NaN", "Inf", "+Inf", and "-Infinity" without
+// error, so parsing alone is not enough: a typo or a templating accident would
+// otherwise put a non-finite value into a comparison that silently accepts it.
+// Validate rejects a non-finite value too; this is the earlier of the two
+// defences, and the one that keeps a malformed environment from ever reaching
+// the policy.
 func envFloat(key string, def float64) float64 {
-	if v, err := strconv.ParseFloat(env(key, ""), 64); err == nil {
+	if v, err := strconv.ParseFloat(env(key, ""), 64); err == nil && lifecycle.IsFinite(v) {
 		return v
 	}
 	return def
