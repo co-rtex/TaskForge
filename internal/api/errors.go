@@ -26,6 +26,7 @@ const (
 	CodeFenceRejected       = "fence_rejected"
 	CodeLeaseExpired        = "lease_expired"
 	CodeStateConflict       = "state_conflict"
+	CodeRenewalConflict     = "renewal_conflict"
 )
 
 // ErrorBody is the single error shape every endpoint returns.

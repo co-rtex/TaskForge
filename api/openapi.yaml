@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: TaskForge API
-  version: 0.2.0-m2
+  version: 0.3.0-m3
   description: |
-    Durable job ingress plus internal worker registration, atomic claim, and
-    fenced start/success operations.
+    Durable job ingress plus internal worker registration, session heartbeat,
+    atomic claim, fenced lease renewal, and fenced start/success operations.
 
     This document describes **only the endpoints that are implemented**. The rest
     of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing,
@@ -13,7 +13,7 @@ info:
 
     ## Authentication
 
-    None yet. Milestone M2 attributes every request to a single configured
+    None yet. Milestone M3 attributes every request to a single configured
     development scope, and the service therefore binds to loopback only.
     Database-backed API keys are milestone M5. See `docs/CURRENT_STATE.md`.
 
@@ -174,7 +174,8 @@ paths:
         an ambiguous registration response is retried. Reusing it with different
         immutable registration data conflicts. A new session for the same stable
         worker name fences the prior session; old active leases remain durable
-        and capacity-consuming until M3 reconciliation.
+        and capacity-consuming until they expire and the reconciler abandons
+        their attempts.
       parameters:
         - name: worker_session_id
           in: path
@@ -232,6 +233,216 @@ paths:
             Registration is idempotent under that session identity: a replay
             that matches returns the already-registered session rather than
             creating or fencing a second one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/worker-sessions/{worker_session_id}/heartbeat:
+    post:
+      tags: [Worker Control]
+      summary: Report that one process session is alive
+      description: |
+        Advances the session's `last_heartbeat_at` using PostgreSQL receipt time,
+        sampled after the session row is locked.
+
+        The request deliberately carries no timestamp. Worker-supplied wall-clock
+        time is never authoritative for staleness, so the response echoes the
+        server time that was actually accepted and a worker confirms liveness
+        from that rather than from its own clock.
+
+        Only a current `HEALTHY` session is accepted. A replaced, unhealthy, or
+        ended session answers `409 worker_session_unavailable` and is never
+        returned to health; that process must establish a new boot session.
+
+        Repeating a heartbeat is harmless. It may advance the stored timestamp
+        again — that is what a heartbeat is for — but it can never create a
+        session or revive a fenced one.
+      parameters:
+        - name: worker_session_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HeartbeatRequest' }
+      responses:
+        '200':
+          description: The accepted PostgreSQL receipt time for this session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Heartbeat' }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The session is not current and healthy. Code
+            `worker_session_unavailable`. A late heartbeat never revives a
+            fenced session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: An identifier was invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical request — the same
+            `worker_session_id` in the path and the same `worker_id` in the
+            body. A heartbeat is idempotent under that session identity: a
+            replay may advance the accepted receipt time again, which is
+            exactly what a heartbeat does, and can never create a session or
+            revive one that was already fenced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome was
+                    known; retry the identical request, which is safe because every
+                    worker-control operation is idempotent under the identity and
+                    fencing identifiers it already carries
+
+  /internal/v1/leases/{lease_id}/renew:
+    post:
+      tags: [Worker Control]
+      summary: Fenced, idempotent lease renewal
+      description: |
+        Extends one lease's authority window so cooperative work may safely run
+        across more than one lease. It extends lease authority **only**: the
+        job's overall `timeout_seconds` budget is measured once from execution
+        start and renewal never resets it.
+
+        Renewal is fenced by the complete five-part fence — `lease_id` in the
+        path plus `job_id`, `attempt_id`, `worker_id`, and `worker_session_id` —
+        and additionally by a client-generated `renewal_request_id` and the
+        `expected_renewal_version` the caller believes is current. That pair is
+        what makes renewal safe to retry rather than silently doubling
+        authority:
+
+        - an exact replay of the renewal that produced the current generation
+          returns the stored window unchanged and moves nothing;
+        - a delayed older generation, or a second distinct request for the same
+          generation, mutates nothing and returns `409 renewal_conflict`;
+        - reusing a `renewal_request_id` that is currently recorded on a different
+          lease returns the same stable `renewal_conflict`, never a leaked
+          uniqueness error.
+
+        Only each lease's current renewal identity is retained, so that last rule
+        constrains identities that are in force, not every identity ever used.
+        Once a lease renews again its previous id is free, and reusing it on
+        another lease renews that lease normally. Nothing is weakened by this: an
+        identity authorizes nothing on its own, and whether a lease is extended is
+        decided by its own fence and `expected_renewal_version`.
+
+        Renewal never resurrects an expired, completed, released, or reconciled
+        lease. PostgreSQL time is resampled after every authority lock, so a
+        renewal that waited across the expiry boundary is rejected with
+        `409 lease_expired` rather than accepted on a stale sample.
+
+        `lease_remaining_milliseconds` is measured by PostgreSQL after those
+        locks. A worker converts it into a conservative monotonic deadline
+        instead of comparing its own wall clock with `lease_expires_at`.
+      parameters:
+        - name: lease_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenewLeaseRequest' }
+      responses:
+        '200':
+          description: The committed renewal window, or an exact replay of it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Renewal' }
+        '400':
+          description: Malformed JSON or an unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The fence, the current session, the lease state, or the renewal
+            generation rejected the renewal. Codes `fence_rejected`,
+            `worker_session_unavailable`, `lease_expired`, `state_conflict`, or
+            `renewal_conflict`. None of them mutates anything.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: An identifier or the expected generation was invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed.
+
+            **Retry:** repeat the identical request with the same full fence —
+            the `lease_id` in the path plus the same `job_id`, `attempt_id`,
+            `worker_id`, and `worker_session_id` — and, critically, the same
+            `renewal_request_id` and the same `expected_renewal_version`.
+            Generating a new renewal request id or incrementing the expected
+            version on a retry is what would extend the lease twice. Under the
+            original pair the renewal is idempotent: if the first call
+            committed, the replay returns that same window without moving the
+            expiry again.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -545,20 +756,20 @@ components:
           maximum: 86400
           default: 300
           description: |
-            Requested handler budget. In milestone M2 the effective budget is the
-            LESSER of this value and the remaining fixed lease window PostgreSQL
-            reports at claim time, minus a small completion margin reserved for
-            reporting the outcome. A value larger than the configured lease
-            (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
-            cannot authorize execution beyond one fixed lease until M3 adds lease
-            renewal.
+            Handler budget for one execution, measured once from execution start.
+            It is **not** limited by the lease: a running attempt renews its lease,
+            so cooperative work may span many lease windows for as long as renewal
+            keeps succeeding, and renewal never extends this budget. A value larger
+            than `TASKFORGE_LEASE_DURATION` is therefore meaningful.
 
-            The worker runs the handler with a deadline-bearing context and
-            cancels it when the budget elapses; a cooperative handler is expected
-            to return. Go cannot forcibly terminate arbitrary handler code, so an
-            uncooperative handler may continue until it returns or the process
-            exits. The durable guarantee is that after the lease authority
-            deadline the worker can no longer successfully report completion.
+            The worker runs the handler with a deadline-bearing context and cancels
+            it when this budget elapses, or as soon as it can no longer prove it
+            still holds the lease. A cooperative handler is expected to return. Go
+            cannot forcibly terminate arbitrary handler code, so an uncooperative
+            handler may continue until it returns or the process exits. The durable
+            guarantee is that once lease authority is gone the worker can no longer
+            report completion — and the reconciler abandons that attempt and hands
+            the job to another worker.
         scheduled_at:
           type: [string, 'null']
           format: date-time
@@ -594,20 +805,20 @@ components:
         timeout_seconds:
           type: integer
           description: |
-            Requested handler budget. In milestone M2 the effective budget is the
-            LESSER of this value and the remaining fixed lease window PostgreSQL
-            reports at claim time, minus a small completion margin reserved for
-            reporting the outcome. A value larger than the configured lease
-            (`TASKFORGE_LEASE_DURATION`) is accepted for forward compatibility but
-            cannot authorize execution beyond one fixed lease until M3 adds lease
-            renewal.
+            Handler budget for one execution, measured once from execution start.
+            It is **not** limited by the lease: a running attempt renews its lease,
+            so cooperative work may span many lease windows for as long as renewal
+            keeps succeeding, and renewal never extends this budget. A value larger
+            than `TASKFORGE_LEASE_DURATION` is therefore meaningful.
 
-            The worker runs the handler with a deadline-bearing context and
-            cancels it when the budget elapses; a cooperative handler is expected
-            to return. Go cannot forcibly terminate arbitrary handler code, so an
-            uncooperative handler may continue until it returns or the process
-            exits. The durable guarantee is that after the lease authority
-            deadline the worker can no longer successfully report completion.
+            The worker runs the handler with a deadline-bearing context and cancels
+            it when this budget elapses, or as soon as it can no longer prove it
+            still holds the lease. A cooperative handler is expected to return. Go
+            cannot forcibly terminate arbitrary handler code, so an uncooperative
+            handler may continue until it returns or the process exits. The durable
+            guarantee is that once lease authority is gone the worker can no longer
+            report completion — and the reconciler abandons that attempt and hands
+            the job to another worker.
         required_capabilities:
           type: array
           items: { type: string }
@@ -656,7 +867,81 @@ components:
         last_heartbeat_at:
           type: string
           format: date-time
-          description: Initialized from PostgreSQL time. Heartbeat updates begin in M3.
+          description: |
+            PostgreSQL receipt time, initialized at registration and advanced by
+            `POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat`.
+
+    HeartbeatRequest:
+      type: object
+      additionalProperties: false
+      required: [worker_id]
+      properties:
+        worker_id: { type: string, format: uuid }
+      description: |
+        Deliberately carries no timestamp. PostgreSQL receipt time is the only
+        authority for heartbeat staleness.
+
+    Heartbeat:
+      type: object
+      required: [worker_session_id, status, last_heartbeat_at]
+      properties:
+        worker_session_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [HEALTHY]
+          description: Only a current healthy session can be heartbeated.
+        last_heartbeat_at:
+          type: string
+          format: date-time
+          description: |
+            The PostgreSQL time the control plane accepted, sampled after the
+            session row was locked. A worker confirms liveness from this value
+            rather than from its own clock.
+
+    RenewLeaseRequest:
+      type: object
+      additionalProperties: false
+      required: [job_id, attempt_id, worker_id, worker_session_id, renewal_request_id, expected_renewal_version]
+      properties:
+        job_id: { type: string, format: uuid }
+        attempt_id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+        renewal_request_id:
+          type: string
+          format: uuid
+          description: |
+            Generated once per logical renewal and reused by every retry of it.
+            A fresh id on a retry would extend the lease a second time.
+        expected_renewal_version:
+          type: integer
+          minimum: 0
+          description: |
+            The generation the caller believes is current. A lease begins at 0,
+            the window issued by the claim itself. A mismatch is
+            `renewal_conflict` and mutates nothing.
+
+    Renewal:
+      type: object
+      required: [lease_id, renewal_version, lease_expires_at, lease_remaining_milliseconds, replayed]
+      properties:
+        lease_id: { type: string, format: uuid }
+        renewal_version:
+          type: integer
+          minimum: 1
+          description: The new generation, always `expected_renewal_version` + 1.
+        lease_expires_at: { type: string, format: date-time }
+        lease_remaining_milliseconds:
+          type: integer
+          minimum: 0
+          description: |
+            PostgreSQL-sampled remaining window, measured after every authority
+            lock. Workers convert it to a conservative monotonic deadline.
+        replayed:
+          type: boolean
+          description: |
+            True when this renewal request id had already committed this
+            generation. The stored window is returned unchanged; nothing moved.
 
     ClaimRequest:
       type: object
@@ -764,6 +1049,7 @@ components:
                 - fence_rejected
                 - lease_expired
                 - state_conflict
+                - renewal_conflict
               description: Stable machine-readable code. Branch on this, not on `message`.
             message: { type: string }
             details:

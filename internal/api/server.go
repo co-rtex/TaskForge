@@ -1,9 +1,9 @@
 // Package api serves TaskForge's HTTP surface.
 //
 // The public surface implements durable job submission/read. The internal
-// surface implements M2 worker registration, atomic claim, and fenced
-// start/success. Every later endpoint in docs/PROJECT_SPEC.md arrives only with
-// the milestone that makes it real.
+// surface implements worker registration, session heartbeat, atomic claim,
+// fenced lease renewal, and fenced start/success. Every later endpoint in
+// docs/PROJECT_SPEC.md arrives only with the milestone that makes it real.
 package api
 
 import (
@@ -75,7 +75,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
 	if s.control != nil {
 		mux.HandleFunc("PUT /internal/v1/worker-sessions/{worker_session_id}", s.handleRegisterWorkerSession)
+		mux.HandleFunc("POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.handleHeartbeat)
 		mux.HandleFunc("POST /internal/v1/claims", s.handleClaim)
+		mux.HandleFunc("POST /internal/v1/leases/{lease_id}/renew", s.handleRenewLease)
 		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/start", s.handleStartAttempt)
 		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/succeed", s.handleSucceedAttempt)
 	}
@@ -92,7 +94,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
 	if s.control != nil {
 		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))
+		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.methodNotAllowed(http.MethodPost))
 		mux.HandleFunc("/internal/v1/claims", s.methodNotAllowed(http.MethodPost))
+		mux.HandleFunc("/internal/v1/leases/{lease_id}/renew", s.methodNotAllowed(http.MethodPost))
 		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/start", s.methodNotAllowed(http.MethodPost))
 		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/succeed", s.methodNotAllowed(http.MethodPost))
 	}

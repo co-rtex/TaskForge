@@ -104,9 +104,7 @@ active lease.
 
 ---
 
-## Current milestone — M3: Heartbeats, lease renewal, and crash recovery
-
-### M3 — Heartbeats, lease renewal, and crash recovery
+## M3 — Heartbeats, lease renewal, and crash recovery
 **Objective.** A killed worker's job is recovered and completed by another worker,
 and the dead worker can never commit an outcome afterward.
 **Deliverables.** Heartbeat endpoint using server time; lease renewal with fencing;
@@ -115,11 +113,18 @@ and the dead worker can never commit an outcome afterward.
 replacement attempt succeeds; a late completion from the dead process is rejected;
 reconciliation is idempotent under repeated and concurrent runs.
 **Depends on.** M2.
-**Status:** not started.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the evidence.
+
+One boundary decision M3 could not avoid is recorded in
+[ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md): an
+abandoned attempt consumes the attempt budget, so recovery requeues while budget
+remains and dead-letters when it is gone. That is the minimum needed to avoid a
+job no worker could ever claim. Everything else about failure — classification,
+backoff, `RETRY_WAIT`, timeouts, the DLQ API, and replay — stays in M4 below.
 
 ---
 
-## Remaining V1 milestones
+## Current milestone — M4: Retry, timeout, cancellation, DLQ, replay, delayed jobs
 
 ### M4 — Retry, timeout, cancellation, DLQ, replay, delayed jobs
 **Objective.** Complete the job lifecycle.
@@ -129,7 +134,12 @@ logical DLQ; replay via `replayed_from_job_id`; `taskforge-scheduler` promoting
 delayed jobs and re-notifying stranded work.
 **Acceptance.** Retries survive a restart; exhaustion dead-letters; cancel and
 success race resolves to exactly one winner; replay preserves terminal history.
-**Depends on.** M3.
+**Depends on.** M3 (complete).
+**Status:** not started.
+
+---
+
+## Remaining V1 milestones
 
 ### M5 — API keys, result storage, CLI, Python SDK
 **Objective.** Make TaskForge usable by an outside developer.

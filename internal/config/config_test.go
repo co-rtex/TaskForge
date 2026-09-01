@@ -210,3 +210,42 @@ malformed-line-without-equals
 func TestLoadDotEnv_MissingFileIsNotAnError(t *testing.T) {
 	require.NoError(t, LoadDotEnv(filepath.Join(t.TempDir(), "absent")))
 }
+
+// TestValidateWorkerTimings_RejectsATransportTimeoutThatOutlivesASafetyWindow
+// covers the gap neither Validate can see on its own: the transport timeout is a
+// worker setting, while the windows it must fit inside are server-owned.
+func TestValidateWorkerTimings_RejectsATransportTimeoutThatOutlivesASafetyWindow(t *testing.T) {
+	shared, err := Load()
+	require.NoError(t, err)
+	worker, err := LoadWorker()
+	require.NoError(t, err)
+
+	t.Run("the documented defaults fit together", func(t *testing.T) {
+		require.NoError(t, ValidateWorkerTimings(shared, worker))
+	})
+
+	t.Run("a timeout longer than the staleness window is rejected", func(t *testing.T) {
+		bad := worker
+		bad.RequestTimeout = shared.SessionStaleAfter + time.Second
+		err := ValidateWorkerTimings(shared, bad)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "TASKFORGE_SESSION_STALE_AFTER")
+	})
+
+	t.Run("a timeout longer than the renewal cadence is rejected", func(t *testing.T) {
+		bad := worker
+		bad.RequestTimeout = shared.LeaseRenewInterval + time.Millisecond
+		err := ValidateWorkerTimings(shared, bad)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "TASKFORGE_LEASE_RENEW_INTERVAL")
+	})
+
+	t.Run("both problems are reported together", func(t *testing.T) {
+		bad := worker
+		bad.RequestTimeout = time.Hour
+		err := ValidateWorkerTimings(shared, bad)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "TASKFORGE_SESSION_STALE_AFTER")
+		require.Contains(t, err.Error(), "TASKFORGE_LEASE_RENEW_INTERVAL")
+	})
+}

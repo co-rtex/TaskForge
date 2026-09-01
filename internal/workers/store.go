@@ -75,8 +75,8 @@ func (s *Store) Register(ctx context.Context, scope string, registration Registr
 		return Session{}, fmt.Errorf("read existing worker session: %w", err)
 	}
 	// A process boot replaces the prior current boot. Its active leases remain
-	// durable and consume logical-worker capacity until M3 reconciliation; they
-	// are not silently transferred to this session.
+	// durable and consume logical-worker capacity until they expire and are
+	// reconciled; they are not silently transferred to this session.
 	if _, err := tx.Exec(ctx, `
 		UPDATE worker_sessions
 		SET status = 'OFFLINE', ended_at = clock_timestamp()
@@ -270,8 +270,8 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 	}
 
 	// Count by logical worker, not just process session. Leases held by a
-	// replaced boot remain reservations until M3 reconciliation and cannot be
-	// bypassed by restarting the process.
+	// replaced boot remain reservations until they expire and are reconciled,
+	// and cannot be bypassed by restarting the process.
 	var activeForWorker int
 	if err := tx.QueryRow(ctx,
 		`SELECT count(*) FROM leases WHERE worker_id = $1 AND status = 'ACTIVE'`,
@@ -536,6 +536,11 @@ type fenceState struct {
 	leaseStatus   LeaseStatus
 	expiresAt     time.Time
 	serverNow     time.Time
+	// renewalVersion and lastRenewalRequestID are read under the same locks as
+	// every other authority field so a renewal decision never uses a value that
+	// was true before the transaction waited.
+	renewalVersion       int
+	lastRenewalRequestID *uuid.UUID
 }
 
 // lockFence uses the same queue -> worker session -> job -> attempt -> lease
@@ -582,7 +587,8 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 
 	var state fenceState
 	err = tx.QueryRow(ctx, `
-		SELECT j.status, a.status, l.status, l.expires_at
+		SELECT j.status, a.status, l.status, l.expires_at,
+		       l.renewal_version, l.last_renewal_request_id
 		FROM jobs j
 		JOIN job_attempts a ON a.job_id = j.id
 		JOIN leases l ON l.attempt_id = a.id
@@ -591,7 +597,8 @@ func (s *Store) lockFence(ctx context.Context, scope string, fence Fence) (pgx.T
 		  AND j.scope = $6 AND a.scope = $6 AND l.scope = $6
 		FOR UPDATE OF j, a, l`,
 		fence.JobID, fence.AttemptID, fence.LeaseID, fence.WorkerID, fence.SessionID, scope,
-	).Scan(&state.jobStatus, &state.attemptStatus, &state.leaseStatus, &state.expiresAt)
+	).Scan(&state.jobStatus, &state.attemptStatus, &state.leaseStatus, &state.expiresAt,
+		&state.renewalVersion, &state.lastRenewalRequestID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fail(ErrFenceRejected)
 	}

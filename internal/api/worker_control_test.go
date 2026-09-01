@@ -20,17 +20,25 @@ import (
 )
 
 type fakeWorkerControl struct {
-	register func(context.Context, string, workers.Registration) (workers.Session, error)
-	claim    func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
-	start    func(context.Context, string, workers.Fence) error
-	succeed  func(context.Context, string, workers.Fence) error
+	register  func(context.Context, string, workers.Registration) (workers.Session, error)
+	heartbeat func(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
+	claim     func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
+	renew     func(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
+	start     func(context.Context, string, workers.Fence) error
+	succeed   func(context.Context, string, workers.Fence) error
 }
 
 func (f *fakeWorkerControl) Register(ctx context.Context, scope string, req workers.Registration) (workers.Session, error) {
 	return f.register(ctx, scope, req)
 }
+func (f *fakeWorkerControl) Heartbeat(ctx context.Context, scope string, req workers.HeartbeatRequest) (workers.HeartbeatResult, error) {
+	return f.heartbeat(ctx, scope, req)
+}
 func (f *fakeWorkerControl) Claim(ctx context.Context, scope string, req workers.ClaimRequest) (workers.ClaimResult, error) {
 	return f.claim(ctx, scope, req)
+}
+func (f *fakeWorkerControl) RenewLease(ctx context.Context, scope string, req workers.RenewalRequest) (workers.RenewalResult, error) {
+	return f.renew(ctx, scope, req)
 }
 func (f *fakeWorkerControl) Start(ctx context.Context, scope string, fence workers.Fence) error {
 	return f.start(ctx, scope, fence)

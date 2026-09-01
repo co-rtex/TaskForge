@@ -13,23 +13,29 @@ Implementation status lives in [CURRENT_STATE.md](CURRENT_STATE.md).
 - **[PARTIAL]** — some of it is built; the section says exactly which part.
 - **[PLANNED]** — designed but not built. Nothing here works yet.
 
-Milestones M1 (durable ingress/outbox) and M2 (workers, sessions, and atomic claim)
-are built. Never promote a marker without a passing test.
+Milestones M1 (durable ingress/outbox), M2 (workers, sessions, and atomic claim),
+and M3 (heartbeats, lease renewal, and crash recovery) are built. Never promote a
+marker without a passing test.
 
 **Implemented today:** durable submission and outbox delivery; the advisory broker
 contract; logical-worker and process-session registration; immutable session
 eligibility; globally idempotent notification consumption; strict-priority atomic
-claim with queue/worker capacity; attempts and fixed leases; fenced start/success;
-and bounded `demo.echo` execution. Heartbeat, renewal, reconciliation, failed
-outcomes, retry, cancellation, delayed scheduling, and result storage remain planned.
+claim with queue/worker capacity; attempts and renewable leases; fenced
+start/success; server-timed session heartbeat; fenced, generation-versioned lease
+renewal; stale-session detection; expired-lease reconciliation with attempt
+abandonment, capacity release, and transactional re-notification; and bounded
+`demo.echo` execution. Failure classification, retry, timeout outcomes,
+cancellation, delayed scheduling, the DLQ API, and result storage remain planned.
 
 ---
 
 ## 1. Model: PostgreSQL-authoritative, pull-based claim — [PARTIAL]
 
-Steps 1, 2, and 5-9 are implemented. Step 10 is implemented for fixed-lease start,
-`demo.echo`, and successful outcome only; renewal and failure outcomes are planned.
-Step 11 is implemented for start/success fencing. Steps 3, 4, and 12 are planned.
+Steps 1, 2, and 5-9 are implemented. Step 10 is implemented for start, renewal,
+`demo.echo`, and successful outcome; failure outcomes are planned. Step 11 is
+implemented for start/success/renewal fencing. Step 12 is implemented for expired
+leases and stale sessions; cancellation finalization and general drift repair are
+planned. Steps 3 and 4 are planned.
 
 TaskForge is a **pull-based** system with a **PostgreSQL-authoritative** control
 plane. The broker signals only that work may exist; PostgreSQL decides atomically
@@ -77,12 +83,12 @@ single outbox publisher · a single reconciler instance.
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `taskforge-api` | Validate and durably accept submissions; serve read APIs; serve internal worker control operations. | **Built** for submission/read plus registration, claim, fenced start, and fenced success. |
+| `taskforge-api` | Validate and durably accept submissions; serve read APIs; serve internal worker control operations. | **Built** for submission/read plus registration, heartbeat, claim, fenced renewal, fenced start, and fenced success. |
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. | Planned (M4) |
-| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, and report fenced outcomes. | **Built** for fixed leases and `demo.echo`; renewal/failure reporting planned (M3/M4). |
-| `taskforge-reconciler` | Expire leases, abandon stale attempts, release capacity, finalize cancellation, repair drift. | Planned (M3) |
+| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, and report fenced outcomes. | **Built** for heartbeat, renewable leases, and `demo.echo`; failure reporting planned (M4). |
+| `taskforge-reconciler` | Expire leases, abandon stale attempts, release capacity, finalize cancellation, repair drift. | **Built** for stale sessions and expired leases; cancellation finalization is M4 and general drift repair is later. |
 | `taskforge-cli` | Operator and developer command-line interface. | Planned (M5) |
 
 Every component is safe to run with N replicas.
@@ -111,8 +117,13 @@ Two distinct dead-letter concepts exist and must not be conflated:
 ## 4. Job state machine — [PARTIAL]
 
 The full state set is enforced by a `CHECK` constraint. M2 implements the successful
-path `QUEUED → LEASED → RUNNING → SUCCEEDED` with dedicated, fenced operations.
-Every other transition in the V1 diagram remains planned.
+path `QUEUED → LEASED → RUNNING → SUCCEEDED` with dedicated, fenced operations. M3
+adds the recovery transitions reconciliation performs on an expired lease:
+`LEASED | RUNNING → QUEUED` when attempt budget remains, and `LEASED | RUNNING →
+DEAD_LETTERED` when the abandoned attempt consumed it
+([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)). Every
+other transition in the V1 diagram remains planned; `RETRY_WAIT`,
+`CANCEL_REQUESTED`, and `CANCELED` are still unreachable.
 
 ```
 PENDING ──► QUEUED ──► LEASED ──► RUNNING ──► SUCCEEDED
@@ -167,9 +178,9 @@ finalizes cancellation only after the lease can no longer commit.
 
 ## 5. Domain model — [PARTIAL]
 
-Job submission plus the successful lifecycle are implemented. Attempt, logical
-worker, process session, and fixed lease records are implemented for M2; failure
-history, heartbeat updates, renewal, and result references remain planned.
+Job submission plus the successful lifecycle are implemented, as are heartbeat
+updates, lease renewal, attempt abandonment, and crash recovery. Failure
+classification, bounded error detail, and result references remain planned.
 
 ### Job
 Id · auth scope · queue · job type · canonical immutable payload · status · priority
@@ -200,9 +211,16 @@ time · **server-received** heartbeat time · status
 
 M2 stores an immutable capability set and trusted handler-type set on each process
 session. Claims carry only identity, queue, and notification event id; PostgreSQL
-loads eligibility from the locked session row. Registration initializes heartbeat
-time, but periodic heartbeat updates begin in M3. See
+loads eligibility from the locked session row. See
 [ADR-0006](adr/0006-session-bound-worker-eligibility.md).
+
+M3 adds periodic heartbeat. The request carries no timestamp: the control plane
+locks the session row, samples `clock_timestamp()` afterwards, and advances
+`last_heartbeat_at` monotonically. Only a current `HEALTHY` session is accepted,
+and a late heartbeat never revives a fenced one. A session that misses the
+configured threshold is marked `UNHEALTHY` with an `ended_at` stamp; `OFFLINE`
+stays reserved for replacement and explicit shutdown, so an operator can tell a
+crash from a restart.
 
 Capacity is derived from active leases or a transactionally maintained reservation
 ledger, and is reconcilable. A mutable `active_jobs` counter is never trusted as
@@ -212,11 +230,17 @@ unquestioned authority.
 Opaque lease id · job id · attempt id · worker id · worker-session id · acquired at ·
 expires at · renewed at · typed status.
 
-A partial unique index enforces **at most one active lease per job**. M2 issues one
-fixed, server-owned lease window and rejects start or success at/after expiry using
-database time sampled after all authority locks. Renewal is planned for M3; it will
-be idempotent and fenced by session + attempt + lease and will never resurrect an
-expired lease.
+A partial unique index enforces **at most one active lease per job**. The window is
+server-owned; start, renewal, and success are all rejected at or after expiry using
+database time sampled after all authority locks.
+
+M3 adds renewal. A lease also carries a monotonic `renewal_version` and the
+identity of the request that produced it, so an ambiguous retry returns the
+committed window instead of extending authority a second time, and a stale or
+competing generation mutates nothing. Renewal never resurrects an expired,
+completed, released, or reconciled lease, and it extends lease authority only —
+never the job's `timeout_seconds` budget. See
+[ADR-0008](adr/0008-fenced-idempotent-lease-renewal.md).
 
 ---
 
@@ -311,10 +335,11 @@ property, and is tested. Weighted fairness and aging are post-V1.
 
 ---
 
-## 9. Concurrency control — [IMPLEMENTED] for M1/M2 operations
+## 9. Concurrency control — [IMPLEMENTED] for M1/M2/M3 operations
 
 Submission idempotency, outbox publishing, notification consumption, queue capacity,
-logical-worker capacity, claim, start, and success are serialized in PostgreSQL.
+logical-worker capacity, claim, heartbeat, renewal, start, success, and
+reconciliation are serialized in PostgreSQL.
 
 - Queue-level global concurrency locks the queue row before counting active leases.
   Counting active rows without preventing concurrent claims is insufficient and is
@@ -329,10 +354,18 @@ logical-worker capacity, claim, start, and success are serialized in PostgreSQL.
 M2 claims first take a transaction-scoped advisory lock derived from the global claim
 request id, then use queue → current worker session → job → attempt → lease row order.
 The identity lock makes same-id requests serialize even when they name different
-queues; a hash collision only over-serializes. Fenced transitions use the same row
-order without the identity lock. Queue capacity counts active leases by queue. Worker
-capacity counts by stable logical worker, so restarting a process cannot evade a lease
-held by its old session.
+queues; a hash collision only over-serializes. Fenced transitions, including renewal,
+use the same row order without the identity lock. Queue capacity counts active leases
+by queue. Worker capacity counts by stable logical worker, so restarting a process
+cannot evade a lease held by its old session.
+
+Heartbeat and stale-session marking lock only the worker-session row, which is a
+prefix of that order. Lease reconciliation takes the full order and deliberately does
+**not** require a healthy session, because an expired lease must be recoverable while
+its process is still heartbeating. Its candidate scan reads lease ids without any
+lock — inverting the order would be the one way to deadlock here — and every field
+that matters is re-read and revalidated under the locks, against a `clock_timestamp()`
+sampled afterwards.
 
 ---
 
@@ -348,6 +381,11 @@ delay, multiplier, maximum, and bounded jitter. The random source is injected. T
 scheduler never sleeps inside domain logic.
 
 Permanent failure or an exhausted attempt budget moves the job to `DEAD_LETTERED`.
+M3 already reaches `DEAD_LETTERED` for one narrow case: an abandoned attempt that
+consumed the total budget, which would otherwise leave a job no worker could ever
+claim. That is the only terminal consequence M3 implements — no failure classes, no
+backoff, no `dlq_entries`, no listing, no replay. See
+[ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md).
 
 DLQ replay preserves terminal history by creating a **new** job linked through
 `replayed_from_job_id`. The relationship between operator "retry" and "replay" is
@@ -356,40 +394,74 @@ defined explicitly rather than implemented ambiguously; see
 
 ---
 
-## 11. Heartbeats, leases, and crash recovery — [PARTIAL]
+## 11. Heartbeats, leases, and crash recovery — [IMPLEMENTED]
 
-M2 implements server-timed fixed lease issuance, current-session fencing, and
-expiry checks for start and success. A worker turns PostgreSQL's sampled remaining
-lease window into a conservative monotonic execution deadline with completion
-margin; PostgreSQL remains authoritative for every state transition. Periodic
-heartbeat, lease renewal, expiry transitions, and crash recovery are M3.
+Lease issuance, renewal, and every expiry check use PostgreSQL time sampled after
+all authority locks. A worker turns the server-measured remaining window into a
+conservative monotonic execution deadline with completion margin; it never
+compares its own wall clock with `expires_at`, and PostgreSQL remains
+authoritative for every state transition.
 
-Server receipt time will be authoritative for heartbeat staleness. Planned
-development defaults (configurable, never hardcoded into domain logic): heartbeat
-every 5 s, unhealthy after 15 s.
+**Heartbeat.** A worker heartbeats its process session on a fixed interval,
+starting immediately after registration and continuing through a graceful drain.
+Server receipt time is authoritative for staleness; the request carries no
+timestamp. Development defaults, configurable and never hardcoded into domain
+logic: heartbeat every 5 s, stale after 15 s. Configuration rejects a stale
+threshold under three heartbeat intervals, so a single lost request can never look
+like a dead process. A worker treats a definitive fence as fatal, retries
+transient failures, and stops presenting itself as ready once it has gone a full
+staleness threshold without confirming liveness. Because the loop runs while idle,
+a replaced worker discovers it without waiting for a broker delivery.
 
-M3 reconciliation will, when a session goes stale and its lease expires,
-transactionally:
+**Renewal.** A running attempt renews its lease on a cadence that must leave room
+for several attempts inside one window (configuration rejects a renewal interval
+above one third of the lease duration). Renewal is fenced by job, attempt, lease,
+worker, and session, and additionally by a renewal identity and generation, so an
+ambiguous retry cannot extend authority twice. See
+[ADR-0008](adr/0008-fenced-idempotent-lease-renewal.md). It extends lease
+authority only; the job's `timeout_seconds` budget is measured once from execution
+start. If renewal loses the fence, or cannot be confirmed before the conservative
+deadline, the worker cancels its cooperative handler and reports nothing.
 
-1. marks the session unhealthy or offline;
-2. expires the active lease;
-3. marks the attempt `ABANDONED`;
-4. releases queue and worker capacity;
-5. transitions the job according to retry budget and cancellation state;
-6. writes the required audit and outbox events.
+**Reconciliation.** Session staleness and lease expiry are related but distinct
+scans, and both are needed. A session can stop heartbeating while its lease is
+still valid, and a lease can expire while its session is perfectly healthy — the
+worker deliberately leaves a lease active after a handler error and keeps
+heartbeating — so requiring both conditions would strand exactly the case this
+exists to recover.
 
-It is safe to run repeatedly and concurrently. A returning old worker is rejected by
-lease and session fencing; its stale completion may be recorded in a bounded audit
-event or log, but it never mutates the authoritative outcome.
+1. Stale current sessions are marked `UNHEALTHY` with an `ended_at` stamp, from
+   server time. `OFFLINE` stays reserved for replacement and explicit shutdown.
+2. For each expired `ACTIVE` lease, **one transaction**: acquire authority rows in
+   the established order, sample PostgreSQL time afterwards, revalidate that the
+   lease is still active and actually expired and that the job/attempt binding and
+   states still qualify, set the lease `EXPIRED` with a `released_at`, set the
+   attempt `ABANDONED` with a `finished_at` (from `LEASED` or `RUNNING` alike),
+   and either return the job to `QUEUED` with a **fresh** `work.available` outbox
+   event or mark it `DEAD_LETTERED` if that abandonment consumed the total attempt
+   budget ([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)).
+
+Capacity is released solely by the lease ceasing to be `ACTIVE`; there is no
+counter to decrement. The recovery event gets a new id because the original event
+id was already globally consumed as the claim identity.
+
+A crash before commit leaves the old state intact, and rerunning repairs it.
+Repeated and concurrent reconciliation never produces a second abandonment, a
+second capacity release, or a duplicate recovery event. A returning old worker is
+rejected by lease and session fencing; its stale heartbeat, renewal, and
+completion are all refused and mutate nothing. Durable attempt and lease history
+plus the transactional recovery event are the record of what happened; a dedicated
+`audit_events` table remains planned.
 
 ---
 
 ## 12. Reliability invariants — [PARTIAL]
 
-Each of these must have an automated test. Invariants 1, 3, 4, 6-12, 17, and 18 are
-implemented and tested for the M1/M2 operations that exist. The full terminal-state,
-multi-attempt, cancellation, retry, and reconciliation invariants remain targets for
-their owning milestones.
+Each of these must have an automated test. Invariants 1, 3-12, and 15-18 are
+implemented and tested for the M1/M2/M3 operations that exist, and 16 is now
+covered by real reconciliation rather than being a target. Invariant 2 holds for
+every terminal state M3 can reach. Invariants 13 and 14 remain targets for M4,
+which owns retry scheduling and cancellation.
 
 1. PostgreSQL is authoritative for all control-plane state.
 2. A terminal job never returns to a non-terminal state.
@@ -420,8 +492,10 @@ their owning milestones.
 | Broker duplicates a notification | Globally idempotent event-id consumption admits one claim; another session gets a safe duplicate outcome. |
 | Broker loses a notification | Scheduler re-notification is planned for M4. In M2, loss of the only notification can strand a queued job. |
 | Publisher crashes mid-publish | Event republished after the claim timeout/visibility window lapses. Documented at-least-once window. |
-| Worker crashes mid-execution | M3 will mark the attempt `ABANDONED` and repair capacity. In M2 the active lease remains recorded and capacity stays reserved. |
-| Worker returns after expiry | Start and completion are rejected by session + lease fencing; renewal arrives in M3. |
+| Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). |
+| Worker stops renewing but keeps heartbeating | The lease still expires on server time and is reconciled anyway. Reconciliation never requires both conditions. |
+| Worker returns after expiry | Heartbeat, renewal, start, and completion are all rejected by session + lease fencing, and mutate nothing. |
+| Reconciler crashes mid-repair | The transaction rolls back; the old state is intact and a later pass repairs it. Repeated and concurrent passes are idempotent. |
 | API crashes mid-request | Transaction rolls back; no partial job, record, or event. |
 | Two workers claim concurrently | One wins; the other gets a different job or none. |
 | Database unavailable | Requests fail fast with a sanitized error; readiness fails; no fabricated success. |
@@ -477,18 +551,25 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0005`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0008`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
 `job_attempts`, and `leases`, plus `schema_migrations` maintained by the runner.
 M2 adds immediate eligibility time, worker-group routing, constrained session/
 attempt/lease bindings, one current session per logical worker, one active lease per
 job, globally unique notification claims, active-capacity indexes, and timeline-order
-constraints.
+constraints. M3 adds renewal generation and identity on `leases`, with a check constraint
+tying them together and a partial unique index ensuring no two leases hold the
+same renewal identity at the same time, plus the two partial indexes the
+reconciler's scans use. That index constrains live identities rather than every
+identity ever used; the exact scope is recorded on the index itself and in
+[ADR-0008](adr/0008-fenced-idempotent-lease-renewal.md).
 
 **Planned:** `results`, `dlq_entries`, `api_keys`, `audit_events`.
 
 Tables are created in the milestone that puts working behavior on them, not in
-advance. Indexes will support eligibility and priority scans, queue and status
-filters, idempotency lookup, pending outbox scans, and active queue/worker capacity.
-Indexes for expiring leases, stale-heartbeat scans, attempt history, and dashboard
-queries arrive only with the implemented query that justifies each one.
+advance. Every index exists because an implemented query orders by exactly its
+columns and filters by exactly its predicate: eligibility and priority scans, queue
+and status filters, idempotency lookup, pending outbox scans, active queue/worker
+capacity, expiring active leases, and stale current-session heartbeats. Indexes for
+attempt history and dashboard queries arrive only with the queries that justify
+them.

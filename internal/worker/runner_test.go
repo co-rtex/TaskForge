@@ -20,17 +20,40 @@ import (
 )
 
 type fakeControl struct {
-	register func(context.Context, workers.Registration) (workers.Session, error)
-	claim    func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
-	start    func(context.Context, workers.Fence) error
-	succeed  func(context.Context, workers.Fence) error
+	register  func(context.Context, workers.Registration) (workers.Session, error)
+	heartbeat func(context.Context, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
+	claim     func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
+	renew     func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error)
+	start     func(context.Context, workers.Fence) error
+	succeed   func(context.Context, workers.Fence) error
 }
 
 func (f *fakeControl) Register(ctx context.Context, req workers.Registration) (workers.Session, error) {
 	return f.register(ctx, req)
 }
+
+// Heartbeat and RenewLease default to succeeding when a test does not care:
+// every Run-based test starts a heartbeat loop, and most of them are about
+// something else entirely.
+func (f *fakeControl) Heartbeat(ctx context.Context, req workers.HeartbeatRequest) (workers.HeartbeatResult, error) {
+	if f.heartbeat == nil {
+		return workers.HeartbeatResult{
+			SessionID: req.SessionID, Status: workers.SessionHealthy, LastHeartbeatAt: time.Now(),
+		}, nil
+	}
+	return f.heartbeat(ctx, req)
+}
 func (f *fakeControl) Claim(ctx context.Context, req workers.ClaimRequest) (workers.ClaimResult, error) {
 	return f.claim(ctx, req)
+}
+func (f *fakeControl) RenewLease(ctx context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
+	if f.renew == nil {
+		return workers.RenewalResult{
+			LeaseID: req.Fence.LeaseID, RenewalVersion: req.ExpectedVersion + 1,
+			ExpiresAt: time.Now().Add(time.Minute), Remaining: time.Minute,
+		}, nil
+	}
+	return f.renew(ctx, req)
 }
 func (f *fakeControl) Start(ctx context.Context, fence workers.Fence) error {
 	return f.start(ctx, fence)

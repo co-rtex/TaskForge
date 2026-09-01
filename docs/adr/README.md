@@ -22,3 +22,5 @@ and the exact clauses they replace.
 | [0005](0005-elasticmq-for-local-broker.md) | ElasticMQ as the local SQS-compatible broker | Accepted | 2026-08-29 | Real SQS semantics locally with no AWS account and no cost. |
 | [0006](0006-session-bound-worker-eligibility.md) | Session-bound worker eligibility | Accepted | 2026-08-29 | Claims load immutable capabilities, handler types, group, and capacity from a process session. |
 | [0007](0007-globally-idempotent-notification-claims.md) | Globally idempotent notification claims | Accepted | 2026-08-29 | One outbox event can create at most one lease across all worker sessions. |
+| [0008](0008-fenced-idempotent-lease-renewal.md) | Fenced, generation-versioned lease renewal | Accepted | 2026-08-31 | Renewal carries a generation and a request identity, so an ambiguous retry cannot extend authority twice. |
+| [0009](0009-abandoned-attempts-consume-the-attempt-budget.md) | An abandoned attempt consumes the attempt budget | Accepted | 2026-08-31 | Crash recovery requeues while budget remains and dead-letters when it is gone, without building M4 retry or DLQ. |

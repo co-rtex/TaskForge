@@ -19,6 +19,13 @@ var (
 	ErrFenceRejected      = errors.New("attempt fence rejected")
 	ErrLeaseExpired       = errors.New("lease expired")
 	ErrStateConflict      = errors.New("state transition conflict")
+	// ErrRenewalConflict reports that a renewal named a generation that is no
+	// longer current, or reused a renewal identity that is currently recorded on a
+	// different lease. Only each lease's live identity is retained, so reusing one
+	// a lease has already superseded is deliberately not a conflict; see ADR-0008's
+	// scope note. It is distinct from ErrLeaseExpired: the lease may still be
+	// perfectly valid and simply owned by a newer generation.
+	ErrRenewalConflict = errors.New("lease renewal generation or identity conflict")
 	// ErrDeadlineExceeded reports that a database call in this operation failed
 	// because the operation's own deadline elapsed. It is produced only by
 	// classifyDatabaseError, from the failing call's returned error — never from
@@ -157,6 +164,63 @@ type Fence struct {
 	LeaseID   uuid.UUID
 	WorkerID  uuid.UUID
 	SessionID uuid.UUID
+}
+
+// HeartbeatRequest identifies the one process session reporting liveness. It
+// deliberately carries no timestamp: PostgreSQL receipt time is authoritative
+// for staleness, and a worker-supplied clock never is.
+type HeartbeatRequest struct {
+	WorkerID  uuid.UUID
+	SessionID uuid.UUID
+}
+
+// HeartbeatResult reports the PostgreSQL time the control plane accepted, so a
+// caller can confirm a heartbeat actually advanced rather than assuming it did.
+type HeartbeatResult struct {
+	SessionID       uuid.UUID
+	Status          SessionStatus
+	LastHeartbeatAt time.Time
+}
+
+// RenewalRequest extends one lease's authority window.
+//
+// Fence is the complete existing five-part fence. RenewalRequestID is generated
+// once per logical renewal and reused by every retry of it, and ExpectedVersion
+// names the generation the caller believes is current. Together they make an
+// ambiguous retry recoverable and a duplicate harmless: renewing twice with one
+// identity cannot extend authority twice, and a delayed older generation cannot
+// extend it at all.
+type RenewalRequest struct {
+	Fence            Fence
+	RenewalRequestID uuid.UUID
+	ExpectedVersion  int
+}
+
+// RenewalResult is the committed renewal window.
+//
+// Remaining is derived from PostgreSQL time sampled after every authority lock,
+// so a worker converts a server-measured duration into a local monotonic
+// deadline instead of comparing its own wall clock with ExpiresAt.
+type RenewalResult struct {
+	LeaseID        uuid.UUID
+	RenewalVersion int
+	ExpiresAt      time.Time
+	Remaining      time.Duration
+	// Replayed is true when this exact renewal identity had already committed
+	// this generation. The stored result is returned unchanged; nothing moved.
+	Replayed bool
+}
+
+// ReconcileStats counts what one reconciliation pass durably changed.
+type ReconcileStats struct {
+	StaleSessions    int
+	ExpiredLeases    int
+	RequeuedJobs     int
+	DeadLetteredJobs int
+	// Skipped counts candidates that no longer qualified once their authority
+	// rows were locked and PostgreSQL time was resampled — a renewal moved the
+	// expiry forward, or another reconciler got there first.
+	Skipped int
 }
 
 // FieldError is one registration or control-request validation problem.

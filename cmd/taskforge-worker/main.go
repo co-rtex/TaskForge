@@ -41,6 +41,11 @@ func run() int {
 		log.Error("worker configuration invalid", slog.String("error", workerErr.Error()))
 		return 1
 	}
+	// Each surface is valid on its own; this is the check neither can make alone.
+	if err := config.ValidateWorkerTimings(shared, workerConfig); err != nil {
+		log.Error("worker timing configuration invalid", slog.String("error", err.Error()))
+		return 1
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -71,6 +76,11 @@ func run() int {
 		Queue: workerConfig.Queue, PollWait: workerConfig.PollWait,
 		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond, ErrorBackoff: time.Second,
 		ShutdownTimeout: workerConfig.ShutdownTimeout,
+		// Liveness and renewal cadence come from validated shared configuration,
+		// because the thresholds they race are enforced server-side.
+		HeartbeatInterval: shared.HeartbeatInterval,
+		SessionStaleAfter: shared.SessionStaleAfter,
+		RenewInterval:     shared.LeaseRenewInterval,
 	}, log)
 
 	healthServer := newHealthServer(workerConfig.HealthAddr, runner, control, broker, log)
