@@ -216,3 +216,37 @@ func TestFailureClass_HandlerReportableSetIsClosed(t *testing.T) {
 		require.True(t, class.Valid())
 	}
 }
+
+// zeroJitter always returns the bottom of the range, which is the one value
+// that turns an overflowed nominal delay into NaN rather than into +Inf.
+type zeroJitter struct{}
+
+func (zeroJitter) Float64() float64 { return 0 }
+
+// TestRetryPolicy_OverflowTimesTheLowestJitterFactorIsStillBounded pins the
+// corner the ordinary overflow test cannot reach.
+//
+// At a large attempt number the nominal delay is +Inf. With full jitter and a
+// source returning exactly 0, the factor is 1 + 1*(2*0-1) = 0, and +Inf * 0 is
+// NaN — which compares false against every bound, so a clamp applied only after
+// the jitter multiply would let NaN reach the Duration conversion. The guard
+// before the multiply is what makes this case bounded.
+//
+// What an unguarded NaN converts to is architecture-dependent: amd64 yields the
+// indefinite value -2^63, a nonsensical negative delay, while arm64 saturates to
+// 0 and looks harmless. So this test fails loudly on one host and silently
+// passes on another if the guard is removed. It is written as a bounds
+// assertion rather than an equality one for exactly that reason: the property
+// that matters is that no input produces a delay outside [0, Max], on any
+// machine.
+func TestRetryPolicy_OverflowTimesTheLowestJitterFactorIsStillBounded(t *testing.T) {
+	policy := RetryPolicy{Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: 1}
+
+	for _, attempt := range []int{1, 2, 60, 100, 1 << 20} {
+		delay := policy.Delay(attempt, zeroJitter{})
+		require.GreaterOrEqualf(t, delay, time.Duration(0),
+			"attempt %d produced a negative delay", attempt)
+		require.LessOrEqualf(t, delay, policy.Max,
+			"attempt %d exceeded the configured maximum", attempt)
+	}
+}
