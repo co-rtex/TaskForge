@@ -253,7 +253,7 @@ Exact commands and real output are recorded in the pull request.
 
 New coverage beyond the M1/M2 suites, all of which still pass unchanged:
 
-**Migrations.** Fresh-database application through `0007`; the two reconciler
+**Migrations.** Fresh-database application through `0008`; the two reconciler
 scan indexes exist, are partial, and match the predicates the real scans use; the
 renewal identity index is partial and prevents two leases from holding the same
 identity at once, with the index's own comment recording that it constrains live
@@ -302,15 +302,41 @@ success, registration replacement, and reconciliation against one another on
 separate connections; a lock-order inversion would surface there as a PostgreSQL
 deadlock, and none occurred.
 
-**End-to-end fault injection.** Worker A reaches a durably `RUNNING` attempt, its
-authority path is severed mid-handler, its session is detected stale, its lease is
-recorded `EXPIRED`, attempt 1 becomes `ABANDONED`, active capacity returns to
-zero, the transactionally created recovery event is published through the real
-outbox publisher and real ElasticMQ, worker B claims attempt 2 and completes it,
-and the job ends `SUCCEEDED` with attempt history `[ABANDONED, SUCCEEDED]` and
-lease history `[EXPIRED, COMPLETED]`. Every late heartbeat, renewal, and success
-from worker A is then rejected and mutates nothing. No recovery state is
-hand-written; the real reconciler produces all of it.
+**End-to-end fault injection, in process.** Worker A reaches a durably `RUNNING`
+attempt and blocks inside a test-only handler; its authority path is then severed
+mid-handler, its session is detected stale, its lease is recorded `EXPIRED`,
+attempt 1 becomes `ABANDONED`, active capacity returns to zero, the
+transactionally created recovery event is published through the real outbox
+publisher and real ElasticMQ, worker B claims attempt 2 and completes it, and the
+job ends `SUCCEEDED` with attempt history `[ABANDONED, SUCCEEDED]` and lease
+history `[EXPIRED, COMPLETED]`. Every late heartbeat, renewal, and success from
+worker A is then rejected and mutates nothing. No recovery state is hand-written;
+the real reconciler produces all of it.
+
+**End-to-end fault injection, at the process boundary.** The same recovery story
+with nothing simulated: every participant is a real binary in its own process —
+`taskforge-api`, `taskforge-outbox`, two `taskforge-worker` processes, and
+`taskforge-reconciler` — consuming from a broker queue created for that test
+alone.
+
+The kill point is precise, and worth stating exactly because `demo.echo` is the
+only trusted handler compiled into the worker and it returns immediately. A proxy
+in front of the API holds worker A's outcome report, so **the handler has already
+returned and its success has not been durably accepted** when the process is
+killed. The job and attempt are still `RUNNING` and the lease still `ACTIVE` at
+that moment — verified by reading durable state, not by a local flag — which is
+the state a crashed worker actually leaves behind. It is not a kill mid-handler;
+no production handler was made slow to widen the window.
+
+Worker A is then terminated with `SIGKILL`, confirmed through the child process's
+own wait status, so the test cannot pass against a worker that merely exited.
+Nothing tells the control plane that A is gone: its session becomes `UNHEALTHY`
+only because heartbeats stopped arriving, its lease lapses on server time, the
+real reconciler binary records `EXPIRED` and `ABANDONED` and releases the
+capacity, and worker B learns of the work solely from the recovery notification
+the reconciler wrote and the real outbox publisher delivered to real ElasticMQ.
+The two attempts are asserted to belong to two different process sessions, so
+authority moved rather than being inherited.
 
 **Binary smoke test.** `taskforge-reconciler` was also run on its own from
 `./bin`, on an isolated loopback port. `GET /healthz` returned

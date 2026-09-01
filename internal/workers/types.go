@@ -20,9 +20,11 @@ var (
 	ErrLeaseExpired       = errors.New("lease expired")
 	ErrStateConflict      = errors.New("state transition conflict")
 	// ErrRenewalConflict reports that a renewal named a generation that is no
-	// longer current, or reused a renewal identity against a different lease or
-	// generation. It is deliberately distinct from ErrLeaseExpired: the lease may
-	// still be perfectly valid and simply owned by a newer generation.
+	// longer current, or reused a renewal identity that is currently recorded on a
+	// different lease. Only each lease's live identity is retained, so reusing one
+	// a lease has already superseded is deliberately not a conflict; see ADR-0008's
+	// scope note. It is distinct from ErrLeaseExpired: the lease may still be
+	// perfectly valid and simply owned by a newer generation.
 	ErrRenewalConflict = errors.New("lease renewal generation or identity conflict")
 	// ErrDeadlineExceeded reports that a database call in this operation failed
 	// because the operation's own deadline elapsed. It is produced only by

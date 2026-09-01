@@ -124,7 +124,10 @@ either way — but it means the replay window is one generation, not unbounded.
 ## Scope note: what identity uniqueness does and does not promise
 
 Added after review, because the original wording of this record promised more
-than migration 0006 enforces.
+than migration 0006 enforces. Migration 0006 creates the index, and its own
+header still describes the identities as "globally unique"; that file has been
+applied and is immutable, so the accurate statement is carried forward by
+migration 0008's `COMMENT ON INDEX` rather than by editing it.
 
 `leases_last_renewal_request_id_idx` is a partial unique index over each lease's
 **current** `last_renewal_request_id`. It therefore guarantees:
@@ -155,6 +158,6 @@ Enforcing lifetime uniqueness would require retaining every renewal in a
 `lease_renewals` table — the alternative rejected above — with its own unbounded
 growth and retention policy, in exchange for rejecting a request that is already
 harmless. That trade is not worth making, so the guarantee is stated narrowly
-here, in migration 0006, in the OpenAPI description, and in `CURRENT_STATE.md`,
-and the boundary is pinned by
+here, in migration 0008's `COMMENT ON INDEX`, in the OpenAPI description, and in
+`CURRENT_STATE.md`, and the boundary is pinned by
 `TestRenewal_ASupersededIdentityIsNotRetainedAndIsHarmless`.

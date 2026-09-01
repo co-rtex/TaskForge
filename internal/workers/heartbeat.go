@@ -103,8 +103,10 @@ func (s *Store) Heartbeat(ctx context.Context, scope string, req HeartbeatReques
 //     recognized;
 //   - a delayed older generation, or a second distinct request for the same
 //     generation, performs no mutation and returns ErrRenewalConflict;
-//   - reusing one renewal identity against a different lease is a domain
-//     conflict, not a leaked uniqueness error.
+//   - reusing a renewal identity that is currently recorded on a different lease
+//     is a domain conflict, not a leaked uniqueness error. Only each lease's live
+//     identity is retained, so an identity a lease has already superseded is
+//     reusable by design; see ADR-0008's scope note.
 //
 // Renewal extends lease authority only. It never touches the job's overall
 // timeout budget, and it never revives an expired, completed, released, or
