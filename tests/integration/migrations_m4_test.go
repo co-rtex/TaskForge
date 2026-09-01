@@ -157,29 +157,52 @@ func TestMigrations_M4SchemaMatchesTheQueriesThatJustifyIt(t *testing.T) {
 		require.Contains(t, comment, "Lifetime uniqueness")
 	})
 
-	t.Run("checksums of 0001 through 0008 are unchanged", func(t *testing.T) {
-		// The runner already refuses to run against a modified applied
-		// migration; this asserts the same thing from the other direction, so an
-		// edit to a shipped file fails here rather than only on someone's
-		// pre-existing database.
+	t.Run("every migration is recorded with the checksum of its own file", func(t *testing.T) {
+		// The runner already refuses to run against a migration whose file
+		// changed after it was applied. This asserts the same rule from the
+		// other direction, so an edit to a shipped file fails here rather than
+		// only on a developer's pre-existing database.
 		loaded, err := database.LoadMigrations()
 		require.NoError(t, err)
-		byVersion := map[int]string{}
-		for _, m := range loaded {
-			byVersion[m.Version] = m.Checksum
-		}
-		for version, want := range map[int]string{
-			1: "", 2: "", 3: "", 4: "", 5: "", 6: "", 7: "", 8: "",
-		} {
-			_ = want
+		require.Len(t, loaded, 11, "M4 ships migrations 0009 through 0011")
+
+		for _, migration := range loaded {
 			var recorded string
 			require.NoErrorf(t, conn.QueryRow(ctx,
-				`SELECT checksum FROM schema_migrations WHERE version = $1`, version).Scan(&recorded),
-				"migration %d is not recorded", version)
-			require.Equalf(t, byVersion[version], recorded,
-				"migration %d's checksum changed; a shipped migration must never be edited", version)
+				`SELECT checksum FROM schema_migrations WHERE version = $1`, migration.Version).Scan(&recorded),
+				"migration %d is not recorded", migration.Version)
+			require.Equalf(t, migration.Checksum, recorded,
+				"migration %d (%s) does not match its recorded checksum",
+				migration.Version, migration.Name)
 		}
-		require.Len(t, loaded, 10, "M4 adds exactly two migrations")
+	})
+
+	// AGENTS.md section 6: once a migration has been APPLIED ANYWHERE it is
+	// immutable. A published file has been applied somewhere by definition, so
+	// its bytes are pinned here rather than trusted to review.
+	//
+	// These are the checksums of the first published form of each M4 migration.
+	// If one of them changes, every database that applied the earlier bytes
+	// fails the runner's own checksum enforcement on its next upgrade, and the
+	// only correct fix is a new forward migration -- never an edit.
+	t.Run("published migrations are byte-identical to their first published form", func(t *testing.T) {
+		loaded, err := database.LoadMigrations()
+		require.NoError(t, err)
+		byVersion := map[int]database.Migration{}
+		for _, m := range loaded {
+			byVersion[m.Version] = m
+		}
+
+		for version, publishedChecksum := range map[int]string{
+			9:  "b41613a127d015607c21ba02a96698631ac3fdfb77ce26939db197e414da2cb8",
+			10: "3572560579e504c83f7b59569acc990dd533c2c7653376d244d008d09674a07a",
+		} {
+			migration, ok := byVersion[version]
+			require.Truef(t, ok, "migration %04d is missing", version)
+			require.Equalf(t, publishedChecksum, migration.Checksum,
+				"migration %04d (%s) was edited after publication; correct it with a "+
+					"new forward migration instead", version, migration.Name)
+		}
 	})
 }
 
@@ -406,7 +429,7 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 10)
+	require.Len(t, migrations, 11)
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -517,8 +540,8 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
-	require.NoError(t, err, "0009 and 0010 must apply to a database holding real M3 data")
-	require.Equal(t, 2, applied, "exactly the two M4 migrations are pending")
+	require.NoError(t, err, "0009 through 0011 must apply to a database holding real M3 data")
+	require.Equal(t, 3, applied, "exactly the three M4 migrations are pending")
 
 	t.Run("every seeded row survives", func(t *testing.T) {
 		for table, want := range map[string]int{
