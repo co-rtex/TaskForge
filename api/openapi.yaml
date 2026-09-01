@@ -257,6 +257,35 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed — the cancellation may already have been recorded.
+
+            **Retry:** repeat the identical cancellation request for the same
+            `job_id`. Cancellation carries no request identity because it needs
+            none: it is keyed by scope and job id alone, so a repeat returns
+            whichever decision is durably recorded and never cancels twice. If
+            the first request did commit, the repeat answers `200` with
+            `already_requested: true` and the original `cancel_requested_at`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome
+                    was known; repeat the identical cancellation request for the
+                    same job id; cancellation is keyed by scope and job id alone,
+                    so a repeat returns the current decision and never cancels
+                    twice
         '500':
           description: Sanitized internal error.
           content:
@@ -310,6 +339,40 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed — the replacement job may already exist.
+
+            **Retry:** repeat the complete identical request on the same path,
+            with the same `job_id` and the same `Idempotency-Key`. Presenting a
+            fresh key after an ambiguous response is **forbidden**: a key is the
+            replay identity, so a different one is a different replay and
+            silently creates a SECOND replacement job for the same failure. If
+            the first request did commit, the repeat answers `200` with
+            `replayed: true` and the replacement that already exists.
+
+            `/v1/jobs/{job_id}/retry` and `/v1/dlq/{job_id}/replay` share one
+            identity namespace, so an ambiguous response from either may be
+            retried through either.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome
+                    was known; repeat the identical request on the same path with
+                    the same Idempotency-Key; a fresh key after an ambiguous
+                    response is forbidden, because it is a different replay
+                    identity and would create a second replacement job
         '500':
           description: Sanitized internal error.
           content:
@@ -428,6 +491,40 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            A database call in this request failed because the request's own
+            server-owned deadline elapsed, so the durable outcome is unknown to
+            the caller. Code `service_unavailable`.
+
+            The deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT. A COMMIT that is cut short is
+            ambiguous, so this response never asserts that nothing was
+            committed — the replacement job may already exist.
+
+            **Retry:** repeat the complete identical request on the same path,
+            with the same `job_id` and the same `Idempotency-Key`. Presenting a
+            fresh key after an ambiguous response is **forbidden**: a key is the
+            replay identity, so a different one is a different replay and
+            silently creates a SECOND replacement job for the same failure. If
+            the first request did commit, the repeat answers `200` with
+            `replayed: true` and the replacement that already exists.
+
+            `/v1/jobs/{job_id}/retry` and `/v1/dlq/{job_id}/replay` share one
+            identity namespace, so an ambiguous response from either may be
+            retried through either.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: >-
+                    the request exceeded its deadline before the durable outcome
+                    was known; repeat the identical request on the same path with
+                    the same Idempotency-Key; a fresh key after an ambiguous
+                    response is forbidden, because it is a different replay
+                    identity and would create a second replacement job
         '500':
           description: Sanitized internal error.
           content:
@@ -868,10 +965,28 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
-          description: Fence, state, current session, or lease expiry rejected the transition.
+          description: |
+            Fence, state, current session, or lease expiry rejected the
+            transition.
+
+            One of these conflicts is not a reason to drop the attempt.
+            Code `cancellation_requested` means a cancellation directive won
+            before this attempt started: the job is `CANCEL_REQUESTED`, this
+            worker still holds the attempt, and the correct response is to
+            acknowledge through `POST /internal/v1/attempts/{attempt_id}/cancel`
+            with the same fence rather than to abandon the attempt and wait for
+            the lease to lapse. It is a distinct code precisely because every
+            other 409 here means the opposite.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: cancellation_requested
+                  message: >-
+                    cancellation was requested before this attempt started;
+                    acknowledge it through POST
+                    /internal/v1/attempts/{attempt_id}/cancel
         '413':
           description: The body exceeded the configured size limit.
           content:
@@ -1835,6 +1950,7 @@ components:
                 - job_not_cancelable
                 - job_not_dead_lettered
                 - invalid_cursor
+                - cancellation_requested
               description: Stable machine-readable code. Branch on this, not on `message`.
             message: { type: string }
             details:

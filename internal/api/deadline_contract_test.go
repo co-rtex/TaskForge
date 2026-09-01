@@ -285,6 +285,7 @@ func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
 			CodeClaimConflict, CodeFenceRejected, CodeLeaseExpired, CodeStateConflict,
 			CodeRenewalConflict, CodeAttemptTimedOut, CodeOutcomeConflict,
 			CodeNotCancelable, CodeNotDeadLettered, CodeInvalidCursor,
+			CodeCancellationRequested,
 		} {
 			require.Containsf(t, documented, code, "error code %q is emitted but undocumented", code)
 		}
@@ -399,4 +400,93 @@ func TestOpenAPI_CancellationContractIsExplicitAboutAttempts(t *testing.T) {
 	require.Contains(t, description, "cancel_requested`")
 	require.Contains(t, description, "never produces a retry and never creates a dead-letter entry")
 	require.Contains(t, description, "no request identity")
+}
+
+// TestOpenAPI_PublicMutatorsDocumentTheirOwnAmbiguity extends the worker-control
+// rule to the public surface.
+//
+// The three public mutating routes could previously only answer 500 when their
+// deadline elapsed, which tells an operator a bug happened and gives no
+// guidance at all. An operator cancelling a runaway job then has to guess, and
+// the cautious guess — do not retry — is the one that leaves the job running.
+func TestOpenAPI_PublicMutatorsDocumentTheirOwnAmbiguity(t *testing.T) {
+	doc := loadOpenAPI(t)
+
+	publicMutators := []struct{ method, path string }{
+		{"post", "/v1/jobs/{job_id}/cancel"},
+		{"post", "/v1/jobs/{job_id}/retry"},
+		{"post", "/v1/dlq/{job_id}/replay"},
+	}
+
+	for _, operation := range publicMutators {
+		method, path := operation.method, operation.path
+		t.Run(method+" "+path, func(t *testing.T) {
+			description, message := describe503(t, doc, method, path)
+			combined := flatten(description + " " + message)
+
+			require.Contains(t, combined, "while acquiring a lock, while executing a statement, or during commit")
+			require.Contains(t, combined, "ambiguous")
+			require.Contains(t, combined, "never asserts that nothing was committed",
+				"the spec must not promise a rollback it cannot guarantee")
+			require.Contains(t, flatten(message), "deadline")
+		})
+	}
+
+	// Cancellation's identity is the job id, and it has no request identity at
+	// all. Telling a caller to reuse an Idempotency-Key here would be nonsense.
+	t.Run("cancellation names the job id as its whole identity", func(t *testing.T) {
+		description, message := describe503(t, doc, "post", "/v1/jobs/{job_id}/cancel")
+		flat := flatten(description)
+		require.Contains(t, flat, "job_id")
+		require.Contains(t, flat, "never cancels twice")
+		require.Contains(t, flat, "already_requested")
+		require.NotContains(t, flat, "idempotency-key",
+			"cancellation carries no request identity, so it must not ask for one")
+		require.Contains(t, flatten(message), "keyed by scope and job id alone")
+	})
+
+	// Retry and replay share one identity namespace, and a fresh key after an
+	// ambiguous response is the specific mistake that duplicates work.
+	for _, path := range []string{"/v1/jobs/{job_id}/retry", "/v1/dlq/{job_id}/replay"} {
+		t.Run(path+" forbids a fresh key after an ambiguous response", func(t *testing.T) {
+			description, message := describe503(t, doc, "post", path)
+			flat := flatten(description)
+			require.Contains(t, flat, "idempotency-key")
+			require.Contains(t, flat, "complete identical request",
+				"the whole request must be repeated, not just its identifiers")
+			require.Contains(t, flat, "forbidden",
+				"a fresh key must be forbidden, not merely discouraged")
+			require.Contains(t, flat, "second replacement job",
+				"the contract must say what a fresh key would actually cost")
+			require.Contains(t, flat, "one identity namespace",
+				"an ambiguous response from either route may be retried through either")
+			require.Contains(t, flatten(message), "idempotency-key")
+		})
+	}
+}
+
+// TestOpenAPI_StartDocumentsTheCancelFirstRefusal pins the one 409 on this route
+// whose correct handling is the opposite of every other 409's.
+//
+// Every other conflict Start can report means this worker no longer holds the
+// attempt, so dropping it is right. A cancellation that won before Start means
+// the worker still holds it and is the only party that can end it promptly. A
+// client that cannot tell them apart leaves the job in CANCEL_REQUESTED for the
+// rest of its lease window.
+func TestOpenAPI_StartDocumentsTheCancelFirstRefusal(t *testing.T) {
+	doc := loadOpenAPI(t)
+	operation, ok := doc.Paths["/internal/v1/attempts/{attempt_id}/start"]["post"]
+	require.True(t, ok)
+
+	response, ok := operation.Responses["409"]
+	require.True(t, ok)
+	flat := flatten(response.Description)
+	require.Contains(t, flat, "cancellation_requested")
+	require.Contains(t, flat, "cancel_requested")
+	require.Contains(t, flat, "/internal/v1/attempts/{attempt_id}/cancel",
+		"the contract must name the acknowledgment route the worker should call")
+	require.Contains(t, flat, "same fence")
+
+	example := response.Content["application/json"].Example.Error
+	require.Equal(t, CodeCancellationRequested, example.Code)
 }
