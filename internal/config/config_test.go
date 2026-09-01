@@ -74,6 +74,32 @@ func TestValidate_RejectsBadConfiguration(t *testing.T) {
 		"multiplier below one": func(c *Config) { c.OutboxBackoffMultiplier = 0.5 },
 		"jitter above one":     func(c *Config) { c.OutboxBackoffJitter = 1.5 },
 		"negative jitter":      func(c *Config) { c.OutboxBackoffJitter = -0.1 },
+
+		"empty scheduler addr":    func(c *Config) { c.SchedulerAddr = "" },
+		"public scheduler bind":   func(c *Config) { c.SchedulerAddr = "0.0.0.0:8084" },
+		"zero scheduler poll":     func(c *Config) { c.SchedulerPollInterval = 0 },
+		"zero scheduler batch":    func(c *Config) { c.SchedulerBatchSize = 0 },
+		"huge scheduler batch":    func(c *Config) { c.SchedulerBatchSize = 1001 },
+		"zero job retry base":     func(c *Config) { c.JobRetryBase = 0 },
+		"retry max below base":    func(c *Config) { c.JobRetryMax = time.Millisecond },
+		"retry multiplier below1": func(c *Config) { c.JobRetryMultiplier = 0.5 },
+		"retry jitter above one":  func(c *Config) { c.JobRetryJitter = 1.5 },
+		"negative retry jitter":   func(c *Config) { c.JobRetryJitter = -0.1 },
+
+		// Re-notification repairs a notification that was genuinely lost. At or
+		// near one polling cadence it would instead re-notify work whose first
+		// notification is simply still on its way.
+		"renotify at one poll interval": func(c *Config) {
+			c.SchedulerPollInterval = 30 * time.Second
+			c.SchedulerRenotifyAfter = 30 * time.Second
+		},
+		// A claimed-but-unpublished event is invisible to the scheduler's
+		// pending-event check for exactly the claim timeout, so a shorter
+		// interval would call an in-flight publish a lost notification.
+		"renotify below the outbox claim timeout": func(c *Config) {
+			c.OutboxClaimTimeout = 10 * time.Minute
+			c.SchedulerRenotifyAfter = time.Minute
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -248,4 +274,27 @@ func TestValidateWorkerTimings_RejectsATransportTimeoutThatOutlivesASafetyWindow
 		require.Contains(t, err.Error(), "TASKFORGE_SESSION_STALE_AFTER")
 		require.Contains(t, err.Error(), "TASKFORGE_LEASE_RENEW_INTERVAL")
 	})
+}
+
+// TestRetryPolicy_MirrorsTheValidatedSettings keeps the one place that turns
+// configuration into policy honest. If these ever drift, two processes reading
+// the same environment would enforce different retry cadences.
+func TestRetryPolicy_MirrorsTheValidatedSettings(t *testing.T) {
+	c := baseConfig()
+	c.JobRetryBase = 2 * time.Second
+	c.JobRetryMax = 90 * time.Second
+	c.JobRetryMultiplier = 3
+	c.JobRetryJitter = 0.15
+	require.NoError(t, c.Validate())
+
+	policy := c.RetryPolicy()
+	require.NoError(t, policy.Validate())
+	require.Equal(t, c.JobRetryBase, policy.Base)
+	require.Equal(t, c.JobRetryMax, policy.Max)
+	require.Equal(t, c.JobRetryMultiplier, policy.Multiplier)
+	require.Equal(t, c.JobRetryJitter, policy.Jitter)
+
+	// The defaults must themselves be a usable policy, not merely individually
+	// in range.
+	require.NoError(t, baseConfig().RetryPolicy().Validate())
 }
