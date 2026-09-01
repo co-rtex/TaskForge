@@ -201,7 +201,9 @@ type ReplayResult struct {
 // leaving no orphan — and reads the winner's replacement.
 //
 // Locking is queue -> original job, extended by the dlq_replays row at the end.
-func (s *Store) Replay(ctx context.Context, scope string, originalJobID uuid.UUID, key string) (ReplayResult, error) {
+func (s *Store) Replay(ctx context.Context, scope string, originalJobID uuid.UUID, key string) (_ ReplayResult, err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ReplayResult{}, fmt.Errorf("begin replay: %w", err)

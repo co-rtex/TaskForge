@@ -237,3 +237,35 @@ func (s *Store) queueExists(ctx context.Context, name string) (bool, error) {
 	}
 	return exists, nil
 }
+
+// ErrDeadlineExceeded reports that a database call in this operation failed
+// because the operation's own deadline elapsed, so its durable outcome is
+// unknown to the caller.
+//
+// It mirrors workers.ErrDeadlineExceeded deliberately rather than being shared
+// with it: the two packages have no dependency between them, and one sentinel
+// reachable from both would create one purely so an error value could be
+// spelled once.
+var ErrDeadlineExceeded = errors.New("operation deadline exceeded")
+
+// classifyDatabaseError is the single translation point between a failed
+// database call and the typed deadline sentinel.
+//
+// It inspects only the returned error. pgx wraps context.DeadlineExceeded when
+// it aborts a query on an expiring deadline, so errors.Is is sufficient. It
+// deliberately never consults ctx.Err(): an unrelated constraint, driver, or
+// state failure that merely finishes after the deadline elapsed must keep its
+// own identity rather than be laundered into a retryable deadline, which would
+// hide a real error behind a 503 that invites the caller to try again.
+func classifyDatabaseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrDeadlineExceeded) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrDeadlineExceeded, err)
+	}
+	return err
+}

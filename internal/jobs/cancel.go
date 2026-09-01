@@ -59,7 +59,9 @@ type CancelResult struct {
 // already holds it, and the job row is the one every competing decision
 // contends on, which is what makes cancel-versus-success resolve to exactly one
 // winner.
-func (s *Store) RequestCancel(ctx context.Context, scope string, jobID uuid.UUID) (CancelResult, error) {
+func (s *Store) RequestCancel(ctx context.Context, scope string, jobID uuid.UUID) (_ CancelResult, err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return CancelResult{}, fmt.Errorf("begin cancellation: %w", err)

@@ -731,6 +731,7 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 // not been through that translation.
 func isDeadlineExhausted(err error) bool {
 	return errors.Is(err, workers.ErrDeadlineExceeded) ||
+		errors.Is(err, jobs.ErrDeadlineExceeded) ||
 		errors.Is(err, context.DeadlineExceeded)
 }
 

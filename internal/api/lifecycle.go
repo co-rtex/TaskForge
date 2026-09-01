@@ -63,6 +63,11 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, jobs.ErrJobNotCancelable):
 		writeError(w, r, s.log, http.StatusConflict, CodeNotCancelable,
 			"the job already reached a terminal outcome and cannot be canceled", nil)
+	case isDeadlineExhausted(err):
+		s.writeDeadlineAmbiguity(w, r, "cancel job",
+			"repeat the identical cancellation request for the same job id; "+
+				"cancellation is keyed by scope and job id alone, so a repeat "+
+				"returns the current decision and never cancels twice")
 	default:
 		s.internalError(w, r, "cancel job", err)
 	}
@@ -129,6 +134,12 @@ func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, jobs.ErrNotDeadLettered):
 		writeError(w, r, s.log, http.StatusConflict, CodeNotDeadLettered,
 			"only a dead-lettered job can be replayed", nil)
+	case isDeadlineExhausted(err):
+		s.writeDeadlineAmbiguity(w, r, "replay job",
+			"repeat the identical request on the same path with the same "+
+				"Idempotency-Key; a fresh key after an ambiguous response is "+
+				"forbidden, because it is a different replay identity and would "+
+				"create a second replacement job")
 	default:
 		s.internalError(w, r, "replay job", err)
 	}
@@ -227,6 +238,25 @@ func toDLQEntryResponse(entry jobs.DLQEntry) DLQEntryResponse {
 		response.TerminalAttemptID = &id
 	}
 	return response
+}
+
+// writeDeadlineAmbiguity renders the sanitized 503 for a public mutating route
+// whose durable outcome is unknown.
+//
+// A deadline can elapse while acquiring a lock, while executing a statement, or
+// during COMMIT, and a COMMIT that is cut short is ambiguous — so this never
+// claims nothing was committed. What it can promise is that repeating the
+// identical request is safe, and it says which identity makes that true for the
+// endpoint the caller actually used. That is why the guidance is a parameter
+// rather than one shared sentence: the worker-control surface already learned
+// that a single string cannot be correct for four different operations.
+func (s *Server) writeDeadlineAmbiguity(w http.ResponseWriter, r *http.Request, op, guidance string) {
+	s.log.Warn("request exhausted its deadline",
+		slog.String("request_id", RequestIDFrom(r.Context())),
+		slog.String("op", op))
+	writeError(w, r, s.log, http.StatusServiceUnavailable, CodeServiceUnavailable,
+		"the request exceeded its deadline before the durable outcome was known; "+
+			guidance, nil)
 }
 
 // writeFieldError renders a single-field 422 with a stable code.
