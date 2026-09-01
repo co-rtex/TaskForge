@@ -359,6 +359,24 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 			// leader's own fatal signal and does not change any follower's ack.
 			return fmt.Errorf("%w: %v", ErrSessionLost, err)
 		}
+		// Cancellation can win between the claim committing and Start being
+		// accepted, and this is the one branch where dropping the attempt would
+		// be wrong. This worker still holds it, so the job would sit in
+		// CANCEL_REQUESTED until its lease lapsed even though a cooperative
+		// worker was right here — the exact wait the acknowledgment exists to
+		// avoid.
+		//
+		// Two independent signals, because either can arrive alone: the
+		// directive may have reached the registry over the heartbeat before
+		// Start was even sent, or Start itself may be the first this process
+		// hears of it. The handler never ran, so there is nothing to cancel
+		// locally; the acknowledgment is the whole response, and the deferred
+		// unregister above runs only after it.
+		if r.attempts.wasCanceled(fence.AttemptID) || isCancellationRequested(err) {
+			r.log.Info("cancellation won before the attempt started", fenceLog(fence)...)
+			r.acknowledgeCancellation(ctx, fence)
+			return nil
+		}
 		r.log.Warn("start attempt rejected", fenceLog(fence, slog.String("error", err.Error()))...)
 		return nil
 	}
@@ -608,6 +626,16 @@ func (r *Runner) acknowledge(ctx context.Context, message queue.Message) {
 		r.log.Warn("acknowledge work notification",
 			slog.String("broker_message_id", message.ID), slog.String("error", err.Error()))
 	}
+}
+
+// isCancellationRequested reports the one Start rejection a worker must answer
+// rather than abandon.
+func isCancellationRequested(err error) bool {
+	if errors.Is(err, workers.ErrCancellationRequested) {
+		return true
+	}
+	var remote *RemoteError
+	return errors.As(err, &remote) && remote.Code == "cancellation_requested"
 }
 
 func isSessionLost(err error) bool {

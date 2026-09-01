@@ -688,6 +688,10 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 		writeError(w, r, s.log, http.StatusConflict, CodeAttemptTimedOut,
 			"the attempt reached its persisted execution deadline; reconciliation "+
 				"owns the TIMED_OUT outcome and no worker-reported outcome is accepted", nil)
+	case errors.Is(err, workers.ErrCancellationRequested):
+		writeError(w, r, s.log, http.StatusConflict, CodeCancellationRequested,
+			"cancellation was requested before this attempt started; acknowledge it "+
+				"through POST /internal/v1/attempts/{attempt_id}/cancel", nil)
 	case errors.Is(err, workers.ErrOutcomeConflict):
 		writeError(w, r, s.log, http.StatusConflict, CodeOutcomeConflict,
 			"the outcome request id was already used for a different attempt, or "+
@@ -726,7 +730,8 @@ func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request,
 // wrapped context.DeadlineExceeded is accepted for any future caller that has
 // not been through that translation.
 func isDeadlineExhausted(err error) bool {
-	return errors.Is(err, workers.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(err, workers.ErrDeadlineExceeded) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func (s *Server) writeWorkerValidation(w http.ResponseWriter, r *http.Request, fields []workers.FieldError) {

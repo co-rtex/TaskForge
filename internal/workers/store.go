@@ -517,6 +517,15 @@ func (s *Store) Start(ctx context.Context, scope string, fence Fence) (_ StartRe
 		}
 		return result, nil
 	}
+	// Cancellation gets its own answer rather than being folded into the generic
+	// state conflict below. The worker's next move differs entirely: a conflict
+	// means the attempt is no longer its concern, while a cancellation means it
+	// still holds an attempt that must be acknowledged, and telling it the wrong
+	// one leaves the job sitting in CANCEL_REQUESTED until the lease lapses even
+	// though a perfectly cooperative worker was right there.
+	if state.jobStatus == "CANCEL_REQUESTED" || state.jobStatus == "CANCELED" {
+		return StartResult{}, ErrCancellationRequested
+	}
 	if state.jobStatus != "LEASED" || state.attemptStatus != AttemptLeased {
 		return StartResult{}, ErrStateConflict
 	}

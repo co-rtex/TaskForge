@@ -249,7 +249,14 @@ func TestContention_CancellationVersusStart(t *testing.T) {
 
 		release()
 		require.NoError(t, <-cancelErr)
-		require.ErrorIs(t, <-startErr, workers.ErrStateConflict)
+
+		// The refusal is typed. A worker that loses this race has to
+		// acknowledge the cancellation rather than drop the attempt, and it can
+		// only tell the two apart if the control plane names the reason.
+		err := <-startErr
+		require.ErrorIs(t, err, workers.ErrCancellationRequested)
+		require.NotErrorIs(t, err, workers.ErrStateConflict,
+			"a cancel-first Start must not be reported as an unrelated state conflict")
 
 		state := readState(t, fence)
 		require.Equal(t, "CANCEL_REQUESTED", state.job)
@@ -259,7 +266,7 @@ func TestContention_CancellationVersusStart(t *testing.T) {
 
 		// Acknowledging it produces the CANCELED attempt with no start time that
 		// migration 0009 revised the timeline constraint to allow.
-		_, err := store.AcknowledgeCancellation(ctx, testScope, cancelAck(fence))
+		_, err = store.AcknowledgeCancellation(ctx, testScope, cancelAck(fence))
 		require.NoError(t, err)
 		require.Equal(t, "CANCELED", readState(t, fence).attempt)
 	})

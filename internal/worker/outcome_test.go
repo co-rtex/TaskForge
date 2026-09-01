@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -681,4 +682,188 @@ func TestClassifyHandlerError_RejectsAServerAuthoritativeClaim(t *testing.T) {
 	require.Equal(t, lifecycle.ClassPermanent, class)
 	require.Equal(t, "invalid_payload", code)
 	require.Equal(t, "no such account", message)
+}
+
+// TestCancellation_WinningBeforeStartIsAcknowledgedFromTheTypedRefusal is the
+// case the heartbeat cannot cover.
+//
+// The directive may never reach this process: the control plane can commit the
+// cancellation and refuse Start before a single heartbeat carries the directive
+// back. Start's own refusal is then the only signal the worker gets, so it has
+// to be typed. A generic state conflict would be indistinguishable from an
+// expired lease or a replaced session — cases where dropping the attempt is
+// correct — and the job would sit in CANCEL_REQUESTED until its lease lapsed
+// even though a cooperative worker was holding it.
+func TestCancellation_WinningBeforeStartIsAcknowledgedFromTheTypedRefusal(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+
+	var handlerRan atomic.Bool
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo",
+		HandlerFunc(func(context.Context, Execution) (json.RawMessage, error) {
+			handlerRan.Store(true)
+			return nil, nil
+		})))
+
+	var acks []workers.CancelAcknowledgment
+	var registeredDuringAck atomic.Bool
+	var succeeded, failed atomic.Bool
+	runnerRef := make(chan *Runner, 1)
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		start: func(context.Context, workers.Fence) (workers.StartResult, error) {
+			// No directive is delivered. This is the control plane's answer and
+			// nothing else, which is the whole point of the case.
+			return workers.StartResult{}, workers.ErrCancellationRequested
+		},
+		cancelAck: func(_ context.Context, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+			runner := <-runnerRef
+			runnerRef <- runner
+			acks = append(acks, ack)
+			if len(acks) == 1 {
+				// The attempt must still be registered while the
+				// acknowledgment is in flight, so a directive arriving now is
+				// still observable rather than silently dropped.
+				runner.attempts.deliver(workers.CancellationDirective{
+					JobID: ack.Fence.JobID, AttemptID: ack.Fence.AttemptID,
+					LeaseID: ack.Fence.LeaseID, CancelRequestedAt: time.Now(),
+				})
+				registeredDuringAck.Store(runner.attempts.wasCanceled(ack.Fence.AttemptID))
+				// Retryable: the identity must be reused, not redrawn.
+				return workers.OutcomeResult{}, &RemoteError{Status: 503, Code: "service_unavailable"}
+			}
+			return workers.OutcomeResult{
+				JobID: ack.Fence.JobID, JobStatus: "CANCELED",
+				AttemptStatus: workers.AttemptCanceled,
+			}, nil
+		},
+		succeed: func(context.Context, workers.Fence) error { succeeded.Store(true); return nil },
+		fail: func(context.Context, workers.FailureReport) (workers.OutcomeResult, error) {
+			failed.Store(true)
+			return workers.OutcomeResult{}, nil
+		},
+	}
+
+	runner := testRunner(control, &fakeBroker{}, registry)
+	runnerRef <- runner
+	require.NoError(t, runner.processMessage(context.Background(), session, advisoryMessage(t)))
+
+	require.Len(t, acks, 2, "an ambiguous acknowledgment must be retried")
+	require.True(t, registeredDuringAck.Load(),
+		"the attempt must stay registered until the acknowledgment completes")
+
+	// The full five-part fence, not a job id: the control plane revalidates
+	// every part before it accepts the acknowledgment.
+	require.Equal(t, assignment.JobID, acks[0].Fence.JobID)
+	require.Equal(t, assignment.AttemptID, acks[0].Fence.AttemptID)
+	require.Equal(t, assignment.LeaseID, acks[0].Fence.LeaseID)
+	require.Equal(t, assignment.WorkerID, acks[0].Fence.WorkerID)
+	require.Equal(t, assignment.SessionID, acks[0].Fence.SessionID)
+
+	// One identity across both calls. A fresh identity on the retry would be a
+	// second outcome, and the retained-identity replay could not recognize it.
+	require.NotEqual(t, uuid.Nil, acks[0].OutcomeRequestID)
+	require.Equal(t, acks[0].OutcomeRequestID, acks[1].OutcomeRequestID,
+		"a retried acknowledgment must reuse one outcome identity")
+
+	require.False(t, handlerRan.Load(), "an attempt that never started has nothing to run")
+	require.False(t, succeeded.Load())
+	require.False(t, failed.Load())
+
+	// The registration is released only after the acknowledgment path finished:
+	// a delivered directive was observable above and is not observable now,
+	// which is only true if the entry itself is gone.
+	require.False(t, runner.attempts.wasCanceled(assignment.AttemptID),
+		"the attempt must be unregistered once the outcome path is over")
+}
+
+// TestCancellation_TypedRefusalIsRecognizedOverTheWire proves the same thing for
+// a real worker, which never sees workers.ErrCancellationRequested.
+//
+// A DB-less worker talks HTTP, so what actually reaches this code is a
+// *RemoteError carrying the API's stable error code. If the runner recognized
+// only the sentinel, this fix would work in unit tests and do nothing in
+// production.
+func TestCancellation_TypedRefusalIsRecognizedOverTheWire(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo",
+		HandlerFunc(func(context.Context, Execution) (json.RawMessage, error) { return nil, nil })))
+
+	var acknowledged atomic.Bool
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		start: func(context.Context, workers.Fence) (workers.StartResult, error) {
+			return workers.StartResult{}, &RemoteError{
+				Status: http.StatusConflict, Code: "cancellation_requested",
+			}
+		},
+		cancelAck: func(_ context.Context, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+			acknowledged.Store(true)
+			return workers.OutcomeResult{
+				JobID: ack.Fence.JobID, JobStatus: "CANCELED",
+				AttemptStatus: workers.AttemptCanceled,
+			}, nil
+		},
+		succeed: func(context.Context, workers.Fence) error { return nil },
+	}
+
+	runner := testRunner(control, &fakeBroker{}, registry)
+	require.NoError(t, runner.processMessage(context.Background(), session, advisoryMessage(t)))
+	require.True(t, acknowledged.Load(),
+		"the API's cancellation_requested code must reach the acknowledgment path")
+}
+
+// TestCancellation_UnrelatedStartConflictsAreStillDropped is the control that
+// makes the test above mean something.
+//
+// Every other reason Start can be refused leaves this worker with no authority
+// to acknowledge anything. Acknowledging a fence that a replacement session or
+// an expired lease already invalidated would be a worker claiming an outcome it
+// cannot prove.
+func TestCancellation_UnrelatedStartConflictsAreStillDropped(t *testing.T) {
+	for name, refusal := range map[string]error{
+		"state conflict":  workers.ErrStateConflict,
+		"fence rejected":  workers.ErrFenceRejected,
+		"lease expired":   workers.ErrLeaseExpired,
+		"remote conflict": &RemoteError{Status: http.StatusConflict, Code: "state_conflict"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			session := testSession(1)
+			assignment := testAssignment(session)
+			registry := NewRegistry()
+			require.NoError(t, registry.Register("demo.echo",
+				HandlerFunc(func(context.Context, Execution) (json.RawMessage, error) { return nil, nil })))
+
+			var acknowledged atomic.Bool
+			control := &fakeControl{
+				claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+					return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+				},
+				start: func(context.Context, workers.Fence) (workers.StartResult, error) {
+					return workers.StartResult{}, refusal
+				},
+				cancelAck: func(context.Context, workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+					acknowledged.Store(true)
+					return workers.OutcomeResult{}, nil
+				},
+				succeed: func(context.Context, workers.Fence) error { return nil },
+			}
+
+			runner := testRunner(control, &fakeBroker{}, registry)
+			err := runner.processMessage(context.Background(), session, advisoryMessage(t))
+			if !errors.Is(err, ErrSessionLost) {
+				require.NoError(t, err)
+			}
+			require.False(t, acknowledged.Load(),
+				"only a cancellation refusal authorizes an acknowledgment")
+		})
+	}
 }

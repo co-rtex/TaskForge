@@ -164,7 +164,15 @@ func TestCancel_WhileLeasedOrRunningRequestsRatherThanTerminates(t *testing.T) {
 			require.ErrorIs(t, err, workers.ErrStateConflict)
 			_, err = store.RenewLease(ctx, testScope, renewalRequest(fence, 0))
 			require.ErrorIs(t, err, workers.ErrStateConflict)
-			require.ErrorIs(t, startError(store, fence), workers.ErrStateConflict)
+
+			// Start is refused too, but with its own code. A worker that lost
+			// this race still holds the attempt and must acknowledge the
+			// cancellation; every other conflict here means the opposite, so
+			// reporting them identically is what leaves the job waiting out its
+			// lease with a cooperative worker right there.
+			startErr := startError(store, fence)
+			require.ErrorIs(t, startErr, workers.ErrCancellationRequested)
+			require.NotErrorIs(t, startErr, workers.ErrStateConflict)
 
 			require.Equal(t, state, readState(t, fence), "every rejection must mutate nothing")
 		})

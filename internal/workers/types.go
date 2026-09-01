@@ -49,6 +49,19 @@ var (
 	// for the lifetime of attempt history, so this is a stable domain conflict
 	// rather than a leaked uniqueness error.
 	ErrOutcomeConflict = errors.New("outcome request id reused for a different outcome")
+	// ErrCancellationRequested reports that cancellation won before this attempt
+	// could start. It is distinct from ErrStateConflict because the two call for
+	// opposite worker behavior: an ordinary state conflict means this attempt is
+	// somebody else's problem now and the worker simply drops it, while a
+	// cancellation means the worker still owns an attempt that must be
+	// acknowledged so the job becomes terminal without waiting out lease expiry.
+	//
+	// Start is the only operation that returns it, and that asymmetry is
+	// deliberate. By the time a worker reports success or failure it has already
+	// received the directive over its heartbeat and taken the cancellation path
+	// itself; Start is the one moment where the control plane is the worker's
+	// only source of truth about a cancellation that raced it.
+	ErrCancellationRequested = errors.New("cancellation was requested before the attempt started")
 )
 
 // SessionStatus is the server-owned health state of one process lifetime.

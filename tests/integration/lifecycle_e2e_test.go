@@ -3,12 +3,16 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -625,4 +629,221 @@ func TestE2E_CancellingAQueuedJobStopsItBeforeAnyWorkerClaimsIt(t *testing.T) {
 	require.Equal(t, 0, countRows(t, "job_attempts"),
 		"a job canceled before any claim must never produce an attempt")
 	require.Equal(t, 0, countActiveLeases(t))
+}
+
+// startWorkerVia is startWorker pointed at a different control-plane URL, so a
+// test can interpose on the worker's own HTTP traffic without changing what the
+// control plane, the API, or the runner actually do.
+func (s *e2eStack) startWorkerVia(t *testing.T, name string, concurrency int, controlURL string) {
+	t.Helper()
+	control := workerruntime.NewClient(controlURL, &http.Client{Timeout: 10 * time.Second})
+	runner := workerruntime.NewRunner(control, s.broker, s.registry, workerruntime.RunnerConfig{
+		Registration: workers.Registration{
+			SessionID: uuid.New(), Name: name, Hostname: name + ".local",
+			WorkerGroup: "default", ConcurrencyLimit: concurrency, Capabilities: []string{"cpu"},
+		},
+		Queue: "default", PollWait: time.Second,
+		RetryAttempts: 3, RetryDelay: 10 * time.Millisecond, ErrorBackoff: 10 * time.Millisecond,
+		HeartbeatInterval: 50 * time.Millisecond, SessionStaleAfter: 3 * time.Second,
+		RenewInterval:   time.Second,
+		ShutdownTimeout: 2 * time.Second,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		done <- runner.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("worker did not stop after cancellation")
+		}
+	})
+}
+
+// startGate holds the worker's first Start request in flight and reports what
+// the control plane eventually answered.
+//
+// It is a transparent proxy in front of the real API. It does not fabricate a
+// response, shortcut a call, or change a body — it only delays requests long
+// enough for a real cancellation to commit first, which widens a window that is
+// otherwise microseconds wide and therefore untestable. Everything a request
+// meets after the delay is the production path.
+//
+// Heartbeats are held for the same window, and that is not incidental. A
+// heartbeat that landed in it would carry the cancellation directive back to
+// the worker, and the worker would then acknowledge from the directive rather
+// than from Start's answer — leaving the typed refusal untested while the test
+// still passed. Holding both makes Start the only thing this process can learn
+// the cancellation from, which is the case the typed refusal exists for.
+type startGate struct {
+	url     string
+	arrived chan struct{}
+	// Two releases, because the two holds end at different moments: Start is
+	// released so the refusal can happen, and heartbeats stay held until the
+	// outcome has been observed.
+	releaseStart     chan struct{}
+	releaseHeartbeat chan struct{}
+
+	status   atomic.Int64
+	code     atomic.Value
+	requests atomic.Int64
+	// forwardedHeartbeats counts heartbeats forwarded after Start was parked.
+	// It must still be zero when the job reaches CANCELED, or a directive could
+	// have arrived that way and the typed refusal would be untested.
+	forwardedHeartbeats atomic.Int64
+}
+
+func newStartGate(t *testing.T, upstream string) *startGate {
+	t.Helper()
+	target, err := url.Parse(upstream)
+	require.NoError(t, err)
+
+	gate := &startGate{
+		arrived:          make(chan struct{}, 1),
+		releaseStart:     make(chan struct{}),
+		releaseHeartbeat: make(chan struct{}),
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if !strings.HasSuffix(response.Request.URL.Path, "/start") {
+			return nil
+		}
+		body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		if err != nil {
+			return err
+		}
+		_ = response.Body.Close()
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		response.ContentLength = int64(len(body))
+		gate.status.Store(int64(response.StatusCode))
+		var envelope api.ErrorBody
+		if json.Unmarshal(body, &envelope) == nil {
+			gate.code.Store(envelope.Error.Code)
+		}
+		return nil
+	}
+
+	parked := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/start") && gate.requests.Add(1) == 1:
+			close(parked)
+			select {
+			case gate.arrived <- struct{}{}:
+			default:
+			}
+			<-gate.releaseStart
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			select {
+			case <-parked:
+				<-gate.releaseHeartbeat
+				gate.forwardedHeartbeats.Add(1)
+			default:
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		// Nothing may stay blocked after the test, however it ended.
+		select {
+		case <-gate.releaseHeartbeat:
+		default:
+			close(gate.releaseHeartbeat)
+		}
+		server.Close()
+	})
+	gate.url = server.URL
+	return gate
+}
+
+// TestE2E_CancellationWinningBeforeStartIsAcknowledgedByTheWorker is the
+// cancel-first race run through every real component.
+//
+// The window is real and narrow: a claim commits, and before the worker's Start
+// reaches the control plane an operator cancels the job. Everything here is
+// production code — the public API commits the cancellation, the control plane
+// refuses Start, the API renders the refusal, and a DB-less worker over HTTP
+// decides what to do with it. Only the arrival time of one HTTP request is
+// controlled, because otherwise the window is too short to observe.
+//
+// What must not happen is the worker treating the refusal as an ordinary
+// conflict and dropping the attempt. The job would then sit in CANCEL_REQUESTED
+// for the rest of its lease window with a cooperative worker holding it and
+// nothing to do — the exact wait the acknowledgment exists to avoid.
+func TestE2E_CancellationWinningBeforeStartIsAcknowledgedByTheWorker(t *testing.T) {
+	var handlerRan atomic.Bool
+	registry := workerruntime.NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", workerruntime.HandlerFunc(
+		func(context.Context, workerruntime.Execution) (json.RawMessage, error) {
+			handlerRan.Store(true)
+			return json.RawMessage(`{}`), nil
+		})))
+
+	stack := startE2EStack(t, registry, time.Hour)
+	gate := newStartGate(t, stack.baseURL)
+	stack.startWorkerVia(t, "cancel-before-start", 1, gate.url)
+
+	job := stack.submit(t, "e2e-cancel-before-start",
+		`{"queue":"default","job_type":"demo.echo","payload":{"n":1},"timeout_seconds":3600}`)
+	jobID := uuid.MustParse(job.ID)
+
+	// The claim has committed and the attempt exists; Start is held at the gate.
+	select {
+	case <-gate.arrived:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the worker never reached Start")
+	}
+	awaitJobStatus(t, jobID, "LEASED", 10*time.Second)
+
+	// A real operator cancellation through the real public API, which wins
+	// because Start has not been accepted yet.
+	response, body := stack.post(t, "/v1/jobs/"+job.ID+"/cancel", "")
+	require.Equalf(t, http.StatusOK, response.StatusCode, "cancel returned %s", body)
+	var canceled api.CancelResponse
+	require.NoError(t, json.Unmarshal(body, &canceled))
+	require.Equal(t, "CANCEL_REQUESTED", canceled.Status,
+		"a claimed job cancels through CANCEL_REQUESTED, because an attempt still holds authority")
+
+	close(gate.releaseStart)
+
+	// The worker acknowledges rather than waiting for the lease to lapse, so the
+	// job is terminal long before reconciliation would have reached it.
+	awaitJobStatus(t, jobID, "CANCELED", 10*time.Second)
+
+	// Checked before heartbeats are let through: no heartbeat completed between
+	// the cancellation committing and the acknowledgment landing, so Start's own
+	// refusal is the only thing this worker could have learned it from.
+	require.Zero(t, gate.forwardedHeartbeats.Load(),
+		"no heartbeat may deliver the directive in this test, or the typed refusal is untested")
+	close(gate.releaseHeartbeat)
+
+	require.EqualValues(t, http.StatusConflict, gate.status.Load(),
+		"the control plane must refuse a cancel-first Start")
+	require.Equal(t, "cancellation_requested", gate.code.Load(),
+		"the refusal must be typed, or the worker cannot tell it from an unrelated conflict")
+
+	var attemptStatus string
+	var startedAt, finishedAt *time.Time
+	require.NoError(t, testPool.QueryRow(context.Background(), `
+		SELECT status, started_at, finished_at FROM job_attempts WHERE job_id = $1`, jobID,
+	).Scan(&attemptStatus, &startedAt, &finishedAt))
+	require.Equal(t, "CANCELED", attemptStatus)
+	require.Nil(t, startedAt, "the attempt never started")
+	require.NotNil(t, finishedAt, "the acknowledgment finalizes the attempt")
+	require.False(t, handlerRan.Load(), "an attempt that never started has nothing to run")
+
+	// The lease is released, so the worker's capacity came back immediately
+	// instead of at the end of the lease window.
+	var leaseStatus string
+	require.NoError(t, testPool.QueryRow(context.Background(), `
+		SELECT l.status FROM leases l
+		JOIN job_attempts a ON a.id = l.attempt_id
+		WHERE a.job_id = $1`, jobID).Scan(&leaseStatus))
+	require.Equal(t, "RELEASED", leaseStatus)
 }
