@@ -290,9 +290,17 @@ ALTER TABLE outbox_events
     -- The pair is meaningless apart: a job reference with no generation cannot
     -- answer the scheduler's question, and a generation with no job has nothing
     -- to be a generation of.
+    --
+    -- The IS NOT NULL on the generation is load-bearing, not redundant. A CHECK
+    -- constraint only rejects a row when it evaluates to FALSE, and
+    -- `NULL >= 1` is NULL, not FALSE — so writing the second branch as
+    -- `job_id IS NOT NULL AND notification_generation >= 1` would let a job
+    -- reference with a NULL generation through, which is exactly the row this
+    -- constraint exists to refuse.
     ADD CONSTRAINT outbox_events_notification_metadata_paired CHECK (
         (job_id IS NULL     AND notification_generation IS NULL) OR
-        (job_id IS NOT NULL AND notification_generation >= 1)
+        (job_id IS NOT NULL AND notification_generation IS NOT NULL
+                           AND notification_generation >= 1)
     );
 
 -- The scheduler's current-generation pending-event check.
