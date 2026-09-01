@@ -569,9 +569,6 @@ func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err err
 	if state.jobStatus == "SUCCEEDED" && state.attemptStatus == AttemptSucceeded && state.leaseStatus == LeaseCompleted {
 		return tx.Commit(ctx)
 	}
-	if !state.leaseUsable() {
-		return ErrLeaseExpired
-	}
 	// The persisted deadline is checked against the SAME post-lock sample that
 	// every other authority decision in this transaction uses. A success that
 	// waited across the deadline while holding no locks would otherwise commit on
@@ -581,8 +578,18 @@ func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err err
 	// Lock order is what resolves timeout-versus-success: whichever transaction
 	// reaches these rows first commits, and the loser re-reads a state its
 	// precondition no longer matches.
+	//
+	// This is checked BEFORE lease usability, and the order is the difference
+	// between a useful answer and a misleading one. When a timeout wins the race
+	// it also releases the lease, so both conditions are true afterwards —
+	// reporting "lease expired" would tell the worker it lost authority, when
+	// what actually happened is that its execution budget ran out. The deadline
+	// is the more specific cause, so it is the one reported.
 	if state.timedOut() {
 		return ErrAttemptTimedOut
+	}
+	if !state.leaseUsable() {
+		return ErrLeaseExpired
 	}
 	// CANCEL_REQUESTED lands here as a state conflict, which is the point: once
 	// cancellation has durably won, no later success from this attempt commits.

@@ -73,16 +73,21 @@ func (s *Store) Fail(ctx context.Context, scope string, report FailureReport) (_
 		return OutcomeResult{}, err
 	}
 
-	if !state.leaseUsable() {
-		return OutcomeResult{}, ErrLeaseExpired
-	}
 	// A failure observed at or after the deadline must NOT become an ordinary
 	// FAILED attempt. The truthful outcome is TIMED_OUT, and only a PostgreSQL
 	// transaction driven by reconciliation may record that; letting this request
 	// write FAILED would both mislabel the attempt and let a handler's own
 	// classification override a server-authoritative one.
+	//
+	// Checked before lease usability for the same reason Succeed checks it
+	// first: a timeout that already won released the lease too, and "your
+	// execution budget ran out" is the more specific and more useful of the two
+	// true answers.
 	if state.timedOut() {
 		return OutcomeResult{}, ErrAttemptTimedOut
+	}
+	if !state.leaseUsable() {
+		return OutcomeResult{}, ErrLeaseExpired
 	}
 	if state.jobStatus != "RUNNING" || state.attemptStatus != AttemptRunning {
 		return OutcomeResult{}, ErrStateConflict
@@ -266,32 +271,47 @@ func (s *Store) finalizeAttempt(
 
 	var retryAt *time.Time
 	var retryDelayMillis *int64
-	if decision.Retry && decision.Delay > 0 {
+	if decision.Retry {
 		// Both the chosen delay and the instant it produced are persisted. The
 		// delay alone would not survive a replay (it would have to be re-added to
 		// a different "now"), and the instant alone would hide what policy
 		// produced it from anyone reading attempt history.
-		at := state.serverNow.Add(decision.Delay)
+		//
+		// The delay is truncated to the granularity it is stored at, and the
+		// instant is derived from the truncated value. Deriving the instant from
+		// the untruncated delay instead would make the two disagree by up to a
+		// millisecond, so a replay reading them back would answer a question the
+		// first response answered differently.
+		//
+		// A zero delay is still recorded, so "requeued immediately" (ADR-0009)
+		// and "no decision was made" stay distinguishable in attempt history.
 		millis := decision.Delay.Milliseconds()
-		retryAt, retryDelayMillis = &at, &millis
-	} else if decision.Retry {
-		// Immediate recovery still records the decision, with a zero delay, so
-		// "requeued immediately" and "no decision was made" stay distinguishable.
-		at := state.serverNow
-		var millis int64
+		at := state.serverNow.Add(time.Duration(millis) * time.Millisecond)
 		retryAt, retryDelayMillis = &at, &millis
 	}
 
-	tag, err := tx.Exec(ctx, `
+	// RETURNING, not the values computed above. PostgreSQL stores timestamps at
+	// microsecond granularity, so the instant this transaction committed is not
+	// necessarily the instant Go computed. Reporting the computed value would
+	// make the first response and its own replay disagree — which is precisely
+	// the promise the retained outcome identity exists to keep.
+	var storedRetryAt *time.Time
+	var storedRetryDelayMillis *int64
+	err := tx.QueryRow(ctx, `
 		UPDATE job_attempts
 		SET status = $2, finished_at = $3, failure_class = $4,
 		    error_code = $5, error_message = $6,
 		    outcome_request_id = COALESCE($7, outcome_request_id),
 		    retry_delay_ms = $8, retry_at = $9
-		WHERE id = $1 AND status IN ('LEASED', 'RUNNING')`,
+		WHERE id = $1 AND status IN ('LEASED', 'RUNNING')
+		RETURNING retry_delay_ms, retry_at`,
 		fence.AttemptID, string(outcome.status), state.serverNow, string(outcome.class),
 		nullableString(outcome.errorCode), nullableString(outcome.errorMessage),
-		outcome.outcomeRequestID, retryDelayMillis, retryAt)
+		outcome.outcomeRequestID, retryDelayMillis, retryAt,
+	).Scan(&storedRetryDelayMillis, &storedRetryAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return OutcomeResult{}, fmt.Errorf("%w: attempt changed during outcome", ErrStateConflict)
+	}
 	if err != nil {
 		var postgresError *pgconn.PgError
 		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
@@ -299,9 +319,7 @@ func (s *Store) finalizeAttempt(
 		}
 		return OutcomeResult{}, fmt.Errorf("record attempt outcome: %w", err)
 	}
-	if tag.RowsAffected() != 1 {
-		return OutcomeResult{}, fmt.Errorf("%w: attempt changed during outcome", ErrStateConflict)
-	}
+	retryAt = storedRetryAt
 
 	// Capacity is released solely by the lease ceasing to be ACTIVE. There is no
 	// counter to decrement, so it cannot drift or go negative.
@@ -315,7 +333,11 @@ func (s *Store) finalizeAttempt(
 	}
 
 	if decision.Retry {
-		result.RetryAt, result.RetryDelay = retryAt, durationPointer(decision.Delay)
+		result.RetryAt = retryAt
+		if storedRetryDelayMillis != nil {
+			result.RetryDelay = durationPointer(
+				time.Duration(*storedRetryDelayMillis) * time.Millisecond)
+		}
 		if decision.Delay > 0 {
 			// RETRY_WAIT, and deliberately NO outbox event. The job is durable and
 			// scheduled; creating a notification now would advertise work no worker

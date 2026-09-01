@@ -70,13 +70,31 @@ func createJob(t *testing.T, key, jobType string, priority int, capabilities []s
 
 func createJobInQueue(t *testing.T, key, queueName, jobType string, priority int, capabilities []string) uuid.UUID {
 	t.Helper()
+	return createJobWithOptions(t, key, queueName, jobType, priority, capabilities, 3, 300, nil)
+}
+
+// createJobWithOptions is the one submission helper every other one delegates
+// to, so a test that needs a specific attempt budget, execution timeout, or
+// schedule goes through exactly the same durable path as a default one.
+func createJobWithOptions(
+	t *testing.T,
+	key, queueName, jobType string,
+	priority int,
+	capabilities []string,
+	maxAttempts, timeoutSeconds int,
+	scheduledAt *time.Time,
+) uuid.UUID {
+	t.Helper()
 	payload, err := json.Marshal(map[string]any{"key": key})
 	require.NoError(t, err)
-	maxAttempts, timeout := 3, 300
 	request := jobs.SubmitRequest{
 		Queue: queueName, Type: jobType, Payload: payload, Priority: &priority,
-		MaxAttempts: &maxAttempts, TimeoutSeconds: &timeout,
+		MaxAttempts: &maxAttempts, TimeoutSeconds: &timeoutSeconds,
 		RequiredCapabilities: capabilities,
+	}
+	if scheduledAt != nil {
+		formatted := scheduledAt.UTC().Format(time.RFC3339Nano)
+		request.ScheduledAt = &formatted
 	}
 	normalized, err := request.Normalize()
 	require.NoError(t, err)
