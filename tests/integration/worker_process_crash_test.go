@@ -201,17 +201,22 @@ func (s *succeedStaller) release() {
 
 func (s *succeedStaller) URL() string { return s.server.URL }
 
-// createIsolatedBrokerQueue gives this test a broker queue of its own.
+// createIsolatedBrokerQueue gives one test a broker queue of its own.
 //
-// Every other test in this package shares one queue and drains it in reset().
-// That is fine for tests whose consumers live and die inside the test, but this
-// one runs real worker processes: a worker that is SIGKILLed or SIGTERMed while
-// long-polling leaves a message in flight, and reset() cannot drain what is not
-// visible. Rather than make every later test tolerate that, this test consumes
-// from a queue nobody else touches.
-func createIsolatedBrokerQueue(t *testing.T) string {
+// Most tests in this package share one queue and drain it in reset(). That is
+// fine when every delivery is either acknowledged or drained before the test
+// ends. It is not fine for a test that leaves messages IN FLIGHT: a worker
+// SIGKILLed while long-polling, or one that legitimately declines to
+// acknowledge a notification for work another worker already took, leaves a
+// message invisible for the queue's visibility timeout. reset() cannot drain
+// what it cannot see, so the message reappears during some later test and looks
+// like that test's own doing.
+//
+// Rather than make every later test tolerate that, these tests consume from a
+// queue nobody else touches.
+func createIsolatedBrokerQueue(t *testing.T, prefix string) string {
 	t.Helper()
-	name := "taskforge-crash-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+	name := prefix + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
 
 	response, err := http.PostForm(brokerEndpoint()+"/", url.Values{
 		"Action": {"CreateQueue"}, "QueueName": {name}, "Version": {"2012-11-05"},
@@ -251,7 +256,7 @@ var queueURLPattern = regexp.MustCompile(`<QueueUrl>([^<]+)</QueueUrl>`)
 func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) {
 	reset(t)
 	binDir := buildBinaries(t)
-	brokerQueue := createIsolatedBrokerQueue(t)
+	brokerQueue := createIsolatedBrokerQueue(t, "taskforge-crash-")
 
 	apiPort, outboxPort := freePort(t), freePort(t)
 	reconcilerPort := freePort(t)
