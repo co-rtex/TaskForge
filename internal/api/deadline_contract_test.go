@@ -490,3 +490,43 @@ func TestOpenAPI_StartDocumentsTheCancelFirstRefusal(t *testing.T) {
 	example := response.Content["application/json"].Example.Error
 	require.Equal(t, CodeCancellationRequested, example.Code)
 }
+
+// TestOpenAPI_OutcomeJobStatusIsTheDecisionNotTheCurrentStatus pins the one
+// sentence that keeps a client from reading job_status as live state.
+//
+// They are the same value until the job moves on, and then they are not: a
+// retryable failure reports RETRY_WAIT, and by the time an ambiguous report is
+// retried the job may have been promoted, claimed again, and succeeded. A client
+// that treated a replay's job_status as current would act on a status the job
+// left behind — and SUCCEEDED is not even in the enum, so the contract would be
+// self-contradictory if the implementation ever answered that way.
+func TestOpenAPI_OutcomeJobStatusIsTheDecisionNotTheCurrentStatus(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	require.NoError(t, err)
+	document := flatten(string(raw))
+
+	require.Contains(t, document, "the status this outcome produced, not the job's status now",
+		"the Outcome schema must say which of the two job_status means")
+	require.Contains(t, document, "the replay still answers `retry_wait`",
+		"the contract must give the concrete case, because that is the one that gets this wrong")
+
+	// And the enum stays closed around the four statuses an outcome can produce.
+	var spec struct {
+		Components struct {
+			Schemas struct {
+				Outcome struct {
+					Properties struct {
+						JobStatus struct {
+							Enum []string `yaml:"enum"`
+						} `yaml:"job_status"`
+					} `yaml:"properties"`
+				} `yaml:"Outcome"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	require.NoError(t, yaml.Unmarshal(raw, &spec))
+	require.ElementsMatch(t,
+		[]string{"QUEUED", "RETRY_WAIT", "CANCELED", "DEAD_LETTERED"},
+		spec.Components.Schemas.Outcome.Properties.JobStatus.Enum,
+		"an outcome produces exactly these four job statuses; SUCCEEDED is not one of them")
+}

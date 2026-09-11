@@ -90,6 +90,25 @@ replacement, after lease closure, and after lease expiry. Only if that
 recognition does not apply is live authority required, and a first-time outcome
 from a fenced boot is still `fence_rejected`.
 
+A replay also reports the decision that COMMITTED, not the job's current status.
+Those are different things as soon as the job moves on: a retryable failure puts
+it into `RETRY_WAIT`, the scheduler promotes it, a new attempt claims it, and it
+may be `SUCCEEDED` minutes later — all while the original attempt's outcome is
+unchanged and still replayable. Reading the live job row would answer with
+whatever happened afterwards, which is neither the committed decision nor even a
+value this outcome contract permits.
+
+Everything needed is already immutable on the attempt, because the outcome
+persists the decision rather than only its effect. `retry_delay_ms` absent means
+no retry was decided, so the job went `DEAD_LETTERED`; zero means it was requeued
+immediately (ADR-0009); positive means it was scheduled for a later attempt, so
+the job went `RETRY_WAIT`. That is the reason the delay is stored even when it is
+zero: it is what keeps "requeued immediately" and "no decision was made"
+distinguishable in attempt history. A cancellation acknowledgment is not a retry
+decision at all and always produced `CANCELED`. The dead-letter reason comes from
+the class stored on the attempt rather than from the request — the two are equal
+by the exactness check, but only one of them is history.
+
 Recognition is exact, not lenient. A different fence, a different retained
 identity, or a changed classification, code, or message is a deterministic
 conflict whether or not the session is healthy. `Succeed` has no body and no

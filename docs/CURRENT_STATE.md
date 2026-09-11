@@ -35,7 +35,7 @@ Six binaries build and run:
   or dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0011`. M4 adds three:
+The schema consists of migrations `0001` through `0012`. M4 adds four:
 
 - `0009_job_lifecycle.sql` — scheduling, cancellation, replay linkage, and
   notification bookkeeping on `jobs`; a persisted execution deadline, a
@@ -65,6 +65,21 @@ The schema consists of migrations `0001` through `0011`. M4 adds three:
     that exact job, a replay's original and replacement must both belong to the
     recorded scope, a job's `replayed_from_job_id` cannot cross scopes, and a
     `dlq_replays` row and its replacement job must name the same original.
+- `0012_per_job_notification_reconstruction.sql` — replaces `0011`'s
+  database-wide reconstruction guard with a per-job one. `0011` asked whether
+  **any** job's notification metadata deviated from the `0009` backfill and
+  repaired nothing if one did. That is correct only for an upgrade that starts
+  at `0008`; migrations `0009` and `0010` were published before `0011` existed,
+  so a deployment can be running M4 code against a database at `0010`, and the
+  moment that code promotes, requeues, or re-notifies one job, `0011` refuses to
+  repair every other job — one advanced job silently cancels the whole repair.
+  Eligibility is a property of a job, so `0012` asks per job: a job is repaired
+  only if it still carries exactly the `0009` stamp (`notification_generation =
+  1` and `last_notification_at = created_at`) and has at least one
+  `work.available` event. Every way M4 writes notification metadata breaks one
+  of those equalities, and every `UPDATE` is additionally guarded with `IS
+  DISTINCT FROM`, so a row whose reconstructed value equals its current one is
+  never written — which also makes the repair idempotent.
 
 ## Implemented behavior
 
@@ -121,6 +136,16 @@ Everything recorded for M1, M2, and M3 still holds. What M4 adds:
   released when a lease renews again. An outcome identity is the permanent record
   of one terminal decision, so nothing releases it. See
   [ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md).
+- A replay reports the decision that **committed**, never the job's current
+  status. A retryable failure puts the job into `RETRY_WAIT`, and the job then
+  moves on — promoted, claimed by a new attempt, and possibly `SUCCEEDED`
+  minutes later — while the original attempt's outcome is unchanged and still
+  replayable. The replayed job status is reconstructed from the attempt row
+  alone, which is immutable once terminal: `retry_delay_ms` absent means
+  `DEAD_LETTERED`, zero means `QUEUED` (ADR-0009's immediate requeue), and
+  positive means `RETRY_WAIT`; a cancellation acknowledgment always produced
+  `CANCELED`. Reading the live job row would report a value the `Outcome`
+  contract does not even permit.
 - Recognizing committed history is separate from exercising live authority. An
   exact replay of a committed `Succeed`, `Fail`, or cancellation acknowledgment
   returns its stored result **after session replacement, after lease closure, and
@@ -336,13 +361,26 @@ Every float setting is checked for finiteness separately from, and before, its
 range. `strconv.ParseFloat` accepts `NaN`, `Inf`, `+Inf`, and `-Infinity`
 without error, and a `NaN` compares false against every bound, so a range check
 alone admits one. The same applies to `TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER` and
-`TASKFORGE_OUTBOX_BACKOFF_JITTER`. There are three defences: parsing falls back
-to the documented default, `Config.Validate` and `RetryPolicy.Validate` both
-reject a non-finite value by name, and `RetryPolicy.Delay` clamps a non-finite
-sample from the injected jitter source. The last matters because converting a
-`NaN` to a `time.Duration` is architecture-dependent — amd64 yields the most
-negative `int64`, arm64 saturates to zero — so the same policy would otherwise
-schedule differently on different machines.
+`TASKFORGE_OUTBOX_BACKOFF_JITTER`.
+
+**A documented default is used only when the variable is absent.** An
+explicitly set value is carried into the configuration as written, so a
+non-finite one reaches `Config.Validate`, is rejected by name, and the process
+fails to start. Substituting the default instead would be a silent lie about
+what is running: a deployment that set the retry multiplier to `NaN` through a
+templating accident would come up quietly on `2.0` and behave in a way nothing
+in its own configuration explains. A value that is present but not a number at
+all is rejected the same way, because that is also what it is. A blank or
+whitespace-only value counts as absent.
+
+`RetryPolicy.Validate` applies the same rule to a policy built in code, and
+`RetryPolicy.Delay` clamps a non-finite sample from the injected jitter source —
+every non-finite sample to `0`, `+Inf` included, because a non-finite sample is
+a broken source rather than a value that was too large. That last defence
+matters because converting a `NaN` to a `time.Duration` is
+architecture-dependent — amd64 yields the most negative `int64`, arm64 saturates
+to zero — so the same policy would otherwise schedule differently on different
+machines.
 
 ## API surface added in M4
 
@@ -414,6 +452,19 @@ Migrations `0009` and `0010` are pinned to the checksums of their first
 published bytes, so an edit to a shipped file fails here rather than only on a
 database that already applied it.
 
+The per-job reconstruction is proven against mixed state, which is the only
+state that distinguishes it from `0011`'s guard. A database is taken to
+migration `0010`, seeded with a job M4 legitimately promoted, a job M4
+re-notified, an untouched M3 job with three historical notifications, and an
+untouched M3 job with one, and then upgraded with the real runner. The two
+M4-authored jobs come out byte-identical, generations and event labels
+included; the three-event legacy job comes out with generations `1, 2, 3` and
+`last_notification_at` set to its newest event rather than its creation time;
+and the one-event legacy job, whose stored values were already right, is not
+written at all. Re-executing `0012`'s body afterwards changes nothing, and a
+fresh database still applies every migration and produces an M4-created job that
+provably cannot match the legacy stamp.
+
 Every relationship migration `0011` adds is checked negatively as well as
 positively: a dead-letter entry naming another job's attempt, or another
 tenant's attempt; a job whose replay source lives in another scope; a replay row
@@ -474,12 +525,26 @@ operations and all three public mutating operations, the shared replay identity
 namespace, the typed cancel-first Start refusal, and the two cancellation facts
 a spec most easily loses.
 
-Configuration and retry-policy tests cover every non-finite float: `NaN`, `Inf`,
-`+Inf`, `-Inf`, and `Infinity` from the environment fall back to the documented
-default; `Config.Validate` and `RetryPolicy.Validate` both reject one by name
-rather than by range; and `Delay` stays inside `[0, Max]` for every sample an
-injected jitter source can physically return, including `NaN`, both infinities,
-and values outside the `[0, 1)` contract.
+Configuration and retry-policy tests cover every non-finite float. Each spelling
+Go's parser accepts — `NaN`, `nan`, `Inf`, `inf`, `+Inf`, `-Inf`, `Infinity`,
+`-Infinity`, `+infinity` — is first asserted to parse to a genuinely non-finite
+value, so the cases pin real parser behavior rather than a guess about it, and
+each is then shown to fail `Load()` with an error naming the variable. A value
+that is present but not a number fails the same way, while an absent or blank
+one still takes the documented default. `Config.Validate` and
+`RetryPolicy.Validate` both reject a non-finite value by name rather than by
+range.
+
+`Delay` is pinned to the exact clamped duration, not to a range: a `NaN` sample
+on attempt 1 of a `1s`/`×2`/`0.5`-jitter policy must be exactly `500ms`. A range
+assertion could not do this job — "between 0 and Max" is satisfied by the arm64
+answer of an entirely unguarded implementation, so the same test would pass on
+one machine and fail on another for the same bug. Every non-finite sample is
+shown to clamp to the same delay as a sample of `0` (including `+Inf`, because
+the finiteness check precedes the range checks), every finite sample at or above
+the range to the same delay as the largest float below `1`, and the two clamps
+to genuinely different delays so a guard that collapsed everything to one value
+would be caught.
 
 Worker-runner tests cover the cancel-first Start refusal with no directive
 delivered at all — as the typed sentinel and as the `cancellation_requested`
@@ -497,6 +562,16 @@ same helper. A replayed failure returns the committed decision without moving a
 stored field, consuming budget again, or creating a second entry; reusing an
 outcome identity for another attempt, or replaying it with a changed body, is a
 stable conflict.
+
+A replay is proved to answer the decision that committed even after the job has
+moved on: a retryable failure is recorded and its whole response captured, the
+job is promoted by the real scheduler, a second attempt claims it and succeeds,
+and the original failure identity is then replayed — returning the original
+`RETRY_WAIT` decision and a response equal to the first one field for field,
+with only `replayed` differing. Exhausted, permanent, and cancellation outcomes
+are covered the same way, each after the job has advanced as far as its terminal
+state allows, so the reconstruction is pinned on every branch rather than only
+the one that motivated it.
 
 Success, failure, and cancellation-acknowledgment replays are each proved to
 return their stored result after the worker session was replaced **and** after

@@ -1817,6 +1817,13 @@ components:
         job_status:
           type: string
           enum: [QUEUED, RETRY_WAIT, CANCELED, DEAD_LETTERED]
+          description: |
+            The status this outcome PRODUCED, not the job's status now. On a
+            replay the two can differ: a retryable failure reports `RETRY_WAIT`,
+            and by the time an ambiguous report is retried the job may have been
+            promoted, claimed again, and succeeded. The replay still answers
+            `RETRY_WAIT`, because that is the decision the outcome identity
+            committed and the only one it can safely be retried against.
         attempt_status:
           type: string
           enum: [FAILED, TIMED_OUT, CANCELED, ABANDONED]

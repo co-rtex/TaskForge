@@ -233,7 +233,9 @@ Attempt history is preserved. The last error is never overwritten in place.
 The execution deadline is stamped once, when the attempt's start transition
 commits, and lease renewal never moves it. The outcome identity is unique for
 the lifetime of attempt history, which is what makes an ambiguous failure or
-cancellation report safe to retry. Recognizing a committed outcome is separate
+cancellation report safe to retry. A replay answers the decision that committed,
+reconstructed from the attempt row rather than read from the job, because the job
+moves on while the attempt's outcome does not. Recognizing a committed outcome is separate
 from exercising live authority, so an exact replay still returns its stored
 result after the session was replaced or the lease closed — the ordinary
 consequences of the failure that lost the response — while a first-time outcome
@@ -748,7 +750,7 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0011`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0012`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
 `job_attempts`, `leases`, `dlq_entries`, and `dlq_replays`, plus
 `schema_migrations` maintained by the runner.
@@ -788,6 +790,17 @@ entry's terminal attempt must belong to that exact job, a replay's original and
 replacement must both belong to the recorded scope, `replayed_from_job_id`
 cannot cross scopes, and a `dlq_replays` row and its replacement job must name
 the same original, so the two records of one replay cannot disagree.
+
+Migration 0012 narrows 0011's reconstruction guard from the database to the job.
+0011 repaired nothing if ANY job's notification metadata deviated from the 0009
+backfill, which is correct only when the upgrade starts at 0008. Migrations 0009
+and 0010 were published before 0011 existed, so a deployment can be running M4
+code at 0010; one promoted, requeued, or re-notified job then cancels the repair
+for every untouched M3 history in the database. Eligibility is a property of a
+job, so 0012 asks per job — still carrying exactly the 0009 stamp, and having at
+least one `work.available` event — and writes only rows whose reconstructed
+values actually differ, which preserves M4-authored metadata and makes the
+repair idempotent.
 
 **Planned:** `results`, `api_keys`, `audit_events`.
 
