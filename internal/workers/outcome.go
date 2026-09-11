@@ -340,23 +340,26 @@ func (s *Store) finalizeAttempt(
 
 	var retryAt *time.Time
 	var retryDelayMillis *int64
+	// The whole-millisecond delay that WILL be persisted, and the only thing the
+	// job transition below is allowed to branch on.
+	var storedMillis int64
 	if decision.Retry {
 		// Both the chosen delay and the instant it produced are persisted. The
 		// delay alone would not survive a replay (it would have to be re-added to
 		// a different "now"), and the instant alone would hide what policy
 		// produced it from anyone reading attempt history.
 		//
-		// The delay is truncated to the granularity it is stored at, and the
-		// instant is derived from the truncated value. Deriving the instant from
-		// the untruncated delay instead would make the two disagree by up to a
-		// millisecond, so a replay reading them back would answer a question the
-		// first response answered differently.
+		// The delay arrives already quantized to whole milliseconds by
+		// lifecycle.Delay, which is the single place that normalization happens,
+		// so this is a lossless read of it rather than a second rounding with its
+		// own opinion. The instant is derived from the same value, so the two
+		// cannot disagree by a fraction of a millisecond.
 		//
 		// A zero delay is still recorded, so "requeued immediately" (ADR-0009)
 		// and "no decision was made" stay distinguishable in attempt history.
-		millis := decision.Delay.Milliseconds()
-		at := state.serverNow.Add(time.Duration(millis) * time.Millisecond)
-		retryAt, retryDelayMillis = &at, &millis
+		storedMillis = decision.Delay.Milliseconds()
+		at := state.serverNow.Add(time.Duration(storedMillis) * time.Millisecond)
+		retryAt, retryDelayMillis = &at, &storedMillis
 	}
 
 	// RETURNING, not the values computed above. PostgreSQL stores timestamps at
@@ -407,7 +410,12 @@ func (s *Store) finalizeAttempt(
 			result.RetryDelay = durationPointer(
 				time.Duration(*storedRetryDelayMillis) * time.Millisecond)
 		}
-		if decision.Delay > 0 {
+		// Branching on the PERSISTED millisecond value, not on decision.Delay.
+		// These are the same number now that the delay is quantized at its
+		// source, and deriving the transition from the stored representation is
+		// what keeps them the same number: the status this outcome reports and
+		// the status its replay reconstructs are read off one durable field.
+		if storedMillis > 0 {
 			// RETRY_WAIT, and deliberately NO outbox event. The job is durable and
 			// scheduled; creating a notification now would advertise work no worker
 			// may claim until available_at passes. The scheduler creates exactly one

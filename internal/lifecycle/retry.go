@@ -124,6 +124,10 @@ func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 //	nominal = min(Max, Base * Multiplier^(n-1))
 //	factor  = 1 + Jitter*(2r - 1)
 //	delay   = clamp(nominal * factor, 0, Max)
+//	result  = whole milliseconds, rounding a positive delay UP to at least 1ms
+//
+// The result is always a whole number of milliseconds because that is the
+// granularity the decision is persisted at. See quantizeDelay.
 //
 // A nil source disables jitter, which is what a caller asserting exact
 // exponential growth wants.
@@ -184,7 +188,58 @@ func (p RetryPolicy) Delay(attemptNumber int, jitter JitterSource) time.Duration
 	if delay > float64(max) {
 		delay = float64(max)
 	}
-	return time.Duration(delay)
+	return quantizeDelay(time.Duration(delay), max)
+}
+
+// quantizeDelay rounds a computed delay to the millisecond granularity the
+// decision is STORED at, rounding a positive delay up and never down to zero.
+//
+// This is the single normalization point for a retry delay. Everything
+// downstream -- the job transition, retry_at, the persisted attempt fields, the
+// first response, and every exact replay of it -- is derived from the value this
+// returns, so none of them can disagree about what was decided.
+//
+// Truncating instead is what made them disagree. job_attempts.retry_delay_ms is
+// whole milliseconds, so a 1ns delay truncated to 0 while the decision that
+// produced it was still "retry after a delay". The first response reported
+// RETRY_WAIT from the unrounded value and the replay read back 0 and reported
+// QUEUED -- two different answers for one committed, immutable decision, and one
+// of them describing a transition the job never made.
+//
+// Rounding UP is the direction that preserves intent: a configured positive
+// backoff must not silently become an immediate retry, which is a materially
+// different behavior under load. Zero stays zero, so ADR-0009's immediate
+// requeue remains distinguishable from the shortest real backoff.
+//
+// The arithmetic is integer-only and cannot overflow. d/time.Millisecond is
+// exact division on an int64, the increment is bounded by
+// math.MaxInt64/1e6 milliseconds, and the final multiply is bounded by capMs,
+// which is itself derived from max by flooring.
+func quantizeDelay(d, max time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	ms := d / time.Millisecond
+	if d%time.Millisecond != 0 {
+		ms++
+	}
+	if ms < 1 {
+		ms = 1
+	}
+	// The ceiling can round past Max, so it is bounded by the largest WHOLE
+	// millisecond Max can express. When Max itself is under a millisecond there
+	// is no value that is both positive and within it; the floor of 1ms wins,
+	// because a positive backoff turning into an immediate retry is the worse
+	// of the two ways to be wrong. Validate keeps a configured policy well
+	// clear of that corner -- only a policy built in code can reach it.
+	capMs := max / time.Millisecond
+	if capMs < 1 {
+		capMs = 1
+	}
+	if ms > capMs {
+		ms = capMs
+	}
+	return ms * time.Millisecond
 }
 
 // Decision is what one terminal attempt outcome does to its job.

@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -505,4 +506,113 @@ func TestOutcomeReplay_ReconstructionIsUnambiguousForEveryTerminalDecision(t *te
 		expected.Replayed = true
 		require.Equal(t, expected, replayed)
 	})
+}
+
+// storeWithRetryPolicy builds a control store whose retry policy is the thing
+// under test, with jitter disabled so the delay is exactly the policy's.
+func storeWithRetryPolicy(policy lifecycle.RetryPolicy) *workers.Store {
+	return workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: integrationLeaseDuration,
+		RetryPolicy:   policy,
+	})
+}
+
+// TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically is the boundary a
+// one-second policy cannot reach.
+//
+// job_attempts.retry_delay_ms stores whole milliseconds. A delay below one
+// millisecond used to be decided as a delayed retry -- the transition branched
+// on the unrounded duration and reported RETRY_WAIT -- and then persisted as 0,
+// so the replay read the stored 0 back and reported QUEUED. One committed,
+// immutable decision with two different answers, and the second one describing a
+// transition the job never made. No later promotion or success could repair it,
+// because the lossy record was already written.
+//
+// The delay is now quantized once, at the policy, and the transition is chosen
+// from the same integer that gets stored, so there is no representation left for
+// the two to disagree about.
+func TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically(t *testing.T) {
+	ctx := context.Background()
+
+	for name, policy := range map[string]lifecycle.RetryPolicy{
+		"1ns": {
+			Base: time.Nanosecond, Max: time.Nanosecond, Multiplier: 1, Jitter: 0,
+		},
+		"500 microseconds": {
+			Base: 500 * time.Microsecond, Max: 500 * time.Microsecond, Multiplier: 1, Jitter: 0,
+		},
+		"exactly 1ms": {
+			Base: time.Millisecond, Max: time.Millisecond, Multiplier: 1, Jitter: 0,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reset(t)
+			store := storeWithRetryPolicy(policy)
+			session := registerWorker(t, store,
+				workerRegistration("sub-ms-replay", 1, nil, []string{"demo.echo"}))
+			createJobWithOptions(t, "sub-ms-replay", "default", "demo.echo", 50, nil, 3, 300, nil)
+
+			claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+			require.NoError(t, err)
+			first := assignmentFence(claim.Assignment)
+			startAttempt(t, store, first)
+
+			report := failureReport(first, lifecycle.ClassRetryable, "upstream_5xx", "upstream returned 502")
+			committed, err := store.Fail(ctx, testScope, report)
+			require.NoError(t, err)
+			require.False(t, committed.Replayed)
+
+			// A positive backoff stays a delayed retry. Turning it into an
+			// immediate requeue would be a different behavior under load, not a
+			// rounding detail.
+			require.Equal(t, "RETRY_WAIT", committed.JobStatus)
+			require.NotNil(t, committed.RetryAt)
+			require.NotNil(t, committed.RetryDelay)
+
+			// Drive the job past the failure entirely: promoted, claimed again,
+			// and completed successfully.
+			makeRetryDue(t, first.JobID)
+			stats, err := jobStore().PromoteDueJobs(ctx, 10)
+			require.NoError(t, err)
+			require.Equal(t, 1, stats.PromotedJobs)
+
+			claim, err = store.Claim(ctx, testScope, claimRequest(session, "default"))
+			require.NoError(t, err)
+			require.Equal(t, workers.Claimed, claim.Disposition)
+			second := assignmentFence(claim.Assignment)
+			require.NotEqual(t, first.AttemptID, second.AttemptID)
+			startAttempt(t, store, second)
+			require.NoError(t, store.Succeed(ctx, testScope, second))
+			require.Equal(t, "SUCCEEDED", readState(t, second).job)
+
+			// The ambiguous first report, retried at last.
+			replayed, err := store.Fail(ctx, testScope, report)
+			require.NoError(t, err)
+
+			// Asserted before anything about magnitude, because this is the
+			// symptom: the decision reported RETRY_WAIT and its own replay used
+			// to answer QUEUED, describing a transition the job never made.
+			require.Equal(t, committed.JobStatus, replayed.JobStatus,
+				"a decision and its own replay must not disagree about what happened")
+			require.Equal(t, "RETRY_WAIT", replayed.JobStatus,
+				"a sub-millisecond delay must not replay as an immediate requeue")
+
+			expected := committed
+			expected.Replayed = true
+			require.Equal(t, expected, replayed,
+				"the complete replay response must be the committed one, field for field")
+
+			// And the decision really is one the attempt row can hold: a positive
+			// policy rounds up to the shortest storable delay rather than down to
+			// an immediate requeue, and the stored integer agrees with both
+			// responses.
+			require.Equal(t, time.Millisecond, *committed.RetryDelay,
+				"a positive sub-millisecond policy is rounded up to the shortest storable delay")
+			stored := readAttemptOutcome(t, first.AttemptID)
+			require.NotNil(t, stored.retryDelayMs)
+			require.Equal(t, committed.RetryDelay.Milliseconds(), *stored.retryDelayMs)
+			require.Positive(t, *stored.retryDelayMs,
+				"the persisted integer must agree that this was a delayed retry")
+		})
+	}
 }

@@ -378,3 +378,97 @@ func TestRetryPolicy_DelayIgnoresANonFiniteJitterFraction(t *testing.T) {
 type constantJitter float64
 
 func (c constantJitter) Float64() float64 { return float64(c) }
+
+// TestRetryPolicy_DelayIsAlwaysWholeMillisecondsAndNeverRoundsAPositiveDelayAway
+// pins the quantization the persisted decision depends on.
+//
+// job_attempts.retry_delay_ms stores whole milliseconds. A delay that does not
+// survive that round trip is a decision the database cannot describe: the
+// transition would be chosen from one number and reconstructed from another. So
+// the policy hands out only values the storage can hold, and it rounds a
+// positive delay UP, because a configured positive backoff silently becoming an
+// immediate retry is a materially different behavior under load.
+func TestRetryPolicy_DelayIsAlwaysWholeMillisecondsAndNeverRoundsAPositiveDelayAway(t *testing.T) {
+	for name, base := range map[string]time.Duration{
+		"1ns":                     time.Nanosecond,
+		"a nanosecond under 1ms":  time.Millisecond - time.Nanosecond,
+		"a microsecond":           time.Microsecond,
+		"500 microseconds":        500 * time.Microsecond,
+		"exactly 1ms":             time.Millisecond,
+		"1ms and a nanosecond":    time.Millisecond + time.Nanosecond,
+		"a whole 250ms":           250 * time.Millisecond,
+		"not a whole millisecond": 1500*time.Microsecond + 7*time.Nanosecond,
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Max equals Base and no jitter, so the nominal delay IS base and the
+			// only thing under test is what quantization does to it.
+			policy := RetryPolicy{Base: base, Max: base, Multiplier: 1, Jitter: 0}
+			delay := policy.Delay(1, nil)
+
+			require.Zero(t, delay%time.Millisecond,
+				"a delay the database cannot store is a decision it cannot describe")
+			require.GreaterOrEqual(t, delay, time.Millisecond,
+				"a positive backoff must never round away to an immediate retry")
+			require.GreaterOrEqual(t, delay, base.Truncate(time.Millisecond),
+				"rounding is upward, so the result is never below the truncated input")
+			require.Equal(t, delay, time.Duration(delay.Milliseconds())*time.Millisecond,
+				"the delay must survive the millisecond round trip the attempt row does")
+		})
+	}
+}
+
+// TestRetryPolicy_ZeroDelayStaysImmediate keeps ADR-0009's immediate requeue
+// distinguishable from the shortest real backoff. Rounding a positive delay up
+// must not also invent one where the policy decided there was none.
+func TestRetryPolicy_ZeroDelayStaysImmediate(t *testing.T) {
+	policy := testPolicy()
+	decision, err := policy.Decide(ClassAbandoned, 1, 1, 3, NewSeededJitter(4))
+	require.NoError(t, err)
+	require.True(t, decision.Retry)
+	require.Zero(t, decision.Delay, "an abandoned attempt is requeued immediately, not backed off")
+
+	// And the quantizer itself leaves zero alone at every bound.
+	require.Zero(t, quantizeDelay(0, time.Minute))
+	require.Zero(t, quantizeDelay(-5*time.Second, time.Minute))
+}
+
+// TestDecide_DelayIsQuantizedBeforeItLeavesThePolicy proves the normalization
+// happens once, at the source, rather than at each call site. Every caller gets
+// a value that is already what will be stored.
+func TestDecide_DelayIsQuantizedBeforeItLeavesThePolicy(t *testing.T) {
+	policy := RetryPolicy{Base: time.Nanosecond, Max: time.Nanosecond, Multiplier: 1, Jitter: 0}
+	decision, err := policy.Decide(ClassRetryable, 1, 1, 5, NewSeededJitter(7))
+	require.NoError(t, err)
+	require.True(t, decision.Retry)
+	require.Equal(t, time.Millisecond, decision.Delay,
+		"a sub-millisecond policy still yields a decision the attempt row can hold")
+	require.Positive(t, decision.Delay.Milliseconds(),
+		"and the persisted integer agrees that this is a delayed retry")
+}
+
+// TestQuantizeDelay_BoundsAndCorners covers the arithmetic directly, including
+// the corner where Max itself cannot express a whole millisecond.
+func TestQuantizeDelay_BoundsAndCorners(t *testing.T) {
+	// Ordinary rounding up, bounded by a Max that can hold it.
+	require.Equal(t, time.Millisecond, quantizeDelay(time.Nanosecond, time.Minute))
+	require.Equal(t, time.Millisecond, quantizeDelay(time.Millisecond, time.Minute))
+	require.Equal(t, 2*time.Millisecond, quantizeDelay(time.Millisecond+time.Nanosecond, time.Minute))
+	require.Equal(t, 250*time.Millisecond, quantizeDelay(250*time.Millisecond, time.Minute))
+
+	// The ceiling is bounded by the largest whole millisecond Max expresses.
+	require.Equal(t, 5*time.Millisecond, quantizeDelay(10*time.Millisecond, 5*time.Millisecond))
+	require.Equal(t, 5*time.Millisecond,
+		quantizeDelay(10*time.Millisecond, 5*time.Millisecond+500*time.Microsecond),
+		"a Max that is not a whole millisecond is floored, never exceeded")
+
+	// A sub-millisecond Max cannot hold any positive delay. Staying positive is
+	// the deliberate resolution; a configured policy cannot reach this corner.
+	require.Equal(t, time.Millisecond, quantizeDelay(time.Nanosecond, time.Nanosecond))
+
+	// No overflow at the top of the range.
+	require.NotPanics(t, func() {
+		got := quantizeDelay(time.Duration(math.MaxInt64), time.Duration(math.MaxInt64))
+		require.Positive(t, got)
+		require.Zero(t, got%time.Millisecond)
+	})
+}
