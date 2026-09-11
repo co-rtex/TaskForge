@@ -750,7 +750,7 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0012`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0013`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
 `job_attempts`, `leases`, `dlq_entries`, and `dlq_replays`, plus
 `schema_migrations` maintained by the runner.
@@ -801,6 +801,17 @@ job, so 0012 asks per job — still carrying exactly the 0009 stamp, and having 
 least one `work.available` event — and writes only rows whose reconstructed
 values actually differ, which preserves M4-authored metadata and makes the
 repair idempotent.
+
+Migration 0013 corrects the one M4 write that rule does not exclude. A DLQ replay
+stamps its replacement job's timestamps from a single post-lock
+`clock_timestamp()` sample and sets generation 1, so it matches the legacy
+fingerprint exactly, while the event it writes in the same transaction takes the
+transaction-start `now()` — strictly earlier. 0012 moved such a replacement's
+`last_notification_at` backward to that earlier instant, and since bounded
+re-notification measures staleness from it, a large enough rewind causes an
+immediate false re-notification. 0013 restores it to the replacement's own
+`created_at`, and only for rows whose replay lineage, generation, single event,
+and backward timestamp together prove 0012 produced them.
 
 **Planned:** `results`, `api_keys`, `audit_events`.
 

@@ -35,7 +35,7 @@ Six binaries build and run:
   or dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0012`. M4 adds four:
+The schema consists of migrations `0001` through `0013`. M4 adds five:
 
 - `0009_job_lifecycle.sql` — scheduling, cancellation, replay linkage, and
   notification bookkeeping on `jobs`; a persisted execution deadline, a
@@ -76,10 +76,25 @@ The schema consists of migrations `0001` through `0012`. M4 adds four:
   Eligibility is a property of a job, so `0012` asks per job: a job is repaired
   only if it still carries exactly the `0009` stamp (`notification_generation =
   1` and `last_notification_at = created_at`) and has at least one
-  `work.available` event. Every way M4 writes notification metadata breaks one
-  of those equalities, and every `UPDATE` is additionally guarded with `IS
-  DISTINCT FROM`, so a row whose reconstructed value equals its current one is
-  never written — which also makes the repair idempotent.
+  `work.available` event. Submission, promotion, crash-recovery requeue, and
+  bounded re-notification each break one of those equalities, and every `UPDATE`
+  is additionally guarded with `IS DISTINCT FROM`, so a row whose reconstructed
+  value equals its current one is never written — which also makes the repair
+  idempotent.
+- `0013_restore_replay_notification_timestamps.sql` — corrects the one M4 write
+  `0012`'s rule does **not** exclude. A DLQ replay stamps its replacement job's
+  `created_at`, `updated_at`, `available_at`, and `last_notification_at` from one
+  post-lock `clock_timestamp()` sample and sets generation 1, so the legacy
+  fingerprint matches exactly; its `work.available` event, written in the same
+  transaction, takes the column `DEFAULT now()` — the transaction *start* time,
+  strictly earlier, and arbitrarily earlier when the replay waited on the queue
+  row lock. `0012` therefore moved such a replacement's `last_notification_at`
+  backward to that older instant, which matters because bounded re-notification
+  measures staleness from it: a rewind past the re-notification interval makes
+  the scheduler re-advertise a job that was just advertised. `0013` restores
+  `last_notification_at` to the replacement's own `created_at`, which is a
+  surviving copy of the instant the replay transaction assigned, and only for
+  rows it can prove `0012` produced — see the eligibility rule below.
 
 ## Implemented behavior
 
@@ -125,13 +140,22 @@ Everything recorded for M1, M2, and M3 still holds. What M4 adds:
   safe code and message, chosen delay, and `retry_at`. An exact replay returns
   those stored values unchanged — it does not consume budget again, redraw
   jitter, or create a second dead-letter entry.
+- The delay is quantized to whole milliseconds **once**, by the retry policy,
+  before anything is decided from it. `retry_delay_ms` stores whole
+  milliseconds, so a sub-millisecond delay used to be decided as a delayed retry
+  from the unrounded duration and then persisted as `0`, making the first
+  response say `RETRY_WAIT` and its own replay say `QUEUED`. The job transition
+  now branches on the same integer that is stored. Rounding is upward, to at
+  least `1ms`, because a configured positive backoff silently becoming an
+  immediate retry is a different behavior under load rather than a rounding
+  detail; zero stays zero, so ADR-0009's immediate requeue stays distinct.
 - Reusing the identity for a different attempt, or replaying it with a different
   classification, code, or message, is a stable `outcome_conflict`, never a
   leaked uniqueness error.
 - The values returned to the caller come from the `UPDATE`'s `RETURNING` clause
   rather than from what Go computed, and the retry instant is derived from the
-  millisecond-truncated delay, so a first response and its own replay cannot
-  disagree by rounding.
+  stored delay, so a first response and its own replay cannot disagree by
+  rounding.
 - This is deliberately stronger than ADR-0008's renewal identity, which is
   released when a lease renews again. An outcome identity is the permanent record
   of one terminal decision, so nothing releases it. See
@@ -452,6 +476,34 @@ Migrations `0009` and `0010` are pinned to the checksums of their first
 published bytes, so an edit to a shipped file fails here rather than only on a
 database that already applied it.
 
+`0013`'s eligibility rule is stated narrowly, and every clause exists to prove a
+row was produced by `0012` rather than to guess that it might have been: the
+`dlq_replays` row names the job as a replacement in the same scope; the job's own
+`replayed_from_job_id` agrees with that record; `notification_generation` is
+still 1, so nothing has promoted or requeued it since; exactly one
+`work.available` event references it, which is the one the replay wrote; the
+current `last_notification_at` equals that event's `created_at`, which is the
+value `0012` writes; and `last_notification_at` is earlier than the job's own
+`created_at`, which nothing in M4 ever produces — submission, promotion,
+requeue, and re-notification all sample server time at or after the row exists.
+A replacement that has since been promoted, requeued, or re-notified fails at
+least one clause and is untouched, and once restored the last clause is false,
+so the repair is idempotent.
+
+The repair is proven through the real replay path, not hand-written SQL. A
+database is taken to `0010`, a job is submitted, claimed, started, and
+permanently failed through the control plane so its DLQ entry is written by the
+production helper, and the replacement is then created by
+`jobs.Store.Replay` — made to wait on the `queues` row lock first, so the
+transaction-start event timestamp is observably older than the post-lock job
+timestamp rather than merely usually so. Alongside it sits an M4-advanced job
+that makes `0011`'s global guard skip, and an untouched three-event M3 history.
+The test proves `0012` rewinds the replacement to the event timestamp, `0013`
+restores it to exactly what the replay transaction wrote, the advanced job is
+unchanged, the legacy history is still reconstructed to generations `1, 2, 3`,
+re-running `0013` changes nothing, and a fresh database still applies `0001`
+through `0013`.
+
 The per-job reconstruction is proven against mixed state, which is the only
 state that distinguishes it from `0011`'s guard. A database is taken to
 migration `0010`, seeded with a job M4 legitimately promoted, a job M4
@@ -562,6 +614,14 @@ same helper. A replayed failure returns the committed decision without moving a
 stored field, consuming budget again, or creating a second entry; reusing an
 outcome identity for another attempt, or replaying it with a changed body, is a
 stable conflict.
+
+The sub-millisecond boundary is proved end to end for `1ns`, `500µs`, and
+exactly `1ms` policies: each records a retryable failure, is promoted, is claimed
+by a second attempt that succeeds, and is then replayed — and the replay must
+report the same `RETRY_WAIT` the first response did, with the whole response
+equal field for field. Unit tests cover the quantizer directly, including the
+corner where `Max` itself cannot express a whole millisecond and the top of the
+`int64` range.
 
 A replay is proved to answer the decision that committed even after the job has
 moved on: a retryable failure is recorded and its whole response captured, the

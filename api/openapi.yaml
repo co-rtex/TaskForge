@@ -1837,6 +1837,14 @@ components:
         retry_delay_milliseconds:
           type: [integer, 'null']
           minimum: 0
+          description: |
+            Whole milliseconds, which is the granularity the decision is stored
+            at. The policy quantizes a positive delay upward to at least `1`
+            before anything is decided from it, so this value and `job_status`
+            can never describe different decisions: `null` means no retry,
+            `0` means requeued immediately, and a positive value means the job
+            waits. A configured positive backoff never becomes an immediate
+            retry by rounding.
         dead_letter_reason:
           type: [string, 'null']
           enum: [PERMANENT_FAILURE, ATTEMPTS_EXHAUSTED, null]

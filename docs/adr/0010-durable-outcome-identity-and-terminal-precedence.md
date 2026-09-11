@@ -61,8 +61,23 @@ domain error, never a leaked uniqueness violation.
 
 The values returned to the caller are read back from the `UPDATE`'s `RETURNING`
 clause rather than from what Go computed, and the retry instant is derived from
-the millisecond-truncated delay. Both exist so a first response and its own
-replay cannot disagree by rounding.
+the stored delay. Both exist so a first response and its own replay cannot
+disagree by rounding.
+
+The delay is quantized to whole milliseconds **once**, by the retry policy,
+before anything is decided from it — the job transition, `retry_at`, the
+persisted attempt fields, the first response, and every replay all derive from
+that single value. Quantizing later, or in more than one place, is what let them
+disagree: `retry_delay_ms` stores whole milliseconds, so a sub-millisecond delay
+truncated to `0` while the transition had already been chosen from the unrounded
+duration produced `RETRY_WAIT` on the first response and `QUEUED` on its own
+replay — two answers for one immutable decision, one of them describing a
+transition the job never made.
+
+Rounding is **upward**, to at least `1ms`, because a configured positive backoff
+silently becoming an immediate retry is a materially different behavior under
+load rather than a rounding detail. Zero stays zero, so ADR-0009's immediate
+requeue remains distinguishable from the shortest real backoff.
 
 Server-detected outcomes — timeout and abandonment — carry no identity, because
 nobody requested them. Their idempotency comes from the attempt no longer being
@@ -102,7 +117,9 @@ Everything needed is already immutable on the attempt, because the outcome
 persists the decision rather than only its effect. `retry_delay_ms` absent means
 no retry was decided, so the job went `DEAD_LETTERED`; zero means it was requeued
 immediately (ADR-0009); positive means it was scheduled for a later attempt, so
-the job went `RETRY_WAIT`. That is the reason the delay is stored even when it is
+the job went `RETRY_WAIT`. That reading is exact only because the delay is
+quantized before the transition is chosen, so the stored integer and the decision
+can never describe different things. That is the reason the delay is stored even when it is
 zero: it is what keeps "requeued immediately" and "no decision was made"
 distinguishable in attempt history. A cancellation acknowledgment is not a retry
 decision at all and always produced `CANCELED`. The dead-letter reason comes from
