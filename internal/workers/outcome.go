@@ -171,8 +171,11 @@ func (s *Store) AcknowledgeCancellation(
 		if state.attemptStatus != AttemptCanceled {
 			return OutcomeResult{}, ErrOutcomeConflict
 		}
+		// CANCELED from the attempt's own outcome, never from the live job row:
+		// a replay reports the decision that committed, not what the job has
+		// done since.
 		result := OutcomeResult{
-			JobID: ack.Fence.JobID, JobStatus: state.jobStatus,
+			JobID: ack.Fence.JobID, JobStatus: decidedJobStatus(state),
 			AttemptStatus: state.attemptStatus, Replayed: true,
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -225,8 +228,9 @@ func replayedOutcome(state fenceState, report FailureReport) (OutcomeResult, err
 		derefString(state.errorMessage) != report.ErrorMessage {
 		return OutcomeResult{}, ErrOutcomeConflict
 	}
+	jobStatus := decidedJobStatus(state)
 	result := OutcomeResult{
-		JobStatus:     state.jobStatus,
+		JobStatus:     jobStatus,
 		AttemptStatus: state.attemptStatus,
 		RetryAt:       state.retryAt,
 		Replayed:      true,
@@ -235,14 +239,53 @@ func replayedOutcome(state fenceState, report FailureReport) (OutcomeResult, err
 		delay := time.Duration(*state.retryDelayMillis) * time.Millisecond
 		result.RetryDelay = &delay
 	}
-	if state.jobStatus == "DEAD_LETTERED" {
-		if report.Class == lifecycle.ClassPermanent {
+	if jobStatus == "DEAD_LETTERED" {
+		// From the class stored on the attempt, not from the request. The two are
+		// equal by the check above, but only one of them is history.
+		if lifecycle.FailureClass(derefString(state.failureClass)) == lifecycle.ClassPermanent {
 			result.DeadLetterReason = lifecycle.ReasonPermanentFailure
 		} else {
 			result.DeadLetterReason = lifecycle.ReasonAttemptsExhausted
 		}
 	}
 	return result, nil
+}
+
+// decidedJobStatus reconstructs the job status this attempt's committed outcome
+// PRODUCED, from the attempt row alone.
+//
+// The job's current status cannot answer this. A job that a failure put into
+// RETRY_WAIT gets promoted, claimed by a new attempt, and may be SUCCEEDED,
+// DEAD_LETTERED, or CANCELED minutes later — all while the original attempt's
+// outcome is unchanged and still replayable. Reading the live job row would make
+// a replay report whatever happened afterwards, which is neither the decision
+// that committed nor even a value the Outcome contract permits.
+//
+// Everything needed is already immutable on the attempt, because finalizeAttempt
+// persists the decision rather than just its effect:
+//
+//	retry_delay_ms IS NULL  no retry was decided             -> DEAD_LETTERED
+//	retry_delay_ms = 0      requeued immediately (ADR-0009)  -> QUEUED
+//	retry_delay_ms > 0      scheduled for a later attempt    -> RETRY_WAIT
+//
+// The zero-delay row is why the delay is stored even when it is zero: it is what
+// keeps "requeued immediately" and "no decision was made" distinguishable in
+// attempt history.
+//
+// A cancellation acknowledgment is not a retry decision at all. It always
+// produced CANCELED, and a canceled job is terminal, so the constant is the
+// whole answer.
+func decidedJobStatus(state fenceState) string {
+	switch {
+	case state.attemptStatus == AttemptCanceled:
+		return "CANCELED"
+	case state.retryDelayMillis == nil:
+		return "DEAD_LETTERED"
+	case *state.retryDelayMillis == 0:
+		return "QUEUED"
+	default:
+		return "RETRY_WAIT"
+	}
 }
 
 func (s *Store) rejectForeignOutcomeIdentity(

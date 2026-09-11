@@ -315,3 +315,194 @@ func TestOutcomeReplay_RecognitionIsExactAndNothingElse(t *testing.T) {
 			"an outcome identity is retained for the lifetime of history and belongs to one attempt")
 	})
 }
+
+// makeRetryDue moves a RETRY_WAIT job's eligibility instant into the past so the
+// real scheduler promotes it now.
+//
+// Only available_at is touched. The backoff itself is real and already committed;
+// waiting it out would be a sleep, and AGENTS.md section 7 forbids those. Nothing
+// about the attempt's recorded outcome is altered, which is what the assertions
+// below are actually about.
+func makeRetryDue(t *testing.T, jobID uuid.UUID) {
+	t.Helper()
+	tag, err := testPool.Exec(context.Background(),
+		`UPDATE jobs SET available_at = clock_timestamp() - interval '1 second'
+		 WHERE id = $1 AND status = 'RETRY_WAIT'`, jobID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected(), "the job must be waiting on a retry")
+}
+
+// TestOutcomeReplay_AnswersTheDecisionThatCommittedNotWhatTheJobDidNext is the
+// case the other replay tests stop short of.
+//
+// A retryable failure puts the job into RETRY_WAIT and leaves the attempt
+// terminal. The job then moves on: the scheduler promotes it, a new attempt
+// claims it, and that attempt succeeds. None of that changes the original
+// attempt's outcome, and none of it may change what replaying that outcome
+// answers.
+//
+// Reading the live job row would report SUCCEEDED — a value the Outcome contract
+// does not even permit, and a direct contradiction of the promise that an
+// ambiguous report returns the decision that committed. The decision is
+// reconstructed from the attempt alone, which is immutable once terminal.
+func TestOutcomeReplay_AnswersTheDecisionThatCommittedNotWhatTheJobDidNext(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	store := controlStore()
+	registration := workerRegistration("replay-advances", 1, nil, []string{"demo.echo"})
+	session := registerWorker(t, store, registration)
+	createJobWithOptions(t, "replay-advances", "default", "demo.echo", 50, nil, 3, 300, nil)
+
+	claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	first := assignmentFence(claim.Assignment)
+	startAttempt(t, store, first)
+
+	report := failureReport(first, lifecycle.ClassRetryable, "upstream_5xx", "upstream returned 502")
+	committed, err := store.Fail(ctx, testScope, report)
+	require.NoError(t, err)
+	require.False(t, committed.Replayed)
+	require.Equal(t, "RETRY_WAIT", committed.JobStatus)
+	require.NotNil(t, committed.RetryAt)
+	require.NotNil(t, committed.RetryDelay)
+
+	// Drive the job all the way past the failure: due, promoted, claimed again,
+	// and completed successfully.
+	makeRetryDue(t, first.JobID)
+	stats, err := jobStore().PromoteDueJobs(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.PromotedJobs)
+
+	claim, err = store.Claim(ctx, testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	require.Equal(t, workers.Claimed, claim.Disposition)
+	second := assignmentFence(claim.Assignment)
+	require.NotEqual(t, first.AttemptID, second.AttemptID)
+	startAttempt(t, store, second)
+	require.NoError(t, store.Succeed(ctx, testScope, second))
+
+	require.Equal(t, "SUCCEEDED", readState(t, second).job,
+		"the job really has moved on, which is what makes the replay below meaningful")
+
+	// The ambiguous first report, retried at last.
+	replayed, err := store.Fail(ctx, testScope, report)
+	require.NoError(t, err)
+
+	require.Equal(t, "RETRY_WAIT", replayed.JobStatus,
+		"a replay reports the decision that committed, not what the job did afterwards")
+	require.Equal(t, committed.JobID, replayed.JobID)
+	require.Equal(t, committed.AttemptStatus, replayed.AttemptStatus)
+	require.Equal(t, committed.DeadLetterReason, replayed.DeadLetterReason)
+	require.NotNil(t, replayed.RetryAt)
+	require.WithinDuration(t, *committed.RetryAt, *replayed.RetryAt, 0)
+	require.NotNil(t, replayed.RetryDelay)
+	require.Equal(t, *committed.RetryDelay, *replayed.RetryDelay)
+
+	// Field-by-field above, then the whole value: the only difference the
+	// contract allows between a first response and its replay is the flag that
+	// says which one it is.
+	expected := committed
+	expected.Replayed = true
+	require.Equal(t, expected, replayed, "the complete replay response must be the committed one")
+
+	// And the replay really was a read: the successful second attempt is intact.
+	require.Equal(t, "SUCCEEDED", readState(t, second).job)
+	require.Equal(t, 2, countRows(t, "job_attempts"))
+}
+
+// TestOutcomeReplay_ReconstructionIsUnambiguousForEveryTerminalDecision covers
+// the other shapes a committed failure can take, so the reconstruction is
+// pinned against every branch rather than only the one that motivated it.
+//
+// Each case advances the job past the decision first, because a decision that
+// only replays correctly while the job sits still is not preserved at all.
+func TestOutcomeReplay_ReconstructionIsUnambiguousForEveryTerminalDecision(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("exhausted retryable failure replays as DEAD_LETTERED", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		session := registerWorker(t, store,
+			workerRegistration("replay-exhausted", 1, nil, []string{"demo.echo"}))
+		// One attempt of budget, so the first retryable failure exhausts it.
+		createJobWithOptions(t, "replay-exhausted", "default", "demo.echo", 50, nil, 1, 300, nil)
+		claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+		require.NoError(t, err)
+		fence := assignmentFence(claim.Assignment)
+		startAttempt(t, store, fence)
+
+		report := failureReport(fence, lifecycle.ClassRetryable, "upstream_5xx", "still failing")
+		committed, err := store.Fail(ctx, testScope, report)
+		require.NoError(t, err)
+		require.Equal(t, "DEAD_LETTERED", committed.JobStatus)
+		require.Equal(t, lifecycle.ReasonAttemptsExhausted, committed.DeadLetterReason)
+		require.Nil(t, committed.RetryAt)
+
+		// A dead-lettered job stays dead-lettered, but a replay creates a linked
+		// replacement — the original's history has company now.
+		_, err = jobStore().Replay(ctx, testScope, fence.JobID, "replay-exhausted-key")
+		require.NoError(t, err)
+
+		replayed, err := store.Fail(ctx, testScope, report)
+		require.NoError(t, err)
+		expected := committed
+		expected.Replayed = true
+		require.Equal(t, expected, replayed)
+	})
+
+	t.Run("permanent failure replays with its own dead-letter reason", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		session := registerWorker(t, store,
+			workerRegistration("replay-permanent", 1, nil, []string{"demo.echo"}))
+		createJobWithOptions(t, "replay-permanent", "default", "demo.echo", 50, nil, 5, 300, nil)
+		claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+		require.NoError(t, err)
+		fence := assignmentFence(claim.Assignment)
+		startAttempt(t, store, fence)
+
+		report := failureReport(fence, lifecycle.ClassPermanent, "invalid_payload", "no such account")
+		committed, err := store.Fail(ctx, testScope, report)
+		require.NoError(t, err)
+		require.Equal(t, "DEAD_LETTERED", committed.JobStatus)
+		require.Equal(t, lifecycle.ReasonPermanentFailure, committed.DeadLetterReason,
+			"a permanent failure did not exhaust the budget, and must not say it did")
+
+		_, err = jobStore().Replay(ctx, testScope, fence.JobID, "replay-permanent-key")
+		require.NoError(t, err)
+
+		replayed, err := store.Fail(ctx, testScope, report)
+		require.NoError(t, err)
+		expected := committed
+		expected.Replayed = true
+		require.Equal(t, expected, replayed)
+	})
+
+	t.Run("cancellation acknowledgment replays as CANCELED", func(t *testing.T) {
+		reset(t)
+		store := controlStore()
+		registration := workerRegistration("replay-cancel-status", 1, nil, []string{"demo.echo"})
+		session := registerWorker(t, store, registration)
+		createJob(t, "replay-cancel-status", "demo.echo", 50, nil)
+		claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+		require.NoError(t, err)
+		fence := assignmentFence(claim.Assignment)
+		startAttempt(t, store, fence)
+
+		_, err = jobStore().RequestCancel(ctx, testScope, fence.JobID)
+		require.NoError(t, err)
+		ack := cancelAck(fence)
+		committed, err := store.AcknowledgeCancellation(ctx, testScope, ack)
+		require.NoError(t, err)
+		require.Equal(t, "CANCELED", committed.JobStatus)
+
+		// Replacing the session is the closest a canceled job comes to moving
+		// on: it is terminal, so nothing else can change under the replay.
+		replaceSession(t, store, registration)
+		replayed, err := store.AcknowledgeCancellation(ctx, testScope, ack)
+		require.NoError(t, err)
+		expected := committed
+		expected.Replayed = true
+		require.Equal(t, expected, replayed)
+	})
+}
