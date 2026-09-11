@@ -7,6 +7,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -466,20 +467,30 @@ func envInt64(key string, def int64) int64 {
 	return def
 }
 
-// envFloat reads a float setting, falling back to the default when the value is
-// absent, unparseable, or not a real number.
+// envFloat reads a float setting. The default is used only when the variable is
+// ABSENT.
+//
+// An explicitly set value is carried into the Config as it was written, and
+// Validate is what accepts or rejects it. That division matters: substituting a
+// default for a value an operator deliberately set is a silent lie about what
+// the process is running. A deployment that set the retry multiplier to `NaN`
+// through a templating accident should fail to start and say so, not come up
+// quietly on 2.0 and behave in a way nothing in its own configuration explains.
 //
 // strconv.ParseFloat accepts "NaN", "Inf", "+Inf", and "-Infinity" without
-// error, so parsing alone is not enough: a typo or a templating accident would
-// otherwise put a non-finite value into a comparison that silently accepts it.
-// Validate rejects a non-finite value too; this is the earlier of the two
-// defences, and the one that keeps a malformed environment from ever reaching
-// the policy.
+// error, so those reach Validate as the non-finite floats they are and are
+// rejected by name. A value that is present but not a number at all is reported
+// the same way, because that is also what it is: not a finite number.
 func envFloat(key string, def float64) float64 {
-	if v, err := strconv.ParseFloat(env(key, ""), 64); err == nil && lifecycle.IsFinite(v) {
-		return v
+	raw := strings.TrimSpace(env(key, ""))
+	if raw == "" {
+		return def
 	}
-	return def
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return math.NaN()
+	}
+	return v
 }
 
 func envDuration(key string, def time.Duration) time.Duration {

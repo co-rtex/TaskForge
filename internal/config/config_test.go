@@ -4,10 +4,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 func baseConfig() Config {
@@ -300,31 +303,85 @@ func TestRetryPolicy_MirrorsTheValidatedSettings(t *testing.T) {
 	require.NoError(t, baseConfig().RetryPolicy().Validate())
 }
 
-// TestLoad_NonFiniteFloatEnvironmentValuesFallBackToTheDefault covers the first
-// of two independent defences.
+// TestLoad_RejectsExplicitNonFiniteFloatEnvironmentValues is the first of two
+// independent defences.
 //
 // strconv.ParseFloat accepts "NaN", "Inf", "+Inf", "-Inf", and "Infinity"
-// without error, so a templating accident or a typo puts a non-finite float
-// into the process rather than failing loudly. A NaN then compares false
-// against every bound, so a range check alone lets it straight through into
-// retry arithmetic. Parsing keeps the documented default instead.
-func TestLoad_NonFiniteFloatEnvironmentValuesFallBackToTheDefault(t *testing.T) {
-	for _, raw := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "Infinity", "-Infinity"} {
+// without error, so a templating accident or a typo puts a non-finite float into
+// the process rather than failing loudly. Quietly substituting the documented
+// default would be worse than either: the process would come up on a value
+// nothing in its own configuration explains, and the operator would have no
+// signal that what they set was discarded.
+//
+// Every spelling below is asserted to parse to a genuinely non-finite float
+// FIRST, so this test pins the behavior of the values Go's parser really
+// accepts rather than a guess about them.
+func TestLoad_RejectsExplicitNonFiniteFloatEnvironmentValues(t *testing.T) {
+	floatKeys := []string{
+		"TASKFORGE_JOB_RETRY_MULTIPLIER",
+		"TASKFORGE_JOB_RETRY_JITTER",
+		"TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER",
+		"TASKFORGE_OUTBOX_BACKOFF_JITTER",
+	}
+	for _, raw := range []string{
+		"NaN", "nan", "Inf", "inf", "+Inf", "-Inf", "Infinity", "-Infinity", "+infinity",
+	} {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		require.NoErrorf(t, err, "%q must be a value Go's parser accepts, or this case proves nothing", raw)
+		require.Falsef(t, lifecycle.IsFinite(parsed), "%q must parse to a non-finite float", raw)
+
+		for _, key := range floatKeys {
+			t.Run(key+"="+raw, func(t *testing.T) {
+				t.Setenv(key, raw)
+				_, err := Load()
+				require.Error(t, err, "an explicitly configured non-finite value must not start the process")
+				require.Contains(t, err.Error(), key,
+					"the error must name the variable the operator has to fix")
+				require.Contains(t, err.Error(), "finite")
+			})
+		}
+	}
+}
+
+// TestLoad_RejectsFloatEnvironmentValuesThatAreNotNumbers covers the same rule
+// for the other way a value can be present and unusable. A default is for an
+// absent variable, not for one an operator set to something meaningless.
+func TestLoad_RejectsFloatEnvironmentValuesThatAreNotNumbers(t *testing.T) {
+	for _, raw := range []string{"abc", "2.0.0", "1e", "--3", "0x1p4z"} {
 		t.Run(raw, func(t *testing.T) {
 			t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", raw)
-			t.Setenv("TASKFORGE_JOB_RETRY_JITTER", raw)
-			t.Setenv("TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER", raw)
-			t.Setenv("TASKFORGE_OUTBOX_BACKOFF_JITTER", raw)
-
-			c, err := Load()
-			require.NoError(t, err, "a non-finite value must not become a usable setting")
-			require.InDelta(t, 2.0, c.JobRetryMultiplier, 1e-9)
-			require.InDelta(t, 0.2, c.JobRetryJitter, 1e-9)
-			require.InDelta(t, 2.0, c.OutboxBackoffMultiplier, 1e-9)
-			require.InDelta(t, 0.2, c.OutboxBackoffJitter, 1e-9)
-			require.NoError(t, c.RetryPolicy().Validate())
+			_, err := Load()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "TASKFORGE_JOB_RETRY_MULTIPLIER")
 		})
 	}
+}
+
+// TestLoad_UsesTheDocumentedDefaultOnlyWhenTheVariableIsAbsent is the other half
+// of the rule. Absent and blank stay absent; nothing else does.
+func TestLoad_UsesTheDocumentedDefaultOnlyWhenTheVariableIsAbsent(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		c, err := Load()
+		require.NoError(t, err)
+		require.InDelta(t, 2.0, c.JobRetryMultiplier, 1e-9)
+		require.InDelta(t, 0.2, c.JobRetryJitter, 1e-9)
+		require.InDelta(t, 2.0, c.OutboxBackoffMultiplier, 1e-9)
+		require.InDelta(t, 0.2, c.OutboxBackoffJitter, 1e-9)
+	})
+
+	t.Run("blank is treated as absent", func(t *testing.T) {
+		t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", "   ")
+		c, err := Load()
+		require.NoError(t, err)
+		require.InDelta(t, 2.0, c.JobRetryMultiplier, 1e-9)
+	})
+
+	t.Run("a padded real value is still accepted", func(t *testing.T) {
+		t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", "  1.5  ")
+		c, err := Load()
+		require.NoError(t, err)
+		require.InDelta(t, 1.5, c.JobRetryMultiplier, 1e-9)
+	})
 }
 
 // TestValidate_RejectsNonFiniteFloats covers the second defence, for a Config

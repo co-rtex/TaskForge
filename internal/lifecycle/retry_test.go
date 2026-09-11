@@ -295,31 +295,70 @@ func TestIsFinite_MatchesTheOnlyValuesArithmeticCanUse(t *testing.T) {
 	}
 }
 
-// TestRetryPolicy_DelaySurvivesANonFiniteInjectedJitterSample is the defense one
-// layer below Validate.
+// TestRetryPolicy_DelayClampsANonFiniteInjectedJitterSampleExactly is the
+// defense one layer below Validate.
 //
 // The sample comes from an injected interface, so it is input this package does
-// not control even when the policy itself validated. A NaN sample multiplied
-// into the delay reaches the Duration conversion, and that conversion is
-// undefined for NaN. The delay must stay inside [0, Max] for every sample a
-// source can physically return.
-func TestRetryPolicy_DelaySurvivesANonFiniteInjectedJitterSample(t *testing.T) {
+// not control even when the policy itself validated. A NaN multiplied into the
+// delay reaches the Duration conversion, and THAT conversion is
+// architecture-dependent: amd64 yields the most negative int64, arm64 saturates
+// to zero. A range assertion is therefore not enough to pin this — "between 0
+// and Max" is satisfied by the arm64 answer of an entirely unguarded
+// implementation, so the same test would pass on one machine and fail on
+// another for the same bug.
+//
+// Each case asserts the exact delay the documented clamp defines instead.
+func TestRetryPolicy_DelayClampsANonFiniteInjectedJitterSampleExactly(t *testing.T) {
 	policy := RetryPolicy{Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: 0.5}
 
+	// One wall value computed by hand, chosen because the arithmetic is exact in
+	// binary floating point: sample 0 gives factor 1 + 0.5*(2*0 - 1) = 0.5, and
+	// attempt 1's nominal delay is the 1s base. Anything unguarded lands on 0 or
+	// a negative duration here, on every architecture.
+	require.Equal(t, 500*time.Millisecond, policy.Delay(1, constantJitter(math.NaN())),
+		"a NaN sample is dropped to 0, so attempt 1 gets base * 0.5")
+
+	// Every NON-FINITE sample clamps to exactly 0, including +Inf. The
+	// finiteness check runs before the range checks, and that ordering is
+	// deliberate rather than incidental: a non-finite sample is not a value that
+	// was too large, it is a source that is broken, so there is no "high" end for
+	// it to belong to. A finite sample below the range clamps to the same floor.
+	floor := constantJitter(0)
 	for name, sample := range map[string]float64{
-		"NaN":              math.NaN(),
-		"+Inf":             math.Inf(1),
-		"-Inf":             math.Inf(-1),
-		"below the range":  -0.25,
-		"at the range top": 1,
-		"above the range":  4,
+		"NaN":             math.NaN(),
+		"+Inf":            math.Inf(1),
+		"-Inf":            math.Inf(-1),
+		"below the range": -0.25,
 	} {
 		for attempt := 1; attempt <= 4; attempt++ {
-			delay := policy.Delay(attempt, constantJitter(sample))
-			require.GreaterOrEqualf(t, delay, time.Duration(0),
-				"%s sample produced a negative delay on attempt %d", name, attempt)
-			require.LessOrEqualf(t, delay, policy.Max,
-				"%s sample produced a delay past Max on attempt %d", name, attempt)
+			require.Equalf(t, policy.Delay(attempt, floor), policy.Delay(attempt, constantJitter(sample)),
+				"%s must clamp to the same delay as a sample of 0 on attempt %d", name, attempt)
+		}
+	}
+
+	// A FINITE sample at or above the range clamps to the largest float below 1,
+	// which is the largest value the [0, 1) contract actually permits.
+	ceiling := constantJitter(math.Nextafter(1, 0))
+	for name, sample := range map[string]float64{
+		"at the range top": 1,
+		"above the range":  4,
+		"far above":        1e300,
+	} {
+		for attempt := 1; attempt <= 4; attempt++ {
+			require.Equalf(t, policy.Delay(attempt, ceiling), policy.Delay(attempt, constantJitter(sample)),
+				"%s must clamp to the same delay as the largest sample below 1 on attempt %d", name, attempt)
+		}
+	}
+
+	// The clamped results are still real delays inside the policy's own bounds,
+	// and the two clamps are genuinely different answers -- a guard that
+	// collapsed every sample to one value would satisfy the equalities above.
+	require.NotEqual(t, policy.Delay(1, floor), policy.Delay(1, ceiling))
+	for attempt := 1; attempt <= 4; attempt++ {
+		for _, source := range []JitterSource{floor, ceiling} {
+			delay := policy.Delay(attempt, source)
+			require.Positive(t, delay)
+			require.LessOrEqual(t, delay, policy.Max)
 		}
 	}
 }
