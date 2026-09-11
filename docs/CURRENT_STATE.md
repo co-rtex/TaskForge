@@ -148,7 +148,24 @@ Everything recorded for M1, M2, and M3 still holds. What M4 adds:
   now branches on the same integer that is stored. Rounding is upward, to at
   least `1ms`, because a configured positive backoff silently becoming an
   immediate retry is a different behavior under load rather than a rounding
-  detail; zero stays zero, so ADR-0009's immediate requeue stays distinct.
+  detail; a calculation that produces exactly zero stays zero, so ADR-0009's
+  immediate requeue stays distinct.
+- `TASKFORGE_JOB_RETRY_MAX` is a **strict upper bound on the stored value**, so
+  it must be at least `1ms` and an exact whole-millisecond multiple. Both
+  `RetryPolicy.Validate` and startup configuration validation enforce that, and
+  a test pins them to the same answer so they cannot drift. A sub-millisecond
+  maximum would leave no storable delay inside it and a non-whole one would be
+  silently floored, so `delay <= maximum` would hold only after an unstated
+  adjustment. `TASKFORGE_JOB_RETRY_BASE` carries no such rule — it is an input
+  to the calculation, so any positive value is allowed and a sub-millisecond
+  base rounds up to `1ms`.
+- Saturation happens in **integer milliseconds, before any conversion**.
+  `float64(math.MaxInt64)` rounds up to exactly `2^63`, one past what an `int64`
+  holds, and that conversion is undefined in Go: arm64 saturated to
+  `math.MaxInt64` while amd64 produced the most negative `int64`, which read as
+  "no delay" and turned a maximal backoff into an immediate retry on one
+  architecture and not the other. The ceiling is now the same number
+  everywhere — `9223372036854ms`, or `2562047h47m16.854s`.
 - Reusing the identity for a different attempt, or replaying it with a different
   classification, code, or message, is a stable `outcome_conflict`, never a
   leaked uniqueness error.
@@ -616,12 +633,22 @@ outcome identity for another attempt, or replaying it with a changed body, is a
 stable conflict.
 
 The sub-millisecond boundary is proved end to end for `1ns`, `500µs`, and
-exactly `1ms` policies: each records a retryable failure, is promoted, is claimed
-by a second attempt that succeeds, and is then replayed — and the replay must
-report the same `RETRY_WAIT` the first response did, with the whole response
-equal field for field. Unit tests cover the quantizer directly, including the
-corner where `Max` itself cannot express a whole millisecond and the top of the
-`int64` range.
+exactly `1ms` bases against a valid `1ms` maximum: each records a retryable
+failure, is promoted, is claimed by a second attempt that succeeds, and is then
+replayed — and the replay must report the same `RETRY_WAIT` the first response
+did, with the whole response equal field for field. The other side of the
+boundary is proved the same way: a retryable failure whose injected jitter
+reduces the calculation to exactly zero commits as `QUEUED` with a stored delay
+of `0`, a later attempt succeeds, and the replay still answers `QUEUED`.
+
+The maximum-duration boundary is tested through the **public** `Delay`, not a
+helper, because the unsafe conversion lived on the public path: with `Base` and
+`Max` at `math.MaxInt64`, every jitter source (including `NaN`, both infinities,
+and out-of-range samples) and attempt numbers up to 1000 must return exactly
+`2562047h47m16.854s` and never zero. A table test additionally proves every
+valid policy returns a whole-millisecond delay within its own maximum, and the
+validation tests pin `RetryPolicy.Validate` and startup configuration validation
+to the same accept/reject answer across a shared table of cases.
 
 A replay is proved to answer the decision that committed even after the job has
 moved on: a retryable failure is recorded and its whole response captured, the

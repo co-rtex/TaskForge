@@ -76,8 +76,30 @@ transition the job never made.
 
 Rounding is **upward**, to at least `1ms`, because a configured positive backoff
 silently becoming an immediate retry is a materially different behavior under
-load rather than a rounding detail. Zero stays zero, so ADR-0009's immediate
-requeue remains distinguishable from the shortest real backoff.
+load rather than a rounding detail. A calculation that produces exactly zero
+stays zero, so ADR-0009's immediate requeue remains distinguishable from the
+shortest real backoff.
+
+`Max` and `Base` carry different granularity rules because they are different
+kinds of thing. `Max` is a **strict upper bound on the stored value**, so it must
+be at least `1ms` and an exact whole-millisecond multiple; both
+`RetryPolicy.Validate` and startup configuration validation enforce that, and a
+test pins them to the same answer so they cannot drift apart. A sub-millisecond
+maximum would leave no storable delay inside it, and a non-whole one would be
+silently floored — the bound that applied would not be the bound that was
+configured, and `delay <= Max` would be true only after an unstated adjustment.
+`Base` is an input to the calculation rather than a bound on a stored value, so
+any positive value is allowed; a sub-millisecond base simply rounds up to the
+smallest storable delay.
+
+The saturation is done in **integer milliseconds, before any conversion**.
+`float64(math.MaxInt64)` rounds up to exactly `2^63`, one past what an `int64`
+holds, and Go leaves that conversion undefined: arm64 saturates to
+`math.MaxInt64` while amd64 yields the most negative `int64`, which then read as
+"no delay" and turned a maximal backoff into an immediate retry. Clamping in
+milliseconds keeps every intermediate value far inside both `float64`'s
+exact-integer range and `int64`'s, so the ceiling is the same number —
+`9223372036854ms`, or `2562047h47m16.854s` — on every architecture.
 
 Server-detected outcomes — timeout and abandonment — carry no identity, because
 nobody requested them. Their idempotency comes from the attempt no longer being

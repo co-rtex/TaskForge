@@ -1844,7 +1844,15 @@ components:
             can never describe different decisions: `null` means no retry,
             `0` means requeued immediately, and a positive value means the job
             waits. A configured positive backoff never becomes an immediate
-            retry by rounding.
+            retry by rounding, and a calculation that produces exactly zero
+            stays zero.
+
+            The value never exceeds the configured maximum backoff, which is
+            itself required to be a whole number of milliseconds so that bound
+            is exact rather than floored. The largest value this field can hold
+            is `9223372036854` — the largest whole-millisecond span a duration
+            can represent — and the calculation saturates there identically on
+            every architecture.
         dead_letter_reason:
           type: [string, 'null']
           enum: [PERMANENT_FAILURE, ATTEMPTS_EXHAUSTED, null]
