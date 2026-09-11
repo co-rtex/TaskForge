@@ -511,11 +511,22 @@ func TestOutcomeReplay_ReconstructionIsUnambiguousForEveryTerminalDecision(t *te
 // storeWithRetryPolicy builds a control store whose retry policy is the thing
 // under test, with jitter disabled so the delay is exactly the policy's.
 func storeWithRetryPolicy(policy lifecycle.RetryPolicy) *workers.Store {
+	return storeWithRetryPolicyAndJitter(policy, nil)
+}
+
+func storeWithRetryPolicyAndJitter(policy lifecycle.RetryPolicy, jitter lifecycle.JitterSource) *workers.Store {
 	return workers.NewStore(testPool, workers.StoreConfig{
 		LeaseDuration: integrationLeaseDuration,
 		RetryPolicy:   policy,
+		Jitter:        jitter,
 	})
 }
+
+// fixedJitter returns one sample forever, so a test can drive the policy to an
+// exact delay instead of asserting a range around a random one.
+type fixedJitter float64
+
+func (f fixedJitter) Float64() float64 { return float64(f) }
 
 // TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically is the boundary a
 // one-second policy cannot reach.
@@ -534,12 +545,16 @@ func storeWithRetryPolicy(policy lifecycle.RetryPolicy) *workers.Store {
 func TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically(t *testing.T) {
 	ctx := context.Background()
 
+	// Every maximum here is a whole millisecond, because Max is a strict upper
+	// bound on a value stored in that unit and a policy that cannot express its
+	// own bound is not a valid one. The BASE is what is under test, and it is
+	// free to be smaller than the granularity it will be stored at.
 	for name, policy := range map[string]lifecycle.RetryPolicy{
-		"1ns": {
-			Base: time.Nanosecond, Max: time.Nanosecond, Multiplier: 1, Jitter: 0,
+		"1ns base": {
+			Base: time.Nanosecond, Max: time.Millisecond, Multiplier: 1, Jitter: 0,
 		},
-		"500 microseconds": {
-			Base: 500 * time.Microsecond, Max: 500 * time.Microsecond, Multiplier: 1, Jitter: 0,
+		"500 microsecond base": {
+			Base: 500 * time.Microsecond, Max: time.Millisecond, Multiplier: 1, Jitter: 0,
 		},
 		"exactly 1ms": {
 			Base: time.Millisecond, Max: time.Millisecond, Multiplier: 1, Jitter: 0,
@@ -547,6 +562,7 @@ func TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically(t *testing.T) 
 	} {
 		t.Run(name, func(t *testing.T) {
 			reset(t)
+			require.NoError(t, policy.Validate(), "the policy under test must be a valid one")
 			store := storeWithRetryPolicy(policy)
 			session := registerWorker(t, store,
 				workerRegistration("sub-ms-replay", 1, nil, []string{"demo.echo"}))
@@ -615,4 +631,82 @@ func TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically(t *testing.T) 
 				"the persisted integer must agree that this was a delayed retry")
 		})
 	}
+}
+
+// TestOutcomeReplay_ZeroDelayRetryableFailureReplaysAsImmediateRetry covers the
+// other side of the quantization boundary.
+//
+// Rounding a positive delay up must not also invent one where the calculation
+// produced none. Full jitter at a sample of 0 gives factor 1 + 1*(2*0 - 1) = 0,
+// so the delay really is zero however large the base is, and a zero delay is an
+// immediate requeue rather than the shortest backoff — ADR-0009's recovery path
+// and the shortest real retry have to stay distinguishable in attempt history.
+//
+// The existing zero-delay coverage is an ABANDONED attempt, which reconciliation
+// produces and which carries no outcome identity, so it can never be replayed.
+// This is a worker-reported retryable failure, which can.
+func TestOutcomeReplay_ZeroDelayRetryableFailureReplaysAsImmediateRetry(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+
+	// A large base, so a zero result can only come from the jitter reducing the
+	// calculation to zero rather than from the base being small.
+	policy := lifecycle.RetryPolicy{
+		Base: time.Minute, Max: time.Hour, Multiplier: 2, Jitter: 1,
+	}
+	require.NoError(t, policy.Validate())
+	require.Zero(t, policy.Delay(1, fixedJitter(0)),
+		"the policy under test must actually compute a zero delay")
+
+	store := storeWithRetryPolicyAndJitter(policy, fixedJitter(0))
+	session := registerWorker(t, store,
+		workerRegistration("zero-delay-replay", 1, nil, []string{"demo.echo"}))
+	createJobWithOptions(t, "zero-delay-replay", "default", "demo.echo", 50, nil, 3, 300, nil)
+
+	claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	first := assignmentFence(claim.Assignment)
+	startAttempt(t, store, first)
+
+	report := failureReport(first, lifecycle.ClassRetryable, "upstream_5xx", "upstream returned 502")
+	committed, err := store.Fail(ctx, testScope, report)
+	require.NoError(t, err)
+	require.False(t, committed.Replayed)
+
+	// The immediate-retry state: claimable now, not waiting on a backoff.
+	require.Equal(t, "QUEUED", committed.JobStatus,
+		"a zero delay is an immediate requeue, not the shortest possible backoff")
+	require.NotNil(t, committed.RetryDelay)
+	require.Zero(t, *committed.RetryDelay)
+	require.NotNil(t, committed.RetryAt)
+	require.Equal(t, "QUEUED", readState(t, first).job)
+
+	// The zero is recorded rather than left NULL, which is what keeps
+	// "requeued immediately" and "no decision was made" distinguishable.
+	stored := readAttemptOutcome(t, first.AttemptID)
+	require.NotNil(t, stored.retryDelayMs)
+	require.Zero(t, *stored.retryDelayMs)
+
+	// No promotion needed — the job is already claimable. Let a second attempt
+	// take it and succeed, so the job has moved on before the replay.
+	claim, err = store.Claim(ctx, testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	require.Equal(t, workers.Claimed, claim.Disposition)
+	second := assignmentFence(claim.Assignment)
+	require.NotEqual(t, first.AttemptID, second.AttemptID)
+	startAttempt(t, store, second)
+	require.NoError(t, store.Succeed(ctx, testScope, second))
+	require.Equal(t, "SUCCEEDED", readState(t, second).job)
+
+	replayed, err := store.Fail(ctx, testScope, report)
+	require.NoError(t, err)
+
+	require.Equal(t, committed.JobStatus, replayed.JobStatus,
+		"a decision and its own replay must not disagree about what happened")
+	require.Equal(t, "QUEUED", replayed.JobStatus,
+		"a zero-delay retry must not replay as a delayed one")
+	expected := committed
+	expected.Replayed = true
+	require.Equal(t, expected, replayed,
+		"the complete replay response must be the committed one, field for field")
 }
