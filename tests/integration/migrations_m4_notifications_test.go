@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -138,7 +139,7 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// The upgrade, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 3, applied)
+	require.Equal(t, 4, applied)
 
 	eventGeneration := func(id uuid.UUID) int {
 		var generation *int
@@ -277,4 +278,283 @@ func pendingEventsAtGeneration(t *testing.T, dsn string, jobID uuid.UUID, genera
 		  AND event_type = 'work.available' AND status = 'PENDING'`,
 		jobID, generation).Scan(&count))
 	return count
+}
+
+// migrateThrough applies migrations 1..upTo to a fresh database, recording each
+// in schema_migrations exactly as the real runner would, and returns a
+// connection to it plus its DSN.
+//
+// Stopping part-way is the whole point: it produces a database at a real
+// published release boundary, which the runner will then upgrade for real.
+func migrateThrough(t *testing.T, ctx context.Context, upTo int) (*pgx.Conn, string) {
+	t.Helper()
+	freshDSN := withFreshDatabase(t)
+	migrations, err := database.LoadMigrations()
+	require.NoError(t, err)
+
+	cfg, err := pgx.ParseConfig(freshDSN)
+	require.NoError(t, err)
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close(context.Background()) })
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    INTEGER     PRIMARY KEY,
+			name       TEXT        NOT NULL,
+			checksum   TEXT        NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`)
+	require.NoError(t, err)
+	for _, migration := range migrations {
+		if migration.Version > upTo {
+			break
+		}
+		require.NoErrorf(t, execMigration(ctx, conn, migration), "migration %d", migration.Version)
+		_, err := conn.Exec(ctx,
+			`INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)`,
+			migration.Version, migration.Name, migration.Checksum)
+		require.NoError(t, err)
+	}
+	return conn, freshDSN
+}
+
+// notificationState is a job's notification metadata plus the generations of its
+// events, which together are everything migration 0012 can touch.
+type notificationState struct {
+	generation       int
+	lastNotification time.Time
+	createdAt        time.Time
+	eventGenerations []int
+}
+
+func readNotificationState(t *testing.T, ctx context.Context, conn *pgx.Conn, jobID uuid.UUID) notificationState {
+	t.Helper()
+	var state notificationState
+	require.NoError(t, conn.QueryRow(ctx, `
+		SELECT notification_generation, last_notification_at, created_at
+		FROM jobs WHERE id = $1`, jobID,
+	).Scan(&state.generation, &state.lastNotification, &state.createdAt))
+
+	rows, err := conn.Query(ctx, `
+		SELECT notification_generation FROM outbox_events
+		WHERE job_id = $1 AND event_type = 'work.available'
+		ORDER BY created_at, id`, jobID)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var generation *int
+		require.NoError(t, rows.Scan(&generation))
+		require.NotNil(t, generation)
+		state.eventGenerations = append(state.eventGenerations, *generation)
+	}
+	require.NoError(t, rows.Err())
+	return state
+}
+
+// TestMigrations_PerJobReconstructionSurvivesMixedState is the upgrade path
+// migration 0011's database-wide guard gets wrong.
+//
+// Migrations 0009 and 0010 were published before 0011 existed, so a deployment
+// can be running M4 code against a database at 0010. As soon as that code
+// advances one job's notification metadata, 0011's guard sees a database that is
+// "no longer the 0009 backfill" and repairs NOTHING — leaving every untouched M3
+// history with the wrong generation and a last_notification_at that makes it look
+// stranded. One advanced job silently cancels the whole repair.
+//
+// Eligibility is a property of a job, so 0012 asks per job. This seeds exactly
+// that mixed state and proves both halves: the advanced job is untouched, and the
+// legacy job is reconstructed.
+func TestMigrations_PerJobReconstructionSurvivesMixedState(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	conn, freshDSN := migrateThrough(t, ctx, 10)
+
+	var now time.Time
+	require.NoError(t, conn.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now))
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+
+	insertJob := func(id uuid.UUID, createdAt time.Time, generation int, lastNotification time.Time) {
+		_, err := conn.Exec(ctx, `
+			INSERT INTO jobs (
+				id, scope, queue, job_type, payload, status, priority,
+				max_attempts, timeout_seconds, available_at, created_at, updated_at,
+				notification_generation, last_notification_at
+			) VALUES ($1, 'mixed', 'default', 'demo.echo', '{"m":1}', 'QUEUED', 50, 5, 300,
+			          $2, $2, $2, $3, $4)`,
+			id, createdAt, generation, lastNotification)
+		require.NoError(t, err)
+	}
+	insertEvent := func(jobID uuid.UUID, generation int, createdAt time.Time) uuid.UUID {
+		id := uuid.New()
+		_, err := conn.Exec(ctx, `
+			INSERT INTO outbox_events (
+				id, event_type, schema_version, payload, status, created_at, published_at,
+				job_id, notification_generation
+			) VALUES ($1, 'work.available', 1, $2, 'PUBLISHED', $3, $3, $4, $5)`,
+			id, fmt.Sprintf(`{"queue":"default","job_id":"%s"}`, jobID), createdAt, jobID, generation)
+		require.NoError(t, err)
+		return id
+	}
+
+	// A job M4 legitimately advanced: promoted once, so its generation is 2 and
+	// its last_notification_at is when that promotion advertised it. Every field
+	// here is correct by construction and must survive untouched.
+	advancedJob := uuid.New()
+	insertJob(advancedJob, ago(50*time.Minute), 2, ago(3*time.Minute))
+	insertEvent(advancedJob, 1, ago(48*time.Minute))
+	insertEvent(advancedJob, 2, ago(3*time.Minute))
+
+	// A job M4 created and then re-notified: generation stays 1, but
+	// last_notification_at advanced past created_at. Also correct, also legacy-
+	// looking at a glance, and also must survive untouched.
+	renotifiedJob := uuid.New()
+	insertJob(renotifiedJob, ago(40*time.Minute), 1, ago(2*time.Minute))
+	insertEvent(renotifiedJob, 1, ago(39*time.Minute))
+	insertEvent(renotifiedJob, 1, ago(2*time.Minute))
+
+	// An untouched M3 job that was abandoned and requeued twice, stamped by
+	// 0009's backfill: generation 1, last_notification_at = created_at, and all
+	// three of its events labelled generation 1.
+	legacyCreated := ago(30 * time.Minute)
+	legacyJob := uuid.New()
+	insertJob(legacyJob, legacyCreated, 1, legacyCreated)
+	insertEvent(legacyJob, 1, ago(28*time.Minute))
+	insertEvent(legacyJob, 1, ago(14*time.Minute))
+	legacyNewest := ago(45 * time.Second)
+	insertEvent(legacyJob, 1, legacyNewest)
+
+	// A second untouched M3 job with a single event, which 0009 stamped
+	// correctly by accident. Reconstruction must agree with what is already there
+	// rather than churn the row.
+	singleCreated := ago(20 * time.Minute)
+	singleEventJob := uuid.New()
+	insertJob(singleEventJob, singleCreated, 1, singleCreated)
+	insertEvent(singleEventJob, 1, singleCreated)
+
+	advancedBefore := readNotificationState(t, ctx, conn, advancedJob)
+	renotifiedBefore := readNotificationState(t, ctx, conn, renotifiedJob)
+	singleBefore := readNotificationState(t, ctx, conn, singleEventJob)
+
+	// The upgrade, through the real runner: 0011 then 0012.
+	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, 2, applied, "exactly 0011 and 0012 are pending from 0010")
+
+	t.Run("M4-authored notification metadata is untouched", func(t *testing.T) {
+		require.Equal(t, advancedBefore, readNotificationState(t, ctx, conn, advancedJob),
+			"a promoted job's generation, timestamp, and event labels are already correct")
+		require.Equal(t, renotifiedBefore, readNotificationState(t, ctx, conn, renotifiedJob),
+			"a re-notified job keeps its generation, and its two same-generation events are ordinary")
+	})
+
+	t.Run("untouched legacy history is reconstructed", func(t *testing.T) {
+		after := readNotificationState(t, ctx, conn, legacyJob)
+		require.Equal(t, []int{1, 2, 3}, after.eventGenerations,
+			"three eligibility transitions must stop sharing one generation")
+		require.Equal(t, 3, after.generation,
+			"the job's current generation is its newest transition's")
+		require.WithinDuration(t, legacyNewest, after.lastNotification, 0,
+			"a job advertised 45 seconds ago is not stranded, whatever its creation time")
+		require.False(t, after.createdAt.Equal(after.lastNotification),
+			"0009 stamped creation time here, which is exactly what was wrong")
+	})
+
+	t.Run("a correctly stamped legacy job is left alone", func(t *testing.T) {
+		require.Equal(t, singleBefore, readNotificationState(t, ctx, conn, singleEventJob),
+			"reconstruction that agrees with the stored value must not write the row")
+	})
+
+	t.Run("reconstruction is idempotent", func(t *testing.T) {
+		// The runner records what it applied, so re-running is a no-op.
+		again, err := database.Migrate(ctx, freshDSN, discardLogger())
+		require.NoError(t, err)
+		require.Zero(t, again)
+
+		// And the repair itself is idempotent independently of that bookkeeping:
+		// executing 0012's body a second time recomputes the same values and
+		// writes nothing, which is what makes a partially applied upgrade safe
+		// to resume.
+		before := map[uuid.UUID]notificationState{}
+		for _, id := range []uuid.UUID{advancedJob, renotifiedJob, legacyJob, singleEventJob} {
+			before[id] = readNotificationState(t, ctx, conn, id)
+		}
+
+		migrations, err := database.LoadMigrations()
+		require.NoError(t, err)
+		var body string
+		for _, migration := range migrations {
+			if migration.Version == 12 {
+				body = migration.SQL
+			}
+		}
+		require.NotEmpty(t, body, "migration 0012 must be loadable")
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, body)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		for id, want := range before {
+			require.Equalf(t, want, readNotificationState(t, ctx, conn, id),
+				"re-running the repair changed job %s", id)
+		}
+	})
+}
+
+// TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase keeps the
+// per-job rule honest on the ordinary path.
+//
+// A fresh install runs 0009 through 0012 in one go with no rows to repair, and
+// then M4 writes notification metadata normally. Nothing about the mixed-state
+// repair may change what a new deployment ends up with.
+func TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	freshDSN := withFreshDatabase(t)
+	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
+	require.NoError(t, err)
+	require.Equal(t, 12, applied, "a fresh database applies every migration")
+
+	cfg, err := pgx.ParseConfig(freshDSN)
+	require.NoError(t, err)
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+
+	// Real submissions through the real store, so the metadata under test is
+	// what production writes rather than what a test hand-assembles.
+	pool := poolFor(t, freshDSN)
+	store := jobs.NewStore(pool)
+	payload, err := json.Marshal(map[string]any{"m": 1})
+	require.NoError(t, err)
+	priority, maxAttempts, timeout := 50, 3, 300
+	normalized, err := jobs.SubmitRequest{
+		Queue: "default", Type: "demo.echo", Payload: payload, Priority: &priority,
+		MaxAttempts: &maxAttempts, TimeoutSeconds: &timeout,
+	}.Normalize()
+	require.NoError(t, err)
+	submitted, err := store.Submit(ctx, "fresh-install", "fresh-install-key", normalized)
+	require.NoError(t, err)
+
+	state := readNotificationState(t, ctx, conn, submitted.Job.ID)
+	require.Equal(t, 1, state.generation)
+	require.Equal(t, []int{1}, state.eventGenerations)
+	require.False(t, state.createdAt.Equal(state.lastNotification),
+		"an M4-created job is stamped with post-lock server time, not its transaction start")
+
+	// The one property that matters for 0012: a job M4 just created is NOT
+	// eligible for legacy reconstruction, so nothing could ever rewrite it.
+	var eligible bool
+	require.NoError(t, conn.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE id = $1 AND notification_generation = 1
+			  AND last_notification_at = created_at
+		)`, submitted.Job.ID).Scan(&eligible))
+	require.False(t, eligible, "an M4-created job must never match the 0009 backfill stamp")
 }

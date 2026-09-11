@@ -164,7 +164,7 @@ func TestMigrations_M4SchemaMatchesTheQueriesThatJustifyIt(t *testing.T) {
 		// only on a developer's pre-existing database.
 		loaded, err := database.LoadMigrations()
 		require.NoError(t, err)
-		require.Len(t, loaded, 11, "M4 ships migrations 0009 through 0011")
+		require.Len(t, loaded, 12, "M4 ships migrations 0009 through 0012")
 
 		for _, migration := range loaded {
 			var recorded string
@@ -429,7 +429,7 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 11)
+	require.Len(t, migrations, 12)
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -540,8 +540,8 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
-	require.NoError(t, err, "0009 through 0011 must apply to a database holding real M3 data")
-	require.Equal(t, 3, applied, "exactly the three M4 migrations are pending")
+	require.NoError(t, err, "0009 through 0012 must apply to a database holding real M3 data")
+	require.Equal(t, 4, applied, "exactly the four M4 migrations are pending")
 
 	t.Run("every seeded row survives", func(t *testing.T) {
 		for table, want := range map[string]int{
