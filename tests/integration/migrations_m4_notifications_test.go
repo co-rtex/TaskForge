@@ -16,6 +16,8 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
 // TestMigrations_ReconstructNotificationHistoryFromRealM3Events is the upgrade
@@ -139,7 +141,7 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// The upgrade, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 4, applied)
+	require.Equal(t, 5, applied)
 
 	eventGeneration := func(id uuid.UUID) int {
 		var generation *int
@@ -440,7 +442,7 @@ func TestMigrations_PerJobReconstructionSurvivesMixedState(t *testing.T) {
 	// The upgrade, through the real runner: 0011 then 0012.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 2, applied, "exactly 0011 and 0012 are pending from 0010")
+	require.Equal(t, 3, applied, "exactly 0011, 0012 and 0013 are pending from 0010")
 
 	t.Run("M4-authored notification metadata is untouched", func(t *testing.T) {
 		require.Equal(t, advancedBefore, readNotificationState(t, ctx, conn, advancedJob),
@@ -517,7 +519,7 @@ func TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase(t *testing.
 	freshDSN := withFreshDatabase(t)
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 12, applied, "a fresh database applies every migration")
+	require.Equal(t, 13, applied, "a fresh database applies every migration")
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -557,4 +559,236 @@ func TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase(t *testing.
 			  AND last_notification_at = created_at
 		)`, submitted.Job.ID).Scan(&eligible))
 	require.False(t, eligible, "an M4-created job must never match the 0009 backfill stamp")
+}
+
+// applyMigration runs exactly one migration by version against an already
+// migrated-through connection, so a test can step an upgrade one release at a
+// time and observe what each one did.
+func applyMigration(t *testing.T, ctx context.Context, conn *pgx.Conn, version int) {
+	t.Helper()
+	migrations, err := database.LoadMigrations()
+	require.NoError(t, err)
+	for _, migration := range migrations {
+		if migration.Version == version {
+			require.NoErrorf(t, execMigration(ctx, conn, migration), "migration %d", version)
+			return
+		}
+	}
+	t.Fatalf("migration %d not found", version)
+}
+
+// waitForLockOn is waitForDatabaseLock against a specific pool, so the upgrade
+// tests can coordinate on their own temporary database rather than the shared one.
+func waitForLockOn(t *testing.T, pool *pgxpool.Pool, queryFragment string) {
+	t.Helper()
+	eventually(t, 5*time.Second, "a database operation waits on a row lock", func() bool {
+		var waiting bool
+		err := pool.QueryRow(context.Background(), `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%' || $1 || '%'
+			)`, queryFragment).Scan(&waiting)
+		return err == nil && waiting
+	})
+}
+
+// TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012 is the upgrade
+// case migration 0012's eligibility rule gets wrong.
+//
+// 0012 assumed every M4-authored job breaks the legacy fingerprint. A DLQ replay
+// does not: it stamps the replacement's created_at, updated_at, available_at and
+// last_notification_at from ONE post-lock clock_timestamp() sample and sets
+// generation 1, so `generation = 1 AND last_notification_at = created_at` holds
+// exactly. Its work.available event, written in the same transaction, takes the
+// column DEFAULT now() — the transaction START time — which is strictly earlier.
+// 0012 therefore treats the replacement as legacy and rewinds its
+// last_notification_at to that older instant.
+//
+// The replacement here is created through the real control-plane replay path
+// against a database at migration 0010, which is the deployment this describes:
+// migrations 0009 and 0010 were published before 0011 existed, so M4 code really
+// can be running at 0010. Nothing about the fixture is hand-written SQL.
+func TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	conn, freshDSN := migrateThrough(t, ctx, 10)
+	pool := poolFor(t, freshDSN)
+
+	const upgradeScope = "replay-upgrade"
+	control := workers.NewStore(pool, workers.StoreConfig{
+		LeaseDuration: integrationLeaseDuration,
+		RetryPolicy:   integrationRetryPolicy(),
+	})
+	store := jobs.NewStore(pool)
+
+	submit := func(key string) uuid.UUID {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{"key": key})
+		require.NoError(t, err)
+		priority, maxAttempts, timeout := 50, 1, 300
+		normalized, err := jobs.SubmitRequest{
+			Queue: "default", Type: "demo.echo", Payload: payload, Priority: &priority,
+			MaxAttempts: &maxAttempts, TimeoutSeconds: &timeout,
+		}.Normalize()
+		require.NoError(t, err)
+		result, err := store.Submit(ctx, upgradeScope, key, normalized)
+		require.NoError(t, err)
+		return result.Job.ID
+	}
+
+	session, err := control.Register(ctx, upgradeScope, workers.Registration{
+		SessionID: uuid.New(), Name: "replay-upgrade", Hostname: "replay.local",
+		WorkerGroup: "default", ConcurrencyLimit: 2, SupportedJobTypes: []string{"demo.echo"},
+	})
+	require.NoError(t, err)
+
+	// A dead-lettered source job, produced by the real failure path so its DLQ
+	// entry is written by the same helper production uses.
+	deadLettered := submit("replay-upgrade-source")
+	claim, err := control.Claim(ctx, upgradeScope, workers.ClaimRequest{
+		WorkerID: session.WorkerID, SessionID: session.ID,
+		ClaimRequestID: uuid.New(), Queue: "default",
+	})
+	require.NoError(t, err)
+	require.Equal(t, workers.Claimed, claim.Disposition)
+	sourceFence := assignmentFence(claim.Assignment)
+	require.Equal(t, deadLettered, sourceFence.JobID)
+	_, err = control.Start(ctx, upgradeScope, sourceFence)
+	require.NoError(t, err)
+	outcome, err := control.Fail(ctx, upgradeScope, workers.FailureReport{
+		Fence: sourceFence, OutcomeRequestID: uuid.New(),
+		Class: lifecycle.ClassPermanent, ErrorCode: "invalid_payload", ErrorMessage: "no such account",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "DEAD_LETTERED", outcome.JobStatus)
+
+	// The replacement, through the real replay path — and made to wait on the
+	// queue row lock first. The wait is what separates the transaction's start
+	// time from its post-lock clock sample, which is exactly the gap 0012
+	// rewinds into. Holding a lock is deterministic; a sleep would not be.
+	holder, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	var held string
+	require.NoError(t, holder.QueryRow(ctx,
+		`SELECT name FROM queues WHERE name = 'default' FOR UPDATE`).Scan(&held))
+
+	replayed := make(chan jobs.ReplayResult, 1)
+	replayErr := make(chan error, 1)
+	go func() {
+		result, err := store.Replay(context.Background(), upgradeScope, deadLettered, "replay-upgrade-key")
+		replayed <- result
+		replayErr <- err
+	}()
+	waitForLockOn(t, pool, "SELECT name FROM queues WHERE name")
+	require.NoError(t, holder.Rollback(ctx))
+	require.NoError(t, <-replayErr)
+	replacement := (<-replayed).Replacement.ID
+
+	// The gap the replay opened, which is what makes this fixture meaningful.
+	var jobCreated, eventCreated time.Time
+	require.NoError(t, conn.QueryRow(ctx,
+		`SELECT created_at FROM jobs WHERE id = $1`, replacement).Scan(&jobCreated))
+	require.NoError(t, conn.QueryRow(ctx, `
+		SELECT created_at FROM outbox_events
+		WHERE job_id = $1 AND event_type = 'work.available'`, replacement).Scan(&eventCreated))
+	require.True(t, eventCreated.Before(jobCreated),
+		"the replay's event carries the transaction start time and the job its post-lock sample")
+
+	replayAuthoritative := readNotificationState(t, ctx, conn, replacement)
+	require.Equal(t, 1, replayAuthoritative.generation)
+	require.True(t, replayAuthoritative.lastNotification.Equal(replayAuthoritative.createdAt),
+		"a replay stamps the job and its notification from one sample, which is why 0012 mistakes it for legacy")
+
+	// A second M4-touched job, so 0011's database-wide guard skips and the
+	// upgrade reaches 0012 with the legacy history still unrepaired.
+	promoted := submit("replay-upgrade-promoted")
+	_, err = pool.Exec(ctx, `
+		UPDATE jobs SET notification_generation = 2, last_notification_at = clock_timestamp()
+		WHERE id = $1`, promoted)
+	require.NoError(t, err)
+	promotedBefore := readNotificationState(t, ctx, conn, promoted)
+
+	// And an untouched M3 job with three historical notifications, which 0012
+	// must still reconstruct.
+	var now time.Time
+	require.NoError(t, conn.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now))
+	legacyCreated := now.Add(-30 * time.Minute)
+	legacy := uuid.New()
+	_, err = conn.Exec(ctx, `
+		INSERT INTO jobs (id, scope, queue, job_type, payload, status, priority,
+			max_attempts, timeout_seconds, available_at, created_at, updated_at,
+			notification_generation, last_notification_at)
+		VALUES ($1, $2, 'default', 'demo.echo', '{"m":1}', 'QUEUED', 50, 5, 300,
+		        $3, $3, $3, 1, $3)`, legacy, upgradeScope, legacyCreated)
+	require.NoError(t, err)
+	legacyNewest := now.Add(-45 * time.Second)
+	for _, at := range []time.Time{now.Add(-28 * time.Minute), now.Add(-14 * time.Minute), legacyNewest} {
+		_, err := conn.Exec(ctx, `
+			INSERT INTO outbox_events (id, event_type, schema_version, payload, status,
+				created_at, published_at, job_id, notification_generation)
+			VALUES (gen_random_uuid(), 'work.available', 1, $1, 'PUBLISHED', $2, $2, $3, 1)`,
+			fmt.Sprintf(`{"queue":"default","job_id":"%s"}`, legacy), at, legacy)
+		require.NoError(t, err)
+	}
+
+	// 0011 first: its global guard sees M4-authored metadata and skips.
+	applyMigration(t, ctx, conn, 11)
+	require.Equal(t, []int{1, 1, 1}, readNotificationState(t, ctx, conn, legacy).eventGenerations,
+		"0011's database-wide guard must skip here, or this fixture proves nothing about 0012")
+
+	// Then immutable 0012, which repairs the legacy job and rewinds the replay.
+	applyMigration(t, ctx, conn, 12)
+
+	t.Run("0012 rewound the replay-created replacement", func(t *testing.T) {
+		rewound := readNotificationState(t, ctx, conn, replacement)
+		require.True(t, rewound.lastNotification.Before(rewound.createdAt),
+			"0012 moved the notification earlier than the job it belongs to")
+		require.True(t, rewound.lastNotification.Equal(eventCreated),
+			"specifically, back to the event's transaction-start timestamp")
+		require.Equal(t, 1, rewound.generation, "only the timestamp moved")
+	})
+
+	t.Run("0013 restores it exactly", func(t *testing.T) {
+		applyMigration(t, ctx, conn, 13)
+		restored := readNotificationState(t, ctx, conn, replacement)
+		require.Equal(t, replayAuthoritative, restored,
+			"the replacement must be exactly what the replay transaction wrote")
+		require.True(t, restored.lastNotification.Equal(jobCreated),
+			"restored to the instant the replay assigned, which created_at still holds")
+	})
+
+	t.Run("unrelated M4 rows are untouched", func(t *testing.T) {
+		require.Equal(t, promotedBefore, readNotificationState(t, ctx, conn, promoted),
+			"a promoted job was never eligible for either migration")
+	})
+
+	t.Run("eligible legacy history is still reconstructed", func(t *testing.T) {
+		after := readNotificationState(t, ctx, conn, legacy)
+		require.Equal(t, []int{1, 2, 3}, after.eventGenerations)
+		require.Equal(t, 3, after.generation)
+		require.True(t, after.lastNotification.Equal(legacyNewest),
+			"0013 must not undo what 0012 correctly repaired")
+	})
+
+	t.Run("0013 is idempotent", func(t *testing.T) {
+		before := map[uuid.UUID]notificationState{}
+		for _, id := range []uuid.UUID{replacement, promoted, legacy} {
+			before[id] = readNotificationState(t, ctx, conn, id)
+		}
+		applyMigration(t, ctx, conn, 13)
+		for id, want := range before {
+			require.Equalf(t, want, readNotificationState(t, ctx, conn, id),
+				"re-running 0013 changed job %s", id)
+		}
+	})
+
+	t.Run("a fresh database applies every migration", func(t *testing.T) {
+		otherDSN := withFreshDatabase(t)
+		applied, err := database.Migrate(ctx, otherDSN, discardLogger())
+		require.NoError(t, err)
+		require.Equal(t, 13, applied, "0001 through 0013 apply to an empty database")
+	})
 }
