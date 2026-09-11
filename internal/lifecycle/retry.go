@@ -89,6 +89,23 @@ func (p RetryPolicy) Validate() error {
 	if p.Base <= 0 {
 		problems = append(problems, "base delay must be positive")
 	}
+	// Max is a STRICT upper bound on a value stored in whole milliseconds, so it
+	// has to be expressible in that unit. A Max under a millisecond bounds every
+	// delay below the smallest storable one, leaving no answer that is both
+	// positive and within it; a Max that is not a whole multiple would be
+	// silently floored, so the effective bound would differ from the configured
+	// one. Requiring both makes "delay <= Max" true as written rather than true
+	// after an unstated adjustment.
+	//
+	// Base has no such requirement. It is an input to a calculation, not a bound
+	// on a stored value, so a sub-millisecond or non-whole-millisecond base is
+	// fine as long as it fits inside a representable Max -- the result is
+	// rounded up to the smallest storable delay.
+	if p.Max < time.Millisecond {
+		problems = append(problems, "maximum delay must be at least 1ms")
+	} else if p.Max%time.Millisecond != 0 {
+		problems = append(problems, "maximum delay must be a whole number of milliseconds")
+	}
 	if p.Max < p.Base {
 		problems = append(problems, "maximum delay must be at least the base delay")
 	}
@@ -185,61 +202,92 @@ func (p RetryPolicy) Delay(attemptNumber int, jitter JitterSource) time.Duration
 	if delay < 0 {
 		delay = 0
 	}
-	if delay > float64(max) {
-		delay = float64(max)
-	}
-	return quantizeDelay(time.Duration(delay), max)
+	return quantizeNanos(delay, max)
 }
 
-// quantizeDelay rounds a computed delay to the millisecond granularity the
-// decision is STORED at, rounding a positive delay up and never down to zero.
+// maxDelayMillis is the largest whole-millisecond delay a time.Duration can
+// hold: math.MaxInt64 nanoseconds floored to milliseconds, or 2562047h47m16.854s.
+//
+// Every result is bounded by this before anything is converted, which is what
+// makes the boundary the same number on every architecture.
+const maxDelayMillis = int64(math.MaxInt64) / int64(time.Millisecond)
+
+// capMillis is the largest whole-millisecond delay this policy permits.
+//
+// Integer arithmetic only: float64(math.MaxInt64) rounds UP to exactly 2^63,
+// which is one past what an int64 holds, so converting it is undefined and
+// genuinely differs by machine -- arm64 saturates to math.MaxInt64 while amd64
+// yields the most negative int64. Dividing the int64 directly never goes near
+// that edge.
+//
+// Max is required to be a whole number of milliseconds and at least 1ms, so for
+// a validated policy this is exactly Max and the returned delay is always within
+// it. The floor of 1 exists only for a sub-millisecond Max, which Validate
+// rejects and only a policy built in code can reach: there is no value that is
+// both positive and within such a Max, and a positive backoff collapsing to an
+// immediate retry is the worse of the two ways to be wrong.
+func capMillis(max time.Duration) int64 {
+	if max <= 0 {
+		return 1
+	}
+	ms := int64(max) / int64(time.Millisecond)
+	if ms < 1 {
+		return 1
+	}
+	if ms > maxDelayMillis {
+		return maxDelayMillis
+	}
+	return ms
+}
+
+// quantizeNanos turns the computed float nanosecond delay into the whole
+// millisecond value the decision is STORED at.
 //
 // This is the single normalization point for a retry delay. Everything
 // downstream -- the job transition, retry_at, the persisted attempt fields, the
 // first response, and every exact replay of it -- is derived from the value this
 // returns, so none of them can disagree about what was decided.
 //
-// Truncating instead is what made them disagree. job_attempts.retry_delay_ms is
-// whole milliseconds, so a 1ns delay truncated to 0 while the decision that
-// produced it was still "retry after a delay". The first response reported
-// RETRY_WAIT from the unrounded value and the replay read back 0 and reported
-// QUEUED -- two different answers for one committed, immutable decision, and one
-// of them describing a transition the job never made.
+// It takes nanoseconds as a float and never as a Duration, which is the whole
+// point. Converting first and clamping afterwards put an unchecked float next to
+// 2^63 through a conversion Go leaves undefined: on amd64 that produced a
+// negative duration, which then read as "no delay" and turned a maximal backoff
+// into an immediate retry, while arm64 saturated and produced the maximum. The
+// saturation now happens in milliseconds, where every intermediate value is
+// comfortably inside both float64's exact-integer range and int64's.
 //
-// Rounding UP is the direction that preserves intent: a configured positive
-// backoff must not silently become an immediate retry, which is a materially
-// different behavior under load. Zero stays zero, so ADR-0009's immediate
-// requeue remains distinguishable from the shortest real backoff.
-//
-// The arithmetic is integer-only and cannot overflow. d/time.Millisecond is
-// exact division on an int64, the increment is bounded by
-// math.MaxInt64/1e6 milliseconds, and the final multiply is bounded by capMs,
-// which is itself derived from max by flooring.
-func quantizeDelay(d, max time.Duration) time.Duration {
-	if d <= 0 {
+// Rounding is UP, because a configured positive backoff must not silently become
+// an immediate retry -- a materially different behavior under load, not a
+// rounding detail. Zero stays zero, so ADR-0009's immediate requeue remains
+// distinguishable from the shortest real backoff. A delay is truncated to 0 only
+// when the calculation itself produced 0.
+func quantizeNanos(nanos float64, max time.Duration) time.Duration {
+	capMs := capMillis(max)
+	// A non-finite value cannot be compared or rounded meaningfully. Everything
+	// upstream already guards against one; this is the last line rather than the
+	// only one, and it saturates rather than collapsing to zero because +Inf
+	// means "longer than anything", not "no delay".
+	if math.IsNaN(nanos) {
 		return 0
 	}
-	ms := d / time.Millisecond
-	if d%time.Millisecond != 0 {
-		ms++
+	if math.IsInf(nanos, 1) {
+		return time.Duration(capMs) * time.Millisecond
 	}
+	if nanos <= 0 {
+		return 0
+	}
+
+	// Ceiling in float milliseconds. The division shrinks the value by a
+	// millionth before anything is compared, so even a delay at the top of the
+	// float range lands far below 2^53 and the conversion below is exact.
+	ms := math.Ceil(nanos / float64(time.Millisecond))
 	if ms < 1 {
 		ms = 1
 	}
-	// The ceiling can round past Max, so it is bounded by the largest WHOLE
-	// millisecond Max can express. When Max itself is under a millisecond there
-	// is no value that is both positive and within it; the floor of 1ms wins,
-	// because a positive backoff turning into an immediate retry is the worse
-	// of the two ways to be wrong. Validate keeps a configured policy well
-	// clear of that corner -- only a policy built in code can reach it.
-	capMs := max / time.Millisecond
-	if capMs < 1 {
-		capMs = 1
+	if ms >= float64(capMs) {
+		return time.Duration(capMs) * time.Millisecond
 	}
-	if ms > capMs {
-		ms = capMs
-	}
-	return ms * time.Millisecond
+	return time.Duration(int64(ms)) * time.Millisecond
 }
 
 // Decision is what one terminal attempt outcome does to its job.

@@ -419,7 +419,7 @@ func TestRetryPolicy_DelayIsAlwaysWholeMillisecondsAndNeverRoundsAPositiveDelayA
 
 // TestRetryPolicy_ZeroDelayStaysImmediate keeps ADR-0009's immediate requeue
 // distinguishable from the shortest real backoff. Rounding a positive delay up
-// must not also invent one where the policy decided there was none.
+// must not also invent one where the calculation produced none.
 func TestRetryPolicy_ZeroDelayStaysImmediate(t *testing.T) {
 	policy := testPolicy()
 	decision, err := policy.Decide(ClassAbandoned, 1, 1, 3, NewSeededJitter(4))
@@ -427,9 +427,162 @@ func TestRetryPolicy_ZeroDelayStaysImmediate(t *testing.T) {
 	require.True(t, decision.Retry)
 	require.Zero(t, decision.Delay, "an abandoned attempt is requeued immediately, not backed off")
 
-	// And the quantizer itself leaves zero alone at every bound.
-	require.Zero(t, quantizeDelay(0, time.Minute))
-	require.Zero(t, quantizeDelay(-5*time.Second, time.Minute))
+	// And a jittered calculation that lands on exactly zero stays zero. Full
+	// jitter with a sample of 0 gives factor 1 + 1*(2*0 - 1) = 0, so the whole
+	// delay is zero however large the base is.
+	zeroed := RetryPolicy{Base: time.Minute, Max: time.Hour, Multiplier: 2, Jitter: 1}
+	require.Zero(t, zeroed.Delay(1, constantJitter(0)),
+		"a delay the calculation reduced to zero is an immediate retry, not a 1ms backoff")
+	require.Zero(t, zeroed.Delay(5, constantJitter(0)))
+}
+
+// TestRetryPolicy_DelaySaturatesAtTheLargestRepresentableDelay is the boundary
+// an unchecked float-to-Duration conversion gets wrong on half the machines that
+// run this.
+//
+// float64(math.MaxInt64) rounds UP to exactly 2^63, one past what an int64
+// holds, and Go leaves that conversion undefined: arm64 saturates to
+// math.MaxInt64 while amd64 yields the most negative int64. The negative value
+// then read as "no delay", so the same policy produced a maximal backoff on one
+// architecture and an IMMEDIATE RETRY on the other.
+//
+// These assertions go through the public Delay, not the internal helper,
+// because the conversion under test lives on the public path.
+func TestRetryPolicy_DelaySaturatesAtTheLargestRepresentableDelay(t *testing.T) {
+	// math.MaxInt64 nanoseconds floored to whole milliseconds.
+	const want = 9223372036854 * time.Millisecond
+	require.Equal(t, "2562047h47m16.854s", want.String(),
+		"the documented ceiling, pinned so a change to it is deliberate")
+
+	sources := map[string]JitterSource{
+		"no jitter source":   nil,
+		"minimum sample":     constantJitter(0),
+		"maximum sample":     constantJitter(math.Nextafter(1, 0)),
+		"out-of-range below": constantJitter(-1),
+		"out-of-range above": constantJitter(4),
+		"NaN sample":         constantJitter(math.NaN()),
+		"+Inf sample":        constantJitter(math.Inf(1)),
+	}
+	attempts := []int{1, 2, 40, 99, 100, 1000}
+
+	// Jitter disabled: the sample is ignored entirely, so every source and every
+	// attempt number must land on the ceiling. This is the case that used to
+	// return 0s on amd64 and the ceiling on arm64.
+	unjittered := RetryPolicy{
+		Base: time.Duration(math.MaxInt64), Max: time.Duration(math.MaxInt64),
+		Multiplier: 2, Jitter: 0,
+	}
+	for name, source := range sources {
+		for _, attempt := range attempts {
+			delay := unjittered.Delay(attempt, source)
+			require.NotZerof(t, delay,
+				"%s on attempt %d collapsed a maximal backoff into an immediate retry", name, attempt)
+			require.Equalf(t, want, delay,
+				"%s on attempt %d must saturate at the same value on every architecture", name, attempt)
+		}
+	}
+
+	// Jitter enabled: the result depends on the sample, but every one of them is
+	// an exact, architecture-independent number that is positive, storable, and
+	// within the ceiling.
+	jittered := RetryPolicy{
+		Base: time.Duration(math.MaxInt64), Max: time.Duration(math.MaxInt64),
+		Multiplier: 2, Jitter: 0.5,
+	}
+	for name, source := range sources {
+		for _, attempt := range attempts {
+			delay := jittered.Delay(attempt, source)
+			require.NotZerof(t, delay,
+				"%s on attempt %d collapsed a maximal backoff into an immediate retry", name, attempt)
+			require.Positivef(t, delay, "%s on attempt %d produced a negative delay", name, attempt)
+			require.LessOrEqualf(t, delay, want, "%s on attempt %d exceeded the representable ceiling", name, attempt)
+			require.Zerof(t, delay%time.Millisecond, "%s on attempt %d is not storable", name, attempt)
+		}
+	}
+
+	// The two jitter extremes, pinned exactly. A sample of 0 with half jitter
+	// halves the ceiling -- 2^62 nanoseconds, rounded up to whole milliseconds --
+	// and the largest sample leaves it at the ceiling.
+	require.Equal(t, 4611686018428*time.Millisecond, jittered.Delay(1, constantJitter(0)),
+		"the minimum sample halves a maximal delay, exactly and on every architecture")
+	require.Equal(t, want, jittered.Delay(1, constantJitter(math.Nextafter(1, 0))))
+
+	// Full jitter at sample 0 zeroes the CALCULATION, which is a real immediate
+	// retry rather than an overflow collapsing into one.
+	zeroed := RetryPolicy{
+		Base: time.Duration(math.MaxInt64), Max: time.Duration(math.MaxInt64),
+		Multiplier: 1, Jitter: 1,
+	}
+	require.Zero(t, zeroed.Delay(1, constantJitter(0)))
+	require.Equal(t, want, zeroed.Delay(1, constantJitter(math.Nextafter(1, 0))))
+}
+
+// TestRetryPolicy_ValidPoliciesNeverExceedTheirMaximum is the property the
+// granularity contract exists to make true as written.
+//
+// Max is a strict upper bound on a value stored in whole milliseconds, so it has
+// to be expressible in that unit -- otherwise the effective bound is a silently
+// floored version of the configured one, and "delay <= Max" is true only after
+// an unstated adjustment.
+func TestRetryPolicy_ValidPoliciesNeverExceedTheirMaximum(t *testing.T) {
+	policies := map[string]RetryPolicy{
+		"sub-millisecond base":     {Base: time.Nanosecond, Max: time.Millisecond, Multiplier: 2, Jitter: 0.2},
+		"non-whole base":           {Base: 1500*time.Microsecond + 7*time.Nanosecond, Max: 2 * time.Millisecond, Multiplier: 2, Jitter: 0.5},
+		"exactly one millisecond":  {Base: time.Millisecond, Max: time.Millisecond, Multiplier: 2, Jitter: 1},
+		"ordinary":                 {Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: 0.2},
+		"no jitter":                {Base: 250 * time.Millisecond, Max: 10 * time.Second, Multiplier: 3, Jitter: 0},
+		"full jitter":              {Base: time.Second, Max: 5 * time.Second, Multiplier: 2, Jitter: 1},
+		"multiplier one":           {Base: 7 * time.Millisecond, Max: 7 * time.Millisecond, Multiplier: 1, Jitter: 0.5},
+		"very large whole maximum": {Base: time.Second, Max: 1000000 * time.Millisecond, Multiplier: 10, Jitter: 0.9},
+	}
+	samples := []float64{0, 0.25, 0.5, math.Nextafter(1, 0)}
+
+	for name, policy := range policies {
+		require.NoErrorf(t, policy.Validate(), "%s must be a valid policy", name)
+		for _, sample := range samples {
+			for _, attempt := range []int{1, 2, 5, 50, 100} {
+				delay := policy.Delay(attempt, constantJitter(sample))
+
+				require.GreaterOrEqualf(t, delay, time.Duration(0),
+					"%s attempt %d sample %v produced a negative delay", name, attempt, sample)
+				require.LessOrEqualf(t, delay, policy.Max,
+					"%s attempt %d sample %v exceeded its own maximum", name, attempt, sample)
+				require.Zerof(t, delay%time.Millisecond,
+					"%s attempt %d sample %v is not storable", name, attempt, sample)
+
+				// Upward rounding, stated as the property rather than as a
+				// constant: whenever the delay is positive and below the cap, it
+				// is at least the smallest storable delay, and it is never below
+				// the whole-millisecond floor of what the calculation asked for.
+				if delay > 0 && delay < policy.Max {
+					require.GreaterOrEqualf(t, delay, time.Millisecond,
+						"%s attempt %d sample %v rounded a positive delay below 1ms", name, attempt, sample)
+				}
+			}
+		}
+	}
+}
+
+// TestRetryPolicy_UpwardRoundingIsExactBelowTheCap pins the rounding direction
+// on values chosen so the expected answer is unambiguous.
+func TestRetryPolicy_UpwardRoundingIsExactBelowTheCap(t *testing.T) {
+	const cap = time.Minute
+	for name, expected := range map[time.Duration]time.Duration{
+		time.Nanosecond:                           time.Millisecond,
+		time.Microsecond:                          time.Millisecond,
+		500 * time.Microsecond:                    time.Millisecond,
+		time.Millisecond - time.Nanosecond:        time.Millisecond,
+		time.Millisecond:                          time.Millisecond,
+		time.Millisecond + time.Nanosecond:        2 * time.Millisecond,
+		1500*time.Microsecond + 7*time.Nanosecond: 2 * time.Millisecond,
+		250 * time.Millisecond:                    250 * time.Millisecond,
+	} {
+		base, want := name, expected
+		policy := RetryPolicy{Base: base, Max: cap, Multiplier: 1, Jitter: 0}
+		require.NoError(t, policy.Validate())
+		require.Equalf(t, want, policy.Delay(1, nil),
+			"a base of %v must round up to %v", base, want)
+	}
 }
 
 // TestDecide_DelayIsQuantizedBeforeItLeavesThePolicy proves the normalization
@@ -446,29 +599,107 @@ func TestDecide_DelayIsQuantizedBeforeItLeavesThePolicy(t *testing.T) {
 		"and the persisted integer agrees that this is a delayed retry")
 }
 
-// TestQuantizeDelay_BoundsAndCorners covers the arithmetic directly, including
-// the corner where Max itself cannot express a whole millisecond.
-func TestQuantizeDelay_BoundsAndCorners(t *testing.T) {
-	// Ordinary rounding up, bounded by a Max that can hold it.
-	require.Equal(t, time.Millisecond, quantizeDelay(time.Nanosecond, time.Minute))
-	require.Equal(t, time.Millisecond, quantizeDelay(time.Millisecond, time.Minute))
-	require.Equal(t, 2*time.Millisecond, quantizeDelay(time.Millisecond+time.Nanosecond, time.Minute))
-	require.Equal(t, 250*time.Millisecond, quantizeDelay(250*time.Millisecond, time.Minute))
+// TestRetryPolicy_DelayOnAnUnvalidatedPolicy covers the corners Validate now
+// rejects, because Delay is still reachable from a policy built in code and has
+// to stay safe and deterministic there.
+//
+// These are not behaviors a configured deployment can produce. They are stated
+// so the boundaries are a decision rather than an accident.
+func TestRetryPolicy_DelayOnAnUnvalidatedPolicy(t *testing.T) {
+	subMillisecondMax := RetryPolicy{
+		Base: time.Nanosecond, Max: time.Nanosecond, Multiplier: 1, Jitter: 0,
+	}
+	require.Error(t, subMillisecondMax.Validate(), "a sub-millisecond maximum is not a valid policy")
+	require.Equal(t, time.Millisecond, subMillisecondMax.Delay(1, nil),
+		"with no storable delay inside such a maximum, staying positive wins over collapsing to zero")
 
-	// The ceiling is bounded by the largest whole millisecond Max expresses.
-	require.Equal(t, 5*time.Millisecond, quantizeDelay(10*time.Millisecond, 5*time.Millisecond))
-	require.Equal(t, 5*time.Millisecond,
-		quantizeDelay(10*time.Millisecond, 5*time.Millisecond+500*time.Microsecond),
-		"a Max that is not a whole millisecond is floored, never exceeded")
+	nonWholeMax := RetryPolicy{
+		Base: 5 * time.Millisecond, Max: 5*time.Millisecond + 500*time.Microsecond,
+		Multiplier: 2, Jitter: 0,
+	}
+	require.Error(t, nonWholeMax.Validate(), "a non-whole-millisecond maximum is not a valid policy")
+	require.Equal(t, 5*time.Millisecond, nonWholeMax.Delay(2, nil),
+		"a maximum that is not a whole millisecond is floored, never exceeded")
 
-	// A sub-millisecond Max cannot hold any positive delay. Staying positive is
-	// the deliberate resolution; a configured policy cannot reach this corner.
-	require.Equal(t, time.Millisecond, quantizeDelay(time.Nanosecond, time.Nanosecond))
-
-	// No overflow at the top of the range.
+	// The top of the range never panics and never goes negative.
 	require.NotPanics(t, func() {
-		got := quantizeDelay(time.Duration(math.MaxInt64), time.Duration(math.MaxInt64))
-		require.Positive(t, got)
-		require.Zero(t, got%time.Millisecond)
+		huge := RetryPolicy{
+			Base: time.Duration(math.MaxInt64), Max: time.Duration(math.MaxInt64),
+			Multiplier: 2, Jitter: 1,
+		}
+		got := huge.Delay(100, constantJitter(math.Nextafter(1, 0)))
+		require.Equal(t, 9223372036854*time.Millisecond, got)
+	})
+}
+
+// TestRetryPolicy_MaximumGranularityRule states the contract Max has to satisfy
+// and, just as importantly, the one Base does not.
+//
+// Max is a strict upper bound on a value stored in whole milliseconds, so it has
+// to be expressible in that unit: a sub-millisecond Max bounds every delay below
+// the smallest storable one, and a non-whole Max would be silently floored, so
+// the effective bound would differ from the configured one. Base is an input to
+// a calculation rather than a bound on a stored value, so it is free.
+func TestRetryPolicy_MaximumGranularityRule(t *testing.T) {
+	t.Run("a maximum below one millisecond is rejected", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Nanosecond, time.Microsecond, 500 * time.Microsecond,
+			time.Millisecond - time.Nanosecond,
+		} {
+			policy := RetryPolicy{Base: time.Nanosecond, Max: max, Multiplier: 2, Jitter: 0.2}
+			err := policy.Validate()
+			require.Errorf(t, err, "a maximum of %v leaves no storable delay inside it", max)
+			require.Contains(t, err.Error(), "at least 1ms")
+		}
+	})
+
+	t.Run("a maximum that is not a whole millisecond is rejected", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Millisecond + time.Nanosecond,
+			1500 * time.Microsecond,
+			time.Second + time.Microsecond,
+			5*time.Millisecond + 500*time.Microsecond,
+		} {
+			policy := RetryPolicy{Base: time.Millisecond, Max: max, Multiplier: 2, Jitter: 0.2}
+			err := policy.Validate()
+			require.Errorf(t, err, "a maximum of %v would be silently floored", max)
+			require.Contains(t, err.Error(), "whole number of milliseconds")
+		}
+	})
+
+	t.Run("exact millisecond multiples are accepted", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Millisecond, 2 * time.Millisecond, 250 * time.Millisecond,
+			time.Second, time.Minute, time.Hour,
+		} {
+			policy := RetryPolicy{Base: time.Millisecond, Max: max, Multiplier: 2, Jitter: 0.2}
+			require.NoErrorf(t, policy.Validate(), "a maximum of %v is exactly expressible", max)
+		}
+	})
+
+	t.Run("a sub-millisecond or non-whole base is accepted with a valid maximum", func(t *testing.T) {
+		for _, base := range []time.Duration{
+			time.Nanosecond, time.Microsecond, 500 * time.Microsecond,
+			time.Millisecond - time.Nanosecond,
+			1500*time.Microsecond + 7*time.Nanosecond,
+			time.Second + time.Nanosecond,
+		} {
+			policy := RetryPolicy{Base: base, Max: time.Minute, Multiplier: 2, Jitter: 0.2}
+			require.NoErrorf(t, policy.Validate(),
+				"a base of %v is an input to a calculation, not a bound on a stored value", base)
+		}
+	})
+
+	t.Run("a valid sub-millisecond base still produces a storable delay", func(t *testing.T) {
+		policy := RetryPolicy{Base: time.Nanosecond, Max: time.Millisecond, Multiplier: 2, Jitter: 0}
+		require.NoError(t, policy.Validate())
+		require.Equal(t, time.Millisecond, policy.Delay(1, nil),
+			"a positive calculation rounds up to the smallest storable delay")
+		require.LessOrEqual(t, policy.Delay(1, nil), policy.Max)
+	})
+
+	t.Run("the maximum must still be at least the base", func(t *testing.T) {
+		policy := RetryPolicy{Base: time.Minute, Max: time.Second, Multiplier: 2, Jitter: 0.2}
+		require.Error(t, policy.Validate())
 	})
 }
