@@ -218,6 +218,18 @@ func (c Config) Validate() error {
 	if c.JobRetryBase <= 0 {
 		problems = append(problems, "TASKFORGE_JOB_RETRY_BASE must be positive")
 	}
+	// The same granularity rule lifecycle.RetryPolicy.Validate enforces, stated
+	// here in terms of the variable an operator actually sets. The retry delay is
+	// stored in whole milliseconds, so the maximum has to be expressible in that
+	// unit for "delay <= maximum" to be true as written. The BASE has no such
+	// requirement -- a sub-millisecond base is rounded up to the smallest
+	// storable delay, which is a calculation detail rather than a broken bound.
+	if c.JobRetryMax < time.Millisecond {
+		problems = append(problems, "TASKFORGE_JOB_RETRY_MAX must be at least 1ms")
+	} else if c.JobRetryMax%time.Millisecond != 0 {
+		problems = append(problems,
+			"TASKFORGE_JOB_RETRY_MAX must be a whole number of milliseconds")
+	}
 	if c.JobRetryMax < c.JobRetryBase {
 		problems = append(problems, "TASKFORGE_JOB_RETRY_MAX must be >= TASKFORGE_JOB_RETRY_BASE")
 	}

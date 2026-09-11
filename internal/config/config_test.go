@@ -427,3 +427,113 @@ func TestRetryPolicy_CannotCarryANonFiniteFloatPastValidation(t *testing.T) {
 	require.Error(t, c.RetryPolicy().Validate(),
 		"the policy must reject what the configuration rejected")
 }
+
+// TestValidate_JobRetryMaximumGranularityRule is the startup half of the rule
+// lifecycle.RetryPolicy.Validate enforces on the policy.
+//
+// The retry delay is stored in whole milliseconds, so the maximum has to be
+// expressible in that unit for "delay <= maximum" to be true as written rather
+// than true after an unstated flooring. The BASE has no such requirement: a
+// sub-millisecond base is rounded up to the smallest storable delay, which is a
+// calculation detail rather than a broken bound.
+func TestValidate_JobRetryMaximumGranularityRule(t *testing.T) {
+	t.Run("a maximum below one millisecond is rejected", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Nanosecond, time.Microsecond, 500 * time.Microsecond,
+			time.Millisecond - time.Nanosecond,
+		} {
+			c := baseConfig()
+			c.JobRetryBase = time.Nanosecond
+			c.JobRetryMax = max
+			err := c.Validate()
+			require.Errorf(t, err, "a maximum of %v leaves no storable delay inside it", max)
+			require.Contains(t, err.Error(), "TASKFORGE_JOB_RETRY_MAX must be at least 1ms")
+		}
+	})
+
+	t.Run("a maximum that is not a whole millisecond is rejected", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Millisecond + time.Nanosecond,
+			1500 * time.Microsecond,
+			time.Second + time.Microsecond,
+		} {
+			c := baseConfig()
+			c.JobRetryMax = max
+			err := c.Validate()
+			require.Errorf(t, err, "a maximum of %v would be silently floored", max)
+			require.Contains(t, err.Error(),
+				"TASKFORGE_JOB_RETRY_MAX must be a whole number of milliseconds")
+		}
+	})
+
+	t.Run("exact millisecond multiples are accepted", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Millisecond, 250 * time.Millisecond, time.Second, time.Minute, time.Hour,
+		} {
+			c := baseConfig()
+			c.JobRetryBase = time.Millisecond
+			c.JobRetryMax = max
+			require.NoErrorf(t, c.Validate(), "a maximum of %v is exactly expressible", max)
+		}
+	})
+
+	t.Run("a sub-millisecond base is accepted with a valid maximum", func(t *testing.T) {
+		c := baseConfig()
+		c.JobRetryBase = time.Nanosecond
+		c.JobRetryMax = time.Millisecond
+		require.NoError(t, c.Validate())
+		require.Equal(t, time.Millisecond, c.RetryPolicy().Delay(1, nil))
+	})
+
+	t.Run("the documented defaults satisfy the rule", func(t *testing.T) {
+		c, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, c.RetryPolicy().Validate(),
+			"the shipped defaults must not need a change to start")
+	})
+}
+
+// TestValidate_AgreesWithTheRetryPolicyItBuilds is the guard against the two
+// validators drifting apart.
+//
+// They are deliberately separate — one names the environment variable an
+// operator has to fix, the other describes a policy built in code — and that is
+// exactly the setup in which one can be tightened and the other forgotten. A
+// configuration that starts must never produce a policy the domain rejects, and
+// a configuration that is refused must never describe a policy the domain would
+// have accepted.
+func TestValidate_AgreesWithTheRetryPolicyItBuilds(t *testing.T) {
+	cases := map[string]struct{ base, max time.Duration }{
+		"documented defaults":         {time.Second, 5 * time.Minute},
+		"sub-millisecond base":        {time.Nanosecond, time.Millisecond},
+		"non-whole base":              {1500*time.Microsecond + 7*time.Nanosecond, time.Second},
+		"maximum below one ms":        {time.Nanosecond, 500 * time.Microsecond},
+		"non-whole maximum":           {time.Millisecond, 1500 * time.Microsecond},
+		"maximum one nanosecond over": {time.Millisecond, time.Second + time.Nanosecond},
+		"maximum below base":          {time.Minute, time.Second},
+		"exactly one millisecond":     {time.Millisecond, time.Millisecond},
+		"zero base":                   {0, time.Minute},
+		"large whole maximum":         {time.Second, time.Hour},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := baseConfig()
+			c.JobRetryBase = tc.base
+			c.JobRetryMax = tc.max
+
+			configErr := c.Validate()
+			policyErr := c.RetryPolicy().Validate()
+			require.Equalf(t, configErr == nil, policyErr == nil,
+				"startup validation says %v but the policy it builds says %v", configErr, policyErr)
+
+			// And when both accept, the policy it builds actually honors its own
+			// bound, which is the property the rule exists for.
+			if configErr == nil {
+				delay := c.RetryPolicy().Delay(1, nil)
+				require.LessOrEqual(t, delay, c.JobRetryMax)
+				require.Zero(t, delay%time.Millisecond)
+			}
+		})
+	}
+}
