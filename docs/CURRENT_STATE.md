@@ -390,7 +390,7 @@ into domain logic. See [.env.example](../.env.example).
 | `TASKFORGE_SCHEDULER_BATCH_SIZE` | `50` | between 1 and 1000 |
 | `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` | `60s` | ≥ 3 × poll interval, and ≥ `TASKFORGE_OUTBOX_CLAIM_TIMEOUT` |
 | `TASKFORGE_JOB_RETRY_BASE` | `1s` | must be positive |
-| `TASKFORGE_JOB_RETRY_MAX` | `5m` | ≥ `TASKFORGE_JOB_RETRY_BASE` |
+| `TASKFORGE_JOB_RETRY_MAX` | `5m` | ≥ `TASKFORGE_JOB_RETRY_BASE`, ≥ `1ms`, and an exact whole-millisecond multiple |
 | `TASKFORGE_JOB_RETRY_MULTIPLIER` | `2.0` | finite, and ≥ 1 |
 | `TASKFORGE_JOB_RETRY_JITTER` | `0.2` | finite, and between 0 and 1 |
 
@@ -642,13 +642,30 @@ reduces the calculation to exactly zero commits as `QUEUED` with a stored delay
 of `0`, a later attempt succeeds, and the replay still answers `QUEUED`.
 
 The maximum-duration boundary is tested through the **public** `Delay`, not a
-helper, because the unsafe conversion lived on the public path: with `Base` and
-`Max` at `math.MaxInt64`, every jitter source (including `NaN`, both infinities,
-and out-of-range samples) and attempt numbers up to 1000 must return exactly
-`2562047h47m16.854s` and never zero. A table test additionally proves every
-valid policy returns a whole-millisecond delay within its own maximum, and the
-validation tests pin `RetryPolicy.Validate` and startup configuration validation
-to the same accept/reject answer across a shared table of cases.
+helper, because the unsafe conversion lived on the public path. Both halves use
+`Base` and `Max` at `math.MaxInt64` and attempt numbers up to 1000, and they
+prove different things:
+
+- **Jitter disabled.** Every case saturates at exactly `2562047h47m16.854s` and
+  never zero — this is the case that returned `0s` on amd64 and the ceiling on
+  arm64. The jitter source is passed but irrelevant here: with `Jitter: 0` the
+  policy never draws a sample, so the matrix of sources (`nil`, the finite
+  extremes, out-of-range values, `NaN`, `+Inf`, `-Inf`) is exercising the
+  conversion rather than the clamp.
+- **Jitter enabled.** The result legitimately depends on the sample, so what is
+  asserted is that every case is deterministic, positive, whole-millisecond, and
+  within the ceiling — not that each returns the ceiling. The extremes are then
+  pinned exactly: the largest finite sample returns the ceiling, while the
+  smallest returns half of it, `4611686018428ms`. `NaN`, `+Inf`, and `-Inf` all
+  return that same halved value, because a non-finite sample clamps to `0` —
+  the finiteness check precedes the range checks, since a non-finite sample is a
+  broken source rather than a value that was too large. Full jitter at a sample
+  of `0` zeroes the calculation itself and correctly yields an immediate retry.
+
+A table test additionally proves every valid policy returns a whole-millisecond
+delay within its own maximum, and the validation tests pin `RetryPolicy.Validate`
+and startup configuration validation to the same accept/reject answer across a
+shared table of cases.
 
 A replay is proved to answer the decision that committed even after the job has
 moved on: a retryable failure is recorded and its whole response captured, the

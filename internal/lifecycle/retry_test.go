@@ -462,6 +462,7 @@ func TestRetryPolicy_DelaySaturatesAtTheLargestRepresentableDelay(t *testing.T) 
 		"out-of-range above": constantJitter(4),
 		"NaN sample":         constantJitter(math.NaN()),
 		"+Inf sample":        constantJitter(math.Inf(1)),
+		"-Inf sample":        constantJitter(math.Inf(-1)),
 	}
 	attempts := []int{1, 2, 40, 99, 100, 1000}
 
@@ -500,12 +501,27 @@ func TestRetryPolicy_DelaySaturatesAtTheLargestRepresentableDelay(t *testing.T) 
 		}
 	}
 
-	// The two jitter extremes, pinned exactly. A sample of 0 with half jitter
-	// halves the ceiling -- 2^62 nanoseconds, rounded up to whole milliseconds --
-	// and the largest sample leaves it at the ceiling.
-	require.Equal(t, 4611686018428*time.Millisecond, jittered.Delay(1, constantJitter(0)),
+	// The jitter extremes, pinned exactly rather than merely bounded. A sample of
+	// 0 with half jitter halves the ceiling -- 2^62 nanoseconds, rounded up to
+	// whole milliseconds -- and the largest sample leaves it at the ceiling.
+	const halved = 4611686018428 * time.Millisecond
+	require.Equal(t, halved, jittered.Delay(1, constantJitter(0)),
 		"the minimum sample halves a maximal delay, exactly and on every architecture")
 	require.Equal(t, want, jittered.Delay(1, constantJitter(math.Nextafter(1, 0))))
+
+	// Every NON-FINITE sample clamps to 0, +Inf and -Inf alike, because the
+	// finiteness check runs before the range checks: a non-finite sample is a
+	// broken source rather than a value that was too large, so there is no high
+	// end for it to belong to. At the maximum they therefore land on the halved
+	// value, not the ceiling.
+	for name, sample := range map[string]float64{
+		"NaN":  math.NaN(),
+		"+Inf": math.Inf(1),
+		"-Inf": math.Inf(-1),
+	} {
+		require.Equalf(t, halved, jittered.Delay(1, constantJitter(sample)),
+			"a %s sample must clamp to 0 and halve the maximal delay, not saturate it", name)
+	}
 
 	// Full jitter at sample 0 zeroes the CALCULATION, which is a real immediate
 	// retry rather than an overflow collapsing into one.
