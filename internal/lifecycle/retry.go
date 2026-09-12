@@ -141,10 +141,20 @@ func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 //	nominal = min(Max, Base * Multiplier^(n-1))
 //	factor  = 1 + Jitter*(2r - 1)
 //	delay   = clamp(nominal * factor, 0, Max)
-//	result  = whole milliseconds, rounding a positive delay UP to at least 1ms
+//	result  = ceil(delay) in whole milliseconds, still bounded by Max
 //
 // The result is always a whole number of milliseconds because that is the
-// granularity the decision is persisted at. See quantizeDelay.
+// granularity the decision is persisted at, and it never exceeds Max: Validate
+// requires Max to be at least 1ms and an exact whole-millisecond multiple, so
+// the bound is expressible in the unit the result is rounded to. A positive
+// delay rounds UP, so a backoff never becomes an immediate retry by rounding; a
+// calculation that produces exactly zero stays zero. See quantizeNanos, which
+// also explains why the saturation happens in milliseconds rather than after a
+// conversion.
+//
+// Base carries no granularity rule. It is an input to the calculation rather
+// than a bound on a stored value, so a sub-millisecond base is fine and simply
+// rounds up to the smallest storable delay.
 //
 // A nil source disables jitter, which is what a caller asserting exact
 // exponential growth wants.
