@@ -124,9 +124,7 @@ backoff, `RETRY_WAIT`, timeouts, the DLQ API, and replay — stays in M4 below.
 
 ---
 
-## Current milestone — M4: Retry, timeout, cancellation, DLQ, replay, delayed jobs
-
-### M4 — Retry, timeout, cancellation, DLQ, replay, delayed jobs
+## M4 — Retry, timeout, cancellation, DLQ, replay, delayed jobs
 **Objective.** Complete the job lifecycle.
 **Deliverables.** Failure classification; exponential backoff with injected jitter;
 `RETRY_WAIT`; timeouts; `CANCEL_REQUESTED` delivery and the cancel-vs-complete race;
@@ -135,11 +133,27 @@ delayed jobs and re-notifying stranded work.
 **Acceptance.** Retries survive a restart; exhaustion dead-letters; cancel and
 success race resolves to exactly one winner; replay preserves terminal history.
 **Depends on.** M3 (complete).
-**Status:** not started.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the evidence.
+
+Three decisions M4 could not avoid are recorded as ADRs. A terminal outcome
+carries a lifetime-unique identity, and cancellation, timeout, and abandonment
+have a stated precedence
+([ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md)). A
+notification generation identifies one eligibility transition, so a stale event
+left by the publish-before-mark window cannot suppress the notification a new
+transition requires
+([ADR-0011](adr/0011-notification-generations-and-bounded-renotification.md)).
+Replay creates a linked new job rather than resurrecting a terminal one, and
+operator retry is the same operation
+([ADR-0012](adr/0012-logical-dlq-and-replay-as-a-new-job.md)).
+
+ADR-0009's boundary held: an abandoned attempt still consumes the attempt budget
+and still requeues immediately with no backoff. Only the budget arithmetic is
+shared with retry.
 
 ---
 
-## Remaining V1 milestones
+## Current milestone — M5: API keys, result storage, CLI, Python SDK
 
 ### M5 — API keys, result storage, CLI, Python SDK
 **Objective.** Make TaskForge usable by an outside developer.
@@ -148,7 +162,12 @@ inline results in PostgreSQL with a defined threshold and large results in MinIO
 `taskforge-cli`; a typed, installable Python SDK.
 **Acceptance.** Every endpoint authenticates; the dev scope from M1 is gone; small
 and large results round-trip; CLI exit codes are stable and output is machine-readable.
-**Depends on.** M4.
+**Depends on.** M4 (complete).
+**Status:** not started.
+
+---
+
+## Remaining V1 milestones
 
 ### M6 — Observability and health
 **Objective.** Make behavior visible.

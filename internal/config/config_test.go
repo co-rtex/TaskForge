@@ -1,12 +1,16 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 func baseConfig() Config {
@@ -74,6 +78,32 @@ func TestValidate_RejectsBadConfiguration(t *testing.T) {
 		"multiplier below one": func(c *Config) { c.OutboxBackoffMultiplier = 0.5 },
 		"jitter above one":     func(c *Config) { c.OutboxBackoffJitter = 1.5 },
 		"negative jitter":      func(c *Config) { c.OutboxBackoffJitter = -0.1 },
+
+		"empty scheduler addr":    func(c *Config) { c.SchedulerAddr = "" },
+		"public scheduler bind":   func(c *Config) { c.SchedulerAddr = "0.0.0.0:8084" },
+		"zero scheduler poll":     func(c *Config) { c.SchedulerPollInterval = 0 },
+		"zero scheduler batch":    func(c *Config) { c.SchedulerBatchSize = 0 },
+		"huge scheduler batch":    func(c *Config) { c.SchedulerBatchSize = 1001 },
+		"zero job retry base":     func(c *Config) { c.JobRetryBase = 0 },
+		"retry max below base":    func(c *Config) { c.JobRetryMax = time.Millisecond },
+		"retry multiplier below1": func(c *Config) { c.JobRetryMultiplier = 0.5 },
+		"retry jitter above one":  func(c *Config) { c.JobRetryJitter = 1.5 },
+		"negative retry jitter":   func(c *Config) { c.JobRetryJitter = -0.1 },
+
+		// Re-notification repairs a notification that was genuinely lost. At or
+		// near one polling cadence it would instead re-notify work whose first
+		// notification is simply still on its way.
+		"renotify at one poll interval": func(c *Config) {
+			c.SchedulerPollInterval = 30 * time.Second
+			c.SchedulerRenotifyAfter = 30 * time.Second
+		},
+		// A claimed-but-unpublished event is invisible to the scheduler's
+		// pending-event check for exactly the claim timeout, so a shorter
+		// interval would call an in-flight publish a lost notification.
+		"renotify below the outbox claim timeout": func(c *Config) {
+			c.OutboxClaimTimeout = 10 * time.Minute
+			c.SchedulerRenotifyAfter = time.Minute
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -248,4 +278,262 @@ func TestValidateWorkerTimings_RejectsATransportTimeoutThatOutlivesASafetyWindow
 		require.Contains(t, err.Error(), "TASKFORGE_SESSION_STALE_AFTER")
 		require.Contains(t, err.Error(), "TASKFORGE_LEASE_RENEW_INTERVAL")
 	})
+}
+
+// TestRetryPolicy_MirrorsTheValidatedSettings keeps the one place that turns
+// configuration into policy honest. If these ever drift, two processes reading
+// the same environment would enforce different retry cadences.
+func TestRetryPolicy_MirrorsTheValidatedSettings(t *testing.T) {
+	c := baseConfig()
+	c.JobRetryBase = 2 * time.Second
+	c.JobRetryMax = 90 * time.Second
+	c.JobRetryMultiplier = 3
+	c.JobRetryJitter = 0.15
+	require.NoError(t, c.Validate())
+
+	policy := c.RetryPolicy()
+	require.NoError(t, policy.Validate())
+	require.Equal(t, c.JobRetryBase, policy.Base)
+	require.Equal(t, c.JobRetryMax, policy.Max)
+	require.Equal(t, c.JobRetryMultiplier, policy.Multiplier)
+	require.Equal(t, c.JobRetryJitter, policy.Jitter)
+
+	// The defaults must themselves be a usable policy, not merely individually
+	// in range.
+	require.NoError(t, baseConfig().RetryPolicy().Validate())
+}
+
+// TestLoad_RejectsExplicitNonFiniteFloatEnvironmentValues is the first of two
+// independent defences.
+//
+// strconv.ParseFloat accepts "NaN", "Inf", "+Inf", "-Inf", and "Infinity"
+// without error, so a templating accident or a typo puts a non-finite float into
+// the process rather than failing loudly. Quietly substituting the documented
+// default would be worse than either: the process would come up on a value
+// nothing in its own configuration explains, and the operator would have no
+// signal that what they set was discarded.
+//
+// Every spelling below is asserted to parse to a genuinely non-finite float
+// FIRST, so this test pins the behavior of the values Go's parser really
+// accepts rather than a guess about them.
+func TestLoad_RejectsExplicitNonFiniteFloatEnvironmentValues(t *testing.T) {
+	floatKeys := []string{
+		"TASKFORGE_JOB_RETRY_MULTIPLIER",
+		"TASKFORGE_JOB_RETRY_JITTER",
+		"TASKFORGE_OUTBOX_BACKOFF_MULTIPLIER",
+		"TASKFORGE_OUTBOX_BACKOFF_JITTER",
+	}
+	for _, raw := range []string{
+		"NaN", "nan", "Inf", "inf", "+Inf", "-Inf", "Infinity", "-Infinity", "+infinity",
+	} {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		require.NoErrorf(t, err, "%q must be a value Go's parser accepts, or this case proves nothing", raw)
+		require.Falsef(t, lifecycle.IsFinite(parsed), "%q must parse to a non-finite float", raw)
+
+		for _, key := range floatKeys {
+			t.Run(key+"="+raw, func(t *testing.T) {
+				t.Setenv(key, raw)
+				_, err := Load()
+				require.Error(t, err, "an explicitly configured non-finite value must not start the process")
+				require.Contains(t, err.Error(), key,
+					"the error must name the variable the operator has to fix")
+				require.Contains(t, err.Error(), "finite")
+			})
+		}
+	}
+}
+
+// TestLoad_RejectsFloatEnvironmentValuesThatAreNotNumbers covers the same rule
+// for the other way a value can be present and unusable. A default is for an
+// absent variable, not for one an operator set to something meaningless.
+func TestLoad_RejectsFloatEnvironmentValuesThatAreNotNumbers(t *testing.T) {
+	for _, raw := range []string{"abc", "2.0.0", "1e", "--3", "0x1p4z"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", raw)
+			_, err := Load()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "TASKFORGE_JOB_RETRY_MULTIPLIER")
+		})
+	}
+}
+
+// TestLoad_UsesTheDocumentedDefaultOnlyWhenTheVariableIsAbsent is the other half
+// of the rule. Absent and blank stay absent; nothing else does.
+func TestLoad_UsesTheDocumentedDefaultOnlyWhenTheVariableIsAbsent(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		c, err := Load()
+		require.NoError(t, err)
+		require.InDelta(t, 2.0, c.JobRetryMultiplier, 1e-9)
+		require.InDelta(t, 0.2, c.JobRetryJitter, 1e-9)
+		require.InDelta(t, 2.0, c.OutboxBackoffMultiplier, 1e-9)
+		require.InDelta(t, 0.2, c.OutboxBackoffJitter, 1e-9)
+	})
+
+	t.Run("blank is treated as absent", func(t *testing.T) {
+		t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", "   ")
+		c, err := Load()
+		require.NoError(t, err)
+		require.InDelta(t, 2.0, c.JobRetryMultiplier, 1e-9)
+	})
+
+	t.Run("a padded real value is still accepted", func(t *testing.T) {
+		t.Setenv("TASKFORGE_JOB_RETRY_MULTIPLIER", "  1.5  ")
+		c, err := Load()
+		require.NoError(t, err)
+		require.InDelta(t, 1.5, c.JobRetryMultiplier, 1e-9)
+	})
+}
+
+// TestValidate_RejectsNonFiniteFloats covers the second defence, for a Config
+// built in code rather than parsed from the environment — which is how every
+// test, and every future embedding of this package, constructs one.
+func TestValidate_RejectsNonFiniteFloats(t *testing.T) {
+	nan := math.NaN()
+	posInf := math.Inf(1)
+	negInf := math.Inf(-1)
+
+	for name, mutate := range map[string]func(*Config){
+		"NaN job retry multiplier":  func(c *Config) { c.JobRetryMultiplier = nan },
+		"+Inf job retry multiplier": func(c *Config) { c.JobRetryMultiplier = posInf },
+		"-Inf job retry multiplier": func(c *Config) { c.JobRetryMultiplier = negInf },
+		"NaN job retry jitter":      func(c *Config) { c.JobRetryJitter = nan },
+		"+Inf job retry jitter":     func(c *Config) { c.JobRetryJitter = posInf },
+		"-Inf job retry jitter":     func(c *Config) { c.JobRetryJitter = negInf },
+		"NaN outbox multiplier":     func(c *Config) { c.OutboxBackoffMultiplier = nan },
+		"+Inf outbox multiplier":    func(c *Config) { c.OutboxBackoffMultiplier = posInf },
+		"-Inf outbox multiplier":    func(c *Config) { c.OutboxBackoffMultiplier = negInf },
+		"NaN outbox jitter":         func(c *Config) { c.OutboxBackoffJitter = nan },
+		"+Inf outbox jitter":        func(c *Config) { c.OutboxBackoffJitter = posInf },
+		"-Inf outbox jitter":        func(c *Config) { c.OutboxBackoffJitter = negInf },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := baseConfig()
+			mutate(&c)
+			err := c.Validate()
+			require.Error(t, err, "a non-finite float must never validate")
+			require.Contains(t, err.Error(), "finite",
+				"it must be rejected as non-finite rather than as an out-of-range value")
+		})
+	}
+}
+
+// TestRetryPolicy_CannotCarryANonFiniteFloatPastValidation is the join between
+// the two: a configuration that validates must produce a policy that validates,
+// so no path exists from the environment to non-finite retry arithmetic.
+func TestRetryPolicy_CannotCarryANonFiniteFloatPastValidation(t *testing.T) {
+	c := baseConfig()
+	c.JobRetryMultiplier = math.NaN()
+	require.Error(t, c.Validate())
+	require.Error(t, c.RetryPolicy().Validate(),
+		"the policy must reject what the configuration rejected")
+}
+
+// TestValidate_JobRetryMaximumGranularityRule is the startup half of the rule
+// lifecycle.RetryPolicy.Validate enforces on the policy.
+//
+// The retry delay is stored in whole milliseconds, so the maximum has to be
+// expressible in that unit for "delay <= maximum" to be true as written rather
+// than true after an unstated flooring. The BASE has no such requirement: a
+// sub-millisecond base is rounded up to the smallest storable delay, which is a
+// calculation detail rather than a broken bound.
+func TestValidate_JobRetryMaximumGranularityRule(t *testing.T) {
+	t.Run("a maximum below one millisecond is rejected", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Nanosecond, time.Microsecond, 500 * time.Microsecond,
+			time.Millisecond - time.Nanosecond,
+		} {
+			c := baseConfig()
+			c.JobRetryBase = time.Nanosecond
+			c.JobRetryMax = max
+			err := c.Validate()
+			require.Errorf(t, err, "a maximum of %v leaves no storable delay inside it", max)
+			require.Contains(t, err.Error(), "TASKFORGE_JOB_RETRY_MAX must be at least 1ms")
+		}
+	})
+
+	t.Run("a maximum that is not a whole millisecond is rejected", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Millisecond + time.Nanosecond,
+			1500 * time.Microsecond,
+			time.Second + time.Microsecond,
+		} {
+			c := baseConfig()
+			c.JobRetryMax = max
+			err := c.Validate()
+			require.Errorf(t, err, "a maximum of %v would be silently floored", max)
+			require.Contains(t, err.Error(),
+				"TASKFORGE_JOB_RETRY_MAX must be a whole number of milliseconds")
+		}
+	})
+
+	t.Run("exact millisecond multiples are accepted", func(t *testing.T) {
+		for _, max := range []time.Duration{
+			time.Millisecond, 250 * time.Millisecond, time.Second, time.Minute, time.Hour,
+		} {
+			c := baseConfig()
+			c.JobRetryBase = time.Millisecond
+			c.JobRetryMax = max
+			require.NoErrorf(t, c.Validate(), "a maximum of %v is exactly expressible", max)
+		}
+	})
+
+	t.Run("a sub-millisecond base is accepted with a valid maximum", func(t *testing.T) {
+		c := baseConfig()
+		c.JobRetryBase = time.Nanosecond
+		c.JobRetryMax = time.Millisecond
+		require.NoError(t, c.Validate())
+		require.Equal(t, time.Millisecond, c.RetryPolicy().Delay(1, nil))
+	})
+
+	t.Run("the documented defaults satisfy the rule", func(t *testing.T) {
+		c, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, c.RetryPolicy().Validate(),
+			"the shipped defaults must not need a change to start")
+	})
+}
+
+// TestValidate_AgreesWithTheRetryPolicyItBuilds is the guard against the two
+// validators drifting apart.
+//
+// They are deliberately separate — one names the environment variable an
+// operator has to fix, the other describes a policy built in code — and that is
+// exactly the setup in which one can be tightened and the other forgotten. A
+// configuration that starts must never produce a policy the domain rejects, and
+// a configuration that is refused must never describe a policy the domain would
+// have accepted.
+func TestValidate_AgreesWithTheRetryPolicyItBuilds(t *testing.T) {
+	cases := map[string]struct{ base, max time.Duration }{
+		"documented defaults":         {time.Second, 5 * time.Minute},
+		"sub-millisecond base":        {time.Nanosecond, time.Millisecond},
+		"non-whole base":              {1500*time.Microsecond + 7*time.Nanosecond, time.Second},
+		"maximum below one ms":        {time.Nanosecond, 500 * time.Microsecond},
+		"non-whole maximum":           {time.Millisecond, 1500 * time.Microsecond},
+		"maximum one nanosecond over": {time.Millisecond, time.Second + time.Nanosecond},
+		"maximum below base":          {time.Minute, time.Second},
+		"exactly one millisecond":     {time.Millisecond, time.Millisecond},
+		"zero base":                   {0, time.Minute},
+		"large whole maximum":         {time.Second, time.Hour},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := baseConfig()
+			c.JobRetryBase = tc.base
+			c.JobRetryMax = tc.max
+
+			configErr := c.Validate()
+			policyErr := c.RetryPolicy().Validate()
+			require.Equalf(t, configErr == nil, policyErr == nil,
+				"startup validation says %v but the policy it builds says %v", configErr, policyErr)
+
+			// And when both accept, the policy it builds actually honors its own
+			// bound, which is the property the rule exists for.
+			if configErr == nil {
+				delay := c.RetryPolicy().Delay(1, nil)
+				require.LessOrEqual(t, delay, c.JobRetryMax)
+				require.Zero(t, delay%time.Millisecond)
+			}
+		})
+	}
 }

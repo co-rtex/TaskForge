@@ -18,14 +18,35 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/api"
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	workerruntime "github.com/co-rtex/TaskForge/internal/worker"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
 const integrationLeaseDuration = 2 * time.Minute
 
+// integrationRetryPolicy is deliberately coarse: base 1s doubling to a 1m cap.
+// Tests that assert an exact delay pass a seeded jitter source; tests that only
+// care that a job entered RETRY_WAIT do not have to care what the delay was.
+func integrationRetryPolicy() lifecycle.RetryPolicy {
+	return lifecycle.RetryPolicy{
+		Base: time.Second, Max: time.Minute, Multiplier: 2, Jitter: 0.2,
+	}
+}
+
 func controlStore() *workers.Store {
-	return workers.NewStore(testPool, integrationLeaseDuration)
+	return controlStoreWithJitter(nil)
+}
+
+// controlStoreWithJitter builds a store whose retry delays are reproducible.
+// A nil source disables jitter entirely, which is what a test asserting exact
+// exponential growth wants.
+func controlStoreWithJitter(jitter lifecycle.JitterSource) *workers.Store {
+	return workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: integrationLeaseDuration,
+		RetryPolicy:   integrationRetryPolicy(),
+		Jitter:        jitter,
+	})
 }
 
 func workerRegistration(name string, concurrency int, capabilities, jobTypes []string) workers.Registration {
@@ -49,13 +70,31 @@ func createJob(t *testing.T, key, jobType string, priority int, capabilities []s
 
 func createJobInQueue(t *testing.T, key, queueName, jobType string, priority int, capabilities []string) uuid.UUID {
 	t.Helper()
+	return createJobWithOptions(t, key, queueName, jobType, priority, capabilities, 3, 300, nil)
+}
+
+// createJobWithOptions is the one submission helper every other one delegates
+// to, so a test that needs a specific attempt budget, execution timeout, or
+// schedule goes through exactly the same durable path as a default one.
+func createJobWithOptions(
+	t *testing.T,
+	key, queueName, jobType string,
+	priority int,
+	capabilities []string,
+	maxAttempts, timeoutSeconds int,
+	scheduledAt *time.Time,
+) uuid.UUID {
+	t.Helper()
 	payload, err := json.Marshal(map[string]any{"key": key})
 	require.NoError(t, err)
-	maxAttempts, timeout := 3, 300
 	request := jobs.SubmitRequest{
 		Queue: queueName, Type: jobType, Payload: payload, Priority: &priority,
-		MaxAttempts: &maxAttempts, TimeoutSeconds: &timeout,
+		MaxAttempts: &maxAttempts, TimeoutSeconds: &timeoutSeconds,
 		RequiredCapabilities: capabilities,
+	}
+	if scheduledAt != nil {
+		formatted := scheduledAt.UTC().Format(time.RFC3339Nano)
+		request.ScheduledAt = &formatted
 	}
 	normalized, err := request.Normalize()
 	require.NoError(t, err)
@@ -69,6 +108,23 @@ func claimRequest(session workers.Session, queueName string) workers.ClaimReques
 		WorkerID: session.WorkerID, SessionID: session.ID,
 		ClaimRequestID: uuid.New(), Queue: queueName,
 	}
+}
+
+// startAttempt commits the LEASED -> RUNNING transition and returns the durable
+// execution deadline the control plane stamped. M4 made Start a typed result
+// rather than an empty 204, because that deadline is state a worker must be told
+// rather than recompute.
+func startAttempt(t *testing.T, store *workers.Store, fence workers.Fence) workers.StartResult {
+	t.Helper()
+	result, err := store.Start(context.Background(), testScope, fence)
+	require.NoError(t, err)
+	return result
+}
+
+// startError returns only the error, for call sites asserting a rejection.
+func startError(store *workers.Store, fence workers.Fence) error {
+	_, err := store.Start(context.Background(), testScope, fence)
+	return err
 }
 
 func assignmentFence(assignment *workers.Assignment) workers.Fence {
@@ -109,7 +165,7 @@ func TestWorkerRegistration_IsIdempotentAndReplacementFencesTheOldBoot(t *testin
 	_, err = store.Claim(context.Background(), testScope, claimRequest(first, "default"))
 	require.ErrorIs(t, err, workers.ErrSessionUnavailable)
 	oldFence := assignmentFence(claim.Assignment)
-	require.ErrorIs(t, store.Start(context.Background(), testScope, oldFence), workers.ErrFenceRejected)
+	require.ErrorIs(t, startError(store, oldFence), workers.ErrFenceRejected)
 	require.ErrorIs(t, store.Succeed(context.Background(), testScope, oldFence), workers.ErrFenceRejected)
 
 	var jobStatus, attemptStatus, leaseStatus string
@@ -542,12 +598,12 @@ func TestFencedStartAndSuccessAreIdempotentAndReleaseCapacity(t *testing.T) {
 
 	wrong := fence
 	wrong.LeaseID = uuid.New()
-	require.ErrorIs(t, store.Start(context.Background(), testScope, wrong), workers.ErrFenceRejected)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	require.ErrorIs(t, startError(store, wrong), workers.ErrFenceRejected)
+	startAttempt(t, store, fence)
 	var startedAt time.Time
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT started_at FROM job_attempts WHERE id = $1`, fence.AttemptID).Scan(&startedAt))
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 	var replayedStartedAt time.Time
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT started_at FROM job_attempts WHERE id = $1`, fence.AttemptID).Scan(&replayedStartedAt))
@@ -591,13 +647,16 @@ func TestExpiredLeaseCannotStart(t *testing.T) {
 		    expires_at = now() - interval '1 minute'
 		WHERE id = $1`, fence.LeaseID)
 	require.NoError(t, err)
-	require.ErrorIs(t, store.Start(context.Background(), testScope, fence), workers.ErrLeaseExpired)
+	require.ErrorIs(t, startError(store, fence), workers.ErrLeaseExpired)
 }
 
 func TestClaim_LeaseWindowStartsAfterCapacityLockWait(t *testing.T) {
 	reset(t)
 	const leaseDuration = 750 * time.Millisecond
-	store := workers.NewStore(testPool, leaseDuration)
+	store := workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: leaseDuration,
+		RetryPolicy:   integrationRetryPolicy(),
+	})
 	session := registerWorker(t, store,
 		workerRegistration("clock-claim-worker", 1, nil, []string{"demo.echo"}))
 	createJob(t, "clock-claim", "demo.echo", 50, nil)
@@ -650,7 +709,7 @@ func TestSucceed_WaitingAcrossExpiryIsRejectedWithoutMutation(t *testing.T) {
 	claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1070,7 +1129,7 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		claim, err := store.Claim(context.Background(), testScope, claimRequest(original, "default"))
 		require.NoError(t, err)
 		fence := assignmentFence(claim.Assignment)
-		require.NoError(t, store.Start(context.Background(), testScope, fence))
+		startAttempt(t, store, fence)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -1119,7 +1178,7 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		claim, err := store.Claim(context.Background(), testScope, claimRequest(original, "default"))
 		require.NoError(t, err)
 		fence := assignmentFence(claim.Assignment)
-		require.NoError(t, store.Start(context.Background(), testScope, fence))
+		startAttempt(t, store, fence)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -1167,9 +1226,24 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		require.Equal(t, "OFFLINE", sessionStatus(t, original.ID))
 		require.Equal(t, "HEALTHY", sessionStatus(t, replacementSessionID))
 
-		// The fenced old boot still cannot mutate anything after replacement.
-		require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence),
-			workers.ErrFenceRejected)
+		// Replacement does not retract history. The success is committed, so an
+		// exact replay of it still recognizes the committed triple and answers
+		// the same way, which is what makes a lost response safe to retry across
+		// a worker restart.
+		require.NoError(t, store.Succeed(context.Background(), testScope, fence),
+			"a committed success replays after its session was replaced")
+		require.Equal(t, "SUCCEEDED", readState(t, fence).job, "the replay changed nothing")
+		require.Equal(t, 1, countRows(t, "job_attempts"))
+		require.Equal(t, 0, countActiveLeases(t))
+
+		// Recognizing history is not authority. A first-time outcome from the
+		// same fenced boot -- a failure that never committed -- is still refused
+		// at the fence.
+		_, failErr := store.Fail(context.Background(), testScope,
+			failureReport(fence, lifecycle.ClassRetryable, "late", "after replacement"))
+		require.ErrorIs(t, failErr, workers.ErrFenceRejected,
+			"a fenced boot cannot commit a new outcome after replacement")
+		require.Equal(t, "SUCCEEDED", readState(t, fence).attempt)
 	})
 
 }

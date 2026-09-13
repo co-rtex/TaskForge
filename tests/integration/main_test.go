@@ -110,6 +110,17 @@ func newBroker(t *testing.T, endpoint string) *sqsbroker.Broker {
 	return b
 }
 
+// newBrokerForQueue connects to the real broker on a named queue, for tests
+// that own a queue nobody else touches.
+func newBrokerForQueue(t *testing.T, queueName string) *sqsbroker.Broker {
+	t.Helper()
+	opts := brokerOptions()
+	opts.QueueName = queueName
+	b, err := sqsbroker.New(context.Background(), opts)
+	require.NoError(t, err)
+	return b
+}
+
 // reset clears all mutable state so each test starts from a known point.
 //
 // queues is preserved and re-seeded because it is reference data, not test
@@ -120,8 +131,9 @@ func reset(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := testPool.Exec(ctx, `
-		TRUNCATE leases, job_attempts, worker_sessions, workers,
-		         idempotency_records, outbox_events, jobs, queues CASCADE`)
+		TRUNCATE dlq_replays, dlq_entries, leases, job_attempts,
+		         worker_sessions, workers, idempotency_records,
+		         outbox_events, jobs, queues CASCADE`)
 	require.NoError(t, err)
 	_, err = testPool.Exec(ctx, `
 		INSERT INTO queues (name, worker_group, max_concurrency)

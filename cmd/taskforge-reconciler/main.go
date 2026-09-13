@@ -19,6 +19,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/reconciler"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 	"github.com/co-rtex/TaskForge/internal/workers"
@@ -50,7 +51,21 @@ func run() int {
 	}
 	defer pool.Close()
 
-	engine := reconciler.New(workers.NewStore(pool, cfg.LeaseDuration), reconciler.Config{
+	// Independently crypto-seeded per process, for the same reason the API's is:
+	// several reconciler replicas detecting the same batch of timeouts must not
+	// schedule their retries for the same instant.
+	jitter, err := lifecycle.NewCryptoSeededJitter()
+	if err != nil {
+		log.Error("seed retry jitter", slog.String("error", err.Error()))
+		return 1
+	}
+
+	store := workers.NewStore(pool, workers.StoreConfig{
+		LeaseDuration: cfg.LeaseDuration,
+		RetryPolicy:   cfg.RetryPolicy(),
+		Jitter:        jitter,
+	})
+	engine := reconciler.New(store, reconciler.Config{
 		StaleAfter:   cfg.SessionStaleAfter,
 		PollInterval: cfg.ReconcilerPollInterval,
 		BatchSize:    cfg.ReconcilerBatchSize,

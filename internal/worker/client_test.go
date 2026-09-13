@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -163,4 +164,171 @@ func TestEscalateSessionLoss_OnlyPromotesSessionLoss(t *testing.T) {
 	require.ErrorIs(t, escalateSessionLoss(workers.ErrFenceRejected), ErrSessionLost)
 	require.NoError(t, escalateSessionLoss(workers.ErrLeaseExpired))
 	require.NoError(t, escalateSessionLoss(workers.ErrRenewalConflict))
+}
+
+// TestParseStartResult_RejectsAResponseThatCouldNotAnswerThisRequest is the
+// strictness the attempt deadline demands.
+//
+// The returned window becomes the handler's execution budget, so a response
+// naming another attempt, or carrying no deadline at all, must not be converted
+// into authority to run for that long.
+func TestParseStartResult_RejectsAResponseThatCouldNotAnswerThisRequest(t *testing.T) {
+	fence := workers.Fence{
+		JobID: uuid.New(), AttemptID: uuid.New(), LeaseID: uuid.New(),
+		WorkerID: uuid.New(), SessionID: uuid.New(),
+	}
+	now := time.Now().UTC()
+	valid := api.StartResponse{
+		AttemptID:                     fence.AttemptID.String(),
+		StartedAt:                     now,
+		AttemptTimeoutAt:              now.Add(30 * time.Second),
+		AttemptTimeoutRemainingMillis: 30_000,
+	}
+
+	for name, mutate := range map[string]func(api.StartResponse) api.StartResponse{
+		"another attempt": func(r api.StartResponse) api.StartResponse {
+			r.AttemptID = uuid.NewString()
+			return r
+		},
+		"unparseable attempt id": func(r api.StartResponse) api.StartResponse {
+			r.AttemptID = "not-a-uuid"
+			return r
+		},
+		"negative remaining window": func(r api.StartResponse) api.StartResponse {
+			r.AttemptTimeoutRemainingMillis = -1
+			return r
+		},
+		"no deadline": func(r api.StartResponse) api.StartResponse {
+			r.AttemptTimeoutAt = time.Time{}
+			return r
+		},
+		"no start time": func(r api.StartResponse) api.StartResponse {
+			r.StartedAt = time.Time{}
+			return r
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseStartResult(fence, mutate(valid))
+			require.Error(t, err)
+		})
+	}
+
+	result, err := parseStartResult(fence, valid)
+	require.NoError(t, err)
+	require.Equal(t, fence.AttemptID, result.AttemptID)
+	require.Equal(t, 30*time.Second, result.Remaining)
+	require.True(t, valid.AttemptTimeoutAt.Equal(result.TimeoutAt))
+
+	// A replay carries the original deadline, and the client passes that through
+	// rather than treating it as a fresh budget.
+	replayed := valid
+	replayed.Replayed = true
+	replayed.AttemptTimeoutRemainingMillis = 500
+	result, err = parseStartResult(fence, replayed)
+	require.NoError(t, err)
+	require.True(t, result.Replayed)
+	require.Equal(t, 500*time.Millisecond, result.Remaining)
+}
+
+// TestParseOutcome_RejectsAnIncoherentDecision keeps a worker from logging a
+// retry decision the control plane did not actually make.
+func TestParseOutcome_RejectsAnIncoherentDecision(t *testing.T) {
+	fence := workers.Fence{
+		JobID: uuid.New(), AttemptID: uuid.New(), LeaseID: uuid.New(),
+		WorkerID: uuid.New(), SessionID: uuid.New(),
+	}
+	retryAt := time.Now().UTC().Add(time.Minute)
+	delay := int64(60_000)
+
+	for name, response := range map[string]api.OutcomeResponse{
+		"another job": {
+			JobID: uuid.NewString(), JobStatus: "RETRY_WAIT", AttemptStatus: "FAILED",
+		},
+		"unparseable job id": {
+			JobID: "not-a-uuid", JobStatus: "RETRY_WAIT", AttemptStatus: "FAILED",
+		},
+		"no job status": {
+			JobID: fence.JobID.String(), AttemptStatus: "FAILED",
+		},
+		"no attempt status": {
+			JobID: fence.JobID.String(), JobStatus: "RETRY_WAIT",
+		},
+		"retry instant without a delay": {
+			JobID: fence.JobID.String(), JobStatus: "RETRY_WAIT",
+			AttemptStatus: "FAILED", RetryAt: &retryAt,
+		},
+		"delay without a retry instant": {
+			JobID: fence.JobID.String(), JobStatus: "RETRY_WAIT",
+			AttemptStatus: "FAILED", RetryDelayMillis: &delay,
+		},
+		"retry decision on a dead-lettered job": {
+			JobID: fence.JobID.String(), JobStatus: "DEAD_LETTERED",
+			AttemptStatus: "FAILED", RetryAt: &retryAt, RetryDelayMillis: &delay,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseOutcome(fence, response)
+			require.Error(t, err)
+		})
+	}
+
+	result, err := parseOutcome(fence, api.OutcomeResponse{
+		JobID: fence.JobID.String(), JobStatus: "RETRY_WAIT", AttemptStatus: "FAILED",
+		RetryAt: &retryAt, RetryDelayMillis: &delay,
+	})
+	require.NoError(t, err)
+	require.Equal(t, fence.JobID, result.JobID)
+	require.Equal(t, workers.AttemptFailed, result.AttemptStatus)
+	require.Equal(t, time.Minute, *result.RetryDelay)
+
+	// A terminal outcome with no retry is equally valid.
+	reason := "PERMANENT_FAILURE"
+	result, err = parseOutcome(fence, api.OutcomeResponse{
+		JobID: fence.JobID.String(), JobStatus: "DEAD_LETTERED",
+		AttemptStatus: "FAILED", DeadLetterReason: &reason,
+	})
+	require.NoError(t, err)
+	require.Nil(t, result.RetryAt)
+	require.Equal(t, lifecycle.ReasonPermanentFailure, result.DeadLetterReason)
+}
+
+// TestParseCancellationDirectives_RejectsAMalformedDirective is why a directive
+// is not interpreted generously: it is acted on by cancelling a running handler,
+// so a worker that cannot tell which attempt it names must not guess.
+func TestParseCancellationDirectives_RejectsAMalformedDirective(t *testing.T) {
+	valid := api.CancellationDirectiveResponse{
+		JobID: uuid.NewString(), AttemptID: uuid.NewString(),
+		LeaseID: uuid.NewString(), CancelRequestedAt: time.Now().UTC(),
+	}
+
+	for name, mutate := range map[string]func(api.CancellationDirectiveResponse) api.CancellationDirectiveResponse{
+		"bad job id": func(d api.CancellationDirectiveResponse) api.CancellationDirectiveResponse {
+			d.JobID = "nope"
+			return d
+		},
+		"bad attempt id": func(d api.CancellationDirectiveResponse) api.CancellationDirectiveResponse {
+			d.AttemptID = ""
+			return d
+		},
+		"bad lease id": func(d api.CancellationDirectiveResponse) api.CancellationDirectiveResponse {
+			d.LeaseID = "nope"
+			return d
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseCancellationDirectives(
+				[]api.CancellationDirectiveResponse{valid, mutate(valid)})
+			require.Error(t, err)
+		})
+	}
+
+	// The ordinary case: none is the norm, and a well-formed one round-trips.
+	empty, err := parseCancellationDirectives(nil)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+
+	directives, err := parseCancellationDirectives([]api.CancellationDirectiveResponse{valid})
+	require.NoError(t, err)
+	require.Len(t, directives, 1)
+	require.Equal(t, valid.AttemptID, directives[0].AttemptID.String())
 }

@@ -137,7 +137,7 @@ func claimedAndRunning(t *testing.T, store *workers.Store, session workers.Sessi
 	require.NoError(t, err)
 	require.Equal(t, workers.Claimed, claim.Disposition)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 	return fence
 }
 
@@ -283,7 +283,7 @@ func TestReconcile_ReplacementClaimsAttemptTwoAndPreservesHistory(t *testing.T) 
 	require.Equal(t, 2, claim.Assignment.AttemptNumber)
 
 	replacementFence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, replacementFence))
+	startAttempt(t, store, replacementFence)
 	require.NoError(t, store.Succeed(context.Background(), testScope, replacementFence))
 
 	require.Equal(t, []string{"ABANDONED", "SUCCEEDED"}, attemptHistory(t, fence.JobID))
@@ -313,7 +313,7 @@ func TestReconcile_ExhaustedAttemptBudgetDeadLettersInsteadOfStranding(t *testin
 	claim, err := store.Claim(context.Background(), testScope, claimRequest(session, "default"))
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
-	require.NoError(t, store.Start(context.Background(), testScope, fence))
+	startAttempt(t, store, fence)
 	expireLease(t, fence.LeaseID)
 	outboxBefore := pendingOutboxIDs(t)
 
@@ -582,12 +582,15 @@ const (
 
 // The three WHEN clauses that tell one operation's lease UPDATE from another's.
 const (
-	whenRenewing      = "NEW.renewal_version IS DISTINCT FROM OLD.renewal_version"
-	whenCompleting    = "NEW.status = 'COMPLETED'"
-	whenExpiring      = "NEW.status = 'EXPIRED'"
-	fragmentRenewing  = "SET renewed_at"
-	fragmentComplete  = "status = 'COMPLETED'"
-	fragmentExpire    = "status = 'EXPIRED'"
+	whenRenewing     = "NEW.renewal_version IS DISTINCT FROM OLD.renewal_version"
+	whenCompleting   = "NEW.status = 'COMPLETED'"
+	whenExpiring     = "NEW.status = 'EXPIRED'"
+	fragmentRenewing = "SET renewed_at"
+	fragmentComplete = "status = 'COMPLETED'"
+	// The reconciler's lease UPDATE is parameterized because failure, timeout,
+	// cancellation, and abandonment share one finalizer, so the fragment is the
+	// statement shape rather than the literal status.
+	fragmentExpire    = "UPDATE leases SET status = $2, released_at = $3"
 	fragmentQueueLock = "SELECT name FROM queues WHERE name"
 )
 
@@ -958,7 +961,9 @@ func TestReconcile_NoDeadlockUnderEveryConcurrentOperation(t *testing.T) {
 				return err
 			}
 			fence := assignmentFence(claim.Assignment)
-			record("start", store.Start(ctx, testScope, fence))
+			if _, err := store.Start(ctx, testScope, fence); err != nil {
+				record("start", err)
+			}
 			if _, err := store.RenewLease(ctx, testScope, renewalRequest(fence, 0)); err != nil {
 				record("renew", err)
 			}

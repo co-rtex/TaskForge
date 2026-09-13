@@ -11,6 +11,8 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 // Execution supplies stable identifiers so a handler with external side
@@ -25,6 +27,48 @@ type Execution struct {
 // executes uploaded source, shell commands, containers, or dynamic plugins.
 type Handler interface {
 	Execute(context.Context, Execution) (json.RawMessage, error)
+}
+
+// FailureError lets a trusted handler declare how its failure should be
+// classified, together with a stable code and a message it asserts is safe to
+// store and return.
+//
+// This is the ONLY way a handler influences classification. A plain error, a
+// wrapped dependency error, and a recovered panic all become a generic retryable
+// failure whose raw text is neither stored, returned, nor logged — because that
+// text is exactly where payload fragments, credentials, driver output, and stack
+// traces reliably appear.
+//
+// Even a declared classification is bounded: TIMED_OUT, CANCELED, and ABANDONED
+// are server-authoritative, so a handler cannot claim them, and the control
+// plane rejects the attempt if one is presented.
+type FailureError struct {
+	// Class must be lifecycle.ClassRetryable or lifecycle.ClassPermanent.
+	Class lifecycle.FailureClass
+	// Code is a stable lowercase token an operator can group by.
+	Code string
+	// Message is optional prose the handler asserts contains no secret, no
+	// payload content, and no unbounded detail. It is bounded again before it is
+	// stored.
+	Message string
+}
+
+func (e *FailureError) Error() string {
+	if e.Message == "" {
+		return "handler failure: " + e.Code
+	}
+	return "handler failure: " + e.Code + ": " + e.Message
+}
+
+// Retryable declares a failure worth another attempt if attempt budget remains.
+func Retryable(code, message string) error {
+	return &FailureError{Class: lifecycle.ClassRetryable, Code: code, Message: message}
+}
+
+// Permanent declares a failure that another attempt could not fix, so the job
+// dead-letters immediately even with nominal attempt budget remaining.
+func Permanent(code, message string) error {
+	return &FailureError{Class: lifecycle.ClassPermanent, Code: code, Message: message}
 }
 
 // HandlerFunc adapts a function to Handler.

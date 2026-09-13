@@ -74,9 +74,9 @@ func (k *killableAPI) RenewLease(ctx context.Context, scope string, req workers.
 	return k.control.RenewLease(ctx, scope, req)
 }
 
-func (k *killableAPI) Start(ctx context.Context, scope string, fence workers.Fence) error {
+func (k *killableAPI) Start(ctx context.Context, scope string, fence workers.Fence) (workers.StartResult, error) {
 	if k.isSevered(fence.SessionID) {
-		return context.DeadlineExceeded
+		return workers.StartResult{}, context.DeadlineExceeded
 	}
 	return k.control.Start(ctx, scope, fence)
 }
@@ -86,6 +86,20 @@ func (k *killableAPI) Succeed(ctx context.Context, scope string, fence workers.F
 		return context.DeadlineExceeded
 	}
 	return k.control.Succeed(ctx, scope, fence)
+}
+
+func (k *killableAPI) Fail(ctx context.Context, scope string, report workers.FailureReport) (workers.OutcomeResult, error) {
+	if k.isSevered(report.Fence.SessionID) {
+		return workers.OutcomeResult{}, context.DeadlineExceeded
+	}
+	return k.control.Fail(ctx, scope, report)
+}
+
+func (k *killableAPI) AcknowledgeCancellation(ctx context.Context, scope string, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+	if k.isSevered(ack.Fence.SessionID) {
+		return workers.OutcomeResult{}, context.DeadlineExceeded
+	}
+	return k.control.AcknowledgeCancellation(ctx, scope, ack)
 }
 
 var _ api.WorkerControl = (*killableAPI)(nil)
@@ -124,7 +138,10 @@ func (h *blockingEcho) Execute(ctx context.Context, execution workerruntime.Exec
 func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 	reset(t)
 	broker := newBroker(t, "")
-	store := workers.NewStore(testPool, crashRecoveryLease)
+	store := workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: crashRecoveryLease,
+		RetryPolicy:   integrationRetryPolicy(),
+	})
 	control := &killableAPI{control: store}
 
 	server := newControlServer(t, control)

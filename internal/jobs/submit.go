@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Submission defaults and bounds. Every one of these is also enforced by a
@@ -35,6 +36,11 @@ const (
 	// are canonicalized must change this, or old and new fingerprints would be
 	// compared as if they meant the same thing.
 	fingerprintVersion = "taskforge.fingerprint.v1"
+
+	// scheduledAtFingerprintTag separates the delayed-submission component from
+	// everything before it. See NormalizedRequest.Fingerprint for why the
+	// component is appended rather than always written.
+	scheduledAtFingerprintTag = "taskforge.fingerprint.scheduled_at"
 )
 
 var (
@@ -46,8 +52,8 @@ var (
 // SubmitRequest is the client-supplied definition of a job.
 //
 // Pointer fields distinguish "absent" from "explicitly zero", which matters:
-// priority 0 is a legal value, and a scheduled_at of null must be accepted while
-// a non-null one is rejected in this milestone.
+// priority 0 is a legal value, and an omitted scheduled_at must stay equivalent
+// to an explicit null rather than becoming a different request.
 type SubmitRequest struct {
 	Queue                string          `json:"queue"`
 	Type                 string          `json:"job_type"`
@@ -91,6 +97,11 @@ type NormalizedRequest struct {
 	MaxAttempts          int
 	TimeoutSeconds       int
 	RequiredCapabilities []string
+	// ScheduledAt is nil for an immediate submission and otherwise the requested
+	// instant converted to UTC. Two requests naming the same instant in
+	// different offsets normalize to the same value here, and therefore to the
+	// same fingerprint.
+	ScheduledAt *time.Time
 }
 
 // Normalize validates a submission and applies defaults.
@@ -156,11 +167,20 @@ func (r SubmitRequest) Normalize() (NormalizedRequest, error) {
 		}
 	}
 
-	// Delayed execution needs the scheduler, which is milestone M4. Accepting the
-	// field and silently running the job immediately would be a lie, so an
-	// explicit value is refused with an explicit reason.
+	// Delayed execution. An omitted field and an explicit null stay equivalent,
+	// so an M1-M3 client that sends `"scheduled_at": null` is unaffected.
 	if r.ScheduledAt != nil {
-		add("scheduled_at", "delayed execution is not implemented in this milestone; send null or omit the field")
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*r.ScheduledAt))
+		if err != nil {
+			add("scheduled_at", "must be an RFC 3339 timestamp, for example 2026-09-01T12:00:00Z")
+		} else {
+			// Canonicalized to UTC immediately, so persistence, comparison
+			// against PostgreSQL time, and fingerprinting all see one
+			// representation of the instant rather than whichever offset the
+			// caller happened to write it in.
+			utc := parsed.UTC()
+			out.ScheduledAt = &utc
+		}
 	}
 
 	out.RequiredCapabilities = normalizeCapabilities(r.RequiredCapabilities, add)
@@ -231,6 +251,17 @@ func ValidateIdempotencyKey(key string) error {
 // Fields are length-prefixed before hashing so that no combination of values can
 // be rearranged into the same byte stream — without it, queue "a" + type "bc"
 // and queue "ab" + type "c" would collide.
+//
+// The scheduling component is APPENDED only when a schedule was requested, and
+// that is deliberate rather than tidy. An immediate submission must hash to
+// exactly the byte stream M1 through M3 produced, or every idempotency key
+// recorded before this milestone would answer 409 instead of replaying its
+// original job the first time a client retried after the upgrade. Absent
+// produces the original stream; present produces a strictly longer one carrying
+// its own domain tag, so the two can never collide.
+//
+// Two requests naming the same instant in different offsets normalized to the
+// same UTC value above, so they hash identically here.
 func (n NormalizedRequest) Fingerprint() string {
 	h := sha256.New()
 	write := func(b []byte) {
@@ -250,6 +281,10 @@ func (n NormalizedRequest) Fingerprint() string {
 	write([]byte(strconv.Itoa(len(n.RequiredCapabilities))))
 	for _, c := range n.RequiredCapabilities {
 		write([]byte(c))
+	}
+	if n.ScheduledAt != nil {
+		write([]byte(scheduledAtFingerprintTag))
+		write([]byte(n.ScheduledAt.UTC().Format(time.RFC3339Nano)))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

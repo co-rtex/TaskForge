@@ -34,7 +34,10 @@ func newAPI(t *testing.T) *httptest.Server {
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, testPool) },
 		},
-	).WithWorkerControl(workers.NewStore(testPool, 30*time.Second))
+	).WithWorkerControl(workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: 30 * time.Second,
+		RetryPolicy:   integrationRetryPolicy(),
+	}))
 	s := httptest.NewServer(srv.Handler())
 	t.Cleanup(s.Close)
 	return s
@@ -282,7 +285,7 @@ func TestSubmit_RejectedRequestLeavesNoPartialState(t *testing.T) {
 	}{
 		"unknown queue":      {"key-unknown-queue", `{"queue":"does-not-exist","job_type":"demo.echo","payload":{}}`, http.StatusUnprocessableEntity},
 		"invalid priority":   {"key-bad-priority", `{"queue":"default","job_type":"demo.echo","payload":{},"priority":500}`, http.StatusUnprocessableEntity},
-		"scheduled job":      {"key-scheduled", `{"queue":"default","job_type":"demo.echo","payload":{},"scheduled_at":"2030-01-01T00:00:00Z"}`, http.StatusUnprocessableEntity},
+		"malformed schedule": {"key-scheduled", `{"queue":"default","job_type":"demo.echo","payload":{},"scheduled_at":"2030-01-01"}`, http.StatusUnprocessableEntity},
 		"payload not object": {"key-bad-payload", `{"queue":"default","job_type":"demo.echo","payload":[1,2]}`, http.StatusUnprocessableEntity},
 		"malformed json":     {"key-malformed", `{"queue":`, http.StatusBadRequest},
 	}

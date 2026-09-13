@@ -83,7 +83,7 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 
 	// Tables for later milestones must not be created in advance.
 	t.Run("no speculative tables", func(t *testing.T) {
-		for _, table := range []string{"results", "dlq_entries", "api_keys", "audit_events"} {
+		for _, table := range []string{"results", "api_keys", "audit_events"} {
 			var exists bool
 			require.NoError(t, conn.QueryRow(ctx,
 				`SELECT EXISTS (SELECT 1 FROM information_schema.tables

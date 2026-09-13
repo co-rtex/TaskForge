@@ -19,13 +19,26 @@ import (
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
+// okStart is the default committed Start result for tests that only care that
+// the transition happened. The budget is generous on purpose: a zero remaining
+// window would cancel every handler the instant it began.
+func okStart(fence workers.Fence) workers.StartResult {
+	now := time.Now()
+	return workers.StartResult{
+		AttemptID: fence.AttemptID, StartedAt: now,
+		TimeoutAt: now.Add(time.Minute), Remaining: time.Minute,
+	}
+}
+
 type fakeControl struct {
 	register  func(context.Context, workers.Registration) (workers.Session, error)
 	heartbeat func(context.Context, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
 	claim     func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
 	renew     func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error)
-	start     func(context.Context, workers.Fence) error
+	start     func(context.Context, workers.Fence) (workers.StartResult, error)
 	succeed   func(context.Context, workers.Fence) error
+	fail      func(context.Context, workers.FailureReport) (workers.OutcomeResult, error)
+	cancelAck func(context.Context, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 }
 
 func (f *fakeControl) Register(ctx context.Context, req workers.Registration) (workers.Session, error) {
@@ -55,11 +68,40 @@ func (f *fakeControl) RenewLease(ctx context.Context, req workers.RenewalRequest
 	}
 	return f.renew(ctx, req)
 }
-func (f *fakeControl) Start(ctx context.Context, fence workers.Fence) error {
+
+// Start defaults to a generous server-measured budget, because most tests are
+// about something other than the attempt deadline and a zero budget would cancel
+// every handler instantly.
+func (f *fakeControl) Start(ctx context.Context, fence workers.Fence) (workers.StartResult, error) {
+	if f.start == nil {
+		now := time.Now()
+		return workers.StartResult{
+			AttemptID: fence.AttemptID, StartedAt: now,
+			TimeoutAt: now.Add(time.Minute), Remaining: time.Minute,
+		}, nil
+	}
 	return f.start(ctx, fence)
 }
 func (f *fakeControl) Succeed(ctx context.Context, fence workers.Fence) error {
 	return f.succeed(ctx, fence)
+}
+func (f *fakeControl) Fail(ctx context.Context, report workers.FailureReport) (workers.OutcomeResult, error) {
+	if f.fail == nil {
+		return workers.OutcomeResult{
+			JobID: report.Fence.JobID, JobStatus: "RETRY_WAIT",
+			AttemptStatus: workers.AttemptFailed,
+		}, nil
+	}
+	return f.fail(ctx, report)
+}
+func (f *fakeControl) AcknowledgeCancellation(ctx context.Context, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+	if f.cancelAck == nil {
+		return workers.OutcomeResult{
+			JobID: ack.Fence.JobID, JobStatus: "CANCELED",
+			AttemptStatus: workers.AttemptCanceled,
+		}, nil
+	}
+	return f.cancelAck(ctx, ack)
 }
 func (f *fakeControl) Ping(context.Context) error { return nil }
 
@@ -147,9 +189,9 @@ func TestProcessMessage_OrdersClaimAckStartHandlerAndSuccess(t *testing.T) {
 			events = append(events, "claim")
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error {
+		start: func(_ context.Context, fence workers.Fence) (workers.StartResult, error) {
 			events = append(events, "start")
-			return nil
+			return okStart(fence), nil
 		},
 		succeed: func(context.Context, workers.Fence) error {
 			events = append(events, "succeed")
@@ -177,7 +219,6 @@ func TestProcessMessage_DeleteFailureStillExecutesDurableClaim(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		succeed: func(context.Context, workers.Fence) error {
 			succeeded = true
 			return nil
@@ -206,7 +247,6 @@ func TestProcessMessage_CooperativeDeadlineCannotBeReportedAsSuccess(t *testing.
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		succeed: func(context.Context, workers.Fence) error {
 			succeeded.Store(true)
 			return nil
@@ -235,7 +275,6 @@ func TestProcessMessage_ExpiredExecutionWindowDoesNotInvokeHandler(t *testing.T)
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		succeed: func(context.Context, workers.Fence) error {
 			succeeded.Store(true)
 			return nil
@@ -317,7 +356,6 @@ func TestProcessMessage_RedeliveryRecoversAnAmbiguousCommittedClaim(t *testing.T
 			}
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment, Replayed: true}, nil
 		},
-		start:   func(context.Context, workers.Fence) error { return nil },
 		succeed: func(context.Context, workers.Fence) error { return nil },
 	}
 	broker := &fakeBroker{}
@@ -347,9 +385,9 @@ func TestProcessMessage_ConcurrentDuplicateDeliveryExecutesOneLocalHandler(t *te
 			claims.Add(1)
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error {
+		start: func(_ context.Context, fence workers.Fence) (workers.StartResult, error) {
 			starts.Add(1)
-			return nil
+			return okStart(fence), nil
 		},
 		succeed: func(context.Context, workers.Fence) error {
 			succeeds.Add(1)
@@ -450,7 +488,6 @@ func TestRunner_ShutdownDrainsAndReportsInFlightSuccess(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		succeed: func(ctx context.Context, _ workers.Fence) error {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -510,7 +547,6 @@ func TestRunner_ShutdownTimeoutBoundsUncooperativeHandler(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start:   func(context.Context, workers.Fence) error { return nil },
 		succeed: func(context.Context, workers.Fence) error { return nil },
 	}
 	broker := &fakeBroker{messages: make(chan queue.Message, 1)}
@@ -553,7 +589,6 @@ func TestRunner_LocalPoolNeverPollsPastItsBound(t *testing.T) {
 		assignment.AttemptNumber = int(sequence.Add(1))
 		return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 	}
-	control.start = func(context.Context, workers.Fence) error { return nil }
 	control.succeed = func(context.Context, workers.Fence) error { return nil }
 
 	broker := &fakeBroker{messages: make(chan queue.Message, 3)}
@@ -678,9 +713,9 @@ func TestRunner_DuplicateDeliveryReleasesItsSlotBeforeLeaderExecution(t *testing
 				Disposition: workers.Claimed, Assignment: assignmentFor(request.ClaimRequestID),
 			}, nil
 		},
-		start: func(_ context.Context, fence workers.Fence) error {
+		start: func(_ context.Context, fence workers.Fence) (workers.StartResult, error) {
 			countFor(&starts, fence.AttemptID).Add(1)
-			return nil
+			return okStart(fence), nil
 		},
 		succeed: func(_ context.Context, fence workers.Fence) error {
 			countFor(&succeeds, fence.AttemptID).Add(1)

@@ -54,13 +54,20 @@ func (r *Runner) runHeartbeat(ctx context.Context, session workers.Session) erro
 			return fmt.Errorf("%w after %s", ErrHeartbeatStale, r.cfg.SessionStaleAfter)
 		}
 		callCtx, cancelCall := context.WithDeadline(ctx, staleAt)
-		_, err := r.control.Heartbeat(callCtx, request)
+		result, err := r.control.Heartbeat(callCtx, request)
 		cancelCall()
 
 		if ctx.Err() != nil {
 			return nil
 		}
 		if err == nil {
+			// Cancellation delivery rides this loop rather than a work
+			// notification, so it reaches a worker that is executing, one that is
+			// idle on an empty queue, and one that is draining. Directives are
+			// applied before the liveness bookkeeping below because a directive
+			// that arrived is worth acting on even if this response turns out to
+			// have been too late to confirm liveness.
+			r.deliverCancellations(result.Cancellations)
 			// A response that arrives at or after the window it was racing proves
 			// nothing: the control plane may already have marked this session stale,
 			// so a late success must not restore local liveness.
@@ -85,6 +92,22 @@ func (r *Runner) runHeartbeat(ctx context.Context, session workers.Session) erro
 			slog.String("error", err.Error()))
 		if !r.now().Before(staleAt) {
 			return fmt.Errorf("%w after %s", ErrHeartbeatStale, r.cfg.SessionStaleAfter)
+		}
+	}
+}
+
+// deliverCancellations applies every directive in one heartbeat response.
+//
+// A directive naming an attempt this process is not executing is normal and is
+// ignored: the control plane answers from durable state, so it can name an
+// attempt whose outcome this worker reported a moment ago.
+func (r *Runner) deliverCancellations(directives []workers.CancellationDirective) {
+	for _, directive := range directives {
+		if r.attempts.deliver(directive) {
+			r.log.Info("cancellation directive delivered",
+				slog.String("job_id", directive.JobID.String()),
+				slog.String("attempt_id", directive.AttemptID.String()),
+				slog.String("lease_id", directive.LeaseID.String()))
 		}
 	}
 }

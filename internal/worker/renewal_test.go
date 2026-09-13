@@ -63,7 +63,6 @@ func TestRenewal_LongHandlerSurvivesSeveralLeaseWindowsWhileRenewalSucceeds(t *t
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		renew: func(_ context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
 			version := req.ExpectedVersion + 1
 			select {
@@ -124,7 +123,6 @@ func TestRenewal_RetriesReuseOneIdentityAndGeneration(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		renew: func(_ context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
 			mu.Lock()
 			calls = append(calls, observed{req.RenewalRequestID, req.ExpectedVersion})
@@ -189,7 +187,6 @@ func TestRenewal_DefinitiveLossCancelsTheHandlerAndPreventsSuccess(t *testing.T)
 				claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 					return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 				},
-				start: func(context.Context, workers.Fence) error { return nil },
 				renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
 					return workers.RenewalResult{}, rejection
 				},
@@ -234,7 +231,6 @@ func TestRenewal_SessionLossIsFatalForTheWholeBoot(t *testing.T) {
 				claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 					return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 				},
-				start: func(context.Context, workers.Fence) error { return nil },
 				renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
 					return workers.RenewalResult{}, rejection
 				},
@@ -274,7 +270,6 @@ func TestRenewal_UnresolvedTransientFailureStopsAtTheSafetyDeadline(t *testing.T
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
 			attempted.Add(1)
 			return workers.RenewalResult{}, &RemoteError{Status: 503, Code: "service_unavailable"}
@@ -301,12 +296,17 @@ func TestRenewal_UnresolvedTransientFailureStopsAtTheSafetyDeadline(t *testing.T
 }
 
 // TestRenewal_DoesNotResetTheOverallJobTimeout is the boundary between the two
-// budgets. The lease is renewed indefinitely here, so the only thing that can
-// stop this handler is timeout_seconds — which renewal must never extend.
+// budgets. The lease is renewed indefinitely here — every renewal returns a
+// fresh hour — so the only thing that can stop this handler is the attempt's own
+// execution deadline, which renewal must never extend.
+//
+// M4 changes where that budget comes from: it is the PostgreSQL-measured
+// remaining window Start returned, not a fresh timer started from
+// timeout_seconds once the response landed. A Start that reports no budget left
+// is therefore the exhausted case, and the handler must not run at all.
 func TestRenewal_DoesNotResetTheOverallJobTimeout(t *testing.T) {
 	session := testSession(1)
 	assignment := testAssignment(session)
-	assignment.TimeoutSeconds = 0 // context.WithTimeout(0) expires immediately
 	assignment.LeaseRemaining = time.Minute
 	assignment.ExecutionDeadline = time.Now().Add(time.Minute)
 
@@ -316,7 +316,13 @@ func TestRenewal_DoesNotResetTheOverallJobTimeout(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
+		start: func(_ context.Context, fence workers.Fence) (workers.StartResult, error) {
+			now := time.Now()
+			return workers.StartResult{
+				AttemptID: fence.AttemptID, StartedAt: now,
+				TimeoutAt: now, Remaining: 0,
+			}, nil
+		},
 		renew: func(_ context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
 			renewals.Add(1)
 			return workers.RenewalResult{
@@ -437,7 +443,6 @@ func TestHeartbeat_ContinuesThroughAGracefulDrain(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start:   func(context.Context, workers.Fence) error { return nil },
 		succeed: func(context.Context, workers.Fence) error { return nil },
 	}
 
@@ -557,7 +562,6 @@ func TestRenewal_AHungCallCannotOutliveTheAuthorityDeadline(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		renew: func(ctx context.Context, _ workers.RenewalRequest) (workers.RenewalResult, error) {
 			return workers.RenewalResult{}, blocked.enter(ctx)
 		},
@@ -615,7 +619,6 @@ func TestRenewal_ALateSuccessCannotRestoreExpiredLocalAuthority(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		start: func(context.Context, workers.Fence) error { return nil },
 		renew: func(ctx context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
 			renewals.Add(1)
 			once.Do(func() { close(entered) })

@@ -71,6 +71,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/jobs", s.handleSubmitJob)
 	mux.HandleFunc("GET /v1/jobs/{job_id}", s.handleGetJob)
+	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.handleCancelJob)
+	// Operator retry IS DLQ replay: same service, same idempotency namespace. Two
+	// routes exist because operators reach for both names, not because there are
+	// two operations.
+	mux.HandleFunc("POST /v1/jobs/{job_id}/retry", s.handleReplayJob)
+	mux.HandleFunc("GET /v1/dlq", s.handleListDLQ)
+	mux.HandleFunc("POST /v1/dlq/{job_id}/replay", s.handleReplayJob)
 	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
 	if s.control != nil {
@@ -80,6 +87,8 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /internal/v1/leases/{lease_id}/renew", s.handleRenewLease)
 		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/start", s.handleStartAttempt)
 		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/succeed", s.handleSucceedAttempt)
+		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/fail", s.handleFailAttempt)
+		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/cancel", s.handleCancelAttempt)
 	}
 
 	// ServeMux answers an unmatched method with a plain-text 405 and an unmatched
@@ -90,6 +99,10 @@ func (s *Server) Handler() http.Handler {
 	// through to here.
 	mux.HandleFunc("/v1/jobs", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}", s.methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/v1/jobs/{job_id}/cancel", s.methodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/v1/jobs/{job_id}/retry", s.methodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/v1/dlq", s.methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/v1/dlq/{job_id}/replay", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/healthz", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
 	if s.control != nil {
@@ -99,6 +112,8 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/internal/v1/leases/{lease_id}/renew", s.methodNotAllowed(http.MethodPost))
 		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/start", s.methodNotAllowed(http.MethodPost))
 		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/succeed", s.methodNotAllowed(http.MethodPost))
+		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/fail", s.methodNotAllowed(http.MethodPost))
+		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/cancel", s.methodNotAllowed(http.MethodPost))
 	}
 	mux.HandleFunc("/", s.handleNotFound)
 
@@ -123,8 +138,19 @@ type JobResponse struct {
 	MaxAttempts          int             `json:"max_attempts"`
 	TimeoutSeconds       int             `json:"timeout_seconds"`
 	RequiredCapabilities []string        `json:"required_capabilities"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
+	// ScheduledAt is what the caller asked for; AvailableAt is what PostgreSQL
+	// will actually order and filter claims by, which retry backoff moves.
+	ScheduledAt *time.Time `json:"scheduled_at"`
+	AvailableAt time.Time  `json:"available_at"`
+	// CancelRequestedAt is set from the moment cancellation wins, including
+	// while a worker is still being asked to stop cooperatively.
+	CancelRequestedAt *time.Time `json:"cancel_requested_at"`
+	// ReplayedFromJobID links a replacement job back to the terminal job it
+	// replaces. Attempt history and results are deliberately not here: a rich
+	// history API is M5's, not this endpoint's.
+	ReplayedFromJobID *string   `json:"replayed_from_job_id"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 func toJobResponse(j *jobs.Job) JobResponse {
@@ -132,7 +158,7 @@ func toJobResponse(j *jobs.Job) JobResponse {
 	if caps == nil {
 		caps = []string{} // an empty JSON array, never null
 	}
-	return JobResponse{
+	response := JobResponse{
 		ID:                   j.ID.String(),
 		Queue:                j.Queue,
 		JobType:              j.Type,
@@ -142,9 +168,23 @@ func toJobResponse(j *jobs.Job) JobResponse {
 		MaxAttempts:          j.MaxAttempts,
 		TimeoutSeconds:       j.TimeoutSeconds,
 		RequiredCapabilities: caps,
+		AvailableAt:          j.AvailableAt.UTC(),
 		CreatedAt:            j.CreatedAt.UTC(),
 		UpdatedAt:            j.UpdatedAt.UTC(),
 	}
+	if j.ScheduledAt != nil {
+		utc := j.ScheduledAt.UTC()
+		response.ScheduledAt = &utc
+	}
+	if j.CancelRequestedAt != nil {
+		utc := j.CancelRequestedAt.UTC()
+		response.CancelRequestedAt = &utc
+	}
+	if j.ReplayedFromJobID != nil {
+		id := j.ReplayedFromJobID.String()
+		response.ReplayedFromJobID = &id
+	}
+	return response
 }
 
 // handleSubmitJob durably accepts a job.

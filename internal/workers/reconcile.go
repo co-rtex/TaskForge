@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/co-rtex/TaskForge/internal/outbox"
+	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
 // MarkStaleSessions marks every current process session that has missed the
@@ -176,31 +176,17 @@ func (s *Store) ReconcileExpiredLeases(ctx context.Context, limit int) (_ Reconc
 	return stats, nil
 }
 
-// leaseBinding is a lease's immutable routing columns. They are set once at
-// claim and never change, so reading them without a lock is a routing hint, not
-// an authority decision; every mutable field is re-read under locks below.
-type leaseBinding struct {
-	jobID     uuid.UUID
-	attemptID uuid.UUID
-	scope     string
-	queue     string
-	workerID  uuid.UUID
-	sessionID uuid.UUID
-}
-
 func (s *Store) reconcileExpiredLease(ctx context.Context, leaseID uuid.UUID, stats *ReconcileStats) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin lease reconciliation: %w", err)
-	}
-	defer rollback(ctx, tx)
-
-	var binding leaseBinding
-	err = tx.QueryRow(ctx, `
-		SELECT job_id, attempt_id, scope, queue, worker_id, worker_session_id
+	// Immutable routing columns only, read without a lock on purpose: taking a
+	// lease lock here and then reaching for queue and session locks would invert
+	// the established order. Every mutable field is re-read under the locks.
+	var fence Fence
+	var scope string
+	err := s.pool.QueryRow(ctx, `
+		SELECT job_id, attempt_id, id, worker_id, worker_session_id, scope
 		FROM leases WHERE id = $1`, leaseID,
-	).Scan(&binding.jobID, &binding.attemptID, &binding.scope, &binding.queue,
-		&binding.workerID, &binding.sessionID)
+	).Scan(&fence.JobID, &fence.AttemptID, &fence.LeaseID,
+		&fence.WorkerID, &fence.SessionID, &scope)
 	if errors.Is(err, pgx.ErrNoRows) {
 		stats.Skipped++
 		return nil
@@ -209,129 +195,94 @@ func (s *Store) reconcileExpiredLease(ctx context.Context, leaseID uuid.UUID, st
 		return fmt.Errorf("route lease reconciliation: %w", err)
 	}
 
-	// Established order: queue -> worker session -> job -> attempt -> lease.
-	var queue string
-	if err := tx.QueryRow(ctx,
-		`SELECT name FROM queues WHERE name = $1 FOR UPDATE`, binding.queue).Scan(&queue); err != nil {
-		return fmt.Errorf("lock queue for lease reconciliation: %w", err)
-	}
 	// The session row is locked but its status is NOT a precondition. An expired
 	// lease is recoverable whether or not its session is still heartbeating; the
 	// lock exists so reconciliation serializes against registration, heartbeat,
 	// claim, and fenced transitions on the same row.
-	var sessionStatus SessionStatus
-	err = tx.QueryRow(ctx, `
-		SELECT status FROM worker_sessions
-		WHERE id = $1 AND worker_id = $2 AND scope = $3
-		FOR UPDATE`, binding.sessionID, binding.workerID, binding.scope).Scan(&sessionStatus)
-	if errors.Is(err, pgx.ErrNoRows) {
-		stats.Skipped++
-		return nil
-	}
+	tx, state, err := s.lockFenceForReconciliation(ctx, scope, fence)
 	if err != nil {
-		return fmt.Errorf("lock worker session for lease reconciliation: %w", err)
+		if errors.Is(err, ErrFenceRejected) {
+			stats.Skipped++
+			return nil
+		}
+		return err
 	}
+	defer rollback(ctx, tx)
 
-	var (
-		jobStatus     string
-		maxAttempts   int
-		attemptStatus AttemptStatus
-		leaseStatus   LeaseStatus
-		expiresAt     time.Time
-	)
-	err = tx.QueryRow(ctx, `
-		SELECT j.status, j.max_attempts, a.status, l.status, l.expires_at
-		FROM jobs j
-		JOIN job_attempts a ON a.job_id = j.id
-		JOIN leases l ON l.attempt_id = a.id
-		WHERE j.id = $1 AND a.id = $2 AND l.id = $3 AND j.scope = $4
-		FOR UPDATE OF j, a, l`,
-		binding.jobID, binding.attemptID, leaseID, binding.scope,
-	).Scan(&jobStatus, &maxAttempts, &attemptStatus, &leaseStatus, &expiresAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	// Revalidated against the post-lock sample. A renewal that committed while
+	// this transaction waited moved the expiry forward, and transaction-start
+	// now() would not have seen it.
+	if state.leaseStatus != LeaseActive || state.serverNow.Before(state.expiresAt) {
 		stats.Skipped++
 		return nil
 	}
+	if !isExecutingAttemptStatus(state.attemptStatus) {
+		// A committed outcome or another reconciler already resolved this attempt.
+		stats.Skipped++
+		return nil
+	}
+
+	// Precedence, and the order matters.
+	//
+	// 1. CANCEL_REQUESTED first. Cancellation already won durably; the only thing
+	//    left is to finalize it, and calling that an abandonment would both lose
+	//    the operator's decision and wrongly consume attempt budget.
+	// 2. A due persisted deadline next. A lease that lapsed around a deadline
+	//    that had already passed is a TIMEOUT, not an abandonment. Getting this
+	//    wrong is not cosmetic: ABANDONED would requeue with no backoff and
+	//    record no failure detail, so a genuinely timing-out job would loop
+	//    through its whole budget at full speed.
+	// 3. Otherwise M3's abandonment path, unchanged (ADR-0009).
+	switch {
+	case state.jobStatus == "CANCEL_REQUESTED":
+		// No outcome identity: nobody requested this, and reconciliation's
+		// idempotency comes from the attempt no longer being LEASED or RUNNING.
+		if _, err := s.finalizeCancellation(ctx, tx, state, fence, nil, LeaseExpired); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit cancellation finalization: %w", err)
+		}
+		stats.ExpiredLeases++
+		stats.CanceledAttempts++
+		return nil
+
+	case !isExecutingJobStatus(state.jobStatus):
+		stats.Skipped++
+		return nil
+
+	case state.timedOut():
+		if err := s.finalizeTimeout(ctx, tx, state, fence, stats); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit expired-lease timeout: %w", err)
+		}
+		stats.ExpiredLeases++
+		stats.TimedOutAttempts++
+		return nil
+	}
+
+	// ADR-0009, unchanged by M4: an abandoned attempt consumes the attempt
+	// budget, and recovery while budget remains is IMMEDIATE requeue — no
+	// backoff, no jitter, no RETRY_WAIT, no failure classification of the job.
+	// The work was interrupted, not judged. Only the budget arithmetic is shared
+	// with retry, through lifecycle.Decide, which returns a zero delay for this
+	// class precisely so the two cannot drift.
+	decision, err := s.retryPolicy.Decide(
+		lifecycle.ClassAbandoned, state.attemptNumber, state.attemptNumber, state.maxAttempts, s.jitter)
 	if err != nil {
-		return fmt.Errorf("lock lease reconciliation state: %w", err)
+		return fmt.Errorf("decide abandonment recovery: %w", err)
 	}
-
-	// Resampled after every authority lock. A renewal that committed while this
-	// transaction waited moved the expiry forward, and transaction-start now()
-	// would not see it — this is the sample that makes the skip below correct.
-	var serverNow time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&serverNow); err != nil {
-		return fmt.Errorf("read lease reconciliation time: %w", err)
-	}
-	if leaseStatus != LeaseActive || serverNow.Before(expiresAt) {
-		stats.Skipped++
-		return nil
-	}
-	// A committed success or another reconciler already resolved this attempt.
-	if !isExecutingJobStatus(jobStatus) || !isExecutingAttemptStatus(attemptStatus) {
-		stats.Skipped++
-		return nil
-	}
-
-	// Capacity is released solely by the lease ceasing to be ACTIVE. There is no
-	// counter to decrement, so it cannot drift or go negative.
-	if tag, err := tx.Exec(ctx, `
-		UPDATE leases SET status = 'EXPIRED', released_at = $2
-		WHERE id = $1 AND status = 'ACTIVE'`, leaseID, serverNow); err != nil {
-		return fmt.Errorf("expire lease: %w", err)
-	} else if tag.RowsAffected() != 1 {
-		stats.Skipped++
-		return nil
-	}
-	// Works from LEASED (never started) and from RUNNING alike: the attempt
-	// timeline constraint requires only a finish time for ABANDONED.
-	if tag, err := tx.Exec(ctx, `
-		UPDATE job_attempts SET status = 'ABANDONED', finished_at = $2
-		WHERE id = $1 AND status IN ('LEASED', 'RUNNING')`, binding.attemptID, serverNow); err != nil {
-		return fmt.Errorf("abandon attempt: %w", err)
-	} else if tag.RowsAffected() != 1 {
-		return fmt.Errorf("%w: attempt changed during reconciliation", ErrStateConflict)
-	}
-
-	// max_attempts counts total attempts including the first, and an abandoned
-	// attempt is an attempt. Counting after the abandonment commits in this same
-	// transaction is what keeps this consistent with the claim predicate, which
-	// refuses a job whose attempts already reach max_attempts.
-	var attemptsUsed int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM job_attempts WHERE job_id = $1`, binding.jobID).Scan(&attemptsUsed); err != nil {
-		return fmt.Errorf("count job attempts: %w", err)
-	}
-
-	requeued := attemptsUsed < maxAttempts
-	if requeued {
-		if tag, err := tx.Exec(ctx, `
-			UPDATE jobs SET status = 'QUEUED', available_at = $2, updated_at = $2
-			WHERE id = $1 AND status IN ('LEASED', 'RUNNING')`, binding.jobID, serverNow); err != nil {
-			return fmt.Errorf("requeue recovered job: %w", err)
-		} else if tag.RowsAffected() != 1 {
-			return fmt.Errorf("%w: job changed during reconciliation", ErrStateConflict)
-		}
-		// Written in this transaction, so a recovered job is never durable without
-		// the notification that wakes a replacement worker.
-		if _, err := outbox.InsertTx(ctx, tx, outbox.EventWorkAvailable, outbox.WorkAvailableSchemaVersion,
-			outbox.WorkAvailableData{Queue: binding.queue, JobID: binding.jobID.String()}); err != nil {
-			return fmt.Errorf("record recovery notification: %w", err)
-		}
-	} else {
-		// The abandonment consumed the total budget. Leaving the job LEASED or
-		// RUNNING would strand it permanently, and requeueing it would produce a
-		// QUEUED job the claim predicate can never take. This is the minimal
-		// terminal consequence; failure classes, retry backoff, dlq_entries,
-		// listing, and replay are M4.
-		// See docs/adr/0009-abandoned-attempts-consume-the-attempt-budget.md.
-		if tag, err := tx.Exec(ctx, `
-			UPDATE jobs SET status = 'DEAD_LETTERED', updated_at = $2
-			WHERE id = $1 AND status IN ('LEASED', 'RUNNING')`, binding.jobID, serverNow); err != nil {
-			return fmt.Errorf("dead-letter exhausted job: %w", err)
-		} else if tag.RowsAffected() != 1 {
-			return fmt.Errorf("%w: job changed during reconciliation", ErrStateConflict)
-		}
+	result, err := s.finalizeAttempt(ctx, tx, state, fence, attemptOutcome{
+		status:       AttemptAbandoned,
+		class:        lifecycle.ClassAbandoned,
+		errorCode:    lifecycle.CodeAbandoned,
+		errorMessage: lifecycle.MessageAbandoned,
+		leaseStatus:  LeaseExpired,
+	}, decision)
+	if err != nil {
+		return err
 	}
 
 	// Counted only after the durable commit, so a reported repair is always a
@@ -340,7 +291,7 @@ func (s *Store) reconcileExpiredLease(ctx context.Context, leaseID uuid.UUID, st
 		return fmt.Errorf("commit lease reconciliation: %w", err)
 	}
 	stats.ExpiredLeases++
-	if requeued {
+	if result.JobStatus == "QUEUED" {
 		stats.RequeuedJobs++
 	} else {
 		stats.DeadLetteredJobs++

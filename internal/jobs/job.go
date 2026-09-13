@@ -62,10 +62,19 @@ func (s Status) Terminal() bool {
 
 func (s Status) String() string { return string(s) }
 
+// Executing reports the states in which an attempt of this job may still be
+// running. It is deliberately a closed list rather than a "not terminal" test:
+// CANCEL_REQUESTED is non-terminal but must stop start, success, failure, and
+// renewal from committing.
+func (s Status) Executing() bool {
+	return s == StatusLeased || s == StatusRunning
+}
+
 // Job is a durable job record.
 //
-// M2 transitions immediate jobs through QUEUED, LEASED, RUNNING, and SUCCEEDED.
-// Later lifecycle states remain typed here but are not reachable yet.
+// M4 makes the whole V1 state machine reachable: delayed submission produces
+// PENDING, retry produces RETRY_WAIT, cancellation produces CANCEL_REQUESTED
+// and CANCELED, and permanent or exhausted failure produces DEAD_LETTERED.
 type Job struct {
 	ID                   uuid.UUID       `json:"id"`
 	Scope                string          `json:"-"` // never returned to a client
@@ -77,6 +86,20 @@ type Job struct {
 	MaxAttempts          int             `json:"max_attempts"`
 	TimeoutSeconds       int             `json:"timeout_seconds"`
 	RequiredCapabilities []string        `json:"required_capabilities"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
+
+	// ScheduledAt is the requested earliest execution instant, canonicalized to
+	// UTC. Nil means the job was submitted for immediate execution.
+	ScheduledAt *time.Time `json:"scheduled_at"`
+	// AvailableAt is the authoritative eligibility time PostgreSQL orders and
+	// filters claims by. It starts at the schedule (or at submission time) and
+	// is moved forward by retry backoff.
+	AvailableAt time.Time `json:"available_at"`
+	// CancelRequestedAt is the PostgreSQL instant cancellation won.
+	CancelRequestedAt *time.Time `json:"cancel_requested_at"`
+	// ReplayedFromJobID names the terminal job this one replaces. Replay never
+	// resurrects a terminal job; it creates a new one linked back to it.
+	ReplayedFromJobID *uuid.UUID `json:"replayed_from_job_id"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
