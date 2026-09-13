@@ -75,7 +75,9 @@ func TestDeadline503Message_IsEndpointNeutral(t *testing.T) {
 
 type openAPIDoc struct {
 	Paths map[string]map[string]struct {
-		Description string `yaml:"description"`
+		Description string                `yaml:"description"`
+		Summary     string                `yaml:"summary"`
+		Security    []map[string][]string `yaml:"security"`
 		Responses   map[string]struct {
 			Description string `yaml:"description"`
 			Content     map[string]struct {
@@ -234,6 +236,20 @@ func TestOpenAPI_Deadline503GuidanceIsPerEndpoint(t *testing.T) {
 func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
 	doc := loadOpenAPI(t)
 
+	t.Run("every implemented key-management route is documented", func(t *testing.T) {
+		for path, method := range map[string]string{
+			"/internal/v1/api-keys":                 "post",
+			"/internal/v1/api-keys/{key_id}/revoke": "post",
+		} {
+			operations, ok := doc.Paths[path]
+			require.Truef(t, ok, "%s is implemented but missing from the spec", path)
+			_, ok = operations[method]
+			require.Truef(t, ok, "%s %s is implemented but missing from the spec", method, path)
+		}
+		_, ok := doc.Paths["/internal/v1/api-keys"]["get"]
+		require.True(t, ok, "GET /internal/v1/api-keys is implemented but missing from the spec")
+	})
+
 	t.Run("every implemented worker-control route is documented", func(t *testing.T) {
 		for path, method := range map[string]string{
 			"/internal/v1/worker-sessions/{worker_session_id}":           "put",
@@ -285,7 +301,7 @@ func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
 			CodeClaimConflict, CodeFenceRejected, CodeLeaseExpired, CodeStateConflict,
 			CodeRenewalConflict, CodeAttemptTimedOut, CodeOutcomeConflict,
 			CodeNotCancelable, CodeNotDeadLettered, CodeInvalidCursor,
-			CodeCancellationRequested,
+			CodeCancellationRequested, CodeUnauthorized,
 		} {
 			require.Containsf(t, documented, code, "error code %q is emitted but undocumented", code)
 		}

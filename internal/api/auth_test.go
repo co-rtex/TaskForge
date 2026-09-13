@@ -116,6 +116,79 @@ func TestAuth_EveryPublicRouteRefusesAnUnauthenticatedRequest(t *testing.T) {
 	}
 }
 
+// TestAuth_EveryPublicRouteConsultsTheCredentialStore proves the wrapper is
+// actually applied to each route, which the 401 above does NOT prove on its own.
+//
+// scopeOrUnauthorized is a second line of defense inside every public handler,
+// so a route registered WITHOUT requireAPIKey still answers 401 — the right
+// status, reached the wrong way, and the earlier test cannot tell the two apart.
+// Counting calls into the credential store can: an unwrapped route never makes
+// one.
+//
+// The difference is not academic. Without the wrapper the handler runs, so an
+// unauthenticated caller reaches body decoding and validation; and the next
+// public handler written without that internal guard would simply be open.
+func TestAuth_EveryPublicRouteConsultsTheCredentialStore(t *testing.T) {
+	for _, route := range publicRoutes {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			var consulted int
+			handler := NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "test"}, discardLogger()).
+				WithAuth(&fakeKeys{
+					authenticate: func(_ context.Context, raw string) (auth.Principal, error) {
+						consulted++
+						require.Equal(t, testRawKey, raw,
+							"the wrapper must hand the store the credential as presented")
+						return auth.Principal{KeyID: uuid.New(), Scope: testScope}, nil
+					},
+				}).Handler()
+
+			recorder := httptest.NewRecorder()
+			request := authorize(httptest.NewRequest(route.method, route.path, strings.NewReader(validBody)))
+			request.Header.Set("Idempotency-Key", "k1")
+			// The job store is nil, so an authenticated request panics on its way
+			// into PostgreSQL. That is the proof it got past authentication, and
+			// it is recovered into a 500 by the recovery middleware.
+			handler.ServeHTTP(recorder, request)
+
+			require.Equal(t, 1, consulted,
+				"this route did not authenticate; it is very likely missing requireAPIKey")
+		})
+	}
+}
+
+// Authentication must precede body decoding and idempotency validation.
+//
+// Otherwise an unauthenticated caller can probe the validation surface — which
+// fields exist, which are rejected, how large a body is accepted — without ever
+// holding a credential.
+func TestAuth_HappensBeforeTheRequestBodyIsLookedAt(t *testing.T) {
+	handler := newTestServer(t)
+
+	for name, body := range map[string]string{
+		"malformed JSON": `{`,
+		"unknown field":  `{"queue":"default","job_type":"demo.echo","payload":{},"priorty":1}`,
+		"oversized body": `{"queue":"default","job_type":"demo.echo","payload":{"a":"` + strings.Repeat("x", 4096) + `"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			// No credential, and a body that would otherwise produce 400 or 413.
+			request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body))
+			request.Header.Set("Idempotency-Key", "k1")
+			handler.ServeHTTP(recorder, request)
+
+			require.Equal(t, http.StatusUnauthorized, recorder.Code,
+				"an unauthenticated caller must not learn anything about validation")
+			require.Equal(t, CodeUnauthorized, decodeError(t, recorder).Error.Code)
+		})
+	}
+
+	t.Run("a missing Idempotency-Key is still 401, not 422", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(validBody)))
+		require.Equal(t, http.StatusUnauthorized, recorder.Code)
+	})
+}
+
 // A server built without WithAuth must fail CLOSED.
 //
 // This is the reason there is no test-only bypass anywhere in this package: a

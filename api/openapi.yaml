@@ -1,11 +1,12 @@
 openapi: 3.1.0
 info:
   title: TaskForge API
-  version: 0.4.0-m4
+  version: 0.5.0-m5a
   description: |
-    The complete durable job lifecycle: idempotent submission including delayed
-    submission, job reads, cancellation, the logical dead-letter queue with
-    replay and operator retry, plus the internal worker-control surface —
+    The complete durable job lifecycle behind API-key authentication: idempotent
+    submission including delayed submission, job reads, cancellation, the logical
+    dead-letter queue with replay and operator retry, plus the internal
+    worker-control surface —
     registration, session heartbeat with cancellation delivery, atomic claim,
     fenced lease renewal, and the fenced start, success, failure, and
     cancellation-acknowledgment transitions.
@@ -17,13 +18,55 @@ info:
 
     ## Authentication
 
-    None yet. Milestone M4 attributes every request to a single configured
-    development scope, and the service therefore binds to loopback only.
-    Database-backed API keys are milestone M5. See `docs/CURRENT_STATE.md`.
+    **Every `/v1` operation requires an API key.** Present it as
+    `Authorization: Bearer <key>`. A key carries exactly one scope, and that
+    scope is the whole tenancy boundary: a caller sees only the jobs and
+    dead-letter entries created under it.
 
-    Routes under `/internal/v1` are for the trusted, compiled-in worker process.
-    They are not a public user API and must not be exposed off loopback before
-    worker/control scopes land in M5.
+    A key looks like `tfk_<lookup>.<secret>`. The `<lookup>` half is not secret —
+    it is stored, listed, and logged so a key can be identified and revoked. The
+    `<secret>` half is returned **exactly once**, by
+    `POST /internal/v1/api-keys`, and is stored only as a cryptographic hash. It
+    cannot be recovered: a caller who loses it revokes that key and mints
+    another.
+
+    A missing, malformed, unknown, or revoked credential all answer the same
+    `401` with code `unauthorized`, and the message names no cause. That is
+    deliberate. A response that distinguished them would let a caller use a
+    lookup prefix as an oracle for which prefixes exist, and would tell whoever
+    holds a stolen key that it has been revoked.
+
+    Revocation takes effect on the next request. A request already in flight when
+    a key is revoked is not interrupted; it completes under the authority it was
+    admitted with.
+
+    If verifying a credential exhausts the request deadline, the answer is `503`
+    with code `service_unavailable`, never `401`. "The key could not be verified"
+    and "the key is not valid" are different facts, and reporting the second for
+    the first would send an operator looking for a revocation that never
+    happened. Verification reads one row and writes nothing, so repeating the
+    identical request is always safe.
+
+    `GET /healthz` and `GET /readyz` are unauthenticated. They expose nothing
+    tenant-specific, and a liveness probe that needed a credential would report a
+    healthy process as dead the moment that credential was revoked.
+
+    ### The internal surface
+
+    Routes under `/internal/v1` are operator and worker plumbing, not a public
+    user API, and they are **not** authenticated. That includes the key-management
+    routes: they are how the first credential comes into existence, so requiring
+    one would make the system unbootstrappable. Anyone who can reach loopback can
+    therefore mint a credential for any scope.
+
+    This is why nothing under `/internal/v1` may be exposed off loopback.
+    Worker/control scopes are separable from user scopes and authenticating this
+    surface is a later milestone; see
+    `docs/adr/0013-database-backed-api-key-authentication.md`.
+
+    Worker-control operations still attribute every request to the single
+    configured development scope (`TASKFORGE_DEV_SCOPE`), which no longer reaches
+    the public surface at all.
 
     ## Idempotency
 
@@ -69,6 +112,10 @@ servers:
 tags:
   - name: Jobs
   - name: DLQ
+  - name: Admin
+    description: |
+      Loopback-only key management. Unauthenticated in this milestone, because
+      these routes are how the first credential is created.
   - name: Worker Control
   - name: Health
 
@@ -77,6 +124,8 @@ paths:
     post:
       tags: [Jobs]
       summary: Submit a job
+      security:
+        - ApiKeyAuth: []
       description: |
         Durably accepts a job. The job, its idempotency record, and the broker
         notification are written in one PostgreSQL transaction, so a success
@@ -178,11 +227,48 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
+        '503':
+          description: |
+            The request exceeded its deadline before its outcome was known. A
+            deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT, and a COMMIT that is cut short is
+            ambiguous, so this never asserts that nothing was committed.
+
+            When the deadline is reached while verifying the API key, that one
+            lookup is all that ran: it reads a single row and writes nothing, so
+            repeating the identical request is unconditionally safe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: the request exceeded its deadline before the durable outcome was known; retry the identical request
+                  request_id: 6a1f...
 
   /v1/jobs/{job_id}:
     get:
       tags: [Jobs]
       summary: Read a job
+      security:
+        - ApiKeyAuth: []
       parameters:
         - name: job_id
           in: path
@@ -201,11 +287,48 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
+        '503':
+          description: |
+            The request exceeded its deadline before its outcome was known. A
+            deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT, and a COMMIT that is cut short is
+            ambiguous, so this never asserts that nothing was committed.
+
+            When the deadline is reached while verifying the API key, that one
+            lookup is all that ran: it reads a single row and writes nothing, so
+            repeating the identical request is unconditionally safe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: the request exceeded its deadline before the durable outcome was known; retry the identical request
+                  request_id: 6a1f...
 
   /v1/jobs/{job_id}/cancel:
     post:
       tags: [Jobs]
       summary: Cancel a job
+      security:
+        - ApiKeyAuth: []
       description: |
         Cancels a job, or begins withdrawing authority from the attempt that is
         executing it. Identity is scope plus job id and nothing else: cancelling
@@ -291,11 +414,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
 
   /v1/jobs/{job_id}/retry:
     post:
       tags: [DLQ]
       summary: Operator retry — the same operation as DLQ replay
+      security:
+        - ApiKeyAuth: []
       description: |
         Identical to `POST /v1/dlq/{job_id}/replay`: one service, one
         idempotency namespace. Two routes exist because operators reach for both
@@ -378,11 +520,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
 
   /v1/dlq:
     get:
       tags: [DLQ]
       summary: List dead-lettered jobs
+      security:
+        - ApiKeyAuth: []
       description: |
         One bounded, scope-filtered page of TaskForge's own logical dead-letter
         queue, newest first. This is authoritative PostgreSQL state, not the
@@ -429,11 +590,48 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
+        '503':
+          description: |
+            The request exceeded its deadline before its outcome was known. A
+            deadline can elapse while acquiring a lock, while executing a
+            statement, or during COMMIT, and a COMMIT that is cut short is
+            ambiguous, so this never asserts that nothing was committed.
+
+            When the deadline is reached while verifying the API key, that one
+            lookup is all that ran: it reads a single row and writes nothing, so
+            repeating the identical request is unconditionally safe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: the request exceeded its deadline before the durable outcome was known; retry the identical request
+                  request_id: 6a1f...
 
   /v1/dlq/{job_id}/replay:
     post:
       tags: [DLQ]
       summary: Replay a dead-lettered job
+      security:
+        - ApiKeyAuth: []
       description: |
         Creates a NEW job from a dead-lettered one. It deliberately does not
         resurrect the original: a terminal job never returns to a non-terminal
@@ -527,6 +725,221 @@ paths:
                     identity and would create a second replacement job
         '500':
           description: Sanitized internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
+
+  /internal/v1/api-keys:
+    post:
+      tags: [Admin]
+      summary: Mint an API key
+      description: |
+        Creates one credential for one scope and returns it **exactly once**.
+        The `key` field of the 201 response is the only copy that will ever
+        exist: only a cryptographic hash of its secret half is stored, so it
+        cannot be recovered. A caller who loses it revokes this key and mints
+        another.
+
+        This route is deliberately **not idempotent and carries no request
+        identity**. There is no `Idempotency-Key`, and one sent here is ignored
+        rather than honored. An idempotent create would have to return an
+        existing secret to a repeat, which is the one thing a write-only
+        credential must never do — so every call mints a distinct key, and two
+        identical calls produce two keys.
+
+        Unauthenticated, and loopback-only: this is how the first credential
+        comes into existence, so requiring one would make the system
+        unbootstrappable. Anyone who can reach loopback can mint a credential
+        for any scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiKeyCreateRequest' }
+            examples:
+              minimal:
+                value:
+                  scope: tenant-a
+                  name: ops-laptop
+      responses:
+        '201':
+          description: |
+            The key was created. This body carries the only copy of the
+            credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+        '400':
+          description: |
+            The body was not a single valid JSON object, or it contained an
+            unknown field. Unknown fields are rejected rather than ignored: a
+            caller who wrote `expires_in` believed in behavior that does not
+            exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `scope` or `name` was empty, longer than 128 characters, or
+            contained a control character.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                emptyScope:
+                  value:
+                    error:
+                      code: validation_failed
+                      message: the request was rejected by validation
+                      details:
+                        - field: scope
+                          message: must contain between 1 and 128 printable characters
+                      request_id: 6a1f...
+        '503':
+          description: |
+            The request exceeded its deadline before the durable outcome was
+            known. A deadline can elapse while acquiring a lock, while executing
+            a statement, or during COMMIT, and a COMMIT that is cut short is
+            ambiguous, so this never asserts that nothing was committed.
+
+            **Do not repeat this request blindly.** It is the one ambiguous
+            mutation in this API that must not simply be retried: with no request
+            identity, a repeat mints a SECOND credential rather than returning
+            the first, and the first may already exist with nobody holding it.
+            List keys through `GET /internal/v1/api-keys` and revoke any key
+            whose credential no caller received.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: the request exceeded its deadline before the durable outcome was known; do NOT repeat this request blindly
+                  request_id: 6a1f...
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Admin]
+      summary: List API keys
+      description: |
+        One bounded page of key metadata, newest first.
+
+        No secret and no hash is returned, by any parameter, ever. Revoked keys
+        are included: an operator auditing which credentials existed needs to see
+        them, and hiding them would make the listing useless for the question it
+        is actually asked.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: One bounded page of key metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyList' }
+        '422':
+          description: '`limit` was not an integer between 1 and 200.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The request exceeded its deadline. Listing keys reads rows and writes
+            nothing, so repeating the identical request is safe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/v1/api-keys/{key_id}/revoke:
+    post:
+      tags: [Admin]
+      summary: Revoke an API key
+      description: |
+        Withdraws one credential. The next request presenting it answers `401`.
+
+        Revocation is **idempotent**, keyed by key id alone. Revoking an
+        already-revoked key succeeds and reports `already_requested` semantics
+        through `already_revoked`, returning the ORIGINAL `revoked_at` rather
+        than moving it: when a credential stopped being valid is exactly the fact
+        an incident review needs, and a repeat must not rewrite it.
+
+        A request already in flight when the key is revoked is not interrupted.
+        It completes under the authority it was admitted with. This is expected
+        behavior, not a gap: revocation governs admission, and TaskForge does not
+        re-check a credential midway through an operation it already accepted.
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: |
+            The key is revoked, including an idempotent repeat, which reports
+            `already_revoked: true` and the original instant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyRevoked' }
+        '404':
+          description: No key with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `key_id` was not a UUID. Unlike the public job routes, this answers
+            422 rather than 404: there is no tenant to hide ids from on this
+            surface, so a caller is better served by being told the id is
+            malformed than by a not-found that sends them looking for a key they
+            think they deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The request exceeded its deadline before the durable outcome was
+            known, so this never asserts that nothing was committed. Repeat the
+            identical request for the same key id: revocation is keyed by key id
+            alone, so a repeat reports the original revocation instant rather
+            than moving it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1392,6 +1805,15 @@ paths:
               schema: { $ref: '#/components/schemas/Readiness' }
 
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A TaskForge API key, presented as `Authorization: Bearer <key>`. Mint one
+        with `POST /internal/v1/api-keys`. See the Authentication section above
+        for the format and for what a `401` does and does not tell you.
+
   schemas:
     SubmitJobRequest:
       type: object
@@ -1941,6 +2363,80 @@ components:
           type: object
           additionalProperties: { type: string, enum: [ok, unavailable] }
 
+    ApiKeyCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, name]
+      properties:
+        scope:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            The tenancy boundary this key acts within. Every job, attempt, and
+            dead-letter entry the key can reach is filtered by it.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Operator-facing label, so this key can be recognized in a listing and
+            revoked deliberately. Nothing authenticates against it.
+
+    ApiKeySummary:
+      type: object
+      required: [id, scope, name, prefix, created_at, revoked_at]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        name: { type: string }
+        prefix:
+          type: string
+          description: |
+            The non-secret lookup segment of the key. Safe to log and to display;
+            it is how a key is identified for revocation.
+        created_at: { type: string, format: date-time }
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+          description: Null while the key is live.
+
+    ApiKeyCreated:
+      type: object
+      required: [id, scope, name, prefix, created_at, key]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        name: { type: string }
+        prefix: { type: string }
+        created_at: { type: string, format: date-time }
+        key:
+          type: string
+          description: |
+            The complete credential, in the form `tfk_<lookup>.<secret>`. This is
+            the only response in TaskForge that ever contains it, and it is
+            returned exactly once. It is not stored and cannot be recovered.
+
+    ApiKeyRevoked:
+      allOf:
+        - $ref: '#/components/schemas/ApiKeySummary'
+        - type: object
+          required: [already_revoked]
+          properties:
+            already_revoked:
+              type: boolean
+              description: |
+                True when this key was already revoked before this call. The
+                reported `revoked_at` is the original instant, not this one.
+
+    ApiKeyList:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/ApiKeySummary' }
+
     Error:
       type: object
       required: [error]
@@ -1957,6 +2453,7 @@ components:
                 - unknown_queue
                 - idempotency_conflict
                 - not_found
+                - unauthorized
                 - payload_too_large
                 - method_not_allowed
                 - internal_error
