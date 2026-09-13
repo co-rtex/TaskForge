@@ -639,8 +639,8 @@ or a hash.
 
 ### M5A gates
 
-The M5A tree passed these gates locally on 2026-09-13, against PostgreSQL 16 and
-ElasticMQ started by `make up`:
+Every gate below was run on the branch head, on 2026-09-13, against PostgreSQL 16
+and ElasticMQ started by `make up`. Durations are wall-clock from that run.
 
 | Command | Result | Real output |
 | --- | --- | --- |
@@ -651,8 +651,8 @@ ElasticMQ started by `make up`:
 | `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 17 top-level contract tests, exit 0 |
 | `docker compose config --quiet` | PASS | exit 0 |
 | `make migrate` on a database from `make down && make up` | PASS | `"migrations complete" applied=14`, `0014_api_keys.sql` last |
-| `make test-integration` | PASS | `ok .../tests/integration 73.420s` |
-| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 83.218s` |
+| `make test-integration` | PASS | `ok .../tests/integration 83.990s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 94.587s` |
 
 Exact commands and complete output are recorded in the pull request.
 
