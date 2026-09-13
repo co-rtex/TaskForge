@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/outbox"
 	"github.com/co-rtex/TaskForge/internal/queue"
@@ -396,7 +397,8 @@ func TestOutbox_EndToEndFromHTTPSubmissionToBrokerNotification(t *testing.T) {
 	broker := newBroker(t, "")
 
 	srv := httptest.NewServer(api.NewServer(jobs.NewStore(testPool),
-		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope}, discardLogger()).Handler())
+		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope}, discardLogger()).
+		WithAuth(auth.NewStore(testPool)).Handler())
 	defer srv.Close()
 
 	resp, job := submit(t, srv.URL, "key-e2e", jobBody)

@@ -51,8 +51,11 @@ func TestMigrations_M4SchemaMatchesTheQueriesThatJustifyIt(t *testing.T) {
 		}
 	})
 
+	// api_keys is no longer on this list: M5A created it along with the code that
+	// reads and writes it. The rest of M5 -- result storage -- and the tables a
+	// later milestone might want are still unbuilt and must stay absent.
 	t.Run("M5+ tables are still not created in advance", func(t *testing.T) {
-		for _, table := range []string{"results", "api_keys", "audit_events", "lease_renewals"} {
+		for _, table := range []string{"results", "audit_events", "lease_renewals"} {
 			var exists bool
 			require.NoError(t, conn.QueryRow(ctx,
 				`SELECT EXISTS (SELECT 1 FROM information_schema.tables
@@ -164,7 +167,8 @@ func TestMigrations_M4SchemaMatchesTheQueriesThatJustifyIt(t *testing.T) {
 		// only on a developer's pre-existing database.
 		loaded, err := database.LoadMigrations()
 		require.NoError(t, err)
-		require.Len(t, loaded, 13, "M4 ships migrations 0009 through 0013")
+		require.Len(t, loaded, 14,
+			"0001 through 0013 shipped in M1 through M4; 0014 is M5A's api_keys")
 
 		for _, migration := range loaded {
 			var recorded string
@@ -429,7 +433,7 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 13)
+	require.Len(t, migrations, 14)
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -540,8 +544,9 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
-	require.NoError(t, err, "0009 through 0013 must apply to a database holding real M3 data")
-	require.Equal(t, 5, applied, "exactly the five M4 migrations are pending")
+	require.NoError(t, err, "0009 through 0014 must apply to a database holding real M3 data")
+	require.Equal(t, 6, applied,
+		"the five M4 migrations, plus M5A's 0014, are pending from an M3 database")
 
 	t.Run("every seeded row survives", func(t *testing.T) {
 		for table, want := range map[string]int{

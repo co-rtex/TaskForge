@@ -21,6 +21,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
+	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
@@ -79,6 +82,15 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// The public API authenticates from M5A onward, so this suite needs a real
+	// credential before any test runs.
+	if err := mintSuiteAPIKey(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "could not mint the suite's api key: %v\n", err)
+		os.Exit(1)
+	}
+	http.DefaultClient.Transport = authorizingTransport{}
+	http.DefaultTransport = authorizingTransport{}
+
 	code := m.Run()
 	pool.Close()
 	os.Exit(code)
@@ -96,6 +108,90 @@ func brokerOptions() sqsbroker.Options {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
+}
+
+// --- public-API credentials -----------------------------------------------
+//
+// Every public route authenticates from M5A onward. These tests are about the
+// job lifecycle, not about authentication, so the credential is presented by a
+// transport rather than threaded through the forty-odd call sites that would
+// otherwise each have to say something about M5A that none of them is about.
+//
+// What the credential must actually DO is proven directly, and negatively, in
+// api_keys_test.go: every public route refuses an unauthenticated request, a
+// revoked key stops working immediately, and a key for one scope cannot see
+// another scope's job. A transport that quietly authorized everything would be
+// a problem only if those tests did not exist.
+
+var (
+	suiteKeyMu  sync.RWMutex
+	suiteAPIKey string
+)
+
+// mintSuiteAPIKey creates the credential this suite presents, for testScope.
+func mintSuiteAPIKey(ctx context.Context) error {
+	created, err := auth.NewStore(testPool).Create(ctx, testScope, "integration-suite")
+	if err != nil {
+		return err
+	}
+	suiteKeyMu.Lock()
+	defer suiteKeyMu.Unlock()
+	suiteAPIKey = created.Raw
+	return nil
+}
+
+// currentAPIKey returns the credential the suite is presenting right now. It
+// changes whenever reset truncates api_keys and mints a new one.
+func currentAPIKey() string {
+	suiteKeyMu.RLock()
+	defer suiteKeyMu.RUnlock()
+	return suiteAPIKey
+}
+
+// authorizingTransport presents the suite's credential on public requests that
+// do not already carry one.
+//
+// It never overwrites an Authorization header a test set itself, which is what
+// lets a test present a second scope's key, a revoked key, or no key at all and
+// observe the real answer. It also leaves /internal/v1 alone: the worker-control
+// surface is deliberately unauthenticated in this milestone, and a transport
+// that credentialed it would hide a regression that started requiring one.
+type authorizingTransport struct{}
+
+func (authorizingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(request.URL.Path, "/v1/") && request.Header.Get("Authorization") == "" {
+		// Cloned rather than mutated: a RoundTripper must not modify the request
+		// it is given.
+		request = request.Clone(request.Context())
+		request.Header.Set("Authorization", "Bearer "+currentAPIKey())
+	}
+	return realTransport.RoundTrip(request)
+}
+
+// realTransport is the transport underneath, captured at package initialization
+// and therefore before TestMain replaces http.DefaultTransport. Dispatching
+// through this variable rather than through http.DefaultTransport is what stops
+// authorizingTransport from wrapping itself once it is installed there.
+var realTransport = http.DefaultTransport
+
+// unauthenticatedClient issues requests with no credential at all, bypassing
+// authorizingTransport. It is what a test uses to prove a route actually
+// refuses an anonymous caller.
+func unauthenticatedClient() *http.Client {
+	return &http.Client{Transport: realTransport, Timeout: 10 * time.Second}
+}
+
+// clientWithKey issues requests presenting one specific credential.
+func clientWithKey(raw string) *http.Client {
+	return &http.Client{Transport: fixedKeyTransport{raw: raw}, Timeout: 10 * time.Second}
+}
+
+type fixedKeyTransport struct{ raw string }
+
+func (t fixedKeyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	request = request.Clone(request.Context())
+	request.Header.Set("Authorization", "Bearer "+t.raw)
+	return realTransport.RoundTrip(request)
 }
 
 // newBroker connects to the real broker, optionally through a custom endpoint.
@@ -133,12 +229,17 @@ func reset(t *testing.T) {
 	_, err := testPool.Exec(ctx, `
 		TRUNCATE dlq_replays, dlq_entries, leases, job_attempts,
 		         worker_sessions, workers, idempotency_records,
-		         outbox_events, jobs, queues CASCADE`)
+		         outbox_events, jobs, queues, api_keys CASCADE`)
 	require.NoError(t, err)
 	_, err = testPool.Exec(ctx, `
 		INSERT INTO queues (name, worker_group, max_concurrency)
 		VALUES ('default', 'default', 100)`)
 	require.NoError(t, err)
+
+	// api_keys was just truncated, so the credential the suite was presenting no
+	// longer exists. Minting here rather than lazily keeps every test that calls
+	// reset holding a live key for testScope.
+	require.NoError(t, mintSuiteAPIKey(ctx))
 
 	drainBroker(t, newBroker(t, ""))
 }

@@ -26,8 +26,13 @@ import (
 type Config struct {
 	MaxRequestBytes int64
 	RequestTimeout  time.Duration
-	// DevScope attributes every request to one scope until API keys land in
-	// milestone M5. See internal/config.Config.DevScope.
+	// DevScope attributes every INTERNAL worker-control request to one scope.
+	//
+	// Since M5A it no longer reaches the public surface at all: those routes
+	// resolve their scope from the authenticated API key. Worker/control scopes
+	// are separable from user scopes (docs/PROJECT_SPEC.md section 6) and are a
+	// later milestone, so this remains required and the internal routes remain
+	// loopback-only. See internal/config.Config.DevScope.
 	DevScope string
 }
 
@@ -42,6 +47,7 @@ type ReadinessCheck struct {
 type Server struct {
 	jobs    *jobs.Store
 	control WorkerControl
+	keys    APIKeys
 	cfg     Config
 	log     *slog.Logger
 	checks  []ReadinessCheck
@@ -63,23 +69,49 @@ func (s *Server) WithWorkerControl(control WorkerControl) *Server {
 	return s
 }
 
+// WithAuth enables API-key authentication on the public surface and the
+// loopback key-management routes that mint credentials for it.
+//
+// Omitting it does not open the public API -- it closes it. Every public route
+// answers 401 without a credential store, because a server that can authenticate
+// nobody has no authenticated caller to serve, and the key-management routes are
+// not registered at all. That is why this package contains no test-only
+// authentication bypass: there is nothing to bypass, and a binary that forgot to
+// call this serves a closed API rather than an open one.
+func (s *Server) WithAuth(keys APIKeys) *Server {
+	s.keys = keys
+	return s
+}
+
 // Handler returns the fully wrapped HTTP handler.
 //
 // Order matters: request id is outermost so every later layer can log it, and
 // recovery sits inside it so a panic is logged with its request id.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/jobs", s.handleSubmitJob)
-	mux.HandleFunc("GET /v1/jobs/{job_id}", s.handleGetJob)
-	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.handleCancelJob)
+	// Every public route is wrapped in requireAPIKey at registration, so the set
+	// of authenticated routes is readable here rather than in an inclusion list
+	// inside a middleware that would drift from the mux. Adding a public route
+	// without the wrapper is a visible omission on this screen.
+	mux.HandleFunc("POST /v1/jobs", s.requireAPIKey(s.handleSubmitJob))
+	mux.HandleFunc("GET /v1/jobs/{job_id}", s.requireAPIKey(s.handleGetJob))
+	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.requireAPIKey(s.handleCancelJob))
 	// Operator retry IS DLQ replay: same service, same idempotency namespace. Two
 	// routes exist because operators reach for both names, not because there are
 	// two operations.
-	mux.HandleFunc("POST /v1/jobs/{job_id}/retry", s.handleReplayJob)
-	mux.HandleFunc("GET /v1/dlq", s.handleListDLQ)
-	mux.HandleFunc("POST /v1/dlq/{job_id}/replay", s.handleReplayJob)
+	mux.HandleFunc("POST /v1/jobs/{job_id}/retry", s.requireAPIKey(s.handleReplayJob))
+	mux.HandleFunc("GET /v1/dlq", s.requireAPIKey(s.handleListDLQ))
+	mux.HandleFunc("POST /v1/dlq/{job_id}/replay", s.requireAPIKey(s.handleReplayJob))
+	// Health probes stay unauthenticated. They reveal nothing tenant-specific,
+	// and a liveness probe that needed a credential would report a healthy
+	// process as dead the moment that credential was revoked.
 	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
+	if s.keys != nil {
+		mux.HandleFunc("POST /internal/v1/api-keys", s.handleCreateAPIKey)
+		mux.HandleFunc("GET /internal/v1/api-keys", s.handleListAPIKeys)
+		mux.HandleFunc("POST /internal/v1/api-keys/{key_id}/revoke", s.handleRevokeAPIKey)
+	}
 	if s.control != nil {
 		mux.HandleFunc("PUT /internal/v1/worker-sessions/{worker_session_id}", s.handleRegisterWorkerSession)
 		mux.HandleFunc("POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.handleHeartbeat)
@@ -105,6 +137,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/dlq/{job_id}/replay", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/healthz", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
+	if s.keys != nil {
+		// 405 is answered before authentication, deliberately. "This path does
+		// not accept DELETE" is a fact about the route table, not about the
+		// caller, so it discloses nothing a reader of the OpenAPI document does
+		// not already have.
+		mux.HandleFunc("/internal/v1/api-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
+		mux.HandleFunc("/internal/v1/api-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
+	}
 	if s.control != nil {
 		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))
 		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.methodNotAllowed(http.MethodPost))
@@ -197,7 +237,13 @@ func toJobResponse(j *jobs.Job) JobResponse {
 //	422 the request was well-formed JSON but invalid
 //	400 the body was not valid JSON, or a field had the wrong type
 //	413 the body exceeded the configured limit
+//	401 no valid API key was presented
 func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.scopeOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
 	key := r.Header.Get("Idempotency-Key")
 	if err := jobs.ValidateIdempotencyKey(key); err != nil {
 		s.writeValidationError(w, r, err)
@@ -236,7 +282,7 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.jobs.Submit(r.Context(), s.cfg.DevScope, key, normalized)
+	result, err := s.jobs.Submit(r.Context(), scope, key, normalized)
 	switch {
 	case err == nil:
 		status := http.StatusCreated
@@ -266,6 +312,11 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 
 // handleGetJob reads one job within the caller's scope.
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.scopeOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
 	id, err := uuid.Parse(r.PathValue("job_id"))
 	if err != nil {
 		// Answering 404 rather than 400 keeps the response identical whether the
@@ -274,7 +325,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := s.jobs.Get(r.Context(), s.cfg.DevScope, id)
+	job, err := s.jobs.Get(r.Context(), scope, id)
 	switch {
 	case err == nil:
 		writeJSON(w, s.log, http.StatusOK, toJobResponse(job))

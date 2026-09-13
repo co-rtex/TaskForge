@@ -1,7 +1,9 @@
 // Command taskforge-api serves TaskForge's HTTP API.
 //
-// It exposes durable job ingress plus the internal M2 worker control surface.
-// Authentication is still planned for M5, so it binds to loopback only.
+// The public /v1 surface authenticates with database-backed API keys. The
+// internal surface -- worker control, and the key-management routes that mint
+// the credentials the public surface checks -- is unauthenticated operator
+// plumbing, so the process still binds to loopback only.
 package main
 
 import (
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
@@ -74,7 +77,7 @@ func run() int {
 		LeaseDuration: cfg.LeaseDuration,
 		RetryPolicy:   cfg.RetryPolicy(),
 		Jitter:        jitter,
-	}))
+	})).WithAuth(auth.NewStore(pool))
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,
@@ -91,7 +94,10 @@ func run() int {
 	go func() {
 		log.Info("api listening",
 			slog.String("addr", cfg.APIAddr),
-			slog.String("dev_scope", cfg.DevScope),
+			// The development scope now attributes only the internal
+			// worker-control surface. Public requests carry their own scope on
+			// an API key.
+			slog.String("worker_control_scope", cfg.DevScope),
 			slog.Int64("max_request_bytes", cfg.MaxRequestBytes))
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
