@@ -130,6 +130,60 @@ func TestCreateAPIKey_HasNoIdempotencyIdentity(t *testing.T) {
 	require.Equal(t, 2, calls, "every call must mint a new credential")
 }
 
+// TestCreateAPIKey_WarnsWhenTheScopeCannotExecuteJobs covers the one silent
+// failure this milestone creates.
+//
+// Workers claim only within the worker-control scope, because that surface is
+// still attributed to the single configured development scope. A key minted for
+// any other scope therefore submits jobs that are durable, readable, and
+// cancelable — and that no worker will ever claim. The job just stays QUEUED.
+//
+// Mint time is the last moment an operator can act on that, so it is logged
+// there, with the consequence spelled out rather than left to be inferred from
+// two scope values printed side by side.
+func TestCreateAPIKey_WarnsWhenTheScopeCannotExecuteJobs(t *testing.T) {
+	mint := func(t *testing.T, devScope, keyScope string) string {
+		t.Helper()
+		var logged bytes.Buffer
+		handler := NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: devScope},
+			slog.New(slog.NewJSONHandler(&logged, nil))).
+			WithAuth(&fakeKeys{
+				create: func(_ context.Context, scope, name string) (auth.Created, error) {
+					return auth.Created{
+						Key: auth.Key{ID: uuid.New(), Scope: scope, Name: name,
+							Prefix: strings.Repeat("a", auth.LookupLen), CreatedAt: time.Now()},
+						Raw: testRawKey,
+					}, nil
+				},
+			}).Handler()
+
+		recorder := doJSON(t, handler, http.MethodPost, "/internal/v1/api-keys",
+			`{"scope":"`+keyScope+`","name":"ops"}`)
+		require.Equal(t, http.StatusCreated, recorder.Code)
+		return logged.String()
+	}
+
+	t.Run("a scope workers cannot claim is warned about", func(t *testing.T) {
+		logged := mint(t, "local-dev", "tenant-a")
+		require.Contains(t, logged, "api key scope cannot execute jobs yet")
+		require.Contains(t, logged, "WARN")
+		require.Contains(t, logged, "tenant-a")
+		require.Contains(t, logged, "local-dev")
+		require.Contains(t, logged, "stay QUEUED",
+			"the log must name the consequence, not just the two scopes")
+	})
+
+	t.Run("the worker-control scope itself is not warned about", func(t *testing.T) {
+		logged := mint(t, "local-dev", "local-dev")
+		require.NotContains(t, logged, "cannot execute jobs yet")
+	})
+
+	t.Run("the warning never carries the credential", func(t *testing.T) {
+		logged := mint(t, "local-dev", "tenant-a")
+		require.NotContains(t, logged, testRawKey)
+	})
+}
+
 func TestCreateAPIKey_RejectsMalformedAndInvalidRequests(t *testing.T) {
 	handler := newKeyAdminServer(t, &fakeKeys{
 		create: func(_ context.Context, scope, name string) (auth.Created, error) {

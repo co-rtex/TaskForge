@@ -112,6 +112,28 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 			slog.String("api_key_id", created.Key.ID.String()),
 			slog.String("scope", created.Key.Scope),
 			slog.String("api_key_prefix", created.Key.Prefix))
+		// A job is only ever claimed within the worker-control scope, because the
+		// claim query filters on it and that surface is still attributed to the
+		// single configured development scope. So a key minted for any OTHER
+		// scope can submit jobs that are durable, readable, and cancelable --
+		// and that no worker will ever claim.
+		//
+		// That is a real consequence of authenticating the public surface before
+		// worker/control scopes exist, and the failure it produces is silent:
+		// the job simply stays QUEUED. Warning at mint time is where an operator
+		// can still act on it; discovering it later means discovering it as a
+		// job that never ran.
+		if created.Key.Scope != s.cfg.DevScope {
+			s.log.Warn("api key scope cannot execute jobs yet",
+				slog.String("request_id", RequestIDFrom(r.Context())),
+				slog.String("api_key_id", created.Key.ID.String()),
+				slog.String("scope", created.Key.Scope),
+				slog.String("worker_control_scope", s.cfg.DevScope),
+				slog.String("consequence",
+					"jobs submitted with this key stay QUEUED: workers claim only "+
+						"within the worker-control scope until worker/control "+
+						"scopes are implemented"))
+		}
 		writeJSON(w, s.log, http.StatusCreated, APIKeyCreatedResponse{
 			ID:        created.Key.ID.String(),
 			Scope:     created.Key.Scope,
