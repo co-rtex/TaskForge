@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/workers"
@@ -37,7 +38,7 @@ func newAPI(t *testing.T) *httptest.Server {
 	).WithWorkerControl(workers.NewStore(testPool, workers.StoreConfig{
 		LeaseDuration: 30 * time.Second,
 		RetryPolicy:   integrationRetryPolicy(),
-	}))
+	})).WithAuth(auth.NewStore(testPool))
 	s := httptest.NewServer(srv.Handler())
 	t.Cleanup(s.Close)
 	return s
@@ -304,7 +305,8 @@ func TestSubmit_RejectedRequestLeavesNoPartialState(t *testing.T) {
 func TestSubmit_OversizedPayloadIsRejected(t *testing.T) {
 	reset(t)
 	srv := api.NewServer(jobs.NewStore(testPool),
-		api.Config{MaxRequestBytes: 2048, DevScope: testScope}, discardLogger())
+		api.Config{MaxRequestBytes: 2048, DevScope: testScope}, discardLogger()).
+		WithAuth(auth.NewStore(testPool))
 	s := httptest.NewServer(srv.Handler())
 	defer s.Close()
 
@@ -328,7 +330,8 @@ func TestSubmit_SurvivesAPIRestart(t *testing.T) {
 	defer pool.Close()
 
 	restarted := httptest.NewServer(api.NewServer(jobs.NewStore(pool),
-		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope}, discardLogger()).Handler())
+		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope}, discardLogger()).
+		WithAuth(auth.NewStore(pool)).Handler())
 	defer restarted.Close()
 
 	resp, err := http.Get(restarted.URL + "/v1/jobs/" + created.ID)

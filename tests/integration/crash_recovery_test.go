@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/reconciler"
@@ -325,7 +326,7 @@ func newControlServer(t *testing.T, control api.WorkerControl) *httptest.Server 
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, testPool) },
 		},
-	).WithWorkerControl(control).Handler())
+	).WithWorkerControl(control).WithAuth(auth.NewStore(testPool)).Handler())
 	t.Cleanup(server.Close)
 	return server
 }

@@ -29,9 +29,10 @@ stale-session detection; reconciliation of due attempt timeouts, unacknowledged
 cancellations, and expired leases; durable retry with bounded exponential
 backoff and injected jitter; public cancellation; the authoritative logical DLQ
 with listing, replay, and operator retry; scheduler promotion of due delayed and
-retry-waiting work; bounded recovery of stranded queued jobs; and bounded
-`demo.echo` execution. Result storage, authentication, the CLI, the SDK, and the
-dashboard remain planned.
+retry-waiting work; bounded recovery of stranded queued jobs; bounded
+`demo.echo` execution; and scoped, revocable API-key authentication on the
+public surface. Result storage, the CLI, the SDK, the dashboard, and
+authentication of the internal worker-control surface remain planned.
 
 ---
 
@@ -213,6 +214,15 @@ cancellation, then a due deadline, then abandonment. See
 ## 5. Domain model — [PARTIAL]
 
 Everything below is implemented except result references, which are M5.
+
+### API key
+Key id · auth scope · operator-facing name · non-secret lookup prefix ·
+cryptographic hash of the secret · creation time · optional revocation time.
+
+The secret itself is returned once, at creation, and is never stored. A key
+carries exactly one scope, and that scope is the whole authorization model:
+there is no permission set, because no implemented behavior would read one. See
+[ADR-0013](adr/0013-database-backed-api-key-authentication.md).
 
 ### Job
 Id · auth scope · queue · job type · canonical immutable payload · status · priority
@@ -750,9 +760,9 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0013`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0014`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
-`job_attempts`, `leases`, `dlq_entries`, and `dlq_replays`, plus
+`job_attempts`, `leases`, `dlq_entries`, `dlq_replays`, and `api_keys`, plus
 `schema_migrations` maintained by the runner.
 M2 adds immediate eligibility time, worker-group routing, constrained session/
 attempt/lease bindings, one current session per logical worker, one active lease per
@@ -813,7 +823,15 @@ immediate false re-notification. 0013 restores it to the replacement's own
 `created_at`, and only for rows whose replay lineage, generation, single event,
 and backward timestamp together prove 0012 produced them.
 
-**Planned:** `results`, `api_keys`, `audit_events`.
+M5A adds `api_keys`: one row per credential, carrying a scope, an operator
+name, a `UNIQUE` non-secret lookup prefix, and a hex SHA-256 digest of the
+secret constrained to exactly that shape. The prefix is unique across the whole
+table rather than only over live rows, so a revoked key's prefix can never name
+a second credential. Its one index matches the one query that justifies it: the
+administrative listing's `created_at DESC, id DESC` keyset order. There is no
+backfill, because no earlier milestone persisted a credential.
+
+**Planned:** `results`, `audit_events`.
 
 Tables are created in the milestone that puts working behavior on them, not in
 advance. Every index exists because an implemented query orders by exactly its

@@ -35,7 +35,13 @@ type CancelResponse struct {
 //	200 the cancellation decision, including an idempotent repeat
 //	404 no such job in the caller's scope
 //	409 the job already reached SUCCEEDED or DEAD_LETTERED
+//	401 no valid API key was presented
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.scopeOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
 	id, err := uuid.Parse(r.PathValue("job_id"))
 	if err != nil {
 		// 404, not 400: matching handleGetJob means a malformed id and someone
@@ -44,7 +50,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.jobs.RequestCancel(r.Context(), s.cfg.DevScope, id)
+	result, err := s.jobs.RequestCancel(r.Context(), scope, id)
 	switch {
 	case err == nil:
 		s.log.Info("job cancellation requested",
@@ -100,7 +106,13 @@ type ReplayResponse struct {
 //	404 no such job in the caller's scope
 //	409 the job is not dead-lettered, so there is nothing to replay
 //	422 the Idempotency-Key header was missing or invalid
+//	401 no valid API key was presented
 func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.scopeOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
 	key := r.Header.Get("Idempotency-Key")
 	if err := jobs.ValidateIdempotencyKey(key); err != nil {
 		s.writeValidationError(w, r, err)
@@ -112,7 +124,7 @@ func (s *Server) handleReplayJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.jobs.Replay(r.Context(), s.cfg.DevScope, id, key)
+	result, err := s.jobs.Replay(r.Context(), scope, id, key)
 	switch {
 	case err == nil:
 		status := http.StatusCreated
@@ -185,7 +197,13 @@ type DLQPageResponse struct {
 //
 //	200 one bounded page
 //	422 the limit or cursor was invalid
+//	401 no valid API key was presented
 func (s *Server) handleListDLQ(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.scopeOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
 	query := r.URL.Query()
 	limit := jobs.DefaultDLQPageSize
 	if raw := query.Get("limit"); raw != "" {
@@ -198,7 +216,7 @@ func (s *Server) handleListDLQ(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
-	page, err := s.jobs.ListDLQ(r.Context(), s.cfg.DevScope, query.Get("cursor"), limit)
+	page, err := s.jobs.ListDLQ(r.Context(), scope, query.Get("cursor"), limit)
 	switch {
 	case err == nil:
 		entries := make([]DLQEntryResponse, 0, len(page.Entries))

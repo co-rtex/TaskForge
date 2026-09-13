@@ -15,20 +15,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestServer builds a server with no job store.
+// newTestServer builds a server with no job store, but with a real credential
+// check in front of the public routes.
 //
 // Every case here is rejected during validation, before any database access, so
 // a nil store is the strongest possible assertion that these paths never touch
 // PostgreSQL. Anything that must reach the store is an integration test.
+//
+// There is deliberately no "authentication disabled" mode. Since M5A the public
+// routes are wrapped in requireAPIKey unconditionally, so a test that wants to
+// reach a handler presents a credential exactly as a client does — which also
+// means no bypass exists for a production binary to reach by accident.
 func newTestServer(t *testing.T, checks ...ReadinessCheck) http.Handler {
 	t.Helper()
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	return NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "test"}, log, checks...).Handler()
+	return NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "test"}, log, checks...).
+		WithAuth(acceptingKeys(testScope)).
+		Handler()
+}
+
+// authorize presents the credential newTestServer's key store accepts.
+func authorize(req *http.Request) *http.Request {
+	req.Header.Set(authorizationHeader, "Bearer "+testRawKey)
+	return req
 }
 
 func post(t *testing.T, h http.Handler, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body))
+	req := authorize(httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -174,6 +188,11 @@ func TestRouting(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			// Deliberately unauthenticated. Routing answers before
+			// authentication: "this path takes POST" and "no such endpoint" are
+			// facts about the route table, not about the caller, and a 401 here
+			// would tell a client to go find a credential for an endpoint that
+			// does not exist.
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
 			require.Equal(t, tc.want, rec.Code)
@@ -192,7 +211,7 @@ func TestRouting(t *testing.T) {
 // tell a malformed id from someone else's id.
 func TestGetJob_MalformedIDIsNotFound(t *testing.T) {
 	rec := httptest.NewRecorder()
-	newTestServer(t).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/jobs/not-a-uuid", nil))
+	newTestServer(t).ServeHTTP(rec, authorize(httptest.NewRequest(http.MethodGet, "/v1/jobs/not-a-uuid", nil)))
 	require.Equal(t, http.StatusNotFound, rec.Code)
 	require.Equal(t, CodeNotFound, decodeError(t, rec).Error.Code)
 }

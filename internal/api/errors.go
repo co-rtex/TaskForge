@@ -16,17 +16,22 @@ const (
 	CodeUnknownQueue        = "unknown_queue"
 	CodeIdempotencyConflict = "idempotency_conflict"
 	CodeNotFound            = "not_found"
-	CodePayloadTooLarge     = "payload_too_large"
-	CodeMethodNotAllowed    = "method_not_allowed"
-	CodeInternal            = "internal_error"
-	CodeServiceUnavailable  = "service_unavailable"
-	CodeSessionConflict     = "worker_session_conflict"
-	CodeSessionUnavailable  = "worker_session_unavailable"
-	CodeClaimConflict       = "claim_conflict"
-	CodeFenceRejected       = "fence_rejected"
-	CodeLeaseExpired        = "lease_expired"
-	CodeStateConflict       = "state_conflict"
-	CodeRenewalConflict     = "renewal_conflict"
+	// CodeUnauthorized reports a public request that presented no valid API key.
+	// It is deliberately the single answer to a missing, malformed, unknown, and
+	// revoked credential alike: a client that could tell them apart could use a
+	// key prefix as an oracle for which prefixes exist.
+	CodeUnauthorized       = "unauthorized"
+	CodePayloadTooLarge    = "payload_too_large"
+	CodeMethodNotAllowed   = "method_not_allowed"
+	CodeInternal           = "internal_error"
+	CodeServiceUnavailable = "service_unavailable"
+	CodeSessionConflict    = "worker_session_conflict"
+	CodeSessionUnavailable = "worker_session_unavailable"
+	CodeClaimConflict      = "claim_conflict"
+	CodeFenceRejected      = "fence_rejected"
+	CodeLeaseExpired       = "lease_expired"
+	CodeStateConflict      = "state_conflict"
+	CodeRenewalConflict    = "renewal_conflict"
 	// CodeAttemptTimedOut is distinct from lease_expired on purpose. The lease may
 	// be perfectly valid and freshly renewed; what has run out is the attempt's
 	// own execution budget, which renewal never extends.

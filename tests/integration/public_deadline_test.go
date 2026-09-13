@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/api"
+	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 )
 
@@ -40,7 +41,7 @@ func newAPIWithTimeout(t *testing.T, timeout time.Duration) *httptest.Server {
 		jobs.NewStore(testPool),
 		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope, RequestTimeout: timeout},
 		discardLogger(),
-	)
+	).WithAuth(auth.NewStore(testPool))
 	s := httptest.NewServer(srv.Handler())
 	t.Cleanup(s.Close)
 	return s

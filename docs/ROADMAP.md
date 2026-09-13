@@ -153,16 +153,70 @@ shared with retry.
 
 ---
 
-## Current milestone — M5: API keys, result storage, CLI, Python SDK
+## M5 — API keys, result storage, CLI, Python SDK
 
-### M5 — API keys, result storage, CLI, Python SDK
-**Objective.** Make TaskForge usable by an outside developer.
-**Deliverables.** Hashed API keys with prefix lookup, scopes, and revocation;
-inline results in PostgreSQL with a defined threshold and large results in MinIO/S3;
-`taskforge-cli`; a typed, installable Python SDK.
-**Acceptance.** Every endpoint authenticates; the dev scope from M1 is gone; small
-and large results round-trip; CLI exit codes are stable and output is machine-readable.
+M5 as originally written bundles four independently testable systems:
+authentication, result storage with a new object-store dependency, a CLI, and an
+SDK. It is split below so each ships on its own evidence, in the order that makes
+the earlier ones useful to the later ones. The objective and acceptance criteria
+of the original M5 are preserved across M5A–M5D, not reduced: scope is regrouped
+here, never silently expanded or shrunk.
+
+### M5A — Database-backed API keys for the public surface
+**Objective.** Replace the single configured development scope on the public API
+with real, revocable, database-backed credentials, so a caller's scope-isolated
+view of jobs and the DLQ is enforced by a credential rather than a constant.
+**Deliverables.** `api_keys` with prefix lookup and a hashed secret; scoped
+authentication on `POST /v1/jobs`, `GET /v1/jobs/{job_id}`, the cancel, retry,
+DLQ listing, and replay routes; a loopback-only mint/revoke/list surface;
+constant-time verification; OpenAPI and contract tests covering all of it.
+**Acceptance.** Every public route refuses an unauthenticated caller; a key for
+one scope cannot see another scope's job; revocation takes effect on the next
+request; missing, malformed, unknown, and revoked credentials are
+indistinguishable; the migration adds an empty table and changes no M1–M4 row.
 **Depends on.** M4 (complete).
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the evidence.
+
+The decision, its alternatives, and the trust boundary it deliberately does not
+move are recorded in
+[ADR-0013](adr/0013-database-backed-api-key-authentication.md). One consequence
+is load-bearing for what follows: worker claims still filter on
+`TASKFORGE_DEV_SCOPE`, so a job submitted with a key minted for any other scope
+stays `QUEUED` forever. Multi-tenant keys isolate reads today, not execution.
+
+## Current milestone — M5B: worker/control authentication
+
+### M5B — Worker/control authentication
+**Objective.** Give the internal worker-control surface its own credential, so
+`TASKFORGE_DEV_SCOPE` can be retired and an authenticated scope can actually
+execute work.
+**Deliverables.** Worker credentials separable from user keys
+([PROJECT_SPEC.md](PROJECT_SPEC.md) §6), tied to the process-session lifecycle
+that already carries fencing and replacement semantics; authentication on
+`/internal/v1`, including key management; removal of `TASKFORGE_DEV_SCOPE`.
+**Acceptance.** Every endpoint authenticates; the dev scope from M1 is gone; a
+job submitted under any authenticated scope is claimable by a worker authorized
+for that scope, which closes M5A's recorded limitation.
+**Depends on.** M5A (complete).
+**Status:** not started.
+
+### M5C — Result storage
+**Objective.** Small and large results round-trip.
+**Deliverables.** Inline results in PostgreSQL with a defined threshold, large
+results in MinIO/S3, and the retrieval endpoint.
+**Acceptance.** Small and large results round-trip; the threshold is explicit and
+tested on both sides of the boundary.
+**Depends on.** M5B, so result retrieval is authenticated on arrival rather than
+retrofitted onto an endpoint that serves job output.
+**Status:** not started.
+
+### M5D — CLI and Python SDK
+**Objective.** Make TaskForge usable by an outside developer.
+**Deliverables.** `taskforge-cli`; a typed, installable Python SDK. Both obtain
+and present API keys rather than reimplementing the credential model.
+**Acceptance.** CLI exit codes are stable and output is machine-readable; the SDK
+places an idempotency key in the canonical header.
+**Depends on.** M5C.
 **Status:** not started.
 
 ---
@@ -177,7 +231,7 @@ bounded label cardinality; real liveness/readiness per service; the operator das
 **Acceptance.** A submission is traceable end to end; no unbounded metric labels; the
 dashboard reads live APIs and handles loading, empty, and error states; nothing is
 hardcoded.
-**Depends on.** M5.
+**Depends on.** M5D.
 
 ### M7 — Full concurrency, restart, failure, and race suites
 **Objective.** Prove the invariants.

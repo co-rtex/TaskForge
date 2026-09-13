@@ -1,9 +1,9 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1, M2, and M3 are merged into `main`; this document records
-the implemented state through M4, which is on the
-`feat/m4-complete-job-lifecycle` branch and its draft pull request.
+planned. Milestones M1 through M4 are merged into `main`; this document records
+the implemented state through M5A, which is on the
+`claude/taskforge-bounded-handoff-fwf0im` branch and its draft pull request.
 
 ## Milestone status
 
@@ -11,17 +11,26 @@ the implemented state through M4, which is on the
 - **M2 — worker sessions, atomic claims, and fenced execution:** complete.
 - **M3 — heartbeat, lease renewal, and reconciliation:** complete.
 - **M4 — retry, timeout, cancellation, DLQ, replay, delayed jobs:** complete.
-- **M5 — API keys, result storage, CLI, Python SDK:** not started.
+- **M5A — database-backed API keys for the public surface:** complete.
+- **M5B — worker/control authentication:** not started.
+- **M5C — result storage:** not started.
+- **M5D — CLI and Python SDK:** not started.
+
+[ROADMAP.md](ROADMAP.md) records why M5 is split into four slices and what each
+one owns.
 
 ## Runnable system
 
 Six binaries build and run:
 
 - `taskforge-api` accepts idempotent immediate and delayed job submissions, job
-  reads, cancellation, DLQ listing, replay and operator retry, plus the internal
-  worker-control surface: session registration, heartbeat with cancellation
-  delivery, atomic claims, fenced lease renewal, and the fenced start, success,
-  failure, and cancellation-acknowledgment transitions.
+  reads, cancellation, DLQ listing, replay and operator retry — all of which now
+  require an API key and take their scope from it — plus the loopback-only key
+  management that mints those keys, plus the internal worker-control surface:
+  session registration, heartbeat with cancellation delivery, atomic claims,
+  fenced lease renewal, and the fenced start, success, failure, and
+  cancellation-acknowledgment transitions. The worker-control surface is
+  unauthenticated and still runs under the configured development scope.
 - `taskforge-outbox` publishes durable work-availability events to ElasticMQ.
 - `taskforge-scheduler` promotes due delayed and retry-waiting jobs and
   re-notifies stranded queued work. It holds no broker connection.
@@ -35,7 +44,8 @@ Six binaries build and run:
   or dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0013`. M4 adds five:
+The schema consists of migrations `0001` through `0014`. M5A adds one,
+`0014_api_keys.sql`, described below. M4 adds five:
 
 - `0009_job_lifecycle.sql` — scheduling, cancellation, replay linkage, and
   notification bookkeeping on `jobs`; a persisted execution deadline, a
@@ -439,9 +449,10 @@ response gains typed cancellation directives. There is deliberately no generic
 New stable error codes: `attempt_timed_out`, `outcome_conflict`,
 `job_not_cancelable`, `job_not_dead_lettered`, `invalid_cursor`,
 `cancellation_requested`.
-[api/openapi.yaml](../api/openapi.yaml) is version `0.4.0-m4` and documents only
-implemented behavior, including a per-endpoint ambiguity contract that forbids a
-fresh outcome identity after a `503`.
+M4 published [api/openapi.yaml](../api/openapi.yaml) at version `0.4.0-m4`,
+documenting only implemented behavior, including a per-endpoint ambiguity
+contract that forbids a fresh outcome identity after a `503`. That contract is
+unchanged; M5A moved the document to `0.5.0-m5a`.
 
 The three public mutating routes — `POST /v1/jobs/{job_id}/cancel`,
 `POST /v1/jobs/{job_id}/retry`, and `POST /v1/dlq/{job_id}/replay` — classify a
@@ -459,7 +470,268 @@ identity and silently creates a second replacement job. No message claims
 nothing was committed — a deadline can land during COMMIT, and that is
 genuinely ambiguous.
 
+## M5A — API-key authentication
+
+### What changed
+
+The public surface authenticates. `POST /v1/jobs`, `GET /v1/jobs/{job_id}`,
+`POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry`, `GET /v1/dlq`,
+and `POST /v1/dlq/{job_id}/replay` each require
+`Authorization: Bearer <key>` and resolve their scope from the authenticated
+key. No scope-filtering logic changed anywhere: `jobs.Store` filters exactly as
+it did in M1 through M4, and only where the scope value comes from is different.
+
+`/healthz` and `/readyz` remain unauthenticated. They expose nothing
+tenant-specific, and a liveness probe behind a credential would report a healthy
+process as dead the moment that credential was revoked.
+
+### The credential
+
+A key is `tfk_<lookup>.<secret>`: a recognizable marker, 16 random bytes encoded
+to a 22-character lookup segment, and 32 random bytes encoded to a 43-character
+secret, both unpadded base64url. Only the lookup segment and a lowercase-hex
+SHA-256 digest of the secret are stored, so the credential cannot be recovered
+from anything TaskForge persists. It is returned once, by the creation endpoint,
+and nowhere else.
+
+The separator is `.` rather than `_` because base64url's alphabet contains `-`
+and `_`; splitting on `_` would cut at whichever underscore a random lookup
+segment happened to contain, so roughly a quarter of generated keys would fail
+to parse. The round-trip test runs 500 keys for that reason — a single sample
+passes three times in four.
+
+A plain SHA-256 rather than a password KDF is justified by the generator: the
+secret carries 256 bits from `crypto/rand`, so there is no guessable structure
+for a work factor to protect. The `secret_hash` CHECK pins the stored shape to
+`^[0-9a-f]{64}$`, so a future writer cannot put a raw key, a truncated digest,
+or a different encoding in that column.
+
+### One indistinguishable failure
+
+A missing header, a malformed credential, an unknown prefix, a wrong secret, and
+a revoked key all answer the same `401` with code `unauthorized` and a message
+that names no cause. Verification runs before the revocation check so the two
+cannot be separated by ordering, and uses `subtle.ConstantTimeCompare` so they
+cannot be separated by timing. A distinguishing response would make a lookup
+prefix an oracle for which prefixes exist, and would tell whoever holds a stolen
+key that it has been revoked.
+
+A deadline inside the credential lookup answers `503` `service_unavailable`,
+never `401`: "I could not verify this" and "you are not authorized" are
+different facts, and reporting the second for the first sends an operator
+hunting for a revocation that never happened. Verification reads one row and
+writes nothing, so that is the one `503` in this API whose guidance promises an
+identical retry is unconditionally safe.
+
+The `Authorization` header is length-bounded before the credential store is
+consulted, so a caller cannot choose how much work a rejected request costs, and
+authentication precedes body decoding, so the validation surface cannot be
+probed anonymously. The `Bearer` scheme is matched case-insensitively per
+RFC 7235.
+
+### Fail-closed, with no test bypass
+
+A `Server` built without `WithAuth` answers `401` on every public route and does
+not register the key-management routes at all. A server that can authenticate
+nobody has no authenticated caller to serve.
+
+There is therefore no test-only authentication bypass anywhere in
+`internal/api`: there is nothing to bypass, and a binary that forgets to wire a
+credential store serves a closed API rather than an open one. The existing
+validation-only unit tests present a real credential through a fake key store,
+exactly as a client does.
+
+### Key management
+
+Three loopback-only routes: `POST /internal/v1/api-keys` mints a key and returns
+it exactly once; `GET /internal/v1/api-keys` lists bounded metadata, newest
+first, including revoked keys; `POST /internal/v1/api-keys/{key_id}/revoke`
+revokes idempotently, reporting the original instant on a repeat rather than
+moving it.
+
+**These routes are themselves unauthenticated.** That is a real security
+boundary, not an oversight: they are how the first credential comes into
+existence, so requiring one would make the system unbootstrappable. Anyone who
+can reach loopback can mint a credential for any scope — the same population
+that can already drive the worker-control surface. It is why nothing under
+`/internal/v1` may be exposed off loopback. See
+[ADR-0013](adr/0013-database-backed-api-key-authentication.md) for the
+alternatives considered.
+
+Key creation deliberately carries no idempotency identity, against the grain of
+every other mutating route here, and an `Idempotency-Key` sent to it is ignored
+rather than honored. An idempotent create would have to return an existing
+secret to a repeat. The cost is that its `503` is the one in this API that tells
+a caller *not* to retry: with no request identity, a repeat mints a second
+credential. The guidance is to list keys and revoke the one nobody received.
+
+### Migration 0014
+
+`api_keys` holds id, scope, operator name, a `UNIQUE` lookup prefix, the secret
+digest, a creation instant from PostgreSQL server time, and a nullable
+revocation instant, with a CHECK that a key cannot have been revoked before it
+existed. One index, `api_keys_listing_idx`, matches the one query that justifies
+it: the administrative listing's `created_at DESC, id DESC` keyset order, whose
+id tiebreak makes a bounded page deterministic when two keys share a creation
+instant.
+
+`prefix` is unique across the whole table rather than only over live rows, so a
+revoked key's prefix can never name a second credential and a log line naming it
+stays unambiguous after revocation.
+
+There is no backfill and nothing to reconstruct, because no earlier milestone
+ever persisted a credential. This is the simplest migration in the repository,
+deliberately and in contrast to `0011` through `0013`.
+
+### Breaking change
+
+**Every request that previously worked unauthenticated now answers `401`.**
+There is no compatibility shim and none should be built. `TASKFORGE_DEV_SCOPE`
+has been documented as a milestone-scoped, temporary mechanism since M1, and
+this is what retiring it from the public surface means.
+
+`TASKFORGE_DEV_SCOPE` itself remains required and validated. Its meaning is
+narrower: it attributes only the internal worker-control surface, which is still
+unauthenticated and still loopback-bound.
+
+### Known limitation: a key outside the worker-control scope cannot execute work
+
+Worker claims filter on the worker-control scope
+(`internal/workers.Store.Claim`, `WHERE j.scope = $1`), and that surface still
+runs under the single configured development scope. **A job submitted with a key
+minted for any other scope is durable, readable, and cancelable — and will never
+be claimed. It stays `QUEUED`.**
+
+The failure is silent by nature, so it is handled three ways rather than
+described once:
+
+- an end-to-end test pins both halves, with an in-scope job succeeding in the
+  same run so the stranded one's fate is provably a scope boundary and not a
+  broken stack;
+- the creation handler logs a warning at mint time naming the consequence, not
+  just the two scope values, because that is the last moment an operator can act
+  on it;
+- the README and `.env.example` say to mint keys with
+  `scope=$TASKFORGE_DEV_SCOPE` for work that must run.
+
+Multi-tenant keys therefore isolate reads, cancellation, and the DLQ today, and
+not execution. This closes with M5B, not before.
+
+### API surface and contract
+
+New stable error code: `unauthorized`.
+[api/openapi.yaml](../api/openapi.yaml) is version `0.5.0-m5a`. It defines the
+`ApiKeyAuth` bearer scheme, declares it on all six public operations, documents
+their `401`, and describes the three key-management routes and their schemas.
+
+Eight new `TestOpenAPI_*` contract tests — seventeen in the package now — read
+the spec and the handlers together, so neither can drift from the other: every public operation must declare exactly
+one `ApiKeyAuth` requirement and document a `401` carrying code `unauthorized`;
+that `401` must name all four cases it refuses to distinguish; the health probes
+must declare no security and can never answer `401`; nothing under
+`/internal/v1` may declare security, and the document must state plainly that
+the surface is unauthenticated and what follows from it; the documented scheme
+must be the one `bearerCredential` actually accepts; only `ApiKeyCreated` may
+carry a credential field, and no schema may expose a property named for a secret
+or a hash.
+
 ## Verification
+
+### M5A gates
+
+Every gate below was run on the branch head, on 2026-09-13, against PostgreSQL 16
+and ElasticMQ started by `make up`. Durations are wall-clock from that run.
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `gofmt -l .` after `make fmt` | PASS | empty — no tracked Go file rewritten |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make build` | PASS | six binaries in `./bin` |
+| `make test-unit` | PASS | every package `ok`, including `internal/auth` |
+| `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 17 top-level contract tests, exit 0 |
+| `docker compose config --quiet` | PASS | exit 0 |
+| `make migrate` on a database from `make down && make up` | PASS | `"migrations complete" applied=14`, `0014_api_keys.sql` last |
+| `make test-integration` | PASS | `ok .../tests/integration 83.990s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 94.587s` |
+
+Exact commands and complete output are recorded in the pull request.
+
+### M5A coverage
+
+`internal/auth` carries 16 top-level unit tests and `internal/api` 59; the
+integration package carries 191, of which 16 are new for M5A.
+
+**Unit.** Key generation is pinned to exact encoded lengths and to a hash vector
+verified independently against `sha256sum`, so a change to either entropy
+constant or to what is hashed fails here rather than silently invalidating
+stored keys. `ParseKey` rejects seventeen malformed shapes — including an
+underscore used as the separator and a whole `Bearer` header passed verbatim —
+each paired with the valid key as a control. `auth.Store`'s malformed-credential
+and validation paths run against a **nil connection pool**: if one of them
+reached PostgreSQL it would panic rather than quietly pass, which is the
+strongest available proof that an unauthenticated caller cannot turn a header
+into database load.
+
+**Constant-time verification** is guarded by an AST assertion over
+`VerifySecret` rather than a timing measurement, which would be flaky and prove
+nothing on a loaded runner. It requires `subtle.ConstantTimeCompare` and forbids
+comparing the digests with `==` or `!=`. The refactor it exists to stop is
+someone simplifying the call into a string comparison, which reads as equivalent
+and hands an attacker who knows a valid prefix a way to walk the stored digest
+one character at a time.
+
+**Integration.** Scope isolation is driven by two real minted credentials over
+real HTTP rather than by a scope string written into the database: a job created
+under key A answers `404` to key B on read, cancel, and retry alike, and the
+durable row carries the key's scope rather than `TASKFORGE_DEV_SCOPE`. Every
+public route refuses an anonymous caller over the wire and writes nothing — no
+job, no idempotency record, no outbox event. Revocation takes effect on the very
+next request. Every authentication failure returns the same error *value*,
+asserted by equality rather than by non-nil.
+
+Schema constraints pair each rejection with a positive control, including at the
+boundary lengths, so a CHECK that rejected everything would fail rather than look
+like a guard. Prefix uniqueness asserts the constraint *name*, because that is
+what `auth.Store` matches on to decide a collision is retryable: a rename would
+silently turn a retry into a leaked unique violation.
+
+Concurrency runs on separate connections. Twelve concurrent creations produce
+twelve distinct, independently authenticatable credentials, each resolving to
+its own scope; eight concurrent revocations of one key produce exactly one
+winner and one instant every caller agrees on; sixteen concurrent
+authentications against one key are clean under the race detector.
+
+The upgrade rehearsal takes a database migrated through `0013`, seeds real
+M1–M4 rows across ten tables, and compares a **per-table content digest** — not
+a row count, which a rewrite-in-place would preserve — before and after. The
+upgrade applies exactly one migration, `api_keys` starts empty, not one digest
+changes, a re-run applies nothing, `0014` is recorded with the checksum of its
+own file, and existing jobs keep their original scope.
+
+**Mutation evidence.** Five defects were reintroduced and reverted. Four
+confirmed the guard written for them: dropping `security` from an operation in
+the spec; falling back to `DevScope` when no scope is in the request context;
+replacing `subtle.ConstantTimeCompare` with `==`; and expecting an end-to-end
+status the job never reaches.
+
+The fifth found a real gap rather than confirming a guard. Removing
+`requireAPIKey` from a public route did **not** fail the original test:
+`scopeOrUnauthorized` is a second line of defense inside every public handler,
+so an unwrapped route still answered `401` — the right status reached the wrong
+way, which that test could not distinguish. It matters, because without the
+wrapper the handler runs, so an unauthenticated caller reaches body decoding and
+validation, and the next public handler written without that internal guard
+would simply be open.
+`TestAuth_EveryPublicRouteConsultsTheCredentialStore` closes it by counting
+calls into the credential store, which an unwrapped route never makes, and a
+companion test pins that authentication precedes body decoding. Removing the
+wrapper from either `/v1/dlq` or `/v1/jobs` now fails.
+
+A sixth mutation checked the limitation above rather than a guard: minting the
+"stranded" key in the executable scope makes the scope-boundary test fail, which
+is what proves that test is observing the boundary and not a coincidence.
+
+### M4 gates
 
 The M4 tree passed these gates locally on 2026-09-01, against PostgreSQL 16 and
 ElasticMQ started by `make up`:
@@ -805,18 +1077,28 @@ Unchanged from M3. The same three jobs —
 `Migrations and integration tests`, and `Race detector (unit and integration)` —
 run on GitHub-hosted Linux runners for every pull request targeting `main` and
 every push to `main`. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
-The M4 pull request's run is recorded in that pull request.
+Each milestone's run is recorded in its own pull request; the M5A run is
+recorded in the M5A pull request.
 
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure.
 
 ## Deliberately not implemented yet
 
-- Result bodies and richer attempt-history APIs are M5.
+- Result bodies and richer attempt-history APIs are M5C.
   `GET /v1/jobs/{job_id}` returns lifecycle fields, not attempt history.
-- Authentication and authorization are M5. Every request is still attributed to
-  one configured development scope, and every service binds to loopback.
-- The CLI, the Python SDK, and the operator dashboard are M5 and M6. The DLQ has
+- **Authentication of the internal worker-control surface is M5B.** Those routes
+  are still unauthenticated, still attributed to one configured development
+  scope, and every service still binds to loopback. Key management is on that
+  same unauthenticated surface, so anyone who can reach loopback can mint a
+  credential for any scope.
+- Authorization beyond scope is post-V1. A key carries exactly one scope and no
+  permission set; there is no RBAC, no per-route permission, and no rate
+  limiting.
+- Key rotation and expiry are not implemented. A key lives until it is revoked.
+- A job submitted under a scope no worker serves stays `QUEUED` — see the M5A
+  limitation above. This closes with M5B.
+- The CLI, the Python SDK, and the operator dashboard are M5D and M6. The DLQ has
   a listing endpoint but no filtering beyond scope and no sorting beyond
   newest-first; operator search and bulk replay belong with the dashboard.
 - Metrics and tracing are M6.
@@ -859,7 +1141,13 @@ repository README.
 
 ## Next objective
 
-M5 will add database-backed API keys with prefix lookup, scopes, and revocation;
-result storage with a defined inline/external threshold; `taskforge-cli`; and a
-typed, installable Python SDK — retiring the single development scope every
-service currently runs under.
+M5B: worker/control authentication. The public surface now authenticates, but
+the internal worker-control surface — including the routes that mint public
+credentials — does not, and `TASKFORGE_DEV_SCOPE` still decides which jobs a
+worker may claim. Until a worker can present its own credential for a scope, a
+key minted for any scope other than the development one produces jobs that never
+run, and key issuance remains reachable by anyone with loopback access.
+
+M5C (result storage) and M5D (the CLI and Python SDK) follow, in that order, so
+that result retrieval is authenticated on arrival rather than retrofitted onto
+an endpoint that serves job output. See [ROADMAP.md](ROADMAP.md).

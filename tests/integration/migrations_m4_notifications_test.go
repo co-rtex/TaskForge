@@ -141,7 +141,7 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// The upgrade, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 5, applied)
+	require.Equal(t, 6, applied, "0009 through 0014 are pending from 0008")
 
 	eventGeneration := func(id uuid.UUID) int {
 		var generation *int
@@ -442,7 +442,7 @@ func TestMigrations_PerJobReconstructionSurvivesMixedState(t *testing.T) {
 	// The upgrade, through the real runner: 0011 then 0012.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 3, applied, "exactly 0011, 0012 and 0013 are pending from 0010")
+	require.Equal(t, 4, applied, "exactly 0011, 0012, 0013 and 0014 are pending from 0010")
 
 	t.Run("M4-authored notification metadata is untouched", func(t *testing.T) {
 		require.Equal(t, advancedBefore, readNotificationState(t, ctx, conn, advancedJob),
@@ -519,7 +519,7 @@ func TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase(t *testing.
 	freshDSN := withFreshDatabase(t)
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 13, applied, "a fresh database applies every migration")
+	require.Equal(t, 14, applied, "a fresh database applies every migration")
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -789,6 +789,6 @@ func TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012(t *testing.
 		otherDSN := withFreshDatabase(t)
 		applied, err := database.Migrate(ctx, otherDSN, discardLogger())
 		require.NoError(t, err)
-		require.Equal(t, 13, applied, "0001 through 0013 apply to an empty database")
+		require.Equal(t, 14, applied, "0001 through 0014 apply to an empty database")
 	})
 }
