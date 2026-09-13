@@ -9,7 +9,7 @@ lifecycle, explicit state machines, idempotent submission, transactional
 database-to-broker delivery, leases and fencing, and crash recovery — rather than
 wrapping an existing queue framework.
 
-> ### Status: early development — milestone 4 of 8
+> ### Status: early development — milestone 5A of 8
 >
 > **What works today:** the complete durable job lifecycle. Idempotent immediate
 > and delayed submission with a recoverable transactional outbox; durable logical
@@ -20,11 +20,12 @@ wrapping an existing queue framework.
 > cancellation; fenced, idempotent lease renewal; retry with bounded exponential
 > backoff and injected jitter; server-authoritative timeouts; cancellation; the
 > logical DLQ with listing, replay, and operator retry; a scheduler that promotes
-> due work and re-notifies queued jobs whose notification was lost; and crash
-> recovery.
+> due work and re-notifies queued jobs whose notification was lost; crash
+> recovery; and scoped, revocable API-key authentication on the public API.
 >
-> **What does not exist yet:** result storage, authentication, the CLI, the SDK,
-> and the dashboard.
+> **What does not exist yet:** result storage, the CLI, the SDK, the dashboard,
+> and authentication of the internal worker-control surface — which stays
+> unauthenticated and loopback-only.
 >
 > See [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) for exactly what is implemented
 > and verified at this commit.
@@ -96,14 +97,46 @@ Without it, a killed worker's lease stays active and its job never runs again.
 The scheduler is what makes a delayed or retry-waiting job eventually run, and
 what repairs a queued job whose notification was lost.
 
+First, mint an API key. Every `/v1` request needs one; the key is returned
+**exactly once** and cannot be recovered afterwards.
+
+```bash
+curl -X POST http://127.0.0.1:8080/internal/v1/api-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"local-dev","name":"my-laptop"}'
+
+export TASKFORGE_API_KEY=tfk_...   # the "key" field of that response
+```
+
+Mint it with `scope` equal to `TASKFORGE_DEV_SCOPE` (`local-dev` by default).
+Workers claim only within that scope, so a job submitted with a key minted for
+any other scope is durable and readable but will never run — it stays `QUEUED`.
+The API logs a warning when you mint such a key. This goes away when
+worker/control authentication lands; see
+[docs/CURRENT_STATE.md](docs/CURRENT_STATE.md).
+
+Key management lives under `/internal/v1` and is itself unauthenticated, because
+it is how the first credential comes into existence. That is why nothing under
+`/internal/v1` may be exposed off loopback. List and revoke with:
+
+```bash
+curl http://127.0.0.1:8080/internal/v1/api-keys
+curl -X POST http://127.0.0.1:8080/internal/v1/api-keys/<key_id>/revoke
+```
+
 Submit a job:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/jobs \
+  -H "Authorization: Bearer $TASKFORGE_API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: my-first-job' \
   -d '{"queue":"default","job_type":"demo.echo","payload":{"message":"hello"}}'
 ```
+
+A missing, malformed, unknown, or revoked key answers `401` with code
+`unauthorized`, and the message deliberately does not say which: a response that
+distinguished them would let a caller probe for which key prefixes exist.
 
 Sending the same key again returns the same job with `200` instead of `201`; sending
 it with a different body returns `409`. The publisher delivers a `work.available`
@@ -118,7 +151,8 @@ promotes it then.
 Cancel a job:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/jobs/<job_id>/cancel
+curl -X POST http://127.0.0.1:8080/v1/jobs/<job_id>/cancel \
+  -H "Authorization: Bearer $TASKFORGE_API_KEY"
 ```
 
 A job that has not been claimed becomes `CANCELED` immediately with no attempt
@@ -129,8 +163,10 @@ of it on the next heartbeat, and the attempt is finalized when the handler stops
 List what failed for good, and run one again:
 
 ```bash
-curl http://127.0.0.1:8080/v1/dlq
+curl http://127.0.0.1:8080/v1/dlq \
+  -H "Authorization: Bearer $TASKFORGE_API_KEY"
 curl -X POST http://127.0.0.1:8080/v1/dlq/<job_id>/replay \
+  -H "Authorization: Bearer $TASKFORGE_API_KEY" \
   -H 'Idempotency-Key: replay-once'
 ```
 
