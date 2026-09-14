@@ -20,6 +20,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/reconciler"
 	workerruntime "github.com/co-rtex/TaskForge/internal/worker"
+	"github.com/co-rtex/TaskForge/internal/workerauth"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -103,6 +104,13 @@ func (k *killableAPI) AcknowledgeCancellation(ctx context.Context, scope string,
 	return k.control.AcknowledgeCancellation(ctx, scope, ack)
 }
 
+// SessionScope is a plain read, not one of the eight fenced authority calls
+// this type severs: a session that has gone stale still has a scope, and
+// severing it here would test nothing about crash recovery.
+func (k *killableAPI) SessionScope(ctx context.Context, sessionID uuid.UUID) (string, *uuid.UUID, error) {
+	return k.control.SessionScope(ctx, sessionID)
+}
+
 var _ api.WorkerControl = (*killableAPI)(nil)
 
 // blockingEcho is a trusted, test-only handler. It behaves exactly like a real
@@ -158,7 +166,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 	registry := workerruntime.NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", handler))
 
-	workerA := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second})
+	workerA := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second}, currentWorkerKey())
 	sessionA := uuid.New()
 	runnerA := workerruntime.NewRunner(workerA, broker, registry, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
@@ -251,7 +259,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 			}
 			return execution.Payload, nil
 		})))
-	workerB := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second})
+	workerB := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second}, currentWorkerKey())
 	runnerB := workerruntime.NewRunner(workerB, broker, registryB, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: "crash-worker-b", Hostname: "b.local",
@@ -320,13 +328,14 @@ func newControlServer(t *testing.T, control api.WorkerControl) *httptest.Server 
 	t.Helper()
 	server := httptest.NewServer(api.NewServer(
 		jobs.NewStore(testPool),
-		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope},
+		api.Config{MaxRequestBytes: 256 * 1024},
 		discardLogger(),
 		api.ReadinessCheck{
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, testPool) },
 		},
-	).WithWorkerControl(control).WithAuth(auth.NewStore(testPool)).Handler())
+	).WithWorkerControl(control).WithAuth(auth.NewStore(testPool)).
+		WithWorkerAuth(workerauth.NewStore(testPool)).Handler())
 	t.Cleanup(server.Close)
 	return server
 }

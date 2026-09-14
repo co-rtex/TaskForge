@@ -39,7 +39,7 @@ func newAPIWithTimeout(t *testing.T, timeout time.Duration) *httptest.Server {
 	t.Helper()
 	srv := api.NewServer(
 		jobs.NewStore(testPool),
-		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope, RequestTimeout: timeout},
+		api.Config{MaxRequestBytes: 256 * 1024, RequestTimeout: timeout},
 		discardLogger(),
 	).WithAuth(auth.NewStore(testPool))
 	s := httptest.NewServer(srv.Handler())

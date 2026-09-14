@@ -397,7 +397,7 @@ func TestOutbox_EndToEndFromHTTPSubmissionToBrokerNotification(t *testing.T) {
 	broker := newBroker(t, "")
 
 	srv := httptest.NewServer(api.NewServer(jobs.NewStore(testPool),
-		api.Config{MaxRequestBytes: 256 * 1024, DevScope: testScope}, discardLogger()).
+		api.Config{MaxRequestBytes: 256 * 1024}, discardLogger()).
 		WithAuth(auth.NewStore(testPool)).Handler())
 	defer srv.Close()
 

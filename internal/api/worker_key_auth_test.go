@@ -324,4 +324,3 @@ func TestHandleRegisterWorkerSession_PersistsThePrincipalsScopeAndKeyID(t *testi
 	require.NotNil(t, gotRegistration.WorkerKeyID)
 	require.Equal(t, principalKeyID, *gotRegistration.WorkerKeyID)
 }
-

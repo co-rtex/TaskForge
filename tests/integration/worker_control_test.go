@@ -347,7 +347,7 @@ func TestClaim_ConcurrentCrossQueueRequestIDReuseReturnsStableConflict(t *testin
 func TestClaim_ExactlyOneWorkerWinsAContestedJob(t *testing.T) {
 	reset(t)
 	server := newAPI(t)
-	client := workerruntime.NewClient(server.URL, &http.Client{Timeout: 10 * time.Second})
+	client := workerruntime.NewClient(server.URL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
 	createJob(t, "contested", "demo.echo", 50, nil)
 
 	const contenders = 24
@@ -769,7 +769,6 @@ func TestWorkerControl_RequestTimeoutCancelsDatabaseLockWait(t *testing.T) {
 	handler := api.NewServer(jobs.NewStore(testPool), api.Config{
 		MaxRequestBytes: 256 * 1024,
 		RequestTimeout:  100 * time.Millisecond,
-		DevScope:        testScope,
 	}, discardLogger()).WithWorkerControl(store).Handler()
 	server := httptest.NewServer(handler)
 	defer server.Close()
