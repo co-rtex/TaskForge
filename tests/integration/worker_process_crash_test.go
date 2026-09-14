@@ -265,7 +265,6 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 
 	shared := map[string]string{
 		"TASKFORGE_DATABASE_URL":             dsn(),
-		"TASKFORGE_DEV_SCOPE":                testScope,
 		"TASKFORGE_BROKER_ENDPOINT":          brokerEndpoint(),
 		"TASKFORGE_BROKER_QUEUE_NAME":        brokerQueue,
 		"TASKFORGE_BROKER_REGION":            "us-east-1",
@@ -316,6 +315,7 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 			"TASKFORGE_WORKER_NAME":             name,
 			"TASKFORGE_WORKER_ADDR":             addr,
 			"TASKFORGE_WORKER_API_URL":          apiURL,
+			"TASKFORGE_WORKER_API_KEY":          currentWorkerKey(),
 			"TASKFORGE_WORKER_QUEUE":            "default",
 			"TASKFORGE_WORKER_GROUP":            "default",
 			"TASKFORGE_WORKER_CONCURRENCY":      "1",

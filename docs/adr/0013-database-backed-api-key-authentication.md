@@ -1,6 +1,10 @@
 # ADR-0013: Database-backed API-key authentication for the public surface
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded by
+  [ADR-0014](0014-worker-control-authentication.md). Its "Worker-control
+  authentication is deferred, and it costs something" section is replaced in
+  full: that deferral is implemented and the limitation it recorded no longer
+  holds. Every other section of this record stands unchanged.
 - **Date:** 2026-09-13
 
 ## Context
@@ -118,6 +122,12 @@ received. The contract says so, and the `503` for that route is the only one in
 this API that tells a caller *not* to repeat the request.
 
 ### Worker-control authentication is deferred, and it costs something
+
+> **Superseded by [ADR-0014](0014-worker-control-authentication.md).** This
+> section is kept verbatim as the record of what M5A actually shipped and
+> why; it no longer describes current behavior. Worker-control authentication
+> is implemented, `TASKFORGE_DEV_SCOPE` is removed, and the stranded-job
+> limitation below is closed.
 
 The internal worker-control surface still runs under `TASKFORGE_DEV_SCOPE`,
 unauthenticated and loopback-bound. `PROJECT_SPEC.md` §6 keeps worker and user

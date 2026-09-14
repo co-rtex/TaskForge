@@ -1,8 +1,8 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M4 are merged into `main`; this document records
-the implemented state through M5A, which is on the
+planned. Milestones M1 through M5A are merged into `main`; this document
+records the implemented state through M5B, which is on the
 `claude/taskforge-bounded-handoff-fwf0im` branch and its draft pull request.
 
 ## Milestone status
@@ -12,7 +12,7 @@ the implemented state through M5A, which is on the
 - **M3 — heartbeat, lease renewal, and reconciliation:** complete.
 - **M4 — retry, timeout, cancellation, DLQ, replay, delayed jobs:** complete.
 - **M5A — database-backed API keys for the public surface:** complete.
-- **M5B — worker/control authentication:** not started.
+- **M5B — worker/control authentication:** complete.
 - **M5C — result storage:** not started.
 - **M5D — CLI and Python SDK:** not started.
 
@@ -24,13 +24,17 @@ one owns.
 Six binaries build and run:
 
 - `taskforge-api` accepts idempotent immediate and delayed job submissions, job
-  reads, cancellation, DLQ listing, replay and operator retry — all of which now
+  reads, cancellation, DLQ listing, replay and operator retry — all of which
   require an API key and take their scope from it — plus the loopback-only key
   management that mints those keys, plus the internal worker-control surface:
-  session registration, heartbeat with cancellation delivery, atomic claims,
-  fenced lease renewal, and the fenced start, success, failure, and
-  cancellation-acknowledgment transitions. The worker-control surface is
-  unauthenticated and still runs under the configured development scope.
+  session registration (which requires a worker key and takes its scope from
+  it), heartbeat with cancellation delivery, atomic claims, fenced lease
+  renewal, and the fenced start, success, failure, and
+  cancellation-acknowledgment transitions. Every worker-control route other
+  than registration takes no credential on the request; it trusts the session
+  identity registration already authenticated and checks that session's
+  worker key has not since been revoked. The loopback-only worker-key
+  management routes mint and revoke those credentials.
 - `taskforge-outbox` publishes durable work-availability events to ElasticMQ.
 - `taskforge-scheduler` promotes due delayed and retry-waiting jobs and
   re-notifies stranded queued work. It holds no broker connection.
@@ -44,8 +48,9 @@ Six binaries build and run:
   or dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0014`. M5A adds one,
-`0014_api_keys.sql`, described below. M4 adds five:
+The schema consists of migrations `0001` through `0015`. M5A adds
+`0014_api_keys.sql` and M5B adds `0015_worker_keys.sql`, both described below.
+M4 adds five:
 
 - `0009_job_lifecycle.sql` — scheduling, cancellation, replay linkage, and
   notification bookkeeping on `jobs`; a persisted execution deadline, a
@@ -587,53 +592,138 @@ deliberately and in contrast to `0011` through `0013`.
 
 **Every request that previously worked unauthenticated now answers `401`.**
 There is no compatibility shim and none should be built. `TASKFORGE_DEV_SCOPE`
-has been documented as a milestone-scoped, temporary mechanism since M1, and
-this is what retiring it from the public surface means.
+has been documented as a milestone-scoped, temporary mechanism since M1;
+M5A narrowed its meaning to the internal worker-control surface, and **M5B
+removes it entirely** — see below.
 
-`TASKFORGE_DEV_SCOPE` itself remains required and validated. Its meaning is
-narrower: it attributes only the internal worker-control surface, which is still
-unauthenticated and still loopback-bound.
+### Known limitation, closed by M5B: a key outside the worker-control scope
+could not execute work
 
-### Known limitation: a key outside the worker-control scope cannot execute work
-
-Worker claims filter on the worker-control scope
-(`internal/workers.Store.Claim`, `WHERE j.scope = $1`), and that surface still
-runs under the single configured development scope. **A job submitted with a key
-minted for any other scope is durable, readable, and cancelable — and will never
-be claimed. It stays `QUEUED`.**
-
-The failure is silent by nature, so it is handled three ways rather than
-described once:
-
-- an end-to-end test pins both halves, with an in-scope job succeeding in the
-  same run so the stranded one's fate is provably a scope boundary and not a
-  broken stack;
-- the creation handler logs a warning at mint time naming the consequence, not
-  just the two scope values, because that is the last moment an operator can act
-  on it;
-- the README and `.env.example` say to mint keys with
-  `scope=$TASKFORGE_DEV_SCOPE` for work that must run.
-
-Multi-tenant keys therefore isolate reads, cancellation, and the DLQ today, and
-not execution. This closes with M5B, not before.
+> **This limitation is closed.** It is kept here, struck through in spirit
+> rather than deleted, because M5B's own section below states plainly what
+> replaced it, and a reader who remembers this paragraph should find the
+> answer next to the question. Worker claims used to filter on a single
+> configured development scope; M5B replaced that with a worker key whose
+> scope can be anything, so a job submitted under any authenticated API-key
+> scope is now claimed by a worker registered under a matching worker key.
+> See "M5B — worker-control authentication" below.
 
 ### API surface and contract
 
 New stable error code: `unauthorized`.
-[api/openapi.yaml](../api/openapi.yaml) is version `0.5.0-m5a`. It defines the
-`ApiKeyAuth` bearer scheme, declares it on all six public operations, documents
-their `401`, and describes the three key-management routes and their schemas.
+[api/openapi.yaml](../api/openapi.yaml) was version `0.5.0-m5a`, now
+`0.6.0-m5b`. It defines the `ApiKeyAuth` bearer scheme, declares it on all six
+public operations, documents their `401`, and describes the three
+key-management routes and their schemas.
 
-Eight new `TestOpenAPI_*` contract tests — seventeen in the package now — read
-the spec and the handlers together, so neither can drift from the other: every public operation must declare exactly
-one `ApiKeyAuth` requirement and document a `401` carrying code `unauthorized`;
-that `401` must name all four cases it refuses to distinguish; the health probes
-must declare no security and can never answer `401`; nothing under
-`/internal/v1` may declare security, and the document must state plainly that
-the surface is unauthenticated and what follows from it; the documented scheme
-must be the one `bearerCredential` actually accepts; only `ApiKeyCreated` may
-carry a credential field, and no schema may expose a property named for a secret
-or a hash.
+Eight new `TestOpenAPI_*` contract tests landed with M5A. Every public
+operation must declare exactly one `ApiKeyAuth` requirement and document a
+`401` carrying code `unauthorized`; that `401` must name all four cases it
+refuses to distinguish; the health probes must declare no security and can
+never answer `401`; the documented scheme must be the one `bearerCredential`
+actually accepts; only `ApiKeyCreated` may carry a credential field, and no
+schema may expose a property named for a secret or a hash. M5B narrows the
+"nothing under `/internal/v1` may declare security" assertion to name its one
+now-authenticated exception — see below.
+
+## M5B — worker-control authentication
+
+### What changed
+
+`PUT /internal/v1/worker-sessions/{worker_session_id}` — the one route that
+registers a new worker process session — now requires
+`Authorization: Bearer <worker key>` and resolves the session's scope from
+that key, exactly as the public surface resolves a request's scope from an
+API key. Every other worker-control route (heartbeat, claim, lease renewal,
+and the fenced start/succeed/fail/cancel transitions) takes no credential on
+the request itself: each resolves the calling session's scope from what
+registration already recorded, and refuses the call if the worker key that
+registered that session has since been revoked. See
+[ADR-0014](adr/0014-worker-control-authentication.md) for the full design and
+its rationale.
+
+`TASKFORGE_DEV_SCOPE` is removed — from `internal/config`, from every binary,
+and from `.env.example`. Nothing reads it anymore: the public surface has
+taken its scope from an API key since M5A, and the internal surface now takes
+its scope from a worker key. `taskforge-worker` gains a new required setting,
+`TASKFORGE_WORKER_API_KEY`, presented on registration.
+
+### The credential
+
+A worker key has the identical `tfk_<lookup>.<secret>` format, storage shape,
+and one-indistinguishable-`401` failure model API keys have had since M5A —
+see that section above, which applies unchanged. It is a genuinely separate
+credential, verified against its own table (`worker_keys`, migration 0015) by
+its own package (`internal/workerauth`), sharing only the pure key-material
+functions (`GenerateMaterial`, `ParseKey`, `HashSecret`, `VerifySecret`) that
+know about neither table. A worker key can never authenticate where an API
+key is checked, or the reverse.
+
+### Two tiers: a credential once, a session forever after
+
+Registration is the only worker-control call that verifies a secret. Every
+later call from that session is authenticated by the session identity itself
+(a worker id and a session id, neither forgeable, exactly as every
+worker-control call has trusted since M2) plus a cheap, secret-free check —
+`internal/workers.Store.SessionScope` reads the scope and worker-key id a
+session was registered under, and `internal/workerauth.Store.IsRevoked`
+checks whether that key is still live. Neither `internal/workers` nor
+`internal/workerauth` depends on the other; `internal/api.Server.resolveWorkerControlScope`
+is the only place their answers meet, and none of `internal/workers.Store`'s
+eight original fenced methods changed signature or locking behavior to make
+this possible.
+
+**Revoking a worker key refuses the next call any session it registered
+makes.** It does not force-expire a lease that session currently holds and
+does not touch reconciliation: a cut-off session goes stale and its lease
+expires through the exact same path a crashed worker's already does. A
+request already in flight when revocation happens is not interrupted — the
+identical in-flight boundary API-key revocation already has.
+
+### Key management
+
+`POST /internal/v1/worker-keys`, `GET /internal/v1/worker-keys`, and
+`POST /internal/v1/worker-keys/{key_id}/revoke` mirror the M5A API-key admin
+routes exactly: loopback-only, themselves unauthenticated (for the identical
+bootstrapping reason — each surface is how its own credential type comes into
+existence), non-idempotent creation with no `Idempotency-Key`, and idempotent
+revocation reporting the original instant on a repeat.
+
+### Migration 0015
+
+`worker_keys` mirrors `api_keys` column for column: id, scope, operator name,
+a `UNIQUE` lookup prefix, the secret digest, a creation instant from
+PostgreSQL server time, and a nullable revocation instant. `worker_sessions`
+gains a nullable `worker_key_id`, populated at registration and left `NULL`
+— never fabricated — for any session registered before this migration or
+through a path that never presented a worker key; such a session is simply
+never treated as revoked, which is the same posture every session had before
+this credential existed. `worker_keys` starts empty on every upgrade path,
+for the identical reason `api_keys` did under M5A: no earlier milestone ever
+persisted this credential.
+
+### Breaking change
+
+**`PUT /internal/v1/worker-sessions/{worker_session_id}` now requires a
+worker key.** There is no compatibility shim. Every other worker-control
+route's request shape is unchanged — the authentication they gained is
+carried entirely by the session, not by a new required field or header.
+
+### API surface and contract
+
+[api/openapi.yaml](../api/openapi.yaml) is now `0.6.0-m5b`. It adds a
+distinct `WorkerKeyAuth` security scheme — never `ApiKeyAuth` reused, because
+the two guard different trust boundaries — declares it on the one route that
+requires it, documents that route's `401`, and describes the three new
+worker-key routes and their schemas. The Authentication section's "internal
+surface" prose now names registration as the one deliberate exception to
+"nothing under `/internal/v1` is authenticated," rather than stating the rule
+without exception as it did through M5A.
+
+`internal/api`'s `TestOpenAPI_*` contract tests gained coverage for the new
+scheme and routes, plus an explicit carve-out in the test that walks the
+internal surface asserting no security: it now skips exactly the one
+authenticated operation, by name, rather than the assertion silently loosening.
 
 ## Verification
 
@@ -730,6 +820,97 @@ wrapper from either `/v1/dlq` or `/v1/jobs` now fails.
 A sixth mutation checked the limitation above rather than a guard: minting the
 "stranded" key in the executable scope makes the scope-boundary test fail, which
 is what proves that test is observing the boundary and not a coincidence.
+
+### M5B gates
+
+Every gate below was run on the branch head, on 2026-09-14, against PostgreSQL 16
+and ElasticMQ started by `make up`. Durations are wall-clock from that run.
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `gofmt -l .` after `make fmt` | PASS | empty — no tracked Go file rewritten |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make build` | PASS | six binaries in `./bin` |
+| `make test-unit` | PASS | every package `ok`, including `internal/workerauth` |
+| `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 |
+| `docker compose config --quiet` | PASS | exit 0 |
+| `make migrate` on a database from `make down && make up` | PASS | `"migrations complete" applied=15`, `0015_worker_keys.sql` last |
+| `make test-integration` | PASS | `ok .../tests/integration 73.636s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 83.810s` |
+
+Exact commands and complete output are recorded in the pull request.
+
+### M5B coverage
+
+`internal/workerauth` carries 10 top-level unit tests, mirroring
+`internal/auth`'s structure exactly. `internal/api` grew from 59 to 69
+top-level tests (the ten new ones drive `requireWorkerKey` and
+`resolveWorkerControlScope` directly, against fakes, with no database). The
+integration package grew from 191 to 204 top-level tests: twelve new in
+`worker_keys_test.go` (schema, store, concurrency, and the two headline
+end-to-end tests), plus revisions to existing worker-control and API-key
+tests to thread a worker key through the real HTTP stack.
+
+**Unit.** `requireWorkerKey` is proven to refuse no credential, an unknown or
+revoked worker key, and a deadline during verification (`503`, not `401`) —
+the identical shape `requireAPIKey`'s own tests already established.
+`resolveWorkerControlScope` is proven to refuse a non-register call whose
+session's worker key has since been revoked, succeed for a live one, fail
+closed when no worker-key store exists to check a real key id, never treat a
+`nil` worker-key id as revoked, and propagate an unknown session as the
+existing `ErrSessionUnavailable` conflict rather than a new error shape.
+
+**Integration.** `TestE2E_AWorkerRegisteredUnderAMatchingWorkerKeyExecutesTheJob`
+is the headline test: a job submitted under an API key for one scope is
+claimed and executed by a worker registered under a worker key for that same
+scope — the real, closed form of the limitation M5A recorded.
+`TestE2E_RevokingAWorkerKeyRefusesTheNextCallItsSessionsMake` drives the
+confirmed Option B semantics over real HTTP: a live session heartbeats fine,
+revoking its worker key makes the *next* heartbeat `401` and every one after,
+and the session's own row stays `HEALTHY` throughout — proving revocation is
+discovered on the next call, not enforced by mutating the session.
+`TestWorkerKeyStore_IsDistinctFromAPIKeyStore` proves the two credential
+stores actually refuse each other's keys, not merely that they are
+implemented as different Go types. Schema constraints, prefix uniqueness
+across revocation, and concurrent create/revoke/authenticate all mirror the
+M5A API-key tests' structure and pass under the race detector.
+
+The upgrade rehearsal seeds real M1–M4 data on a database migrated through
+`0010`, applies `0014` and `0015` together through the real runner (both are
+now pending from an M4 baseline), and checks: `worker_keys` exists and starts
+empty; every pre-existing `worker_sessions` row gets a `NULL worker_key_id`
+and no other column changes, checked by an explicit content digest restricted
+to the columns that existed before `0015`; a second run applies nothing; and
+both `0014` and `0015` are recorded with the checksum of their own files.
+`TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012` — which
+deliberately runs current control-plane code against a database frozen at
+migration `0010` to reproduce a real historical upgrade boundary — needed
+`0014` and `0015` applied immediately after reaching `0010`, since
+`workers.Store.Register`'s INSERT now names `worker_key_id` unconditionally;
+neither migration touches the notification-history tables that test is
+actually about, so this changes nothing the test asserts.
+
+**Mutation evidence.** Two guards were confirmed by deliberately breaking
+them and watching the corresponding test fail, then reverting. Removing
+`requireWorkerKey` from the registration route's mux registration made
+`TestHandleRegisterWorkerSession_PersistsThePrincipalsScopeAndKeyID` fail
+(expected `200`, got `401`) — caught by the handler's own defensive
+`workerPrincipalFrom` check, the same defense-in-depth pattern M5A's
+`scopeOrUnauthorized` uses, so this also proves the second line of defense
+works. Removing the `IsRevoked` check from `resolveWorkerControlScope` made
+`TestResolveWorkerControlScope_RefusesANonRegisterCallWhoseWorkerKeyWasRevoked`
+fail (expected `401`, got `200`) — the guard that makes Option B revocation
+real, not merely documented.
+
+A third finding came from `make test-race` itself, not from a deliberate
+mutation: the first version of the headline end-to-end test started a second,
+wrong-scope worker sharing the stack's broker queue to demonstrate isolation
+inline. Under the race detector it occasionally received the job's broker
+notification, found nothing it was eligible to claim, and held the message
+invisible for the queue's visibility timeout — starving the worker that
+could actually claim it, and timing out at 30s. Removed; isolation is already
+proven elsewhere, and three repeated `-race` runs of the test as fixed
+complete in ~0.15s each.
 
 ### M4 gates
 
@@ -1077,8 +1258,8 @@ Unchanged from M3. The same three jobs —
 `Migrations and integration tests`, and `Race detector (unit and integration)` —
 run on GitHub-hosted Linux runners for every pull request targeting `main` and
 every push to `main`. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
-Each milestone's run is recorded in its own pull request; the M5A run is
-recorded in the M5A pull request.
+Each milestone's run is recorded in its own pull request; the M5B run is
+recorded in the M5B pull request.
 
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure.
@@ -1087,17 +1268,16 @@ exercised by a real hosted failure.
 
 - Result bodies and richer attempt-history APIs are M5C.
   `GET /v1/jobs/{job_id}` returns lifecycle fields, not attempt history.
-- **Authentication of the internal worker-control surface is M5B.** Those routes
-  are still unauthenticated, still attributed to one configured development
-  scope, and every service still binds to loopback. Key management is on that
-  same unauthenticated surface, so anyone who can reach loopback can mint a
-  credential for any scope.
+- Worker registration authenticates, but every other worker-control route and
+  both key-management surfaces (`/internal/v1/api-keys` and
+  `/internal/v1/worker-keys`) remain unauthenticated by design, and every
+  service still binds to loopback. Anyone who can reach loopback can still
+  mint a credential of either kind for any scope.
 - Authorization beyond scope is post-V1. A key carries exactly one scope and no
   permission set; there is no RBAC, no per-route permission, and no rate
   limiting.
-- Key rotation and expiry are not implemented. A key lives until it is revoked.
-- A job submitted under a scope no worker serves stays `QUEUED` — see the M5A
-  limitation above. This closes with M5B.
+- Key rotation and expiry are not implemented for either credential type. A
+  key lives until it is revoked.
 - The CLI, the Python SDK, and the operator dashboard are M5D and M6. The DLQ has
   a listing endpoint but no filtering beyond scope and no sorting beyond
   newest-first; operator search and bulk replay belong with the dashboard.
@@ -1141,13 +1321,13 @@ repository README.
 
 ## Next objective
 
-M5B: worker/control authentication. The public surface now authenticates, but
-the internal worker-control surface — including the routes that mint public
-credentials — does not, and `TASKFORGE_DEV_SCOPE` still decides which jobs a
-worker may claim. Until a worker can present its own credential for a scope, a
-key minted for any scope other than the development one produces jobs that never
-run, and key issuance remains reachable by anyone with loopback access.
+M5C: result storage. Both the public surface and worker registration now
+authenticate with real, scoped, revocable credentials, and a job submitted
+under any scope is claimed and executed by a worker registered for that same
+scope — M5A's recorded limitation is closed. What remains before results:
+`GET /v1/jobs/{job_id}` returns lifecycle fields only, with no result body and
+no richer attempt-history API.
 
-M5C (result storage) and M5D (the CLI and Python SDK) follow, in that order, so
-that result retrieval is authenticated on arrival rather than retrofitted onto
-an endpoint that serves job output. See [ROADMAP.md](ROADMAP.md).
+M5D (the CLI and Python SDK) follows, so that result retrieval is
+authenticated on arrival rather than retrofitted onto an endpoint that serves
+job output. See [ROADMAP.md](ROADMAP.md).

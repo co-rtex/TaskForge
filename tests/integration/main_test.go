@@ -34,6 +34,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
+	"github.com/co-rtex/TaskForge/internal/workerauth"
 )
 
 const (
@@ -86,6 +87,12 @@ func TestMain(m *testing.M) {
 	// credential before any test runs.
 	if err := mintSuiteAPIKey(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "could not mint the suite's api key: %v\n", err)
+		os.Exit(1)
+	}
+	// Worker registration authenticates from M5B onward, and this suite's
+	// e2eStack helpers register real workers under this key by default.
+	if err := mintSuiteWorkerKey(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "could not mint the suite's worker key: %v\n", err)
 		os.Exit(1)
 	}
 	http.DefaultClient.Transport = authorizingTransport{}
@@ -148,24 +155,75 @@ func currentAPIKey() string {
 	return suiteAPIKey
 }
 
+// --- worker-key credentials -------------------------------------------------
+//
+// Since M5B, PUT /internal/v1/worker-sessions/{id} authenticates with a worker
+// key -- see docs/adr/0014-worker-control-authentication.md. e2eStack's default
+// worker (registered by (*e2eStack).startWorker) presents this suite-wide key,
+// minted for testScope, so the ordinary case needs no test to think about
+// worker keys at all. Tests about the credential itself, or about a worker
+// registered for a DIFFERENT scope, mint their own with mintWorkerKey.
+
+var (
+	suiteWorkerKeyMu sync.RWMutex
+	suiteWorkerKey   string
+)
+
+// mintSuiteWorkerKey creates the worker credential this suite's default
+// worker presents, for testScope.
+func mintSuiteWorkerKey(ctx context.Context) error {
+	created, err := workerauth.NewStore(testPool).Create(ctx, testScope, "integration-suite-worker")
+	if err != nil {
+		return err
+	}
+	suiteWorkerKeyMu.Lock()
+	defer suiteWorkerKeyMu.Unlock()
+	suiteWorkerKey = created.Raw
+	return nil
+}
+
+// currentWorkerKey returns the worker credential the suite's default worker is
+// presenting right now. It changes whenever reset truncates worker_keys and
+// mints a new one.
+func currentWorkerKey() string {
+	suiteWorkerKeyMu.RLock()
+	defer suiteWorkerKeyMu.RUnlock()
+	return suiteWorkerKey
+}
+
 // authorizingTransport presents the suite's credential on public requests that
-// do not already carry one.
+// do not already carry one, and the suite's worker key on the one internal
+// route that authenticates.
 //
 // It never overwrites an Authorization header a test set itself, which is what
 // lets a test present a second scope's key, a revoked key, or no key at all and
-// observe the real answer. It also leaves /internal/v1 alone: the worker-control
-// surface is deliberately unauthenticated in this milestone, and a transport
-// that credentialed it would hide a regression that started requiring one.
+// observe the real answer. Every /internal/v1 route other than worker
+// registration is left alone: the rest of that surface is deliberately
+// unauthenticated, and a transport that credentialed it would hide a
+// regression that started requiring one.
 type authorizingTransport struct{}
 
 func (authorizingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	if strings.HasPrefix(request.URL.Path, "/v1/") && request.Header.Get("Authorization") == "" {
+	switch {
+	case strings.HasPrefix(request.URL.Path, "/v1/") && request.Header.Get("Authorization") == "":
 		// Cloned rather than mutated: a RoundTripper must not modify the request
 		// it is given.
 		request = request.Clone(request.Context())
 		request.Header.Set("Authorization", "Bearer "+currentAPIKey())
+	case isWorkerRegistrationRequest(request) && request.Header.Get("Authorization") == "":
+		request = request.Clone(request.Context())
+		request.Header.Set("Authorization", "Bearer "+currentWorkerKey())
 	}
 	return realTransport.RoundTrip(request)
+}
+
+// isWorkerRegistrationRequest identifies PUT /internal/v1/worker-sessions/{id}
+// specifically, not its /heartbeat sub-route: registration is the one
+// worker-control call that authenticates.
+func isWorkerRegistrationRequest(r *http.Request) bool {
+	return r.Method == http.MethodPut &&
+		strings.HasPrefix(r.URL.Path, "/internal/v1/worker-sessions/") &&
+		!strings.HasSuffix(r.URL.Path, "/heartbeat")
 }
 
 // realTransport is the transport underneath, captured at package initialization
@@ -229,17 +287,18 @@ func reset(t *testing.T) {
 	_, err := testPool.Exec(ctx, `
 		TRUNCATE dlq_replays, dlq_entries, leases, job_attempts,
 		         worker_sessions, workers, idempotency_records,
-		         outbox_events, jobs, queues, api_keys CASCADE`)
+		         outbox_events, jobs, queues, api_keys, worker_keys CASCADE`)
 	require.NoError(t, err)
 	_, err = testPool.Exec(ctx, `
 		INSERT INTO queues (name, worker_group, max_concurrency)
 		VALUES ('default', 'default', 100)`)
 	require.NoError(t, err)
 
-	// api_keys was just truncated, so the credential the suite was presenting no
-	// longer exists. Minting here rather than lazily keeps every test that calls
-	// reset holding a live key for testScope.
+	// api_keys and worker_keys were just truncated, so the credentials the
+	// suite was presenting no longer exist. Minting here rather than lazily
+	// keeps every test that calls reset holding live keys for testScope.
 	require.NoError(t, mintSuiteAPIKey(ctx))
+	require.NoError(t, mintSuiteWorkerKey(ctx))
 
 	drainBroker(t, newBroker(t, ""))
 }

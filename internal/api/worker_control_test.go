@@ -20,14 +20,15 @@ import (
 )
 
 type fakeWorkerControl struct {
-	register  func(context.Context, string, workers.Registration) (workers.Session, error)
-	heartbeat func(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
-	claim     func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
-	renew     func(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
-	start     func(context.Context, string, workers.Fence) (workers.StartResult, error)
-	succeed   func(context.Context, string, workers.Fence) error
-	fail      func(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
-	cancelAck func(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
+	register     func(context.Context, string, workers.Registration) (workers.Session, error)
+	heartbeat    func(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
+	claim        func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
+	renew        func(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
+	start        func(context.Context, string, workers.Fence) (workers.StartResult, error)
+	succeed      func(context.Context, string, workers.Fence) error
+	fail         func(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
+	cancelAck    func(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
+	sessionScope func(context.Context, uuid.UUID) (string, *uuid.UUID, error)
 }
 
 func (f *fakeWorkerControl) Register(ctx context.Context, scope string, req workers.Registration) (workers.Session, error) {
@@ -54,11 +55,22 @@ func (f *fakeWorkerControl) Fail(ctx context.Context, scope string, report worke
 func (f *fakeWorkerControl) AcknowledgeCancellation(ctx context.Context, scope string, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
 	return f.cancelAck(ctx, scope, ack)
 }
+func (f *fakeWorkerControl) SessionScope(ctx context.Context, sessionID uuid.UUID) (string, *uuid.UUID, error) {
+	if f.sessionScope == nil {
+		// A session registered with no worker key on record: resolves cleanly
+		// to a fixed scope, and is never treated as revoked, so tests that do
+		// not care about authentication can drive Claim/Start/etc. directly.
+		return "test-scope", nil, nil
+	}
+	return f.sessionScope(ctx, sessionID)
+}
 
 func newWorkerControlHandler(control WorkerControl) http.Handler {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	return NewServer(nil, Config{MaxRequestBytes: 2048, DevScope: "test"}, log).
-		WithWorkerControl(control).Handler()
+	return NewServer(nil, Config{MaxRequestBytes: 2048}, log).
+		WithWorkerControl(control).
+		WithWorkerAuth(acceptingWorkerKeys("test-scope")).
+		Handler()
 }
 
 func TestWorkerControl_ClaimResponseCarriesAckDecision(t *testing.T) {
@@ -95,8 +107,8 @@ func TestWorkerControl_RejectsUnknownFieldsAndBadIdentifiers(t *testing.T) {
 
 	t.Run("bad session id", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPut, "/internal/v1/worker-sessions/not-a-uuid",
-			strings.NewReader(`{}`))
+		request := authorizeWorker(httptest.NewRequest(http.MethodPut, "/internal/v1/worker-sessions/not-a-uuid",
+			strings.NewReader(`{}`)))
 		handler.ServeHTTP(recorder, request)
 		require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
 		require.Equal(t, CodeValidationFailed, decodeError(t, recorder).Error.Code)

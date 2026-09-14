@@ -74,13 +74,25 @@ func TestOpenAPI_HealthProbesAreNotAuthenticated(t *testing.T) {
 	}
 }
 
+// workerKeyAuthenticatedOperation is the one route under /internal/v1 that
+// requires a credential as of M5B. Every test in this file that walks the
+// internal surface expecting it unauthenticated has to carve this one out
+// explicitly, rather than the exception silently passing because the walk
+// happened to skip it.
+var workerKeyAuthenticatedOperation = struct{ method, path string }{
+	"put", "/internal/v1/worker-sessions/{worker_session_id}",
+}
+
 // TestOpenAPI_TheInternalSurfaceIsDocumentedAsUnauthenticated pins the trust
-// boundary this milestone deliberately did NOT move.
+// boundary this milestone deliberately did NOT move for most of the surface,
+// and DID move for exactly one route.
 //
-// Worker control and key management are both unauthenticated and loopback-only.
-// That is a real exposure, and the document has to say so plainly: a reader who
-// assumed `/internal/v1` was authenticated because `/v1` is would put this
-// service behind a public load balancer.
+// Key management and every worker-control route except registration are still
+// unauthenticated and loopback-only. That is a real exposure, and the document
+// has to say so plainly: a reader who assumed `/internal/v1` was authenticated
+// because `/v1` is would put this service behind a public load balancer.
+// Registration is the one deliberate exception, and it has to be documented as
+// one rather than silently exempted from this test.
 func TestOpenAPI_TheInternalSurfaceIsDocumentedAsUnauthenticated(t *testing.T) {
 	doc := loadOpenAPI(t)
 
@@ -89,6 +101,9 @@ func TestOpenAPI_TheInternalSurfaceIsDocumentedAsUnauthenticated(t *testing.T) {
 			continue
 		}
 		for method, operation := range operations {
+			if method == workerKeyAuthenticatedOperation.method && path == workerKeyAuthenticatedOperation.path {
+				continue
+			}
 			require.Emptyf(t, operation.Security,
 				"%s %s is not authenticated; declaring security would misdescribe it", method, path)
 			_, has401 := operation.Responses["401"]
@@ -98,11 +113,34 @@ func TestOpenAPI_TheInternalSurfaceIsDocumentedAsUnauthenticated(t *testing.T) {
 
 	document := flatten(readOpenAPI(t))
 	require.Contains(t, document, "not** authenticated",
-		"the document must state that the internal surface is unauthenticated")
+		"the document must state that most of the internal surface is unauthenticated")
 	require.Contains(t, document, "anyone who can reach loopback can therefore mint a credential",
 		"the document must state the actual consequence, not just the fact")
 	require.Contains(t, document, "may be exposed off loopback",
 		"the document must say what follows from it")
+}
+
+// TestOpenAPI_RegistrationIsTheDocumentedExceptionToTheInternalSurface proves
+// the one authenticated internal route is authenticated in the document the
+// exact way the handler actually authenticates it.
+func TestOpenAPI_RegistrationIsTheDocumentedExceptionToTheInternalSurface(t *testing.T) {
+	doc := loadOpenAPI(t)
+
+	operation, ok := doc.Paths[workerKeyAuthenticatedOperation.path][workerKeyAuthenticatedOperation.method]
+	require.True(t, ok)
+
+	require.Lenf(t, operation.Security, 1, "registration must declare exactly one security requirement")
+	scopes, named := operation.Security[0]["WorkerKeyAuth"]
+	require.True(t, named, "registration must require WorkerKeyAuth, not ApiKeyAuth or nothing")
+	require.Empty(t, scopes)
+
+	response, documented := operation.Responses["401"]
+	require.True(t, documented, "registration requires a credential but documents no 401")
+	require.Equal(t, CodeUnauthorized, response.Content["application/json"].Example.Error.Code)
+
+	document := flatten(readOpenAPI(t))
+	require.Contains(t, document, "worker-key authentication",
+		"the document must name the section a reader finds the model in")
 }
 
 // The security scheme must be the one the handler actually implements.
@@ -124,6 +162,19 @@ func TestOpenAPI_SecuritySchemeMatchesTheImplementedHeader(t *testing.T) {
 	require.Equal(t, strings.ToLower(bearerScheme), scheme.Scheme,
 		"the documented scheme must be the one bearerCredential accepts")
 	require.Contains(t, strings.ToLower(scheme.Description), "authorization: bearer")
+
+	// WorkerKeyAuth is a second, distinct scheme -- not ApiKeyAuth reused --
+	// because requireWorkerKey authenticates against a different credential
+	// store than requireAPIKey does, even though both parse the header with
+	// the identical bearerCredential helper.
+	workerScheme, ok := spec.Components.SecuritySchemes["WorkerKeyAuth"]
+	require.True(t, ok, "the document must define a distinct WorkerKeyAuth scheme")
+	require.Equal(t, "http", workerScheme.Type)
+	require.Equal(t, strings.ToLower(bearerScheme), workerScheme.Scheme,
+		"the documented scheme must be the one bearerCredential accepts")
+	require.Contains(t, strings.ToLower(workerScheme.Description), "authorization: bearer")
+	require.NotEqual(t, scheme.Description, workerScheme.Description,
+		"the two schemes guard different trust boundaries and must not share one description")
 }
 
 // TestOpenAPI_KeyCreationDocumentsThatItIsNotIdempotent guards the single
@@ -202,8 +253,17 @@ func TestOpenAPI_OnlyCreationEverReturnsACredential(t *testing.T) {
 	require.True(t, carriesKey, "creation is where the credential is returned")
 	require.Contains(t, flatten(created.Properties["key"].Description), "exactly once")
 
+	// A worker key is a second, distinct credential with the identical
+	// one-time-return property -- not a place this guard should carve an
+	// exception for, but a second instance of the same rule.
+	workerCreated, ok := spec.Components.Schemas["WorkerKeyCreated"]
+	require.True(t, ok)
+	_, workerCarriesKey := workerCreated.Properties["key"]
+	require.True(t, workerCarriesKey, "worker key creation is where that credential is returned")
+	require.Contains(t, flatten(workerCreated.Properties["key"].Description), "exactly once")
+
 	for name, schema := range spec.Components.Schemas {
-		if name == "ApiKeyCreated" {
+		if name == "ApiKeyCreated" || name == "WorkerKeyCreated" {
 			continue
 		}
 		for property := range schema.Properties {

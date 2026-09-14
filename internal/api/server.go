@@ -26,14 +26,6 @@ import (
 type Config struct {
 	MaxRequestBytes int64
 	RequestTimeout  time.Duration
-	// DevScope attributes every INTERNAL worker-control request to one scope.
-	//
-	// Since M5A it no longer reaches the public surface at all: those routes
-	// resolve their scope from the authenticated API key. Worker/control scopes
-	// are separable from user scopes (docs/PROJECT_SPEC.md section 6) and are a
-	// later milestone, so this remains required and the internal routes remain
-	// loopback-only. See internal/config.Config.DevScope.
-	DevScope string
 }
 
 // ReadinessCheck reports whether a dependency is usable. It must honor the
@@ -45,12 +37,13 @@ type ReadinessCheck struct {
 
 // Server wires handlers to their dependencies.
 type Server struct {
-	jobs    *jobs.Store
-	control WorkerControl
-	keys    APIKeys
-	cfg     Config
-	log     *slog.Logger
-	checks  []ReadinessCheck
+	jobs       *jobs.Store
+	control    WorkerControl
+	keys       APIKeys
+	workerKeys WorkerKeys
+	cfg        Config
+	log        *slog.Logger
+	checks     []ReadinessCheck
 }
 
 // NewServer builds a Server.
@@ -83,6 +76,24 @@ func (s *Server) WithAuth(keys APIKeys) *Server {
 	return s
 }
 
+// WithWorkerAuth enables worker-key authentication on registration
+// (PUT /internal/v1/worker-sessions/{id}) and the loopback key-management
+// routes that mint credentials for it.
+//
+// It is independent of WithWorkerControl: that continues to gate whether the
+// eight fenced worker-control routes exist at all, exactly as it always has,
+// while this gates only whether registration among them can verify a
+// credential and whether the three worker-key admin routes are registered. A
+// production binary calls both. Omitting this one does not open registration
+// -- it closes it, for the identical reason omitting WithAuth closes the
+// public surface: a server that can authenticate nobody has no authenticated
+// caller to serve, and the worker-key admin routes are not registered at
+// all. There is no test-only bypass for this either.
+func (s *Server) WithWorkerAuth(keys WorkerKeys) *Server {
+	s.workerKeys = keys
+	return s
+}
+
 // Handler returns the fully wrapped HTTP handler.
 //
 // Order matters: request id is outermost so every later layer can log it, and
@@ -112,8 +123,18 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /internal/v1/api-keys", s.handleListAPIKeys)
 		mux.HandleFunc("POST /internal/v1/api-keys/{key_id}/revoke", s.handleRevokeAPIKey)
 	}
+	if s.workerKeys != nil {
+		mux.HandleFunc("POST /internal/v1/worker-keys", s.handleCreateWorkerKey)
+		mux.HandleFunc("GET /internal/v1/worker-keys", s.handleListWorkerKeys)
+		mux.HandleFunc("POST /internal/v1/worker-keys/{key_id}/revoke", s.handleRevokeWorkerKey)
+	}
 	if s.control != nil {
-		mux.HandleFunc("PUT /internal/v1/worker-sessions/{worker_session_id}", s.handleRegisterWorkerSession)
+		// Registration alone is wrapped in requireWorkerKey: every other
+		// worker-control route below resolves its scope from the session
+		// identity the request already carries rather than a fresh credential.
+		// See requireWorkerKey's doc comment for why that asymmetry is
+		// deliberate.
+		mux.HandleFunc("PUT /internal/v1/worker-sessions/{worker_session_id}", s.requireWorkerKey(s.handleRegisterWorkerSession))
 		mux.HandleFunc("POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.handleHeartbeat)
 		mux.HandleFunc("POST /internal/v1/claims", s.handleClaim)
 		mux.HandleFunc("POST /internal/v1/leases/{lease_id}/renew", s.handleRenewLease)
@@ -144,6 +165,10 @@ func (s *Server) Handler() http.Handler {
 		// not already have.
 		mux.HandleFunc("/internal/v1/api-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
 		mux.HandleFunc("/internal/v1/api-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
+	}
+	if s.workerKeys != nil {
+		mux.HandleFunc("/internal/v1/worker-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
+		mux.HandleFunc("/internal/v1/worker-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
 	}
 	if s.control != nil {
 		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))

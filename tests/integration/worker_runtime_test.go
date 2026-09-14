@@ -53,7 +53,7 @@ func TestWorker_EndToEndAndDuplicateBrokerDeliveryCreateOneAttempt(t *testing.T)
 	require.NoError(t, broker.Publish(context.Background(), bodies[0]))
 
 	observedBroker := &countingBroker{Broker: broker}
-	control := workerruntime.NewClient(server.URL, &http.Client{Timeout: 10 * time.Second})
+	control := workerruntime.NewClient(server.URL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
 	registry := workerruntime.NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", workerruntime.DemoEcho{}))
 	runner := workerruntime.NewRunner(control, observedBroker, registry, workerruntime.RunnerConfig{

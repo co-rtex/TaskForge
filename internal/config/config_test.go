@@ -18,11 +18,18 @@ func baseConfig() Config {
 	return c
 }
 
+// setTestWorkerAPIKey sets a placeholder worker key so LoadWorker's own
+// Validate call succeeds. It carries no meaning beyond "present": tests that
+// exercise TASKFORGE_WORKER_API_KEY itself set or clear it explicitly.
+func setTestWorkerAPIKey(t *testing.T) {
+	t.Helper()
+	t.Setenv("TASKFORGE_WORKER_API_KEY", "test-worker-key")
+}
+
 func TestLoad_DefaultsAreValid(t *testing.T) {
 	c, err := Load()
 	require.NoError(t, err)
 	require.NoError(t, c.Validate())
-	require.Equal(t, "local-dev", c.DevScope)
 	require.Positive(t, c.MaxRequestBytes)
 	require.Equal(t, 25*time.Second, c.APIRequestTimeout)
 	require.Equal(t, 30*time.Second, c.LeaseDuration)
@@ -58,7 +65,6 @@ func TestValidate_RejectsBadConfiguration(t *testing.T) {
 	tests := map[string]func(*Config){
 		"empty database url": func(c *Config) { c.DatabaseURL = "" },
 		"empty api addr":     func(c *Config) { c.APIAddr = "" },
-		"empty dev scope":    func(c *Config) { c.DevScope = "" },
 		"empty queue name":   func(c *Config) { c.BrokerQueueName = "" },
 		"tiny body limit":    func(c *Config) { c.MaxRequestBytes = 10 },
 		"tiny api timeout":   func(c *Config) { c.APIRequestTimeout = time.Millisecond },
@@ -115,6 +121,7 @@ func TestValidate_RejectsBadConfiguration(t *testing.T) {
 }
 
 func TestLoadWorker_DefaultsAreValid(t *testing.T) {
+	setTestWorkerAPIKey(t)
 	c, err := LoadWorker()
 	require.NoError(t, err)
 	require.NoError(t, c.Validate())
@@ -123,13 +130,22 @@ func TestLoadWorker_DefaultsAreValid(t *testing.T) {
 }
 
 func TestLoadWorker_CanonicalizesCapabilities(t *testing.T) {
+	setTestWorkerAPIKey(t)
 	t.Setenv("TASKFORGE_WORKER_CAPABILITIES", "gpu,cpu,gpu")
 	c, err := LoadWorker()
 	require.NoError(t, err)
 	require.Equal(t, []string{"cpu", "gpu"}, c.Capabilities)
 }
 
+func TestLoadWorker_RequiresAWorkerAPIKey(t *testing.T) {
+	t.Setenv("TASKFORGE_WORKER_API_KEY", "")
+	_, err := LoadWorker()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TASKFORGE_WORKER_API_KEY")
+}
+
 func TestWorkerConfig_ReportsEveryProblem(t *testing.T) {
+	setTestWorkerAPIKey(t)
 	c, err := LoadWorker()
 	require.NoError(t, err)
 	c.APIBaseURL = "not-a-url"
@@ -162,6 +178,7 @@ func TestWorkerConfig_PollWaitMustBeWholeSecondsWithinTheBrokerBound(t *testing.
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
+			setTestWorkerAPIKey(t)
 			c, err := LoadWorker()
 			require.NoError(t, err)
 			c.PollWait = test.pollWait
@@ -178,6 +195,7 @@ func TestWorkerConfig_PollWaitMustBeWholeSecondsWithinTheBrokerBound(t *testing.
 }
 
 func TestWorkerConfig_RejectsUnauthenticatedNonLoopbackEndpoints(t *testing.T) {
+	setTestWorkerAPIKey(t)
 	c, err := LoadWorker()
 	require.NoError(t, err)
 	c.APIBaseURL = "http://192.0.2.10:8080"
@@ -245,6 +263,7 @@ func TestLoadDotEnv_MissingFileIsNotAnError(t *testing.T) {
 // covers the gap neither Validate can see on its own: the transport timeout is a
 // worker setting, while the windows it must fit inside are server-owned.
 func TestValidateWorkerTimings_RejectsATransportTimeoutThatOutlivesASafetyWindow(t *testing.T) {
+	setTestWorkerAPIKey(t)
 	shared, err := Load()
 	require.NoError(t, err)
 	worker, err := LoadWorker()

@@ -132,7 +132,7 @@ func TestAuth_EveryPublicRouteConsultsTheCredentialStore(t *testing.T) {
 	for _, route := range publicRoutes {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
 			var consulted int
-			handler := NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "test"}, discardLogger()).
+			handler := NewServer(nil, Config{MaxRequestBytes: 1024}, discardLogger()).
 				WithAuth(&fakeKeys{
 					authenticate: func(_ context.Context, raw string) (auth.Principal, error) {
 						consulted++
@@ -195,7 +195,7 @@ func TestAuth_HappensBeforeTheRequestBodyIsLookedAt(t *testing.T) {
 // binary that forgets to wire a credential store serves a closed API, not an
 // open one, so the mistake is a visible outage rather than a silent breach.
 func TestAuth_AServerWithNoCredentialStoreRefusesEverything(t *testing.T) {
-	handler := NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "test"}, discardLogger()).Handler()
+	handler := NewServer(nil, Config{MaxRequestBytes: 1024}, discardLogger()).Handler()
 
 	for _, route := range publicRoutes {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
@@ -351,13 +351,13 @@ func TestBearerCredential_RejectsWhatIsNotABearerCredential(t *testing.T) {
 	}
 }
 
-// An authenticated request must reach its handler carrying the key's scope, not
-// the process's configured development scope. This is the substitution the whole
-// milestone exists to make.
-func TestAuth_AnAuthenticatedRequestCarriesTheKeyScopeNotTheDevScope(t *testing.T) {
+// An authenticated request must reach its handler carrying the key's own
+// scope, read from the credential store's answer rather than any
+// process-wide default.
+func TestAuth_AnAuthenticatedRequestCarriesTheKeyScope(t *testing.T) {
 	var seen string
 	var found bool
-	server := NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "the-dev-scope"}, discardLogger()).
+	server := NewServer(nil, Config{MaxRequestBytes: 1024}, discardLogger()).
 		WithAuth(acceptingKeys("scope-from-the-key"))
 
 	handler := server.requireAPIKey(func(_ http.ResponseWriter, r *http.Request) {
@@ -369,7 +369,6 @@ func TestAuth_AnAuthenticatedRequestCarriesTheKeyScopeNotTheDevScope(t *testing.
 
 	require.True(t, found, "the authenticated scope must be bound to the request context")
 	require.Equal(t, "scope-from-the-key", seen)
-	require.NotEqual(t, "the-dev-scope", seen)
 }
 
 // A handler reached without the wrapper must refuse rather than fall back.
@@ -379,7 +378,7 @@ func TestAuth_AnAuthenticatedRequestCarriesTheKeyScopeNotTheDevScope(t *testing.
 // public route registered without the wrapper would otherwise read whatever
 // scope the process was configured with and serve another tenant's data.
 func TestAuth_AHandlerWithNoScopeInContextRefusesInsteadOfFallingBack(t *testing.T) {
-	server := NewServer(nil, Config{MaxRequestBytes: 1024, DevScope: "the-dev-scope"}, discardLogger())
+	server := NewServer(nil, Config{MaxRequestBytes: 1024}, discardLogger())
 
 	recorder := httptest.NewRecorder()
 	scope, ok := server.scopeOrUnauthorized(recorder, httptest.NewRequest(http.MethodGet, "/v1/dlq", nil))

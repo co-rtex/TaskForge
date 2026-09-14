@@ -184,8 +184,6 @@ is load-bearing for what follows: worker claims still filter on
 `TASKFORGE_DEV_SCOPE`, so a job submitted with a key minted for any other scope
 stays `QUEUED` forever. Multi-tenant keys isolate reads today, not execution.
 
-## Current milestone — M5B: worker/control authentication
-
 ### M5B — Worker/control authentication
 **Objective.** Give the internal worker-control surface its own credential, so
 `TASKFORGE_DEV_SCOPE` can be retired and an authenticated scope can actually
@@ -193,12 +191,23 @@ execute work.
 **Deliverables.** Worker credentials separable from user keys
 ([PROJECT_SPEC.md](PROJECT_SPEC.md) §6), tied to the process-session lifecycle
 that already carries fencing and replacement semantics; authentication on
-`/internal/v1`, including key management; removal of `TASKFORGE_DEV_SCOPE`.
-**Acceptance.** Every endpoint authenticates; the dev scope from M1 is gone; a
-job submitted under any authenticated scope is claimable by a worker authorized
-for that scope, which closes M5A's recorded limitation.
+worker registration, with every later worker-control call trusting the
+registered session and a cheap revocation check instead of a re-presented
+credential; removal of `TASKFORGE_DEV_SCOPE`. Worker-key management stays
+loopback-only and unauthenticated, mirroring M5A's own bootstrapping
+precedent for `api_keys` — it is how the first worker credential comes into
+existence.
+**Acceptance.** Registration authenticates and every other worker-control
+route is refused once its session's worker key is revoked; the dev scope from
+M1 is gone; a job submitted under any authenticated scope is claimed and
+executed by a worker registered for that scope, which closes M5A's recorded
+limitation.
 **Depends on.** M5A (complete).
-**Status:** not started.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and [ADR-0014](adr/0014-worker-control-authentication.md) for the
+decision.
+
+## Current milestone — M5C: result storage
 
 ### M5C — Result storage
 **Objective.** Small and large results round-trip.

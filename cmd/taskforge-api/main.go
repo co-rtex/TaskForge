@@ -1,9 +1,10 @@
 // Command taskforge-api serves TaskForge's HTTP API.
 //
-// The public /v1 surface authenticates with database-backed API keys. The
-// internal surface -- worker control, and the key-management routes that mint
-// the credentials the public surface checks -- is unauthenticated operator
-// plumbing, so the process still binds to loopback only.
+// The public /v1 surface authenticates with database-backed API keys, and the
+// internal worker-control surface authenticates registration with a separate
+// database-backed worker key -- see docs/adr/0014-worker-control-authentication.md.
+// The key-management routes for both credential types are unauthenticated
+// operator plumbing, so the process still binds to loopback only.
 package main
 
 import (
@@ -23,6 +24,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
+	"github.com/co-rtex/TaskForge/internal/workerauth"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -66,7 +68,6 @@ func run() int {
 		api.Config{
 			MaxRequestBytes: cfg.MaxRequestBytes,
 			RequestTimeout:  cfg.APIRequestTimeout,
-			DevScope:        cfg.DevScope,
 		},
 		log,
 		api.ReadinessCheck{
@@ -77,7 +78,7 @@ func run() int {
 		LeaseDuration: cfg.LeaseDuration,
 		RetryPolicy:   cfg.RetryPolicy(),
 		Jitter:        jitter,
-	})).WithAuth(auth.NewStore(pool))
+	})).WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool))
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,
@@ -94,10 +95,6 @@ func run() int {
 	go func() {
 		log.Info("api listening",
 			slog.String("addr", cfg.APIAddr),
-			// The development scope now attributes only the internal
-			// worker-control surface. Public requests carry their own scope on
-			// an API key.
-			slog.String("worker_control_scope", cfg.DevScope),
 			slog.Int64("max_request_bytes", cfg.MaxRequestBytes))
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err

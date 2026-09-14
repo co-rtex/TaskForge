@@ -415,14 +415,15 @@ func TestAPIKeys_ScopeIsolationIsEnforcedByTheKey(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, read(t, clientB),
 		"another scope's key must not see this job, and must not be able to tell it exists")
 
-	// The durable row is attributed to the KEY's scope, not to the configured
-	// development scope the process still uses for worker control.
+	// The durable row is attributed to the KEY's scope, not to the suite's own
+	// default scope -- which this assertion would not catch if the two
+	// happened to be equal, so it deliberately picks a scope that differs.
 	var storedScope string
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT scope FROM jobs WHERE id = $1`, job.ID).Scan(&storedScope))
 	require.Equal(t, "tenant-a", storedScope)
 	require.NotEqual(t, testScope, storedScope,
-		"the scope must come from the credential, not from TASKFORGE_DEV_SCOPE")
+		"the scope must come from the credential, not from any configured default")
 
 	t.Run("B cannot cancel or replay A's job either", func(t *testing.T) {
 		for _, path := range []string{"/v1/jobs/" + job.ID + "/cancel", "/v1/jobs/" + job.ID + "/retry"} {
@@ -505,53 +506,120 @@ func TestAPIKeys_RevocationTakesEffectOnTheNextRequest(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, list(t), "and stays refused")
 }
 
-// The internal worker-control surface must be provably untouched by this
-// milestone: it still answers with no Authorization header at all.
-//
-// This is the regression that would be easiest to introduce and hardest to
-// notice, because a worker would simply stop being able to register and the
-// failure would look like a worker bug.
-func TestAPIKeys_TheWorkerControlSurfaceStillNeedsNoCredential(t *testing.T) {
+// TestAPIKeys_WorkerControlAuthenticatesOnlyRegistration pins the precise
+// shape of M5B's trust boundary, which is easy to get subtly wrong in either
+// direction: an anonymous registration must now be refused, a registration
+// bearing a real worker key must be attributed to THAT key's scope rather
+// than any configured default, and both key-management surfaces must stay
+// reachable anonymously, because each is how its own credential type comes
+// into existence.
+func TestAPIKeys_WorkerControlAuthenticatesOnlyRegistration(t *testing.T) {
 	reset(t)
 	server := newAPI(t)
 	anonymous := unauthenticatedClient()
 
-	sessionID := uuid.New()
 	body := `{"worker_name":"auth-probe","hostname":"auth.local","worker_group":"default",
 		"concurrency_limit":1,"capabilities":["cpu"],"supported_job_types":["demo.echo"]}`
-	request, err := http.NewRequest(http.MethodPut,
-		server.URL+"/internal/v1/worker-sessions/"+sessionID.String(), strings.NewReader(body))
-	require.NoError(t, err)
-	request.Header.Set("Content-Type", "application/json")
 
-	response, err := anonymous.Do(request)
-	require.NoError(t, err)
-	defer response.Body.Close()
-	require.Equal(t, http.StatusOK, response.StatusCode,
-		"worker control is deliberately unauthenticated in this milestone")
+	t.Run("an anonymous registration is refused", func(t *testing.T) {
+		sessionID := uuid.New()
+		request, err := http.NewRequest(http.MethodPut,
+			server.URL+"/internal/v1/worker-sessions/"+sessionID.String(), strings.NewReader(body))
+		require.NoError(t, err)
+		request.Header.Set("Content-Type", "application/json")
 
-	var session api.WorkerSessionResponse
-	require.NoError(t, json.NewDecoder(response.Body).Decode(&session))
-	require.Equal(t, sessionID.String(), session.WorkerSessionID)
+		response, err := anonymous.Do(request)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		require.Equal(t, http.StatusUnauthorized, response.StatusCode)
+		require.Equal(t, "Bearer", response.Header.Get("WWW-Authenticate"))
 
-	// And it is still attributed to the configured development scope, not to any
-	// key's scope.
-	var scope string
-	require.NoError(t, testPool.QueryRow(context.Background(),
-		`SELECT scope FROM worker_sessions WHERE id = $1`, sessionID).Scan(&scope))
-	require.Equal(t, testScope, scope)
+		var envelope api.ErrorBody
+		require.NoError(t, json.NewDecoder(response.Body).Decode(&envelope))
+		require.Equal(t, api.CodeUnauthorized, envelope.Error.Code)
+		require.Zero(t, countRows(t, "worker_sessions"), "a refused registration must write nothing")
+	})
 
-	// The key-management routes are reachable anonymously too, which is what
-	// makes the system bootstrappable and is exactly why nothing here may leave
-	// loopback.
-	mintRequest, err := http.NewRequest(http.MethodPost, server.URL+"/internal/v1/api-keys",
-		strings.NewReader(`{"scope":"bootstrapped","name":"first-key"}`))
-	require.NoError(t, err)
-	mintRequest.Header.Set("Content-Type", "application/json")
-	mintResponse, err := anonymous.Do(mintRequest)
-	require.NoError(t, err)
-	defer mintResponse.Body.Close()
-	require.Equal(t, http.StatusCreated, mintResponse.StatusCode)
+	t.Run("a registration bearing a real worker key is attributed to that key's scope", func(t *testing.T) {
+		workerKey := mintWorkerKey(t, "tenant-worker-scope", "auth-probe-key")
+		sessionID := uuid.New()
+		request, err := http.NewRequest(http.MethodPut,
+			server.URL+"/internal/v1/worker-sessions/"+sessionID.String(), strings.NewReader(body))
+		require.NoError(t, err)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+workerKey.Raw)
+
+		response, err := clientWithKey(workerKey.Raw).Do(request)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		require.Equal(t, http.StatusOK, response.StatusCode)
+
+		var session api.WorkerSessionResponse
+		require.NoError(t, json.NewDecoder(response.Body).Decode(&session))
+		require.Equal(t, sessionID.String(), session.WorkerSessionID)
+
+		var scope string
+		require.NoError(t, testPool.QueryRow(context.Background(),
+			`SELECT scope FROM worker_sessions WHERE id = $1`, sessionID).Scan(&scope))
+		require.Equal(t, "tenant-worker-scope", scope)
+		require.NotEqual(t, testScope, scope,
+			"the scope must come from the worker key's own scope, not any configured default")
+	})
+
+	// Both key-management surfaces are reachable anonymously, which is what
+	// makes the system bootstrappable and is exactly why nothing here may
+	// leave loopback.
+	t.Run("both key-management surfaces are reachable anonymously", func(t *testing.T) {
+		mintAPIKey, err := http.NewRequest(http.MethodPost, server.URL+"/internal/v1/api-keys",
+			strings.NewReader(`{"scope":"bootstrapped","name":"first-key"}`))
+		require.NoError(t, err)
+		mintAPIKey.Header.Set("Content-Type", "application/json")
+		apiKeyResponse, err := anonymous.Do(mintAPIKey)
+		require.NoError(t, err)
+		defer apiKeyResponse.Body.Close()
+		require.Equal(t, http.StatusCreated, apiKeyResponse.StatusCode)
+
+		mintWorkerKeyReq, err := http.NewRequest(http.MethodPost, server.URL+"/internal/v1/worker-keys",
+			strings.NewReader(`{"scope":"bootstrapped","name":"first-worker-key"}`))
+		require.NoError(t, err)
+		mintWorkerKeyReq.Header.Set("Content-Type", "application/json")
+		workerKeyResponse, err := anonymous.Do(mintWorkerKeyReq)
+		require.NoError(t, err)
+		defer workerKeyResponse.Body.Close()
+		require.Equal(t, http.StatusCreated, workerKeyResponse.StatusCode)
+	})
+
+	// Heartbeat and every other non-registration worker-control route still
+	// takes no credential on the request -- it trusts the session identity
+	// registration already authenticated. This is the asymmetry, not a
+	// leftover: presenting no Authorization header here must not regress to
+	// 401 alongside registration.
+	t.Run("heartbeat still needs no credential on the request itself", func(t *testing.T) {
+		created := mintWorkerKey(t, testScope, "heartbeat-probe")
+		sessionID := uuid.New()
+		registerRequest, err := http.NewRequest(http.MethodPut,
+			server.URL+"/internal/v1/worker-sessions/"+sessionID.String(), strings.NewReader(body))
+		require.NoError(t, err)
+		registerRequest.Header.Set("Content-Type", "application/json")
+		registerResponse, err := clientWithKey(created.Raw).Do(registerRequest)
+		require.NoError(t, err)
+		defer registerResponse.Body.Close()
+		require.Equal(t, http.StatusOK, registerResponse.StatusCode)
+
+		var session api.WorkerSessionResponse
+		require.NoError(t, json.NewDecoder(registerResponse.Body).Decode(&session))
+
+		heartbeatBody := `{"worker_id":"` + session.WorkerID + `"}`
+		heartbeatRequest, err := http.NewRequest(http.MethodPost,
+			server.URL+"/internal/v1/worker-sessions/"+sessionID.String()+"/heartbeat",
+			strings.NewReader(heartbeatBody))
+		require.NoError(t, err)
+		heartbeatRequest.Header.Set("Content-Type", "application/json")
+		heartbeatResponse, err := anonymous.Do(heartbeatRequest)
+		require.NoError(t, err)
+		defer heartbeatResponse.Body.Close()
+		require.Equal(t, http.StatusOK, heartbeatResponse.StatusCode)
+	})
 }
 
 // The full key lifecycle over HTTP: mint, use, list, revoke, refuse.

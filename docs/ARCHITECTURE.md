@@ -30,9 +30,12 @@ cancellations, and expired leases; durable retry with bounded exponential
 backoff and injected jitter; public cancellation; the authoritative logical DLQ
 with listing, replay, and operator retry; scheduler promotion of due delayed and
 retry-waiting work; bounded recovery of stranded queued jobs; bounded
-`demo.echo` execution; and scoped, revocable API-key authentication on the
-public surface. Result storage, the CLI, the SDK, the dashboard, and
-authentication of the internal worker-control surface remain planned.
+`demo.echo` execution; scoped, revocable API-key authentication on the public
+surface; and scoped, revocable worker-key authentication of registration on
+the internal worker-control surface, with every later worker-control call
+trusting that session's identity and a cheap revocation check rather than a
+re-presented credential. Result storage, the CLI, the SDK, and the dashboard
+remain planned.
 
 ---
 
@@ -830,6 +833,15 @@ table rather than only over live rows, so a revoked key's prefix can never name
 a second credential. Its one index matches the one query that justifies it: the
 administrative listing's `created_at DESC, id DESC` keyset order. There is no
 backfill, because no earlier milestone persisted a credential.
+
+M5B adds `worker_keys`, mirroring `api_keys` column for column and index for
+index, and one additive column: `worker_sessions.worker_key_id`, a nullable
+foreign key to `worker_keys` recording which credential authenticated a
+session's registration. It is deliberately not backfilled — a session row
+that predates this migration has no credential to record, and a `NULL` here
+is simply never treated as revoked, which is the security posture every
+session already had. See
+[ADR-0014](adr/0014-worker-control-authentication.md).
 
 **Planned:** `results`, `audit_events`.
 

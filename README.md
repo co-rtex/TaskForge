@@ -9,7 +9,7 @@ lifecycle, explicit state machines, idempotent submission, transactional
 database-to-broker delivery, leases and fencing, and crash recovery — rather than
 wrapping an existing queue framework.
 
-> ### Status: early development — milestone 5A of 8
+> ### Status: early development — milestone 5B of 8
 >
 > **What works today:** the complete durable job lifecycle. Idempotent immediate
 > and delayed submission with a recoverable transactional outbox; durable logical
@@ -21,11 +21,16 @@ wrapping an existing queue framework.
 > backoff and injected jitter; server-authoritative timeouts; cancellation; the
 > logical DLQ with listing, replay, and operator retry; a scheduler that promotes
 > due work and re-notifies queued jobs whose notification was lost; crash
-> recovery; and scoped, revocable API-key authentication on the public API.
+> recovery; scoped, revocable API-key authentication on the public API; and
+> scoped, revocable worker-key authentication of registration, with every later
+> worker-control call trusting that session and a cheap revocation check
+> instead of a re-presented credential. A job submitted under any authenticated
+> scope is claimed and executed by a worker registered for that same scope.
 >
-> **What does not exist yet:** result storage, the CLI, the SDK, the dashboard,
-> and authentication of the internal worker-control surface — which stays
-> unauthenticated and loopback-only.
+> **What does not exist yet:** result storage, the CLI, the SDK, and the
+> dashboard. Both key-management surfaces stay unauthenticated and
+> loopback-only, because each is how its own credential type comes into
+> existence.
 >
 > See [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) for exactly what is implemented
 > and verified at this commit.
@@ -82,7 +87,44 @@ make migrate     # apply the schema
 make build       # compile ./bin/taskforge-{api,outbox,scheduler,migrate,worker,reconciler}
 ```
 
-Run the API, publisher, scheduler, worker, and reconciler in five terminals:
+First, mint an API key and a worker key for the same scope. Both are returned
+**exactly once** and cannot be recovered afterwards.
+
+```bash
+curl -X POST http://127.0.0.1:8080/internal/v1/api-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"local-dev","name":"my-laptop"}'
+
+export TASKFORGE_API_KEY=tfk_...   # the "key" field of that response
+
+curl -X POST http://127.0.0.1:8080/internal/v1/worker-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"local-dev","name":"my-worker"}'
+
+export TASKFORGE_WORKER_API_KEY=tfk_...   # the "key" field of THAT response
+```
+
+A worker key's scope decides which jobs a worker started with it can claim: a
+job submitted under an API key for a *different* scope is durable and
+readable but will never be claimed by that worker — it stays `QUEUED`. Mint
+both keys for the same scope for work that must run.
+
+Both key-management surfaces live under `/internal/v1` and are themselves
+unauthenticated, because each is how its own credential type comes into
+existence. That is why nothing under `/internal/v1` may be exposed off
+loopback. List and revoke with:
+
+```bash
+curl http://127.0.0.1:8080/internal/v1/api-keys
+curl -X POST http://127.0.0.1:8080/internal/v1/api-keys/<key_id>/revoke
+
+curl http://127.0.0.1:8080/internal/v1/worker-keys
+curl -X POST http://127.0.0.1:8080/internal/v1/worker-keys/<key_id>/revoke
+```
+
+Now run the API, publisher, scheduler, worker, and reconciler in five
+terminals. `TASKFORGE_WORKER_API_KEY` must be set (or present in `.env`)
+before starting the worker — it presents that credential when it registers.
 
 ```bash
 ./bin/taskforge-api
@@ -96,33 +138,6 @@ The reconciler is what makes a crash recoverable, and what records a timeout.
 Without it, a killed worker's lease stays active and its job never runs again.
 The scheduler is what makes a delayed or retry-waiting job eventually run, and
 what repairs a queued job whose notification was lost.
-
-First, mint an API key. Every `/v1` request needs one; the key is returned
-**exactly once** and cannot be recovered afterwards.
-
-```bash
-curl -X POST http://127.0.0.1:8080/internal/v1/api-keys \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"local-dev","name":"my-laptop"}'
-
-export TASKFORGE_API_KEY=tfk_...   # the "key" field of that response
-```
-
-Mint it with `scope` equal to `TASKFORGE_DEV_SCOPE` (`local-dev` by default).
-Workers claim only within that scope, so a job submitted with a key minted for
-any other scope is durable and readable but will never run — it stays `QUEUED`.
-The API logs a warning when you mint such a key. This goes away when
-worker/control authentication lands; see
-[docs/CURRENT_STATE.md](docs/CURRENT_STATE.md).
-
-Key management lives under `/internal/v1` and is itself unauthenticated, because
-it is how the first credential comes into existence. That is why nothing under
-`/internal/v1` may be exposed off loopback. List and revoke with:
-
-```bash
-curl http://127.0.0.1:8080/internal/v1/api-keys
-curl -X POST http://127.0.0.1:8080/internal/v1/api-keys/<key_id>/revoke
-```
 
 Submit a job:
 

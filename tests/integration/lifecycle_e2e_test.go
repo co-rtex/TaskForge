@@ -78,7 +78,7 @@ func startE2EStack(t *testing.T, registry *workerruntime.Registry, renotifyAfter
 	stack := &e2eStack{
 		baseURL:  httpServer.URL,
 		broker:   broker,
-		control:  workerruntime.NewClient(httpServer.URL, &http.Client{Timeout: 10 * time.Second}),
+		control:  workerruntime.NewClient(httpServer.URL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey()),
 		registry: registry,
 	}
 
@@ -636,7 +636,7 @@ func TestE2E_CancellingAQueuedJobStopsItBeforeAnyWorkerClaimsIt(t *testing.T) {
 // control plane, the API, or the runner actually do.
 func (s *e2eStack) startWorkerVia(t *testing.T, name string, concurrency int, controlURL string) {
 	t.Helper()
-	control := workerruntime.NewClient(controlURL, &http.Client{Timeout: 10 * time.Second})
+	control := workerruntime.NewClient(controlURL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
 	runner := workerruntime.NewRunner(control, s.broker, s.registry, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: name, Hostname: name + ".local",

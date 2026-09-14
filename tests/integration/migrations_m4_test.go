@@ -167,8 +167,8 @@ func TestMigrations_M4SchemaMatchesTheQueriesThatJustifyIt(t *testing.T) {
 		// only on a developer's pre-existing database.
 		loaded, err := database.LoadMigrations()
 		require.NoError(t, err)
-		require.Len(t, loaded, 14,
-			"0001 through 0013 shipped in M1 through M4; 0014 is M5A's api_keys")
+		require.Len(t, loaded, 15,
+			"0001 through 0013 shipped in M1 through M4; 0014 is M5A's api_keys; 0015 is M5B's worker_keys")
 
 		for _, migration := range loaded {
 			var recorded string
@@ -433,7 +433,7 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 14)
+	require.Len(t, migrations, 15)
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -544,9 +544,9 @@ func TestMigrations_CarryRealM3DataThroughTheM4Upgrade(t *testing.T) {
 
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
-	require.NoError(t, err, "0009 through 0014 must apply to a database holding real M3 data")
-	require.Equal(t, 6, applied,
-		"the five M4 migrations, plus M5A's 0014, are pending from an M3 database")
+	require.NoError(t, err, "0009 through 0015 must apply to a database holding real M3 data")
+	require.Equal(t, 7, applied,
+		"the five M4 migrations, plus M5A's 0014 and M5B's 0015, are pending from an M3 database")
 
 	t.Run("every seeded row survives", func(t *testing.T) {
 		for table, want := range map[string]int{
