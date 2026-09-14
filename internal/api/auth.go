@@ -53,9 +53,8 @@ const scopeKey ctxKey = requestIDKey + 1
 // authenticatedScope returns the scope bound to ctx by requireAPIKey.
 //
 // It reports ok=false rather than falling back to a configured default. A
-// handler that somehow ran without authentication must refuse, not quietly serve
-// another tenant's scope: silently substituting DevScope here is exactly the
-// defect this milestone exists to remove.
+// handler that somehow ran without authentication must refuse, not quietly
+// serve another tenant's scope under some fallback value.
 func authenticatedScope(ctx context.Context) (string, bool) {
 	scope, ok := ctx.Value(scopeKey).(string)
 	return scope, ok
