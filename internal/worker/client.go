@@ -35,10 +35,20 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	now     func() time.Time
+	// workerKey authenticates Register only -- see
+	// docs/adr/0014-worker-control-authentication.md. Every other
+	// control-plane call is authenticated by the session Register created,
+	// not by presenting this credential again.
+	workerKey string
 }
 
-func NewClient(baseURL string, httpClient *http.Client) *Client {
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: httpClient, now: time.Now}
+func NewClient(baseURL string, httpClient *http.Client, workerKey string) *Client {
+	return &Client{
+		baseURL:   strings.TrimRight(baseURL, "/"),
+		http:      httpClient,
+		now:       time.Now,
+		workerKey: workerKey,
+	}
 }
 
 func (c *Client) Register(ctx context.Context, registration workers.Registration) (workers.Session, error) {
@@ -56,7 +66,8 @@ func (c *Client) Register(ctx context.Context, registration workers.Registration
 	}
 	var response api.WorkerSessionResponse
 	if err := c.doJSON(ctx, http.MethodPut,
-		"/internal/v1/worker-sessions/"+registration.SessionID.String(), request, &response); err != nil {
+		"/internal/v1/worker-sessions/"+registration.SessionID.String(), request, &response,
+		withWorkerKey(c.workerKey)); err != nil {
 		return workers.Session{}, err
 	}
 	workerID, err := uuid.Parse(response.WorkerID)
@@ -491,7 +502,25 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) doJSON(ctx context.Context, method, path string, body, responseTarget any) error {
+// requestOption customizes one outgoing control request. It exists because
+// only Register carries a worker key -- every other call is authenticated by
+// the session, not by a credential attached per request.
+type requestOption func(*http.Request)
+
+// withWorkerKey attaches the worker key as a Bearer credential. A blank key
+// is a no-op rather than an empty Authorization header, so an unconfigured
+// key produces the server's ordinary 401 instead of a malformed request.
+func withWorkerKey(key string) requestOption {
+	return func(r *http.Request) {
+		if key != "" {
+			r.Header.Set("Authorization", "Bearer "+key)
+		}
+	}
+}
+
+func (c *Client) doJSON(
+	ctx context.Context, method, path string, body, responseTarget any, opts ...requestOption,
+) error {
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode control request: %w", err)
@@ -502,6 +531,9 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, response
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set(api.RequestIDHeader, uuid.NewString())
+	for _, opt := range opts {
+		opt(request)
+	}
 
 	response, err := c.http.Do(request)
 	if err != nil {

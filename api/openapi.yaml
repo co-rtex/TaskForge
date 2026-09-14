@@ -1,15 +1,15 @@
 openapi: 3.1.0
 info:
   title: TaskForge API
-  version: 0.5.0-m5a
+  version: 0.6.0-m5b
   description: |
     The complete durable job lifecycle behind API-key authentication: idempotent
     submission including delayed submission, job reads, cancellation, the logical
     dead-letter queue with replay and operator retry, plus the internal
     worker-control surface —
-    registration, session heartbeat with cancellation delivery, atomic claim,
-    fenced lease renewal, and the fenced start, success, failure, and
-    cancellation-acknowledgment transitions.
+    registration behind worker-key authentication, session heartbeat with
+    cancellation delivery, atomic claim, fenced lease renewal, and the fenced
+    start, success, failure, and cancellation-acknowledgment transitions.
 
     This document describes **only the endpoints that are implemented**. The rest
     of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing, workers,
@@ -54,19 +54,50 @@ info:
     ### The internal surface
 
     Routes under `/internal/v1` are operator and worker plumbing, not a public
-    user API, and they are **not** authenticated. That includes the key-management
-    routes: they are how the first credential comes into existence, so requiring
-    one would make the system unbootstrappable. Anyone who can reach loopback can
-    therefore mint a credential for any scope.
+    user API. Most of them are **not** authenticated. That includes both
+    key-management surfaces, `/internal/v1/api-keys` and
+    `/internal/v1/worker-keys`: each is how its corresponding credential comes
+    into existence, so requiring one would make the system unbootstrappable.
+    Anyone who can reach loopback can therefore mint a credential for any
+    scope.
 
-    This is why nothing under `/internal/v1` may be exposed off loopback.
-    Worker/control scopes are separable from user scopes and authenticating this
-    surface is a later milestone; see
-    `docs/adr/0013-database-backed-api-key-authentication.md`.
+    This is why nothing under `/internal/v1` may be exposed off loopback —
+    including the one exception below, since worker-key authentication limits
+    who can register a session, not who can reach the network it registers
+    on.
 
-    Worker-control operations still attribute every request to the single
-    configured development scope (`TASKFORGE_DEV_SCOPE`), which no longer reaches
-    the public surface at all.
+    **The one exception is `PUT /internal/v1/worker-sessions/{worker_session_id}`.**
+    Since milestone M5B it requires a worker key. Every other worker-control
+    route — heartbeat, claim, lease renewal, and the fenced
+    start/succeed/fail/cancel transitions — still takes no credential on the
+    request; instead it trusts the session identity that registration already
+    authenticated, and is refused once the worker key that registered that
+    session has been revoked. See "Worker-key authentication" below and
+    `docs/adr/0014-worker-control-authentication.md`.
+
+    ### Worker-key authentication
+
+    A worker key is a second, distinct credential: verified against its own
+    table by its own package (`internal/workerauth`), and never
+    interchangeable with an API key even though it shares the identical
+    `tfk_<lookup>.<secret>` format and the identical `401`/`503` contract
+    described above. Mint one with `POST /internal/v1/worker-keys` and
+    present it as `Authorization: Bearer <worker key>` — only on
+    `PUT /internal/v1/worker-sessions/{worker_session_id}`. A worker key's
+    scope becomes the scope the session it registers acts within, exactly as
+    an API key's scope does for the public surface: workers claim only within
+    the scope their worker key named.
+
+    Every later worker-control call a registered session makes — heartbeat,
+    claim, lease renewal, and the fenced start/succeed/fail/cancel
+    transitions — resolves its scope from that session's own registration
+    record instead of a fresh credential, and is refused the moment the
+    worker key that registered it is revoked, with no credential
+    re-presented. **Revoking a worker key therefore refuses the next call any
+    session it registered makes.** A request already in flight when
+    revocation happens is not interrupted, and a lease that session holds is
+    not force-expired: it lapses and is reconciled through the same,
+    unmodified path any other abandoned session's lease is.
 
     ## Idempotency
 
@@ -944,10 +975,210 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /internal/v1/worker-keys:
+    post:
+      tags: [Admin]
+      summary: Mint a worker key
+      description: |
+        Creates one worker credential for one scope and returns it **exactly
+        once**. The `key` field of the 201 response is the only copy that will
+        ever exist: only a cryptographic hash of its secret half is stored, so
+        it cannot be recovered. A caller who loses it revokes this key and
+        mints another.
+
+        A worker key is distinct from an API key — see "Worker-key
+        authentication" above — and is accepted only on
+        `PUT /internal/v1/worker-sessions/{worker_session_id}`. Its scope is
+        what workers registering under it can claim.
+
+        This route is deliberately **not idempotent and carries no request
+        identity**, for the identical reason `POST /internal/v1/api-keys`
+        is not: an idempotent create would have to return an existing secret
+        to a repeat, which a write-only credential must never do. Every call
+        mints a distinct key, and two identical calls produce two keys.
+
+        Unauthenticated, and loopback-only: this is how the first worker
+        credential comes into existence, so requiring one would make the
+        system unbootstrappable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkerKeyCreateRequest' }
+            examples:
+              minimal:
+                value:
+                  scope: tenant-a
+                  name: worker-fleet-a
+      responses:
+        '201':
+          description: |
+            The worker key was created. This body carries the only copy of the
+            credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerKeyCreated' }
+        '400':
+          description: |
+            The body was not a single valid JSON object, or it contained an
+            unknown field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: The body exceeded the configured size limit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `scope` or `name` was empty, longer than 128 characters, or
+            contained a control character.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                emptyScope:
+                  value:
+                    error:
+                      code: validation_failed
+                      message: the request was rejected by validation
+                      details:
+                        - field: scope
+                          message: must contain between 1 and 128 printable characters
+                      request_id: 6a1f...
+        '503':
+          description: |
+            The request exceeded its deadline before the durable outcome was
+            known. A deadline can elapse while acquiring a lock, while executing
+            a statement, or during COMMIT, and a COMMIT that is cut short is
+            ambiguous, so this never asserts that nothing was committed.
+
+            **Do not repeat this request blindly.** With no request identity, a
+            repeat mints a SECOND credential rather than returning the first,
+            and the first may already exist with nobody holding it. List keys
+            through `GET /internal/v1/worker-keys` and revoke any key whose
+            credential no caller received.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: the request exceeded its deadline before the durable outcome was known; do NOT repeat this request blindly
+                  request_id: 6a1f...
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Admin]
+      summary: List worker keys
+      description: |
+        One bounded page of worker key metadata, newest first.
+
+        No secret and no hash is returned, by any parameter, ever. Revoked
+        keys are included: an operator auditing which credentials existed
+        needs to see them, and hiding them would make the listing useless for
+        the question it is actually asked.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: One bounded page of worker key metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerKeyList' }
+        '422':
+          description: '`limit` was not an integer between 1 and 200.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The request exceeded its deadline. Listing keys reads rows and
+            writes nothing, so repeating the identical request is safe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/v1/worker-keys/{key_id}/revoke:
+    post:
+      tags: [Admin]
+      summary: Revoke a worker key
+      description: |
+        Withdraws one worker credential.
+
+        Revocation is **idempotent**, keyed by key id alone. Revoking an
+        already-revoked key succeeds, reporting `already_revoked: true` and
+        the ORIGINAL `revoked_at` rather than moving it.
+
+        A request already in flight when the key is revoked is not
+        interrupted; it completes under the authority it was admitted with.
+        This governs registration only: revoking a worker key does not
+        force-expire a session already registered under it, or the lease that
+        session holds. It refuses the *next* call that session makes — see
+        "Worker-key authentication" above — and an abandoned lease lapses and
+        is reconciled through the same, unmodified path any other session's
+        would be.
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: |
+            The key is revoked, including an idempotent repeat, which reports
+            `already_revoked: true` and the original instant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerKeyRevoked' }
+        '404':
+          description: No key with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `key_id` was not a UUID. Unlike the public job routes, this
+            answers 422 rather than 404: there is no tenant to hide ids from
+            on this surface.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The request exceeded its deadline before the durable outcome was
+            known, so this never asserts that nothing was committed. Repeat
+            the identical request for the same key id: revocation is keyed by
+            key id alone, so a repeat reports the original revocation instant
+            rather than moving it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Internal error. The response is sanitized; use `request_id` to find the cause in the logs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /internal/v1/worker-sessions/{worker_session_id}:
     put:
       tags: [Worker Control]
       summary: Idempotently register one worker process session
+      security:
+        - WorkerKeyAuth: []
       description: |
         `worker_session_id` is generated once per process boot and reused when
         an ambiguous registration response is retried. Reusing it with different
@@ -955,6 +1186,10 @@ paths:
         worker name fences the prior session; old active leases remain durable
         and capacity-consuming until they expire and the reconciler abandons
         their attempts.
+
+        The one authenticated worker-control route: requires a worker key, and
+        the session's scope becomes that key's scope. See "Worker-key
+        authentication" in the Authentication section above.
       parameters:
         - name: worker_session_id
           in: path
@@ -976,6 +1211,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            A missing, malformed, unknown, or revoked worker key all answer
+            this identically, and the message names no cause — see
+            "Worker-key authentication" above.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: "a valid worker key must be presented as an Authorization: Bearer credential"
+                  request_id: 6a1f...
         '409':
           description: The session id conflicts or the session was already replaced.
           content:
@@ -1814,6 +2062,19 @@ components:
         with `POST /internal/v1/api-keys`. See the Authentication section above
         for the format and for what a `401` does and does not tell you.
 
+    WorkerKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A TaskForge worker key, presented as `Authorization: Bearer <worker
+        key>`. Mint one with `POST /internal/v1/worker-keys`. It is a distinct
+        credential from `ApiKeyAuth`, verified against a different table, and
+        is accepted on exactly one route:
+        `PUT /internal/v1/worker-sessions/{worker_session_id}`. See "Worker-key
+        authentication" in the Authentication section above for the full
+        model, including how a session's later calls are authenticated
+        without presenting this credential again.
+
   schemas:
     SubmitJobRequest:
       type: object
@@ -2436,6 +2697,81 @@ components:
         keys:
           type: array
           items: { $ref: '#/components/schemas/ApiKeySummary' }
+
+    WorkerKeyCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, name]
+      properties:
+        scope:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            The scope a session registering with this key acts within. Only a
+            worker whose key names a scope can claim jobs submitted under an
+            API key of that same scope.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Operator-facing label, so this key can be recognized in a listing
+            and revoked deliberately. Nothing authenticates against it.
+
+    WorkerKeySummary:
+      type: object
+      required: [id, scope, name, prefix, created_at, revoked_at]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        name: { type: string }
+        prefix:
+          type: string
+          description: |
+            The non-secret lookup segment of the key. Safe to log and to
+            display; it is how a key is identified for revocation.
+        created_at: { type: string, format: date-time }
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+          description: Null while the key is live.
+
+    WorkerKeyCreated:
+      type: object
+      required: [id, scope, name, prefix, created_at, key]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        name: { type: string }
+        prefix: { type: string }
+        created_at: { type: string, format: date-time }
+        key:
+          type: string
+          description: |
+            The complete credential, in the form `tfk_<lookup>.<secret>`. This
+            is the only response that ever contains it, and it is returned
+            exactly once. It is not stored and cannot be recovered.
+
+    WorkerKeyRevoked:
+      allOf:
+        - $ref: '#/components/schemas/WorkerKeySummary'
+        - type: object
+          required: [already_revoked]
+          properties:
+            already_revoked:
+              type: boolean
+              description: |
+                True when this key was already revoked before this call. The
+                reported `revoked_at` is the original instant, not this one.
+
+    WorkerKeyList:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/WorkerKeySummary' }
 
     Error:
       type: object

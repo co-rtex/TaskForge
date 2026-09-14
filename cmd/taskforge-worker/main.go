@@ -61,7 +61,7 @@ func run() int {
 	}
 
 	httpClient := &http.Client{Timeout: workerConfig.RequestTimeout}
-	control := workerruntime.NewClient(workerConfig.APIBaseURL, httpClient)
+	control := workerruntime.NewClient(workerConfig.APIBaseURL, httpClient, workerConfig.WorkerAPIKey)
 	registry := workerruntime.NewRegistry()
 	if err := registry.Register("demo.echo", workerruntime.DemoEcho{}); err != nil {
 		log.Error("register trusted handler", slog.String("error", err.Error()))

@@ -109,6 +109,19 @@ type Registration struct {
 	ConcurrencyLimit  int
 	Capabilities      []string
 	SupportedJobTypes []string
+	// WorkerKeyID identifies the worker key that authenticated this
+	// registration, persisted on the session so a later revocation of that key
+	// can be recognized on the session's next control-plane call (see
+	// Store.SessionScope) without re-presenting a credential on every call.
+	//
+	// Nil when this registration did not go through an authenticated HTTP
+	// caller -- every real production path sets it, because
+	// internal/api.requireWorkerKey never calls Register without one. A
+	// session registered with a nil WorkerKeyID persists a NULL
+	// worker_key_id and is simply never treated as revoked, which is the same
+	// posture a session registered before this field existed has: this is a
+	// property of the column being genuinely optional, not a gap.
+	WorkerKeyID *uuid.UUID
 }
 
 // Session is the durable identity returned by registration.

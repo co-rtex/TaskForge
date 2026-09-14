@@ -129,12 +129,13 @@ func (s *Store) Register(ctx context.Context, scope string, registration Registr
 	err = tx.QueryRow(ctx, `
 		INSERT INTO worker_sessions (
 			id, worker_id, scope, hostname, worker_group, concurrency_limit,
-			capabilities, supported_job_types, status, registered_at, last_heartbeat_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+			capabilities, supported_job_types, status, registered_at, last_heartbeat_at,
+			worker_key_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11)
 		RETURNING registered_at, last_heartbeat_at`,
 		session.ID, session.WorkerID, scope, session.Hostname, session.WorkerGroup,
 		session.ConcurrencyLimit, session.Capabilities, session.SupportedJobTypes,
-		string(session.Status), registeredAt,
+		string(session.Status), registeredAt, reg.WorkerKeyID,
 	).Scan(&session.RegisteredAt, &session.LastHeartbeatAt)
 	if err != nil {
 		var postgresError *pgconn.PgError
@@ -176,6 +177,40 @@ func sameRegistration(existing Session, workerID uuid.UUID, reg Registration) bo
 		existing.ConcurrencyLimit == reg.ConcurrencyLimit &&
 		slices.Equal(existing.Capabilities, reg.Capabilities) &&
 		slices.Equal(existing.SupportedJobTypes, reg.SupportedJobTypes)
+}
+
+// SessionScope reads the scope and authenticating worker key this session was
+// registered under, so an HTTP caller can resolve the scope every other
+// worker-control operation needs before dispatching into it, without
+// requiring a fresh credential on every call.
+//
+// This is the one new read this milestone adds to this package, and it is
+// deliberately a plain, unlocked SELECT: it runs before a fenced operation's
+// own transaction begins, and every one of those transactions still verifies
+// worker id, session id, and scope together under its own row lock exactly as
+// it always has. A scope resolved here that were somehow stale would simply
+// fail that later fence match -- this read decides nothing on its own.
+//
+// It is also silent about revocation. WorkerKeyID is returned as read, nil or
+// not, and whether the key it names is still live is a question this package
+// has no table to answer -- internal/api checks it, via
+// internal/workerauth.Store.IsRevoked, using the id returned here.
+func (s *Store) SessionScope(ctx context.Context, sessionID uuid.UUID) (scope string, workerKeyID *uuid.UUID, err error) {
+	defer func() { err = classifyDatabaseError(err) }()
+
+	err = s.pool.QueryRow(ctx, `
+		SELECT scope, worker_key_id FROM worker_sessions WHERE id = $1`, sessionID,
+	).Scan(&scope, &workerKeyID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No such session. Every fenced operation's own WHERE clause would
+			// reach exactly this same conclusion and answer the same error; this
+			// simply answers it one round trip sooner.
+			return "", nil, ErrSessionUnavailable
+		}
+		return "", nil, fmt.Errorf("read worker session scope: %w", err)
+	}
+	return scope, workerKeyID, nil
 }
 
 // Claim atomically reserves at most one eligible job for one current session.

@@ -238,8 +238,10 @@ func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
 
 	t.Run("every implemented key-management route is documented", func(t *testing.T) {
 		for path, method := range map[string]string{
-			"/internal/v1/api-keys":                 "post",
-			"/internal/v1/api-keys/{key_id}/revoke": "post",
+			"/internal/v1/api-keys":                    "post",
+			"/internal/v1/api-keys/{key_id}/revoke":    "post",
+			"/internal/v1/worker-keys":                 "post",
+			"/internal/v1/worker-keys/{key_id}/revoke": "post",
 		} {
 			operations, ok := doc.Paths[path]
 			require.Truef(t, ok, "%s is implemented but missing from the spec", path)
@@ -248,6 +250,8 @@ func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
 		}
 		_, ok := doc.Paths["/internal/v1/api-keys"]["get"]
 		require.True(t, ok, "GET /internal/v1/api-keys is implemented but missing from the spec")
+		_, ok = doc.Paths["/internal/v1/worker-keys"]["get"]
+		require.True(t, ok, "GET /internal/v1/worker-keys is implemented but missing from the spec")
 	})
 
 	t.Run("every implemented worker-control route is documented", func(t *testing.T) {

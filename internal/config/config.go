@@ -55,12 +55,6 @@ type Config struct {
 	JobRetryMultiplier float64
 	JobRetryJitter     float64
 
-	// DevScope is the single authentication scope every request is attributed
-	// to until database-backed API keys land in milestone M5. It exists so the
-	// idempotency and ownership model is already scoped correctly; it is not
-	// authentication and must never be exposed off loopback.
-	DevScope string
-
 	BrokerEndpoint        string
 	BrokerQueueName       string
 	BrokerRegion          string
@@ -89,7 +83,6 @@ func Load() (Config, error) {
 		MaxRequestBytes:   envInt64("TASKFORGE_MAX_REQUEST_BYTES", 256*1024),
 		APIRequestTimeout: envDuration("TASKFORGE_API_REQUEST_TIMEOUT", 25*time.Second),
 		LeaseDuration:     envDuration("TASKFORGE_LEASE_DURATION", 30*time.Second),
-		DevScope:          env("TASKFORGE_DEV_SCOPE", "local-dev"),
 
 		HeartbeatInterval:  envDuration("TASKFORGE_HEARTBEAT_INTERVAL", 5*time.Second),
 		SessionStaleAfter:  envDuration("TASKFORGE_SESSION_STALE_AFTER", 15*time.Second),
@@ -139,7 +132,6 @@ func (c Config) Validate() error {
 	}
 	req("TASKFORGE_DATABASE_URL", c.DatabaseURL)
 	req("TASKFORGE_API_ADDR", c.APIAddr)
-	req("TASKFORGE_DEV_SCOPE", c.DevScope)
 	req("TASKFORGE_BROKER_QUEUE_NAME", c.BrokerQueueName)
 	req("TASKFORGE_BROKER_REGION", c.BrokerRegion)
 	req("TASKFORGE_OUTBOX_ADDR", c.OutboxAddr)
@@ -298,7 +290,14 @@ func (c Config) RetryPolicy() lifecycle.RetryPolicy {
 // separate means API and outbox startup cannot fail because of an irrelevant
 // worker-only environment value.
 type WorkerConfig struct {
-	APIBaseURL      string
+	APIBaseURL string
+	// WorkerAPIKey is the worker key this process presents as a Bearer
+	// credential when registering with the API -- see
+	// docs/adr/0014-worker-control-authentication.md. It authenticates
+	// registration only; every subsequent control-plane call is authenticated
+	// by the session that registration created, not by presenting this value
+	// again.
+	WorkerAPIKey    string
 	HealthAddr      string
 	Name            string
 	Hostname        string
@@ -319,6 +318,7 @@ func LoadWorker() (WorkerConfig, error) {
 	}
 	c := WorkerConfig{
 		APIBaseURL:      env("TASKFORGE_WORKER_API_URL", "http://127.0.0.1:8080"),
+		WorkerAPIKey:    env("TASKFORGE_WORKER_API_KEY", ""),
 		HealthAddr:      env("TASKFORGE_WORKER_ADDR", "127.0.0.1:8082"),
 		Name:            env("TASKFORGE_WORKER_NAME", "local-worker"),
 		Hostname:        env("TASKFORGE_WORKER_HOSTNAME", hostname),
@@ -342,12 +342,18 @@ func (c WorkerConfig) Validate() error {
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		problems = append(problems, "TASKFORGE_WORKER_API_URL must be an absolute http(s) URL")
 	} else if !isLoopbackHost(parsed.Hostname()) {
-		problems = append(problems, "TASKFORGE_WORKER_API_URL must use a loopback host until authentication is implemented")
+		// Permanent, not a stand-in for authentication: the worker health
+		// endpoint and the API's own loopback bind (see Config.Validate) are
+		// deliberately never exposed off-host, worker key or not.
+		problems = append(problems, "TASKFORGE_WORKER_API_URL must use a loopback host")
+	}
+	if strings.TrimSpace(c.WorkerAPIKey) == "" {
+		problems = append(problems, "TASKFORGE_WORKER_API_KEY must not be empty")
 	}
 	if strings.TrimSpace(c.HealthAddr) == "" {
 		problems = append(problems, "TASKFORGE_WORKER_ADDR must not be empty")
 	} else if !isLoopbackBind(c.HealthAddr) {
-		problems = append(problems, "TASKFORGE_WORKER_ADDR must bind to a loopback address until authentication is implemented")
+		problems = append(problems, "TASKFORGE_WORKER_ADDR must bind to a loopback address")
 	}
 	if !workerRoutingPattern.MatchString(c.Name) {
 		problems = append(problems, "TASKFORGE_WORKER_NAME must be a valid worker name")

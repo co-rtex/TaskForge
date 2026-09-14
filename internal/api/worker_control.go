@@ -22,6 +22,13 @@ import (
 // There is deliberately no generic "set attempt status" operation and no
 // worker-authoritative timeout: each transition is its own named method with its
 // own preconditions, and TIMED_OUT is reachable only through reconciliation.
+//
+// SessionScope is the one addition since M5A, and it changes none of the
+// other eight methods' signatures or preconditions. Every one of them still
+// takes scope as an explicit parameter and still fences every transition on
+// it exactly as before; SessionScope only tells the HTTP layer what value to
+// pass, by reading what registration already persisted, instead of that
+// value coming from one fixed configured scope.
 type WorkerControl interface {
 	Register(context.Context, string, workers.Registration) (workers.Session, error)
 	Heartbeat(context.Context, string, workers.HeartbeatRequest) (workers.HeartbeatResult, error)
@@ -31,6 +38,9 @@ type WorkerControl interface {
 	Succeed(context.Context, string, workers.Fence) error
 	Fail(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
 	AcknowledgeCancellation(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
+	// SessionScope reads the scope and authenticating worker key a session was
+	// registered under. See internal/workers.Store.SessionScope.
+	SessionScope(ctx context.Context, sessionID uuid.UUID) (scope string, workerKeyID *uuid.UUID, err error)
 }
 
 type registerWorkerSessionRequest struct {
@@ -74,6 +84,17 @@ func toWorkerSessionResponse(session workers.Session) WorkerSessionResponse {
 }
 
 func (s *Server) handleRegisterWorkerSession(w http.ResponseWriter, r *http.Request) {
+	// requireWorkerKey guarantees this is present whenever this handler runs
+	// wired the normal way; refusing rather than trusting that unconditionally
+	// is the same defensive posture scopeOrUnauthorized takes for the public
+	// surface: a handler that somehow ran without its wrapper must refuse, not
+	// register a session under a zero-value scope.
+	principal, ok := workerPrincipalFrom(r.Context())
+	if !ok {
+		s.writeWorkerKeyUnauthorized(w, r)
+		return
+	}
+
 	sessionID, err := uuid.Parse(r.PathValue("worker_session_id"))
 	if err != nil {
 		s.writeWorkerValidation(w, r, []workers.FieldError{{Field: "worker_session_id", Message: "must be a UUID"}})
@@ -84,7 +105,8 @@ func (s *Server) handleRegisterWorkerSession(w http.ResponseWriter, r *http.Requ
 	if !s.decodeControlJSON(w, r, &request) {
 		return
 	}
-	session, err := s.control.Register(r.Context(), s.cfg.DevScope, workers.Registration{
+	workerKeyID := principal.KeyID
+	session, err := s.control.Register(r.Context(), principal.Scope, workers.Registration{
 		SessionID:         sessionID,
 		Name:              request.WorkerName,
 		Hostname:          request.Hostname,
@@ -92,6 +114,7 @@ func (s *Server) handleRegisterWorkerSession(w http.ResponseWriter, r *http.Requ
 		ConcurrencyLimit:  request.ConcurrencyLimit,
 		Capabilities:      request.Capabilities,
 		SupportedJobTypes: request.SupportedJobTypes,
+		WorkerKeyID:       &workerKeyID,
 	})
 	if err != nil {
 		s.writeWorkerControlError(w, r, "register worker session", err)
@@ -152,7 +175,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.control.Heartbeat(r.Context(), s.cfg.DevScope,
+	scope, ok := s.resolveWorkerControlScope(w, r, sessionID)
+	if !ok {
+		return
+	}
+	result, err := s.control.Heartbeat(r.Context(), scope,
 		workers.HeartbeatRequest{WorkerID: workerID, SessionID: sessionID})
 	if err != nil {
 		s.writeWorkerControlError(w, r, "heartbeat worker session", err)
@@ -208,7 +235,11 @@ func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.control.RenewLease(r.Context(), s.cfg.DevScope, req)
+	scope, ok := s.resolveWorkerControlScope(w, r, req.Fence.SessionID)
+	if !ok {
+		return
+	}
+	result, err := s.control.RenewLease(r.Context(), scope, req)
 	if err != nil {
 		s.writeWorkerControlError(w, r, "renew lease", err)
 		return
@@ -340,7 +371,11 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		s.writeWorkerValidation(w, r, fields)
 		return
 	}
-	result, err := s.control.Claim(r.Context(), s.cfg.DevScope, req)
+	scope, ok := s.resolveWorkerControlScope(w, r, req.SessionID)
+	if !ok {
+		return
+	}
+	result, err := s.control.Claim(r.Context(), scope, req)
 	if err != nil {
 		s.writeWorkerControlError(w, r, "claim job", err)
 		return
@@ -406,7 +441,11 @@ func (s *Server) handleStartAttempt(w http.ResponseWriter, r *http.Request) {
 		s.writeWorkerValidation(w, r, fields)
 		return
 	}
-	result, err := s.control.Start(r.Context(), s.cfg.DevScope, fence)
+	scope, ok := s.resolveWorkerControlScope(w, r, fence.SessionID)
+	if !ok {
+		return
+	}
+	result, err := s.control.Start(r.Context(), scope, fence)
 	if err != nil {
 		s.writeWorkerControlError(w, r, "start attempt", err)
 		return
@@ -515,7 +554,11 @@ func (s *Server) handleFailAttempt(w http.ResponseWriter, r *http.Request) {
 		ErrorCode:        request.ErrorCode,
 		ErrorMessage:     request.ErrorMessage,
 	}
-	result, err := s.control.Fail(r.Context(), s.cfg.DevScope, report)
+	scope, ok := s.resolveWorkerControlScope(w, r, fence.SessionID)
+	if !ok {
+		return
+	}
+	result, err := s.control.Fail(r.Context(), scope, report)
 	if err != nil {
 		s.writeWorkerControlError(w, r, "fail attempt", err)
 		return
@@ -552,7 +595,11 @@ func (s *Server) handleCancelAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.control.AcknowledgeCancellation(r.Context(), s.cfg.DevScope,
+	scope, ok := s.resolveWorkerControlScope(w, r, fence.SessionID)
+	if !ok {
+		return
+	}
+	result, err := s.control.AcknowledgeCancellation(r.Context(), scope,
 		workers.CancelAcknowledgment{Fence: fence, OutcomeRequestID: outcomeID})
 	if err != nil {
 		s.writeWorkerControlError(w, r, "acknowledge attempt cancellation", err)
@@ -589,7 +636,11 @@ func (s *Server) handleFencedTransition(
 		s.writeWorkerValidation(w, r, fields)
 		return
 	}
-	if err := transition(r.Context(), s.cfg.DevScope, fence); err != nil {
+	scope, ok := s.resolveWorkerControlScope(w, r, fence.SessionID)
+	if !ok {
+		return
+	}
+	if err := transition(r.Context(), scope, fence); err != nil {
 		s.writeWorkerControlError(w, r, op, err)
 		return
 	}
@@ -653,6 +704,52 @@ func (s *Server) decodeControlJSON(w http.ResponseWriter, r *http.Request, targe
 		return false
 	}
 	return true
+}
+
+// resolveWorkerControlScope resolves the scope one already-registered
+// session's worker-control request should act within, and refuses the
+// request if the session is unknown or the worker key that registered it has
+// since been revoked.
+//
+// This is the seven non-Register worker-control handlers' entire dependency
+// on authentication: no credential is re-presented, and none of the fenced
+// Store methods below this point are touched by any of it. On success, ok is
+// true and scope is exactly what SessionScope read off the session row; on
+// failure this has already written the response (401 for a revoked or
+// unverifiable key, or whatever writeWorkerControlError already gives an
+// unknown session -- the same 409 an unmodified fenced call would give the
+// identical bogus id), and the caller simply returns.
+func (s *Server) resolveWorkerControlScope(w http.ResponseWriter, r *http.Request, sessionID uuid.UUID) (scope string, ok bool) {
+	scope, workerKeyID, err := s.control.SessionScope(r.Context(), sessionID)
+	if err != nil {
+		s.writeWorkerControlError(w, r, "resolve worker session scope", err)
+		return "", false
+	}
+	if workerKeyID == nil {
+		// This session was registered before worker keys existed, or through a
+		// path that never presented one. Never treated as revoked -- see
+		// migrations/0015_worker_keys.sql's comment on worker_sessions.worker_key_id
+		// for why that is the correct, not merely convenient, reading of a nil
+		// value here.
+		return scope, true
+	}
+	if s.workerKeys == nil {
+		// A session was registered with a real credential, but this server
+		// instance has no way to verify whether it is still live -- fail
+		// closed rather than trust a credential nothing here can check.
+		s.writeWorkerKeyUnauthorized(w, r)
+		return "", false
+	}
+	revoked, err := s.workerKeys.IsRevoked(r.Context(), *workerKeyID)
+	if err != nil {
+		s.writeWorkerControlError(w, r, "check worker key revocation", err)
+		return "", false
+	}
+	if revoked {
+		s.writeWorkerKeyUnauthorized(w, r)
+		return "", false
+	}
+	return scope, true
 }
 
 func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request, op string, err error) {
