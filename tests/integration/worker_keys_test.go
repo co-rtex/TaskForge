@@ -427,11 +427,14 @@ func TestE2E_AWorkerRegisteredUnderAMatchingWorkerKeyExecutesTheJob(t *testing.T
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&job))
 	jobID := uuid.MustParse(job.ID)
 
-	// A worker registered under the SUITE's default worker key (a different
-	// scope) must never claim this job -- it proves the isolation still holds
-	// even while a matching worker exists for another job in the same run.
-	stack.startWorker(t, "wrong-scope-worker", 1)
-
+	// Deliberately no second, wrong-scope worker sharing this stack's broker
+	// queue: scope isolation is proven elsewhere (TestAPIKeys_ScopeIsolationIsEnforcedByTheKey,
+	// requireWorkerKey and resolveWorkerControlScope's own unit tests), and a
+	// worker that receives this job's broker notification but is never
+	// eligible to claim it would hold that message invisible for the queue's
+	// visibility timeout, stalling the worker that actually can -- a race
+	// against the test's own timeout that this test does not need to run.
+	//
 	// The worker registered under a key matching the job's own scope, driven
 	// through its own control client so it presents workerKey rather than the
 	// stack's suite-wide default.
