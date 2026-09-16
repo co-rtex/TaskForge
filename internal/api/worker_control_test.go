@@ -25,7 +25,7 @@ type fakeWorkerControl struct {
 	claim        func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
 	renew        func(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
 	start        func(context.Context, string, workers.Fence) (workers.StartResult, error)
-	succeed      func(context.Context, string, workers.Fence) error
+	succeed      func(context.Context, string, workers.Fence, *workers.ResultRef) error
 	fail         func(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
 	cancelAck    func(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 	sessionScope func(context.Context, uuid.UUID) (string, *uuid.UUID, error)
@@ -46,8 +46,8 @@ func (f *fakeWorkerControl) RenewLease(ctx context.Context, scope string, req wo
 func (f *fakeWorkerControl) Start(ctx context.Context, scope string, fence workers.Fence) (workers.StartResult, error) {
 	return f.start(ctx, scope, fence)
 }
-func (f *fakeWorkerControl) Succeed(ctx context.Context, scope string, fence workers.Fence) error {
-	return f.succeed(ctx, scope, fence)
+func (f *fakeWorkerControl) Succeed(ctx context.Context, scope string, fence workers.Fence, result *workers.ResultRef) error {
+	return f.succeed(ctx, scope, fence, result)
 }
 func (f *fakeWorkerControl) Fail(ctx context.Context, scope string, report workers.FailureReport) (workers.OutcomeResult, error) {
 	return f.fail(ctx, scope, report)

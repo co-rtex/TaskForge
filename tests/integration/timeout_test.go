@@ -393,7 +393,7 @@ func TestTimeout_SuccessBeforeTheDeadlineWinsAndStaysTerminal(t *testing.T) {
 		workerRegistration("success-before", 1, nil, []string{"demo.echo"}))
 	fence, _ := claimedRunningWithTimeout(t, store, session, "success-before", 3, 3600)
 
-	require.NoError(t, store.Succeed(ctx, testScope, fence))
+	require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 	require.Equal(t, "SUCCEEDED", readJob(t, fence.JobID).status)
 
 	// Even if the deadline is later moved into the past, a committed success is
@@ -431,7 +431,7 @@ func TestTimeout_SuccessWaitingAcrossTheDeadlineIsRejected(t *testing.T) {
 	require.NoError(t, err)
 
 	resultCh := make(chan error, 1)
-	go func() { resultCh <- store.Succeed(ctx, testScope, fence) }()
+	go func() { resultCh <- store.Succeed(ctx, testScope, fence, nil) }()
 	waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
 	waitForServerTime(t, timeoutAt.Add(50*time.Millisecond))
 	require.NoError(t, queueLock.Commit(ctx))
@@ -506,7 +506,7 @@ func TestTimeout_AnUncooperativeHandlerCannotCommitAfterwards(t *testing.T) {
 
 	// Everything the handler's worker could still try, long after its attempt
 	// was closed. Each must be refused, and none may mutate anything.
-	require.Error(t, store.Succeed(ctx, testScope, fence))
+	require.Error(t, store.Succeed(ctx, testScope, fence, nil))
 	_, err = store.Fail(ctx, testScope,
 		failureReport(fence, lifecycle.ClassRetryable, "transient", ""))
 	require.Error(t, err)
@@ -554,7 +554,7 @@ func TestContention_TimeoutVersusSuccess(t *testing.T) {
 		waitForDatabaseLock(t, fragmentAttemptTx)
 
 		successErr := make(chan error, 1)
-		go func() { successErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { successErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentQueueLock)
 
 		release()
@@ -594,7 +594,7 @@ func TestContention_TimeoutVersusSuccess(t *testing.T) {
 			"taskforge_test_gate_success_first", "BEFORE UPDATE", "job_attempts", whenSucceeding)
 
 		successErr := make(chan error, 1)
-		go func() { successErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { successErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		// Parked at its attempt UPDATE, holding every authority row, with its
 		// deadline check already passed against a pre-expiry sample.
 		waitForDatabaseLock(t, fragmentAttemptTx)

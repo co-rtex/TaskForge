@@ -24,7 +24,11 @@ type ControlPlane interface {
 	Claim(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
 	RenewLease(context.Context, workers.RenewalRequest) (workers.RenewalResult, error)
 	Start(context.Context, workers.Fence) (workers.StartResult, error)
-	Succeed(context.Context, workers.Fence) error
+	// Succeed's result parameter is nil when the job succeeded with nothing
+	// to record. A non-nil ResultRef is already fully resolved by the
+	// caller -- classified, and for a large result already uploaded to the
+	// object store -- before Succeed is ever called; see runner.go.
+	Succeed(context.Context, workers.Fence, *workers.ResultRef) error
 	Fail(context.Context, workers.FailureReport) (workers.OutcomeResult, error)
 	AcknowledgeCancellation(context.Context, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 	Ping(context.Context) error
@@ -375,8 +379,50 @@ func parseStartResult(fence workers.Fence, response api.StartResponse) (workers.
 	}, nil
 }
 
-func (c *Client) Succeed(ctx context.Context, fence workers.Fence) error {
-	return c.transition(ctx, "succeed", fence)
+// Succeed reports a fenced successful outcome and, when result is non-nil,
+// the result it produced. result is already fully resolved by the caller: a
+// large result has already been uploaded to the object store, so this call
+// never itself performs an upload and never blocks on one.
+func (c *Client) Succeed(ctx context.Context, fence workers.Fence, result *workers.ResultRef) error {
+	body := struct {
+		JobID           string         `json:"job_id"`
+		LeaseID         string         `json:"lease_id"`
+		WorkerID        string         `json:"worker_id"`
+		WorkerSessionID string         `json:"worker_session_id"`
+		Result          *resultPayload `json:"result,omitempty"`
+	}{
+		fence.JobID.String(), fence.LeaseID.String(), fence.WorkerID.String(), fence.SessionID.String(),
+		toResultPayload(result),
+	}
+	return c.doJSON(ctx, http.MethodPost,
+		"/internal/v1/attempts/"+fence.AttemptID.String()+"/succeed", body, nil)
+}
+
+// resultPayload is the wire shape of a fenced Succeed call's optional
+// result. Its fields mirror internal/api's succeedAttemptRequest.Result and,
+// in turn, the results table's own columns -- see
+// migrations/0016_results.sql -- so nothing is reinterpreted in between.
+type resultPayload struct {
+	Location       string          `json:"location"`
+	InlineBody     json.RawMessage `json:"inline_body,omitempty"`
+	ObjectBucket   string          `json:"object_bucket,omitempty"`
+	ObjectKey      string          `json:"object_key,omitempty"`
+	SizeBytes      int64           `json:"size_bytes"`
+	ChecksumSHA256 string          `json:"checksum_sha256,omitempty"`
+}
+
+func toResultPayload(result *workers.ResultRef) *resultPayload {
+	if result == nil {
+		return nil
+	}
+	return &resultPayload{
+		Location:       string(result.Location),
+		InlineBody:     result.Inline,
+		ObjectBucket:   result.Bucket,
+		ObjectKey:      result.Key,
+		SizeBytes:      result.SizeBytes,
+		ChecksumSHA256: result.Checksum,
+	}
 }
 
 // Fail reports one fenced terminal failure.
@@ -469,11 +515,6 @@ func parseOutcome(fence workers.Fence, response api.OutcomeResponse) (workers.Ou
 		result.DeadLetterReason = lifecycle.DLQReason(*response.DeadLetterReason)
 	}
 	return result, nil
-}
-
-func (c *Client) transition(ctx context.Context, operation string, fence workers.Fence) error {
-	return c.doJSON(ctx, http.MethodPost,
-		"/internal/v1/attempts/"+fence.AttemptID.String()+"/"+operation, fenceBody(fence), nil)
 }
 
 func fenceBody(fence workers.Fence) any {

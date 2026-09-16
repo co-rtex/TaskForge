@@ -246,7 +246,7 @@ func TestStaleSession_CanDoNothingAtAll(t *testing.T) {
 	require.ErrorIs(t, err, workers.ErrFenceRejected)
 
 	require.ErrorIs(t, startError(store, fence), workers.ErrFenceRejected)
-	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence), workers.ErrFenceRejected)
+	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence, nil), workers.ErrFenceRejected)
 
 	// Marking it again changes nothing.
 	marked, err = store.MarkStaleSessions(context.Background(), 5*time.Second, 10)
@@ -609,7 +609,7 @@ func TestRenewal_ReplayOnATerminalLeaseIsRejected(t *testing.T) {
 	}{
 		"completed by a successful outcome": {
 			drive: func(t *testing.T, store *workers.Store, fence workers.Fence) {
-				require.NoError(t, store.Succeed(context.Background(), testScope, fence))
+				require.NoError(t, store.Succeed(context.Background(), testScope, fence, nil))
 			},
 			wantLease: "COMPLETED", wantJob: "SUCCEEDED",
 		},
@@ -689,7 +689,7 @@ func TestRenewal_NeverResurrectsAClosedLease(t *testing.T) {
 	require.NoError(t, err)
 	fence := assignmentFence(claim.Assignment)
 	startAttempt(t, store, fence)
-	require.NoError(t, store.Succeed(context.Background(), testScope, fence))
+	require.NoError(t, store.Succeed(context.Background(), testScope, fence, nil))
 
 	_, err = store.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
 	require.ErrorIs(t, err, workers.ErrLeaseExpired)

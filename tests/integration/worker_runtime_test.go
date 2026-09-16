@@ -56,7 +56,7 @@ func TestWorker_EndToEndAndDuplicateBrokerDeliveryCreateOneAttempt(t *testing.T)
 	control := workerruntime.NewClient(server.URL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
 	registry := workerruntime.NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", workerruntime.DemoEcho{}))
-	runner := workerruntime.NewRunner(control, observedBroker, registry, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, observedBroker, registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: "e2e-worker", Hostname: "e2e.local",
 			WorkerGroup: "default", ConcurrencyLimit: 2, Capabilities: []string{"cpu"},

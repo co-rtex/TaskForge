@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/results"
 )
 
 // Config configures the HTTP server.
@@ -41,9 +42,22 @@ type Server struct {
 	control    WorkerControl
 	keys       APIKeys
 	workerKeys WorkerKeys
+	results    Results
+	objects    ObjectStore
 	cfg        Config
 	log        *slog.Logger
 	checks     []ReadinessCheck
+}
+
+// Results reads a job's recorded result. See internal/results.Store.
+type Results interface {
+	Get(ctx context.Context, scope string, jobID uuid.UUID) (*results.Result, error)
+}
+
+// ObjectStore fetches large result bytes a worker has already uploaded. See
+// internal/objectstore.Client.
+type ObjectStore interface {
+	Get(ctx context.Context, bucket, key string) ([]byte, error)
 }
 
 // NewServer builds a Server.
@@ -94,6 +108,23 @@ func (s *Server) WithWorkerAuth(keys WorkerKeys) *Server {
 	return s
 }
 
+// WithResults enables GET /v1/jobs/{job_id}/result. store reads the recorded
+// metadata row; objects fetches an object-located result's actual bytes and
+// may be nil for a deployment that only ever expects small, inline results
+// -- a request that then reaches an object-located row is a sanitized 500,
+// the same as any other operator misconfiguration this package reports,
+// rather than a panic or a silently empty body.
+//
+// Omitting this call entirely does not open the route with a fallback:
+// exactly like WithAuth and WithWorkerAuth, the route is not registered at
+// all unless this is called, so a binary that forgot to wire it serves a
+// plain 404 rather than a route that always answers empty.
+func (s *Server) WithResults(store Results, objects ObjectStore) *Server {
+	s.results = store
+	s.objects = objects
+	return s
+}
+
 // Handler returns the fully wrapped HTTP handler.
 //
 // Order matters: request id is outermost so every later layer can log it, and
@@ -106,6 +137,9 @@ func (s *Server) Handler() http.Handler {
 	// without the wrapper is a visible omission on this screen.
 	mux.HandleFunc("POST /v1/jobs", s.requireAPIKey(s.handleSubmitJob))
 	mux.HandleFunc("GET /v1/jobs/{job_id}", s.requireAPIKey(s.handleGetJob))
+	if s.results != nil {
+		mux.HandleFunc("GET /v1/jobs/{job_id}/result", s.requireAPIKey(s.handleGetJobResult))
+	}
 	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.requireAPIKey(s.handleCancelJob))
 	// Operator retry IS DLQ replay: same service, same idempotency namespace. Two
 	// routes exist because operators reach for both names, not because there are
@@ -152,6 +186,9 @@ func (s *Server) Handler() http.Handler {
 	// through to here.
 	mux.HandleFunc("/v1/jobs", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}", s.methodNotAllowed(http.MethodGet))
+	if s.results != nil {
+		mux.HandleFunc("/v1/jobs/{job_id}/result", s.methodNotAllowed(http.MethodGet))
+	}
 	mux.HandleFunc("/v1/jobs/{job_id}/cancel", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}/retry", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/dlq", s.methodNotAllowed(http.MethodGet))
@@ -211,8 +248,11 @@ type JobResponse struct {
 	// while a worker is still being asked to stop cooperatively.
 	CancelRequestedAt *time.Time `json:"cancel_requested_at"`
 	// ReplayedFromJobID links a replacement job back to the terminal job it
-	// replaces. Attempt history and results are deliberately not here: a rich
-	// history API is M5's, not this endpoint's.
+	// replaces. Attempt history is deliberately not here: a rich history API
+	// remains future work. A result, once recorded, is retrieved separately
+	// through GET /v1/jobs/{job_id}/result rather than embedded here, so
+	// reading a job's status never pulls a potentially large result body
+	// along with it.
 	ReplayedFromJobID *string   `json:"replayed_from_job_id"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
@@ -359,6 +399,55 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.internalError(w, r, "get job", err)
 	}
+}
+
+// handleGetJobResult serves one job's recorded result: the exact JSON bytes
+// a trusted handler produced, regardless of whether they are stored inline
+// in PostgreSQL or in the object store. The caller never needs to know
+// which -- both are served with the same Content-Type and the same status.
+//
+// This is a server-side proxy of the bytes, not a presigned-URL redirect:
+// every retrieval goes through the same scope check GET /v1/jobs/{job_id}
+// already does, with no separate credential a redirect target would need to
+// enforce on its own.
+func (s *Server) handleGetJobResult(w http.ResponseWriter, r *http.Request) {
+	scope, ok := s.scopeOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
+	id, err := uuid.Parse(r.PathValue("job_id"))
+	if err != nil {
+		// Same anti-oracle reasoning as handleGetJob: a malformed id and an id
+		// that is simply not the caller's must look identical.
+		writeError(w, r, s.log, http.StatusNotFound, CodeNotFound, "result not found", nil)
+		return
+	}
+
+	result, err := s.results.Get(r.Context(), scope, id)
+	if err != nil {
+		if errors.Is(err, results.ErrResultNotFound) {
+			writeError(w, r, s.log, http.StatusNotFound, CodeNotFound, "result not found", nil)
+			return
+		}
+		s.internalError(w, r, "get job result", err)
+		return
+	}
+
+	body := []byte(result.InlineBody)
+	if result.Location == results.LocationObject {
+		if s.objects == nil {
+			s.internalError(w, r, "get job result", fmt.Errorf(
+				"result for job %s is object-located but no object store is configured", id))
+			return
+		}
+		body, err = s.objects.Get(r.Context(), result.ObjectBucket, result.ObjectKey)
+		if err != nil {
+			s.internalError(w, r, "fetch object result", err)
+			return
+		}
+	}
+	writeJSON(w, s.log, http.StatusOK, json.RawMessage(body))
 }
 
 // handleLiveness answers whether the process is alive. It deliberately checks

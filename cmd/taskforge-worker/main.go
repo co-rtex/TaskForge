@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/config"
+	"github.com/co-rtex/TaskForge/internal/objectstore"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 	workerruntime "github.com/co-rtex/TaskForge/internal/worker"
@@ -60,6 +61,16 @@ func run() int {
 		return 1
 	}
 
+	objects, err := objectstore.New(ctx, objectstore.Options{
+		Endpoint: shared.ResultsEndpoint, Region: shared.ResultsRegion,
+		Bucket: shared.ResultsBucket, AccessKeyID: shared.ResultsAccessKeyID,
+		SecretAccessKey: shared.ResultsSecretAccessKey,
+	})
+	if err != nil {
+		log.Error("connect to result object store", slog.String("error", err.Error()))
+		return 1
+	}
+
 	httpClient := &http.Client{Timeout: workerConfig.RequestTimeout}
 	control := workerruntime.NewClient(workerConfig.APIBaseURL, httpClient, workerConfig.WorkerAPIKey)
 	registry := workerruntime.NewRegistry()
@@ -67,7 +78,7 @@ func run() int {
 		log.Error("register trusted handler", slog.String("error", err.Error()))
 		return 1
 	}
-	runner := workerruntime.NewRunner(control, broker, registry, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, broker, registry, objects, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: workerConfig.Name, Hostname: workerConfig.Hostname,
 			WorkerGroup: workerConfig.WorkerGroup, ConcurrencyLimit: workerConfig.Concurrency,
@@ -81,6 +92,11 @@ func run() int {
 		HeartbeatInterval: shared.HeartbeatInterval,
 		SessionStaleAfter: shared.SessionStaleAfter,
 		RenewInterval:     shared.LeaseRenewInterval,
+		// Same reasoning: the inline/object boundary and the bucket a result
+		// is uploaded to are shared, validated configuration, not local
+		// worker defaults.
+		ResultInlineThresholdBytes: shared.ResultInlineThresholdBytes,
+		ResultsBucket:              shared.ResultsBucket,
 	}, log)
 
 	healthServer := newHealthServer(workerConfig.HealthAddr, runner, control, broker, log)

@@ -153,7 +153,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // startWorker runs a real DB-less worker against the stack until the test ends.
 func (s *e2eStack) startWorker(t *testing.T, name string, concurrency int) {
 	t.Helper()
-	runner := workerruntime.NewRunner(s.control, s.broker, s.registry, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(s.control, s.broker, s.registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: name, Hostname: name + ".local",
 			WorkerGroup: "default", ConcurrencyLimit: concurrency, Capabilities: []string{"cpu"},
@@ -637,7 +637,7 @@ func TestE2E_CancellingAQueuedJobStopsItBeforeAnyWorkerClaimsIt(t *testing.T) {
 func (s *e2eStack) startWorkerVia(t *testing.T, name string, concurrency int, controlURL string) {
 	t.Helper()
 	control := workerruntime.NewClient(controlURL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
-	runner := workerruntime.NewRunner(control, s.broker, s.registry, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, s.broker, s.registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: name, Hostname: name + ".local",
 			WorkerGroup: "default", ConcurrencyLimit: concurrency, Capabilities: []string{"cpu"},

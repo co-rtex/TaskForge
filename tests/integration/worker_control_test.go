@@ -166,7 +166,7 @@ func TestWorkerRegistration_IsIdempotentAndReplacementFencesTheOldBoot(t *testin
 	require.ErrorIs(t, err, workers.ErrSessionUnavailable)
 	oldFence := assignmentFence(claim.Assignment)
 	require.ErrorIs(t, startError(store, oldFence), workers.ErrFenceRejected)
-	require.ErrorIs(t, store.Succeed(context.Background(), testScope, oldFence), workers.ErrFenceRejected)
+	require.ErrorIs(t, store.Succeed(context.Background(), testScope, oldFence, nil), workers.ErrFenceRejected)
 
 	var jobStatus, attemptStatus, leaseStatus string
 	require.NoError(t, testPool.QueryRow(context.Background(), `
@@ -611,12 +611,12 @@ func TestFencedStartAndSuccessAreIdempotentAndReleaseCapacity(t *testing.T) {
 
 	wrong = fence
 	wrong.SessionID = uuid.New()
-	require.ErrorIs(t, store.Succeed(context.Background(), testScope, wrong), workers.ErrFenceRejected)
-	require.NoError(t, store.Succeed(context.Background(), testScope, fence))
+	require.ErrorIs(t, store.Succeed(context.Background(), testScope, wrong, nil), workers.ErrFenceRejected)
+	require.NoError(t, store.Succeed(context.Background(), testScope, fence, nil))
 	var finishedAt time.Time
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT finished_at FROM job_attempts WHERE id = $1`, fence.AttemptID).Scan(&finishedAt))
-	require.NoError(t, store.Succeed(context.Background(), testScope, fence))
+	require.NoError(t, store.Succeed(context.Background(), testScope, fence, nil))
 	var replayedFinishedAt time.Time
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT finished_at FROM job_attempts WHERE id = $1`, fence.AttemptID).Scan(&replayedFinishedAt))
@@ -729,7 +729,7 @@ func TestSucceed_WaitingAcrossExpiryIsRejectedWithoutMutation(t *testing.T) {
 	require.NoError(t, err)
 
 	resultCh := make(chan error, 1)
-	go func() { resultCh <- store.Succeed(ctx, testScope, fence) }()
+	go func() { resultCh <- store.Succeed(ctx, testScope, fence, nil) }()
 	waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
 	waitForServerTime(t, expiresAt.Add(50*time.Millisecond))
 	require.NoError(t, queueLock.Commit(ctx))
@@ -1139,7 +1139,7 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		require.NoError(t, err)
 
 		succeedErr := make(chan error, 1)
-		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, "SELECT name FROM queues WHERE name")
 
 		replacement := registerReplacement(t, store, registration)
@@ -1188,7 +1188,7 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 			"taskforge_test_gate_leases", "BEFORE UPDATE", "leases")
 
 		succeedErr := make(chan error, 1)
-		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, "UPDATE leases SET status = 'COMPLETED'")
 
 		registerErr := make(chan error, 1)
@@ -1229,7 +1229,7 @@ func TestRegisterReplacement_RacingSucceedYieldsOnlyValidSerialOutcomes(t *testi
 		// exact replay of it still recognizes the committed triple and answers
 		// the same way, which is what makes a lost response safe to retry across
 		// a worker restart.
-		require.NoError(t, store.Succeed(context.Background(), testScope, fence),
+		require.NoError(t, store.Succeed(context.Background(), testScope, fence, nil),
 			"a committed success replays after its session was replaced")
 		require.Equal(t, "SUCCEEDED", readState(t, fence).job, "the replay changed nothing")
 		require.Equal(t, 1, countRows(t, "job_attempts"))

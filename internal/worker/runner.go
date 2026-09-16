@@ -13,8 +13,15 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/queue"
+	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
+
+// ObjectStore uploads a large result's bytes before Succeed is ever called.
+// See internal/objectstore.Client.
+type ObjectStore interface {
+	Put(ctx context.Context, bucket, key string, body []byte, contentType string) error
+}
 
 // RunnerConfig bounds all local concurrency, liveness, and retry behavior.
 type RunnerConfig struct {
@@ -35,6 +42,11 @@ type RunnerConfig struct {
 	// leave room for several attempts inside one lease window; the relationship
 	// is validated in internal/config.
 	RenewInterval time.Duration
+
+	// ResultInlineThresholdBytes and ResultsBucket decide where a handler's
+	// output is stored before Succeed is called -- see prepareResult.
+	ResultInlineThresholdBytes int
+	ResultsBucket              string
 }
 
 var (
@@ -75,6 +87,7 @@ type Runner struct {
 	control   ControlPlane
 	broker    queue.Broker
 	registry  *Registry
+	objects   ObjectStore
 	cfg       RunnerConfig
 	log       *slog.Logger
 	ready     atomic.Bool
@@ -90,7 +103,7 @@ type Runner struct {
 	now func() time.Time
 }
 
-func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, cfg RunnerConfig, log *slog.Logger) *Runner {
+func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
 	if cfg.RetryAttempts < 1 {
 		cfg.RetryAttempts = 1
 	}
@@ -109,8 +122,14 @@ func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, cf
 	if cfg.RenewInterval <= 0 {
 		cfg.RenewInterval = 10 * time.Second
 	}
+	// A zero threshold would classify every non-empty result as too large to
+	// inline, silently requiring objects for a Runner built without one. The
+	// documented default matches internal/config's own default exactly.
+	if cfg.ResultInlineThresholdBytes <= 0 {
+		cfg.ResultInlineThresholdBytes = 64 * 1024
+	}
 	return &Runner{
-		control: control, broker: broker, registry: registry, cfg: cfg, log: log,
+		control: control, broker: broker, registry: registry, objects: objects, cfg: cfg, log: log,
 		flights:  make(map[uuid.UUID]*deliveryFlight),
 		attempts: newAttemptRegistry(),
 		now:      time.Now,
@@ -431,7 +450,7 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	handlerCtx, cancelHandler := context.WithCancelCause(executionCtx)
 	r.attempts.bind(fence.AttemptID, cancelHandler)
 
-	_, handlerErr := invokeHandler(handlerCtx, handler, Execution{
+	handlerResult, handlerErr := invokeHandler(handlerCtx, handler, Execution{
 		JobID: assignment.JobID, AttemptID: assignment.AttemptID, Payload: assignment.Payload,
 	})
 	// Captured before the derived contexts are cancelled: cancelling first would
@@ -493,7 +512,18 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		return nil
 	}
 
-	if err := r.retry(ctx, func() error { return r.control.Succeed(ctx, fence) }); err != nil {
+	result, ok := r.prepareResult(ctx, fence, assignment.Scope, handlerResult)
+	if !ok {
+		// Already logged inside prepareResult. Succeed must never be called
+		// with a large result this process could not actually upload: doing
+		// so would report success for a result nothing can ever retrieve.
+		// Reporting nothing at all leaves this exactly as recoverable as any
+		// other reason a worker fails to report in time -- the lease lapses
+		// and reconciliation hands the job to a replacement attempt.
+		return nil
+	}
+
+	if err := r.retry(ctx, func() error { return r.control.Succeed(ctx, fence, result) }); err != nil {
 		if isSessionLost(err) {
 			// The claim decision was already published; this session-loss is the
 			// leader's own fatal signal and does not change any follower's ack.
@@ -502,8 +532,58 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		r.log.Warn("report successful outcome", fenceLog(fence, slog.String("error", err.Error()))...)
 		return nil
 	}
-	r.log.Info("job succeeded", fenceLog(fence)...)
+	r.log.Info("job succeeded", fenceLog(fence, slog.Bool("has_result", result != nil))...)
 	return nil
+}
+
+// prepareResult classifies the handler's output and, for a result at or
+// above the configured threshold, uploads it to the object store before
+// Succeed is ever called. It reports its own failures and returns ok=false
+// when a required upload could not be completed; the caller must then
+// abandon this attempt rather than call Succeed with an incomplete result.
+//
+// This runs entirely before the fenced Succeed transition and never inside a
+// PostgreSQL transaction: an unreachable or slow object store must never
+// hold the queue row's authority lock Succeed's own transaction takes. The
+// object key is deterministic and attempt-scoped --
+// results/<scope>/<job_id>/<attempt_id> -- not job-scoped; see
+// docs/adr/0015-result-storage.md's Known limitation for the orphaned-object
+// consequence that choice accepts.
+func (r *Runner) prepareResult(ctx context.Context, fence workers.Fence, scope string, handlerResult []byte) (*workers.ResultRef, bool) {
+	if len(handlerResult) == 0 {
+		return nil, true
+	}
+
+	if results.Classify(handlerResult, r.cfg.ResultInlineThresholdBytes) == results.LocationInline {
+		return &workers.ResultRef{
+			Location:  results.LocationInline,
+			Inline:    handlerResult,
+			SizeBytes: int64(len(handlerResult)),
+		}, true
+	}
+
+	if r.objects == nil {
+		r.log.Error("large result requires an object store, none is configured",
+			fenceLog(fence, slog.Int("size_bytes", len(handlerResult)))...)
+		return nil, false
+	}
+
+	key := fmt.Sprintf("results/%s/%s/%s", scope, fence.JobID, fence.AttemptID)
+	checksum := results.ChecksumSHA256(handlerResult)
+	if err := r.retry(ctx, func() error {
+		return r.objects.Put(ctx, r.cfg.ResultsBucket, key, handlerResult, "application/json")
+	}); err != nil {
+		r.log.Warn("upload large result", fenceLog(fence,
+			slog.String("object_key", key), slog.String("error", err.Error()))...)
+		return nil, false
+	}
+	return &workers.ResultRef{
+		Location:  results.LocationObject,
+		Bucket:    r.cfg.ResultsBucket,
+		Key:       key,
+		SizeBytes: int64(len(handlerResult)),
+		Checksum:  checksum,
+	}, true
 }
 
 // reportFailure classifies a handler error and reports it under ONE outcome

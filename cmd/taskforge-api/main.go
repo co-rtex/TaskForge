@@ -23,6 +23,8 @@ import (
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/objectstore"
+	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 	"github.com/co-rtex/TaskForge/internal/workerauth"
 	"github.com/co-rtex/TaskForge/internal/workers"
@@ -63,6 +65,16 @@ func run() int {
 		return 1
 	}
 
+	objects, err := objectstore.New(ctx, objectstore.Options{
+		Endpoint: cfg.ResultsEndpoint, Region: cfg.ResultsRegion,
+		Bucket: cfg.ResultsBucket, AccessKeyID: cfg.ResultsAccessKeyID,
+		SecretAccessKey: cfg.ResultsSecretAccessKey,
+	})
+	if err != nil {
+		log.Error("connect to result object store", slog.String("error", err.Error()))
+		return 1
+	}
+
 	server := api.NewServer(
 		jobs.NewStore(pool),
 		api.Config{
@@ -78,7 +90,8 @@ func run() int {
 		LeaseDuration: cfg.LeaseDuration,
 		RetryPolicy:   cfg.RetryPolicy(),
 		Jitter:        jitter,
-	})).WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool))
+	})).WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool)).
+		WithResults(results.NewStore(pool), objects)
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,

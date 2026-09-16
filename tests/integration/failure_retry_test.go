@@ -608,7 +608,7 @@ func TestFail_RequiresARunningAttemptUnderALiveLease(t *testing.T) {
 		session := registerWorker(t, store,
 			workerRegistration("succeeded-fail", 1, nil, []string{"demo.echo"}))
 		fence := claimedAndRunning(t, store, session, "succeeded-fail")
-		require.NoError(t, store.Succeed(ctx, testScope, fence))
+		require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 
 		_, err := store.Fail(ctx, testScope,
 			failureReport(fence, lifecycle.ClassRetryable, "transient", ""))

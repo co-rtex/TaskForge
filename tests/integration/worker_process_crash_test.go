@@ -432,7 +432,7 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 	require.ErrorIs(t, err, workers.ErrSessionUnavailable)
 	_, err = control.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
 	require.ErrorIs(t, err, workers.ErrFenceRejected)
-	require.ErrorIs(t, control.Succeed(context.Background(), testScope, fence),
+	require.ErrorIs(t, control.Succeed(context.Background(), testScope, fence, nil),
 		workers.ErrFenceRejected)
 
 	// Every surviving service stopped cleanly and logged no error.

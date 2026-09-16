@@ -99,13 +99,13 @@ func TestOutcomeReplay_CommittedHistoryIsRecognizedWithoutLiveAuthority(t *testi
 			fence := assignmentFence(claim.Assignment)
 			startAttempt(t, store, fence)
 
-			require.NoError(t, store.Succeed(ctx, testScope, fence))
+			require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 			committed := readOutcomeState(t, fence)
 			require.Equal(t, leaseOutcome{"SUCCEEDED", "SUCCEEDED", "COMPLETED"}, committed)
 
 			invalidate(t, store, registration, fence)
 
-			require.NoError(t, store.Succeed(ctx, testScope, fence),
+			require.NoError(t, store.Succeed(ctx, testScope, fence, nil),
 				"a committed success must still be recognized once its fence is no longer live")
 			require.Equal(t, committed, readOutcomeState(t, fence),
 				"a replay reads history; it must not write any part of it again")
@@ -284,7 +284,7 @@ func TestOutcomeReplay_RecognitionIsExactAndNothingElse(t *testing.T) {
 		// is therefore a mutation, and a replaced boot has no authority for one.
 		replaceSession(t, store, registration)
 
-		require.ErrorIs(t, store.Succeed(ctx, testScope, fence), workers.ErrFenceRejected)
+		require.ErrorIs(t, store.Succeed(ctx, testScope, fence, nil), workers.ErrFenceRejected)
 		_, err = store.Fail(ctx, testScope,
 			failureReport(fence, lifecycle.ClassRetryable, "upstream_5xx", "upstream returned 502"))
 		require.ErrorIs(t, err, workers.ErrFenceRejected)
@@ -380,7 +380,7 @@ func TestOutcomeReplay_AnswersTheDecisionThatCommittedNotWhatTheJobDidNext(t *te
 	second := assignmentFence(claim.Assignment)
 	require.NotEqual(t, first.AttemptID, second.AttemptID)
 	startAttempt(t, store, second)
-	require.NoError(t, store.Succeed(ctx, testScope, second))
+	require.NoError(t, store.Succeed(ctx, testScope, second, nil))
 
 	require.Equal(t, "SUCCEEDED", readState(t, second).job,
 		"the job really has moved on, which is what makes the replay below meaningful")
@@ -598,7 +598,7 @@ func TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically(t *testing.T) 
 			second := assignmentFence(claim.Assignment)
 			require.NotEqual(t, first.AttemptID, second.AttemptID)
 			startAttempt(t, store, second)
-			require.NoError(t, store.Succeed(ctx, testScope, second))
+			require.NoError(t, store.Succeed(ctx, testScope, second, nil))
 			require.Equal(t, "SUCCEEDED", readState(t, second).job)
 
 			// The ambiguous first report, retried at last.
@@ -695,7 +695,7 @@ func TestOutcomeReplay_ZeroDelayRetryableFailureReplaysAsImmediateRetry(t *testi
 	second := assignmentFence(claim.Assignment)
 	require.NotEqual(t, first.AttemptID, second.AttemptID)
 	startAttempt(t, store, second)
-	require.NoError(t, store.Succeed(ctx, testScope, second))
+	require.NoError(t, store.Succeed(ctx, testScope, second, nil))
 	require.Equal(t, "SUCCEEDED", readState(t, second).job)
 
 	replayed, err := store.Fail(ctx, testScope, report)

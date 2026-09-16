@@ -83,11 +83,11 @@ func (k *killableAPI) Start(ctx context.Context, scope string, fence workers.Fen
 	return k.control.Start(ctx, scope, fence)
 }
 
-func (k *killableAPI) Succeed(ctx context.Context, scope string, fence workers.Fence) error {
+func (k *killableAPI) Succeed(ctx context.Context, scope string, fence workers.Fence, result *workers.ResultRef) error {
 	if k.isSevered(fence.SessionID) {
 		return context.DeadlineExceeded
 	}
-	return k.control.Succeed(ctx, scope, fence)
+	return k.control.Succeed(ctx, scope, fence, result)
 }
 
 func (k *killableAPI) Fail(ctx context.Context, scope string, report workers.FailureReport) (workers.OutcomeResult, error) {
@@ -168,7 +168,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 
 	workerA := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second}, currentWorkerKey())
 	sessionA := uuid.New()
-	runnerA := workerruntime.NewRunner(workerA, broker, registry, workerruntime.RunnerConfig{
+	runnerA := workerruntime.NewRunner(workerA, broker, registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: sessionA, Name: "crash-worker-a", Hostname: "a.local",
 			WorkerGroup: "default", ConcurrencyLimit: 1, Capabilities: []string{"cpu"},
@@ -260,7 +260,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 			return execution.Payload, nil
 		})))
 	workerB := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second}, currentWorkerKey())
-	runnerB := workerruntime.NewRunner(workerB, broker, registryB, workerruntime.RunnerConfig{
+	runnerB := workerruntime.NewRunner(workerB, broker, registryB, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: "crash-worker-b", Hostname: "b.local",
 			WorkerGroup: "default", ConcurrencyLimit: 1, Capabilities: []string{"cpu"},
@@ -312,7 +312,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 	_, err = store.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
 	require.ErrorIs(t, err, workers.ErrFenceRejected, "a dead session cannot renew")
 
-	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence),
+	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence, nil),
 		workers.ErrFenceRejected, "a dead session cannot commit an outcome")
 
 	require.Equal(t, settled, readState(t, fence),
