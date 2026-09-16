@@ -570,6 +570,8 @@ func (r *Runner) prepareResult(ctx context.Context, fence workers.Fence, scope s
 
 	key := fmt.Sprintf("results/%s/%s/%s", scope, fence.JobID, fence.AttemptID)
 	checksum := results.ChecksumSHA256(handlerResult)
+	r.log.Info("uploading large result", fenceLog(fence,
+		slog.String("object_key", key), slog.Int("size_bytes", len(handlerResult)))...)
 	if err := r.retry(ctx, func() error {
 		return r.objects.Put(ctx, r.cfg.ResultsBucket, key, handlerResult, "application/json")
 	}); err != nil {

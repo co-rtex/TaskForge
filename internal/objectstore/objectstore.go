@@ -23,16 +23,29 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// requestTimeout bounds a single S3 request end to end. The SDK's own default
-// HTTP client (awshttp.BuildableClient, below) leaves its overall Timeout at
-// the zero value -- unbounded -- unless a caller sets one; only its
-// per-phase Expect-100-Continue wait is bounded by default. Without this, an
-// object store that accepts a connection but never answers (seen against a
-// local S3-compatible endpoint during development) hangs the request
-// forever, holding the worker's concurrency slot along with it. Ten seconds
-// matches the timeout internal/worker's control-plane HTTP client already
-// uses for the same reason.
-const requestTimeout = 10 * time.Second
+// The SDK's own default HTTP client (awshttp.BuildableClient, below) leaves
+// its overall Timeout at the zero value -- unbounded -- unless a caller sets
+// one; only its per-phase Expect-100-Continue wait is bounded by default.
+// Without this, an object store that accepts a connection but never answers
+// hangs the request forever, holding the worker's concurrency slot along
+// with it -- confirmed against this project's own CI, where LocalStack does
+// exactly that against every PutObject and an unbounded client produced no
+// error at all, only a silent hang indistinguishable from any other cause of
+// a slow attempt.
+//
+// The bound differs by destination because the failure mode does too. A
+// local, same-host endpoint has no legitimate reason to take seconds to
+// answer even a large body; a bound generous enough for real AWS S3 over a
+// real network would just make a genuinely wedged local endpoint hang for
+// most of a test's own patience before ever producing a visible error.
+// remoteRequestTimeout is not yet exercised by anything in this repository
+// (no deployment targets real AWS S3 yet) and is a placeholder bound
+// pending real production traffic to tune it against, not a measured
+// value.
+const (
+	localRequestTimeout  = 3 * time.Second
+	remoteRequestTimeout = 30 * time.Second
+)
 
 // Options configures an object-store client.
 type Options struct {
@@ -76,8 +89,13 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		// WithTimeout keeps every other BuildableClient default (proxy from
 		// environment, TLS 1.2 minimum, connection pooling) and adds only the
-		// one missing bound; see requestTimeout's comment for why it exists.
-		o.HTTPClient = awshttp.NewBuildableClient().WithTimeout(requestTimeout)
+		// one missing bound; see the constants' comment above for why it
+		// exists and why the local and remote bounds differ.
+		timeout := remoteRequestTimeout
+		if opts.Endpoint != "" {
+			timeout = localRequestTimeout
+		}
+		o.HTTPClient = awshttp.NewBuildableClient().WithTimeout(timeout)
 		if opts.Endpoint != "" {
 			o.BaseEndpoint = aws.String(opts.Endpoint)
 			// A local endpoint needs path-style addressing for an arbitrary
@@ -94,9 +112,9 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 			// endpoint later fronted by TLS, matching the pre-v1.30 behavior
 			// of computing a checksum only for operations that require one
 			// rather than every operation that merely supports one. Real AWS
-			// S3 keeps the modern default. See requestTimeout above for what
-			// actually bounds a request against an endpoint that accepts a
-			// connection but never answers.
+			// S3 keeps the modern default. See localRequestTimeout above for
+			// what actually bounds a request against an endpoint that
+			// accepts a connection but never answers.
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}

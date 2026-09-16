@@ -252,6 +252,40 @@ future reader hitting the same symptom needs — including the reminder
 that a plausible, well-documented public fix for a same-looking symptom
 against a different tool is not evidence it applies to this one.
 
+**The 10-second timeout was itself not enough, for an arithmetic reason
+rather than a diagnostic one.** The identical failure recurred a third
+time on the push that introduced it. The cause this time was not that the
+fix was wrong, but that it was too generous relative to the test
+observing it: `prepareResult`'s upload is wrapped in `Runner.retry`, which
+attempts up to three times, so a single 10-second bound on each attempt
+allows up to 30 seconds before the worker ever logs a failure — twice the
+large-result test's own 15-second patience, inherited from every other
+`eventually()` call in this suite. The upload could time out correctly and
+still never produce a single line of visible evidence, because the test
+gives up and tears down the worker first. `internal/objectstore.New` now
+uses two bounds instead of one: `localRequestTimeout` (3 seconds) for a
+custom-endpoint client, short enough that three attempts finish with
+margin to spare inside the test's window, justified on its own terms
+because a same-host Docker-networked endpoint has no legitimate reason to
+take seconds to answer even a large body; and `remoteRequestTimeout` (30
+seconds, an unvalidated placeholder — nothing in this repository deploys
+against real AWS S3 yet) for everything else. `internal/worker/runner.go`
+also gained one `Info`-level log line immediately before the upload
+attempt, so that even a failure this bound still cannot make visible in
+time leaves a trace of how far execution got.
+
+This still does not explain *why* LocalStack's S3 gateway fails to answer
+a `PutObject` carrying a body at all, only that it does, reliably, across
+every push so far, against a body of a few hundred bytes — small enough
+that the well-documented large-payload LocalStack issues in this area do
+not obviously apply. Public LocalStack issue trackers document a
+recurring, multi-year pattern of `PutObject` hangs specifically on
+requests that carry a body, across unrelated LocalStack versions, which
+raises the possibility this is a server-side defect this project cannot
+fix from the client side at all — a possibility the next hosted CI run's
+actual error message (now reachable within the test's own window) should
+finally confirm or rule out, rather than another guess.
+
 ## Known limitation: an abandoned attempt's uploaded object is orphaned, permanently
 
 The object key `results/<scope>/<job_id>/<attempt_id>` is attempt-scoped,
