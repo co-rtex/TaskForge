@@ -31,6 +31,7 @@ func newTestServer(t *testing.T, checks ...ReadinessCheck) http.Handler {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	return NewServer(nil, Config{MaxRequestBytes: 1024}, log, checks...).
 		WithAuth(acceptingKeys(testScope)).
+		WithResults(acceptingResults(), nil).
 		Handler()
 }
 

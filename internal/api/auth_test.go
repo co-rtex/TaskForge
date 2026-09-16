@@ -84,6 +84,7 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Disca
 var publicRoutes = []struct{ method, path string }{
 	{http.MethodPost, "/v1/jobs"},
 	{http.MethodGet, "/v1/jobs/" + "11111111-1111-1111-1111-111111111111"},
+	{http.MethodGet, "/v1/jobs/11111111-1111-1111-1111-111111111111/result"},
 	{http.MethodPost, "/v1/jobs/11111111-1111-1111-1111-111111111111/cancel"},
 	{http.MethodPost, "/v1/jobs/11111111-1111-1111-1111-111111111111/retry"},
 	{http.MethodGet, "/v1/dlq"},
@@ -140,7 +141,9 @@ func TestAuth_EveryPublicRouteConsultsTheCredentialStore(t *testing.T) {
 							"the wrapper must hand the store the credential as presented")
 						return auth.Principal{KeyID: uuid.New(), Scope: testScope}, nil
 					},
-				}).Handler()
+				}).
+				WithResults(acceptingResults(), nil).
+				Handler()
 
 			recorder := httptest.NewRecorder()
 			request := authorize(httptest.NewRequest(route.method, route.path, strings.NewReader(validBody)))

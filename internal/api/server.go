@@ -108,17 +108,21 @@ func (s *Server) WithWorkerAuth(keys WorkerKeys) *Server {
 	return s
 }
 
-// WithResults enables GET /v1/jobs/{job_id}/result. store reads the recorded
-// metadata row; objects fetches an object-located result's actual bytes and
-// may be nil for a deployment that only ever expects small, inline results
-// -- a request that then reaches an object-located row is a sanitized 500,
-// the same as any other operator misconfiguration this package reports,
-// rather than a panic or a silently empty body.
+// WithResults supplies GET /v1/jobs/{job_id}/result its dependencies. store
+// reads the recorded metadata row; objects fetches an object-located
+// result's actual bytes and may be nil for a deployment that only ever
+// expects small, inline results -- a request that then reaches an
+// object-located row is a sanitized 500, the same as any other operator
+// misconfiguration this package reports, rather than a panic or a silently
+// empty body.
 //
-// Omitting this call entirely does not open the route with a fallback:
-// exactly like WithAuth and WithWorkerAuth, the route is not registered at
-// all unless this is called, so a binary that forgot to wire it serves a
-// plain 404 rather than a route that always answers empty.
+// Unlike WithWorkerControl, WithAuth, and WithWorkerAuth, the route is
+// registered unconditionally: PROJECT_SPEC.md item 13 makes result
+// retrieval a core public route exactly like job submission and cancellation,
+// not opt-in admin plumbing, so a server built without calling this answers
+// the same 401 every other public route does for an unauthenticated caller,
+// and a 500 for an authenticated one -- never a 404 that would make this one
+// route look like it does not exist.
 func (s *Server) WithResults(store Results, objects ObjectStore) *Server {
 	s.results = store
 	s.objects = objects
@@ -137,9 +141,7 @@ func (s *Server) Handler() http.Handler {
 	// without the wrapper is a visible omission on this screen.
 	mux.HandleFunc("POST /v1/jobs", s.requireAPIKey(s.handleSubmitJob))
 	mux.HandleFunc("GET /v1/jobs/{job_id}", s.requireAPIKey(s.handleGetJob))
-	if s.results != nil {
-		mux.HandleFunc("GET /v1/jobs/{job_id}/result", s.requireAPIKey(s.handleGetJobResult))
-	}
+	mux.HandleFunc("GET /v1/jobs/{job_id}/result", s.requireAPIKey(s.handleGetJobResult))
 	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.requireAPIKey(s.handleCancelJob))
 	// Operator retry IS DLQ replay: same service, same idempotency namespace. Two
 	// routes exist because operators reach for both names, not because there are
@@ -186,9 +188,7 @@ func (s *Server) Handler() http.Handler {
 	// through to here.
 	mux.HandleFunc("/v1/jobs", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}", s.methodNotAllowed(http.MethodGet))
-	if s.results != nil {
-		mux.HandleFunc("/v1/jobs/{job_id}/result", s.methodNotAllowed(http.MethodGet))
-	}
+	mux.HandleFunc("/v1/jobs/{job_id}/result", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/v1/jobs/{job_id}/cancel", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}/retry", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/dlq", s.methodNotAllowed(http.MethodGet))
@@ -413,6 +413,14 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetJobResult(w http.ResponseWriter, r *http.Request) {
 	scope, ok := s.scopeOrUnauthorized(w, r)
 	if !ok {
+		return
+	}
+	if s.results == nil {
+		// Authenticated, but this server instance was never wired with a
+		// results store -- an operator misconfiguration, reported the same
+		// way s.objects == nil is reported below, never a 404 that would
+		// make a real route look like it does not exist.
+		s.internalError(w, r, "get job result", fmt.Errorf("no results store configured"))
 		return
 	}
 
