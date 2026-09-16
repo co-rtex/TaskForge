@@ -1065,8 +1065,8 @@ its status as of this record.
 | `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/results` and `internal/worker` |
 | `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 |
 | `docker compose config --quiet` | PASS | exit 0 |
-| `make test-integration` | NOT RUN locally (see above) | hosted CI: two consecutive failures of `TestResults_LargeResultRoundTripsThroughTheObjectStore` (commits `bee0f3c`, `d545591`), root-caused and fixed by commit `c67fee1` after an intermediate, ultimately-insufficient fix (`91e7a4b`) — see [ADR-0015](adr/0015-result-storage.md); hosted re-run on `c67fee1` pending confirmation as of this record |
-| `make test-race` | NOT RUN locally (see above) | same two hosted failures and the same fix; hosted re-run on `c67fee1` pending confirmation as of this record |
+| `make test-integration` | NOT RUN locally (see above) | hosted CI: three consecutive failures of `TestResults_LargeResultRoundTripsThroughTheObjectStore` on the pushes that introduced this milestone (`bee0f3c`/`d545591` against an unbounded client; `91e7a4b`'s checksum-mode change did not address it; `c67fee1`'s 10-second timeout was structurally correct but too generous for its own three retries to surface within the test's 15-second patience) — see [ADR-0015](adr/0015-result-storage.md); `725ba97` splits the bound by destination and adds a pre-upload log line; hosted re-run pending confirmation as of this record |
+| `make test-race` | NOT RUN locally (see above) | same hosted failures and the same fix; hosted re-run pending confirmation as of this record |
 
 Exact commands and complete output are recorded in the pull request.
 
