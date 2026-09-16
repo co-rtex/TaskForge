@@ -314,6 +314,7 @@ func parseAssignment(response api.AssignmentResponse) (workers.Assignment, error
 		return workers.Assignment{}, err
 	}
 	return workers.Assignment{
+		Scope: response.Scope,
 		JobID: jobID, Queue: response.Queue, JobType: response.JobType, Payload: response.Payload,
 		Priority: response.Priority, TimeoutSeconds: response.TimeoutSeconds,
 		RequiredCapabilities: response.RequiredCapabilities,

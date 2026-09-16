@@ -313,6 +313,7 @@ type claimRequest struct {
 
 // AssignmentResponse is the committed authoritative payload plus its fence.
 type AssignmentResponse struct {
+	Scope                string          `json:"scope"`
 	JobID                string          `json:"job_id"`
 	Queue                string          `json:"queue"`
 	JobType              string          `json:"job_type"`
@@ -346,6 +347,7 @@ func toClaimResponse(result workers.ClaimResult) ClaimResponse {
 	}
 	if assignment := result.Assignment; assignment != nil {
 		response.Assignment = &AssignmentResponse{
+			Scope:                assignment.Scope,
 			JobID:                assignment.JobID.String(),
 			Queue:                assignment.Queue,
 			JobType:              assignment.JobType,

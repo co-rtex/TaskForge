@@ -2464,8 +2464,11 @@ components:
 
     Assignment:
       type: object
-      required: [job_id, queue, job_type, payload, priority, timeout_seconds, required_capabilities, attempt_id, attempt_number, lease_id, lease_expires_at, lease_remaining_milliseconds, worker_id, worker_session_id]
+      required: [scope, job_id, queue, job_type, payload, priority, timeout_seconds, required_capabilities, attempt_id, attempt_number, lease_id, lease_expires_at, lease_remaining_milliseconds, worker_id, worker_session_id]
       properties:
+        scope:
+          type: string
+          description: The claimed job's auth scope, read from PostgreSQL like every other field here. A large result's object-store key is derived from this, not from any value the worker already held locally.
         job_id: { type: string, format: uuid }
         queue: { type: string }
         job_type: { type: string }

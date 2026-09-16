@@ -92,6 +92,34 @@ func TestWorkerControl_ClaimResponseCarriesAckDecision(t *testing.T) {
 	require.False(t, response.SafeToAcknowledge)
 }
 
+// TestWorkerControl_ClaimResponseIncludesAssignmentScope proves the wire
+// response actually carries the scope workers.Store.Claim resolved, not just
+// that the Go struct on the server side has one. AssignmentResponse omitted
+// this field entirely until M5C needed a worker to know its own job's scope
+// (internal/worker/runner.go's object-store key) -- nothing before that ever
+// read it, so the gap was never observed.
+func TestWorkerControl_ClaimResponseIncludesAssignmentScope(t *testing.T) {
+	control := &fakeWorkerControl{
+		claim: func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{
+				Disposition: workers.Claimed,
+				Assignment:  &workers.Assignment{Scope: "acme-corp", JobType: "demo.echo"},
+			}, nil
+		},
+	}
+	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
+		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))
+	newWorkerControlHandler(control).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	var response ClaimResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.NotNil(t, response.Assignment)
+	require.Equal(t, "acme-corp", response.Assignment.Scope)
+}
+
 func TestWorkerControl_RejectsUnknownFieldsAndBadIdentifiers(t *testing.T) {
 	control := &fakeWorkerControl{}
 	handler := newWorkerControlHandler(control)
