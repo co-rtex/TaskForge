@@ -116,7 +116,13 @@ func startResultWorker(t *testing.T, apiURL string, broker queue.Broker, thresho
 func TestResults_SmallResultRoundTripsInline(t *testing.T) {
 	reset(t)
 	server := newAPI(t)
-	broker := newBroker(t, "")
+	// An isolated queue, not the shared one: a real worker polls it for the
+	// whole test, and reset's drain only removes what is visible at that
+	// instant -- a message left invisible by an unrelated test elsewhere in
+	// this package would starve this one for the rest of its own queue's
+	// defaultVisibilityTimeout, exactly the failure mode
+	// createIsolatedBrokerQueue exists to rule out for lifecycle_e2e_test.go.
+	broker := newBrokerForQueue(t, createIsolatedBrokerQueue(t, "taskforge-results-e2e-"))
 
 	payload := `{"message":"hello small result"}`
 	resp, submitted := submit(t, server.URL, "results-small",
@@ -153,7 +159,9 @@ func TestResults_SmallResultRoundTripsInline(t *testing.T) {
 func TestResults_LargeResultRoundTripsThroughTheObjectStore(t *testing.T) {
 	reset(t)
 	server := newAPI(t)
-	broker := newBroker(t, "")
+	// See TestResults_SmallResultRoundTripsInline's comment on why this is an
+	// isolated queue rather than the shared one.
+	broker := newBrokerForQueue(t, createIsolatedBrokerQueue(t, "taskforge-results-e2e-"))
 
 	padding := strings.Repeat("x", 300)
 	payload := fmt.Sprintf(`{"padding":%q}`, padding)
