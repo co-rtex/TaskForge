@@ -341,6 +341,8 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	}
 
 	assignment := claim.Assignment
+	r.log.Info("claimed job", slog.String("job_id", assignment.JobID.String()),
+		slog.String("attempt_id", assignment.AttemptID.String()), slog.String("job_type", assignment.JobType))
 	handler, ok := r.registry.Lookup(assignment.JobType)
 	if !ok {
 		// The control plane filters on the immutable registered handler set. This
@@ -399,6 +401,7 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		r.log.Warn("start attempt rejected", fenceLog(fence, slog.String("error", err.Error()))...)
 		return nil
 	}
+	r.log.Info("attempt started", fenceLog(fence, slog.Duration("remaining", start.Remaining))...)
 
 	// Lease authority is a cancelable context rather than a fixed deadline: the
 	// renewal loop owns it and cancels it the moment it can no longer prove this
@@ -453,6 +456,11 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	handlerResult, handlerErr := invokeHandler(handlerCtx, handler, Execution{
 		JobID: assignment.JobID, AttemptID: assignment.AttemptID, Payload: assignment.Payload,
 	})
+	if handlerErr != nil {
+		r.log.Info("handler returned", fenceLog(fence, slog.String("error", handlerErr.Error()))...)
+	} else {
+		r.log.Info("handler returned", fenceLog(fence, slog.Int("result_bytes", len(handlerResult)))...)
+	}
 	// Captured before the derived contexts are cancelled: cancelling first would
 	// make every successful handler look cancelled, while ignoring the value
 	// would let a cooperative timeout that returns nil be reported as success.
