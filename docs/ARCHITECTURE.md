@@ -96,9 +96,9 @@ single outbox publisher · a single reconciler instance.
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |
-| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, and report fenced outcomes including failures and cooperative cancellation. | **Built** for `demo.echo`; result persistence is M5. |
+| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, classify and record their result (uploading a large one to the object store first), and report fenced outcomes including failures and cooperative cancellation. | **Built** for `demo.echo` |
 | `taskforge-reconciler` | Mark stale sessions, record due attempt timeouts, finalize unacknowledged cancellations, expire leases, abandon their attempts, and release capacity. | **Built**; general drift repair beyond these is later. |
-| `taskforge-cli` | Operator and developer command-line interface. | Planned (M5) |
+| `taskforge-cli` | Operator and developer command-line interface. | Planned (M5D) |
 
 Every component is safe to run with N replicas.
 
@@ -216,7 +216,7 @@ cancellation, then a due deadline, then abandonment. See
 
 ## 5. Domain model — [PARTIAL]
 
-Everything below is implemented except result references, which are M5.
+Everything below is implemented except a trace id, which is M6.
 
 ### API key
 Key id · auth scope · operator-facing name · non-secret lookup prefix ·
@@ -239,7 +239,22 @@ worker id · **worker-session id** · typed status · start and finish times ·
 persisted execution deadline · retained outcome request identity · failure class
 · bounded error code and safe message · persisted retry delay and `retry_at`.
 The lease references the attempt through a constrained one-to-one binding. A
-result reference and a trace id are planned.
+trace id is planned (M6). A result is not a field here — see below.
+
+### Result
+Job id (primary key — at most one row per job, the outcome of whichever
+attempt actually succeeded) · attempt id (which attempt produced it) · auth
+scope · location (`inline` or `object`) · inline body **or** object bucket,
+key, and SHA-256 checksum, never both · size in bytes · content type ·
+creation time.
+
+A job at or above the configured threshold
+(`TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES`) stores its result in an
+S3-compatible object store instead of inline; either way the row is written
+in the same fenced transaction as the job's `SUCCEEDED` transition. See
+[ADR-0015](adr/0015-result-storage.md), including its accepted limitation
+that an abandoned attempt's uploaded object is orphaned rather than
+reclaimed.
 
 Attempt history is preserved. The last error is never overwritten in place.
 
@@ -751,7 +766,7 @@ intentional unconditional `200`; readiness is not.
 | Migrations | Numbered `.sql` + embedded runner | No extra binary to install; the SQL stays readable and reviewable. |
 | Broker | ElasticMQ locally, AWS SQS Standard as direction | See [ADR-0005](adr/0005-elasticmq-for-local-broker.md). |
 | Small results | PostgreSQL | Bounded size, transactional with state. |
-| Large results | MinIO locally, S3 in cloud | Keeps unbounded blobs out of PostgreSQL. |
+| Large results | LocalStack's S3 provider locally, S3 in cloud | Keeps unbounded blobs out of PostgreSQL. See [ADR-0015](adr/0015-result-storage.md) for why LocalStack rather than MinIO. |
 | Cache | None initially | Redis is not authoritative state and has no measured need yet. |
 | HTTP | Go standard library | Routing needs are modest; a framework would add opacity. |
 | Cloud direction | AWS ECS + RDS + SQS + S3 + ALB, via Terraform | Kubernetes is post-V1 and not required for V1. |
@@ -763,10 +778,11 @@ without explicit authorization; V1 runs entirely locally.
 
 ## 16. Schema
 
-**Implemented** (`migrations/0001` through `0014`): `queues`, `jobs`,
+**Implemented** (`migrations/0001` through `0016`): `queues`, `jobs`,
 `idempotency_records`, `outbox_events`, `workers`, `worker_sessions`,
-`job_attempts`, `leases`, `dlq_entries`, `dlq_replays`, and `api_keys`, plus
-`schema_migrations` maintained by the runner.
+`job_attempts`, `leases`, `dlq_entries`, `dlq_replays`, `api_keys`,
+`worker_keys`, and `results`, plus `schema_migrations` maintained by the
+runner.
 M2 adds immediate eligibility time, worker-group routing, constrained session/
 attempt/lease bindings, one current session per logical worker, one active lease per
 job, globally unique notification claims, active-capacity indexes, and timeline-order
@@ -843,7 +859,20 @@ is simply never treated as revoked, which is the security posture every
 session already had. See
 [ADR-0014](adr/0014-worker-control-authentication.md).
 
-**Planned:** `results`, `audit_events`.
+M5C adds `results`: at most one row per job, `job_id` itself the primary
+key rather than a surrogate, referencing `jobs (id)` and, through a
+composite foreign key reusing 0011's `jobs_id_scope_key`, tying its
+denormalized `scope` to the real job's. A `results_location_shape` CHECK
+ties `location` (`inline` or `object`) to exactly which of `inline_body` or
+`object_bucket`/`object_key`/`checksum_sha256` is populated. No new columns
+on `job_attempts`; `attempt_id` is recorded on `results` itself, for
+operator traceability, not for any implemented query. There is no backfill,
+because no earlier milestone persisted a result. See
+[ADR-0015](adr/0015-result-storage.md), including the accepted limitation
+that an abandoned attempt's uploaded object is orphaned rather than
+reclaimed.
+
+**Planned:** `audit_events`.
 
 Tables are created in the milestone that puts working behavior on them, not in
 advance. Every index exists because an implemented query orders by exactly its

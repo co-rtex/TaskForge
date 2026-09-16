@@ -1,8 +1,8 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M5A are merged into `main`; this document
-records the implemented state through M5B, which is on the
+planned. Milestones M1 through M5B are merged into `main`; this document
+records the implemented state through M5C, which is on the
 `claude/taskforge-bounded-handoff-fwf0im` branch and its draft pull request.
 
 ## Milestone status
@@ -13,7 +13,8 @@ records the implemented state through M5B, which is on the
 - **M4 — retry, timeout, cancellation, DLQ, replay, delayed jobs:** complete.
 - **M5A — database-backed API keys for the public surface:** complete.
 - **M5B — worker/control authentication:** complete.
-- **M5C — result storage:** not started.
+- **M5C — result storage:** implementation complete; hosted CI verification
+  in progress (see "### M5C gates" below for what has run so far).
 - **M5D — CLI and Python SDK:** not started.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into four slices and what each
@@ -24,33 +25,39 @@ one owns.
 Six binaries build and run:
 
 - `taskforge-api` accepts idempotent immediate and delayed job submissions, job
-  reads, cancellation, DLQ listing, replay and operator retry — all of which
-  require an API key and take their scope from it — plus the loopback-only key
-  management that mints those keys, plus the internal worker-control surface:
-  session registration (which requires a worker key and takes its scope from
-  it), heartbeat with cancellation delivery, atomic claims, fenced lease
-  renewal, and the fenced start, success, failure, and
-  cancellation-acknowledgment transitions. Every worker-control route other
-  than registration takes no credential on the request; it trusts the session
-  identity registration already authenticated and checks that session's
-  worker key has not since been revoked. The loopback-only worker-key
-  management routes mint and revoke those credentials.
+  reads, small and large result retrieval, cancellation, DLQ listing, replay
+  and operator retry — all of which require an API key and take their scope
+  from it — plus the loopback-only key management that mints those keys, plus
+  the internal worker-control surface: session registration (which requires a
+  worker key and takes its scope from it), heartbeat with cancellation
+  delivery, atomic claims, fenced lease renewal, and the fenced start, success
+  (optionally carrying a result), failure, and cancellation-acknowledgment
+  transitions. Every worker-control route other than registration takes no
+  credential on the request; it trusts the session identity registration
+  already authenticated and checks that session's worker key has not since
+  been revoked. The loopback-only worker-key management routes mint and revoke
+  those credentials. `taskforge-api` never depends on the result object store
+  being reachable at boot; only a request that needs an object-located result
+  does.
 - `taskforge-outbox` publishes durable work-availability events to ElasticMQ.
 - `taskforge-scheduler` promotes due delayed and retry-waiting jobs and
   re-notifies stranded queued work. It holds no broker connection.
 - `taskforge-worker` polls ElasticMQ only while it has capacity, heartbeats its
-  process session, executes trusted handlers through the control plane, renews
-  each running attempt's lease, reports classified failures, and acknowledges
-  cancellation cooperatively.
+  process session, executes trusted handlers through the control plane,
+  classifies each handler's result and uploads a large one to the object
+  store before reporting success, renews each running attempt's lease,
+  reports classified failures, and acknowledges cancellation cooperatively.
+  Its boot depends on the configured result object store and bucket being
+  reachable, exactly as it already depends on the broker.
 - `taskforge-reconciler` marks stale sessions unhealthy, records due attempt
   timeouts, finalizes cancellations no worker acknowledged, expires lapsed
   leases, abandons their attempts, releases the capacity they held, and requeues
   or dead-letters the job.
 - `taskforge-migrate` applies numbered PostgreSQL migrations.
 
-The schema consists of migrations `0001` through `0015`. M5A adds
-`0014_api_keys.sql` and M5B adds `0015_worker_keys.sql`, both described below.
-M4 adds five:
+The schema consists of migrations `0001` through `0016`. M5A adds
+`0014_api_keys.sql`, M5B adds `0015_worker_keys.sql`, and M5C adds
+`0016_results.sql`, all described below. M4 adds five:
 
 - `0009_job_lifecycle.sql` — scheduling, cancellation, replay linkage, and
   notification bookkeeping on `jobs`; a persisted execution deadline, a
@@ -725,6 +732,132 @@ scheme and routes, plus an explicit carve-out in the test that walks the
 internal surface asserting no security: it now skips exactly the one
 authenticated operation, by name, rather than the assertion silently loosening.
 
+## M5C — result storage
+
+### What changed
+
+A trusted handler's return value is no longer discarded. `demo.echo` always
+produced one (`internal/worker/handler.go`'s `DemoEcho.Execute` has returned
+an exact copy of the payload since M2), and every successful attempt since
+then has thrown it away. `internal/worker/runner.go` now classifies it by
+size and, before ever reporting success, either keeps it to send inline or
+uploads it to an S3-compatible object store. `internal/workers.Store.Succeed`
+records it in the `results` table in the same fenced transaction as the
+`SUCCEEDED` transition, and `GET /v1/jobs/{job_id}/result` serves it back —
+authenticated by the same `ApiKeyAuth` scope check every other public route
+already uses, since M5A and M5B mean that check has somewhere real to land.
+See [ADR-0015](adr/0015-result-storage.md) for the full design.
+
+### Classification and the threshold
+
+A result at or above `TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES` (default
+`65536`) is too large to store inline; everything smaller is
+(`internal/results.Classify`, exercised at, just below, and just above the
+boundary). The threshold lives on the shared `internal/config.Config`
+struct and is validated to be positive and strictly less than
+`TASKFORGE_MAX_REQUEST_BYTES` — an inline result travels inside the fenced
+`/succeed` request body, which is itself subject to that same limit, so a
+threshold at or above it would let a worker classify a result as "small
+enough to inline" that its own reporting request could never actually
+deliver.
+
+### Upload before report
+
+For a large result, `internal/worker/runner.go` uploads to the object store
+*before* calling `Succeed` — never inside `Succeed`'s own PostgreSQL
+transaction, which already holds the established
+`queue → worker session → job → attempt → lease` authority lock order for
+its duration. Holding those locks across a slow or unreachable network call
+would block every other fenced operation on the same queue. The upload is
+wrapped in the same bounded retry helper (`Runner.retry`) every other
+worker-control call already uses; if it still fails, the worker reports
+nothing at all and the attempt is abandoned to the ordinary crash-recovery
+path (ADR-0009) — indistinguishable from any other reason a worker fails to
+report in time, needing zero new control-plane failure-mode logic. The
+object key is deterministic: `results/<scope>/<job_id>/<attempt_id>`.
+
+### `Succeed`'s one new parameter, and why its replay branch stays safe
+
+`internal/workers.Store.Succeed` gained one parameter, `result
+*ResultRef` — the one fenced-method signature change this milestone makes.
+Its replay branch (an exact replay of an already-committed success) returns
+before `result` is ever looked at, so a replayed call cannot attempt a
+second `results` insert; this is proven, not merely argued, by
+`TestSucceedReplay_DoesNotInsertASecondResult`'s mutation evidence below.
+This is not a breaking change: a worker that never sends `result` keeps
+working exactly as it did before this milestone.
+
+### The `results` table
+
+Migration `0016_results.sql` adds `results`: at most one row per job,
+`job_id` itself the primary key (not a surrogate, and not keyed by
+attempt), `attempt_id NOT NULL` for operator traceability, a denormalized
+`scope` tied to the real job's by a composite foreign key reusing migration
+0011's `jobs_id_scope_key`, and a `results_location_shape` CHECK tying
+`location` (`inline` or `object`) to exactly which of `inline_body` or
+`object_bucket`/`object_key`/`checksum_sha256` is populated. Zero new
+columns on `job_attempts`. There is no backfill, because no earlier
+milestone ever persisted a result.
+
+### Known limitation: an abandoned attempt's uploaded object is orphaned
+
+The object key a worker uploads a large result to is attempt-scoped
+(`results/<scope>/<job_id>/<attempt_id>`), not job-scoped — considered and
+deliberately rejected in favor of keeping it attempt-scoped; see
+[ADR-0015](adr/0015-result-storage.md)'s "Alternatives considered" for why a
+job-scoped overwrite key was rejected. The accepted consequence: an attempt
+whose object upload succeeds but whose process then dies or loses its
+session before it ever calls `Succeed` leaves that uploaded object in the
+object store permanently — nothing in PostgreSQL ever points at it, and a
+replacement attempt (the ordinary ADR-0009 recovery path) uploads under its
+own, different `attempt_id` if it also produces a large result, never
+touching the first attempt's object.
+
+This is a storage cost, not a correctness or invariant violation. Nothing
+is ever observably `SUCCEEDED` with a broken or missing result reference,
+because the `results` row is written in the same transaction as the
+`SUCCEEDED` transition that makes the outcome observable at all — the
+orphan is simply never referenced by anything, ever again. Garbage
+collection of orphaned attempt-scoped objects is out of scope for this
+milestone and is left for later; no specific future milestone is named for
+it here.
+
+### Breaking change
+
+**None.** `POST /internal/v1/attempts/{attempt_id}/succeed`'s request body
+gains `result` as a genuinely optional field; a worker that never sends it
+is unaffected. This is the first M5 slice that ships without one.
+
+### Local and CI infrastructure
+
+MinIO was the original plan for the local S3-compatible object store,
+matching what `docs/ARCHITECTURE.md` and `docs/ROADMAP.md` said before this
+milestone. Its Docker Hub images are gone — `docker pull minio/minio` and
+`docker pull minio/mc` both answer "repository does not exist", confirmed
+against the real registry independent of any local network policy.
+`compose.yaml` uses LocalStack's S3 provider (`SERVICES=s3`) instead;
+`internal/objectstore` needed no code change, since it already speaks the
+real AWS S3 API against whatever endpoint it is configured with. See
+[ADR-0015](adr/0015-result-storage.md) for the full account.
+`scripts/wait-for-infra.sh` gained a third `wait_for` block, probing
+LocalStack's `/_localstack/health` endpoint from the host, the same way it
+already probes ElasticMQ rather than trusting a Docker healthcheck. Both CI
+jobs that start local infrastructure collect its logs alongside PostgreSQL's
+and ElasticMQ's on failure.
+
+### API surface and contract
+
+`GET /v1/jobs/{job_id}/result` is new: `ApiKeyAuth`, registered
+unconditionally like every other public route (not conditionally like the
+worker-control surface), serving the exact JSON bytes a handler produced
+regardless of where they are stored, with the same anti-oracle `404` shape
+`GET /v1/jobs/{job_id}` already uses for a malformed id. `POST
+.../attempts/{attempt_id}/succeed`'s request schema gains an optional
+`result` field (a new `SucceedRequest` schema replaces its direct use of
+`FenceRequest`, and a new `ResultPayload` schema mirrors the `results`
+table's own columns). [api/openapi.yaml](../api/openapi.yaml) is now
+`0.7.0-m5c`.
+
 ## Verification
 
 ### M5A gates
@@ -911,6 +1044,67 @@ invisible for the queue's visibility timeout — starving the worker that
 could actually claim it, and timing out at 30s. Removed; isolation is already
 proven elsewhere, and three repeated `-race` runs of the test as fixed
 complete in ~0.15s each.
+
+### M5C gates
+
+Every gate below was run on the branch head, on 2026-09-16, in this
+sandbox. `test-integration` and `test-race` could not be run locally in
+this environment: this sandbox's Docker daemon can pull only
+already-cached images, and LocalStack's image is not cached here — every
+pull attempt (LocalStack itself, and two alternative S3-compatible test
+doubles) fails at blob fetch from a blocked registry host, independent of
+this project's own code. Hosted CI, which has unrestricted network access,
+is the substitute gate for those two; see the row-level notes below for
+its status as of this record.
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `gofmt -l .` after `make fmt` | PASS | empty — no tracked Go file rewritten |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make build` | PASS | six binaries in `./bin`, including `taskforge-worker` |
+| `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/results` and `internal/worker` |
+| `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 |
+| `docker compose config --quiet` | PASS | exit 0 |
+| `make test-integration` | NOT RUN locally (see above) | hosted CI: two consecutive failures of `TestResults_LargeResultRoundTripsThroughTheObjectStore` (commits `bee0f3c`, `d545591`), root-caused and fixed by commit `c67fee1` after an intermediate, ultimately-insufficient fix (`91e7a4b`) — see [ADR-0015](adr/0015-result-storage.md); hosted re-run on `c67fee1` pending confirmation as of this record |
+| `make test-race` | NOT RUN locally (see above) | same two hosted failures and the same fix; hosted re-run on `c67fee1` pending confirmation as of this record |
+
+Exact commands and complete output are recorded in the pull request.
+
+### M5C coverage
+
+`internal/results` carries 5 top-level unit tests covering `Classify`'s
+threshold (inclusive on the object side), an independently-verified SHA-256
+test vector, and `Result.Validate`'s two well-formed shapes plus every
+malformed one. `internal/worker` grew from 55 to 60 top-level tests: the
+five new ones drive `prepareResult` directly against a fake object store —
+an empty handler result produces no result at all, a result below the
+threshold never touches the object store, one at or above it uploads
+before `prepareResult` returns, a retry-exhausted upload failure and a
+missing object store both refuse rather than proceed. `internal/api` grew
+from 69 to 76 top-level tests: the seven new ones drive
+`GET /v1/jobs/{job_id}/result` against fakes — an inline result served as
+its exact bytes, an object-located result proxied through a fake object
+store, a missing object store on an object-located row answering `500`
+rather than `404`, the shared not-found/malformed-id shape, authentication,
+a missing `Results` store answering `500` (the route is registered
+unconditionally, like every other public route, not conditionally like
+worker-control), and `405` on the wrong method. The integration package
+grew from 204 to 207 top-level tests: three new in `results_test.go` — the
+small-result and large-result end-to-end round trips, and the
+no-result-recorded `404` — each driving a real worker process against real
+PostgreSQL, a real broker, and a real object store, plus signature-ripple
+updates to existing worker-control and outcome tests for `Succeed`'s new
+parameter.
+
+**Mutation evidence.** `Store.Succeed`'s replay guard was confirmed by
+deliberately duplicating the `results.InsertResultTx` call into the replay
+branch (the one that returns before ever reaching the real insert) and
+watching `TestSucceedReplay_DoesNotInsertASecondResult` fail with a real
+PostgreSQL `duplicate key value violates unique constraint "results_pkey"`
+error, then reverting. This proves the replay branch is safe by
+construction — it returns before `result` is ever looked at — not merely
+safe because the primary key would reject a second attempt at the same
+`job_id` if the code ever reached it.
 
 ### M4 gates
 
