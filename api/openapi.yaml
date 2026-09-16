@@ -1,20 +1,21 @@
 openapi: 3.1.0
 info:
   title: TaskForge API
-  version: 0.6.0-m5b
+  version: 0.7.0-m5c
   description: |
     The complete durable job lifecycle behind API-key authentication: idempotent
-    submission including delayed submission, job reads, cancellation, the logical
-    dead-letter queue with replay and operator retry, plus the internal
-    worker-control surface —
+    submission including delayed submission, job reads, small and large result
+    retrieval, cancellation, the logical dead-letter queue with replay and
+    operator retry, plus the internal worker-control surface —
     registration behind worker-key authentication, session heartbeat with
     cancellation delivery, atomic claim, fenced lease renewal, and the fenced
-    start, success, failure, and cancellation-acknowledgment transitions.
+    start, success (optionally carrying a result), failure, and
+    cancellation-acknowledgment transitions.
 
     This document describes **only the endpoints that are implemented**. The rest
     of the V1 surface listed in `docs/PROJECT_SPEC.md` — job listing, workers,
-    queues, result retrieval — arrives with the milestone that makes it real. An
-    endpoint is never documented here before it works.
+    queues — arrives with the milestone that makes it real. An endpoint is never
+    documented here before it works.
 
     ## Authentication
 
@@ -341,6 +342,90 @@ paths:
             deadline can elapse while acquiring a lock, while executing a
             statement, or during COMMIT, and a COMMIT that is cut short is
             ambiguous, so this never asserts that nothing was committed.
+
+            When the deadline is reached while verifying the API key, that one
+            lookup is all that ran: it reads a single row and writes nothing, so
+            repeating the identical request is unconditionally safe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: service_unavailable
+                  message: the request exceeded its deadline before the durable outcome was known; retry the identical request
+                  request_id: 6a1f...
+
+  /v1/jobs/{job_id}/result:
+    get:
+      tags: [Jobs]
+      summary: Read a job's result
+      security:
+        - ApiKeyAuth: []
+      description: |
+        Returns the exact JSON bytes a trusted handler produced for this job,
+        regardless of whether they were stored inline in PostgreSQL or in the
+        S3-compatible object store -- both are served identically, with the
+        same `Content-Type` and the same status. This is a server-side proxy
+        of the bytes, not a presigned-URL redirect, so every retrieval passes
+        through the same scope check every other read on this API does.
+
+        A job that has not (yet) succeeded, that succeeded with nothing to
+        record, or that does not exist in the caller's scope, all answer 404
+        identically -- the same anti-oracle reasoning `GET /v1/jobs/{job_id}`
+        already applies to a malformed id.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: |
+            The result, exactly as the handler produced it. There is no fixed
+            schema: the body is whatever JSON value the job's `job_type`
+            produces.
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: |
+            No result is recorded for this job in the caller's scope. A
+            malformed id, a job in another scope, and a job with nothing
+            recorded are indistinguishable, for the identical reason a
+            malformed id on `GET /v1/jobs/{job_id}` is.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            No valid API key was presented. A missing header, a malformed
+            credential, an unknown key, and a revoked key are indistinguishable
+            by design: telling them apart would make a lookup prefix an oracle
+            for which prefixes exist, and would tell whoever holds a stolen key
+            that it has been revoked.
+          headers:
+            WWW-Authenticate: { schema: { type: string }, description: Always `Bearer`. }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: unauthorized
+                  message: a valid API key must be presented as an Authorization Bearer credential
+                  request_id: 6a1f...
+        '500':
+          description: |
+            Sanitized internal error. Two operator misconfigurations answer
+            this rather than a 404 that would make a real route look absent:
+            this server instance was never wired with a results store at all,
+            or this particular result is stored in the object store and this
+            server instance was never wired with one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The request exceeded its deadline before its outcome was known.
 
             When the deadline is reached while verifying the API key, that one
             lookup is all that ran: it reads a single row and writes nothing, so
@@ -1699,8 +1784,10 @@ paths:
       description: |
         Idempotently accepts success only for the exact current job, attempt,
         lease, worker, and process session. Atomically marks job and attempt
-        `SUCCEEDED`, closes the lease, and releases derived capacity. No result
-        body is stored; result persistence arrives in M5.
+        `SUCCEEDED`, closes the lease, releases derived capacity, and --
+        when the request carries one -- records the result in the same
+        transaction. A replayed request is recognized before `result` is
+        ever looked at, so it can never attempt to record a second one.
 
         Two additional preconditions, both checked against the same post-lock
         PostgreSQL sample as every other authority decision:
@@ -1726,7 +1813,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/FenceRequest' }
+            schema: { $ref: '#/components/schemas/SucceedRequest' }
       responses:
         '204': { description: Accepted, or an exact already-accepted replay. }
         '400':
@@ -1740,12 +1827,19 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '413':
-          description: The body exceeded the configured size limit.
+          description: |
+            The body exceeded the configured size limit. An inline result is
+            the one thing here whose size an operator controls
+            (`TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES`), and it is validated
+            to stay well under this limit.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
-          description: An identifier was invalid.
+          description: |
+            An identifier was invalid, or `result` did not match its declared
+            `location` -- for example an `inline` result with no body, or an
+            `object` result missing its bucket, key, or checksum.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2184,8 +2278,11 @@ components:
           description: |
             The terminal job this one replaces. Replay never resurrects a
             terminal job; it creates a new one linked back to it. Attempt
-            history and results are deliberately absent from this endpoint — a
-            rich history API is milestone M5.
+            history remains absent from this endpoint — a rich history API
+            remains future work. A result, once recorded, is retrieved
+            separately through `GET /v1/jobs/{job_id}/result` rather than
+            embedded here, so reading a job's status never pulls a
+            potentially large result body along with it.
         priority: { type: integer }
         max_attempts: { type: integer }
         timeout_seconds:
@@ -2406,6 +2503,45 @@ components:
         lease_id: { type: string, format: uuid }
         worker_id: { type: string, format: uuid }
         worker_session_id: { type: string, format: uuid }
+
+    SucceedRequest:
+      type: object
+      additionalProperties: false
+      required: [job_id, lease_id, worker_id, worker_session_id]
+      description: |
+        The same five-part fence every worker-control transition takes, plus
+        an optional result. `result` is absent, not an empty object, when the
+        job succeeded with nothing to record.
+      properties:
+        job_id: { type: string, format: uuid }
+        lease_id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        worker_session_id: { type: string, format: uuid }
+        result: { $ref: '#/components/schemas/ResultPayload' }
+
+    ResultPayload:
+      type: object
+      additionalProperties: false
+      required: [location, size_bytes]
+      description: |
+        A worker has already classified the handler's output and, for a large
+        result, already uploaded it to the object store before Succeed is
+        ever called -- the control plane never uploads on a worker's behalf.
+        These fields mirror the `results` table's own columns exactly.
+        `inline_body` is present only when `location` is `inline`;
+        `object_bucket`, `object_key`, and `checksum_sha256` are present only
+        when `location` is `object`.
+      properties:
+        location:
+          type: string
+          enum: [inline, object]
+        inline_body: {}
+        object_bucket: { type: string }
+        object_key: { type: string }
+        size_bytes: { type: integer, minimum: 0 }
+        checksum_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
 
     CancellationDirective:
       type: object
