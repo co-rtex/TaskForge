@@ -67,6 +67,15 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 			// bucket name -- LocalStack does not support virtual-hosted-style
 			// requests against it; real AWS S3 needs no such override.
 			o.UsePathStyle = true
+			// The SDK's default since v1.30 is to attach a trailing CRC32
+			// checksum to every PutObject via aws-chunked transfer encoding.
+			// LocalStack's S3 provider cannot parse that framing, and the
+			// request hangs rather than failing fast. "when required" is the
+			// pre-v1.30 behavior: a checksum is still sent for operations
+			// that need one, just not attached unconditionally to ones that
+			// merely support it. Real AWS S3 keeps the modern default.
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	})
 

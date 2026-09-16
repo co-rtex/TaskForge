@@ -65,6 +65,17 @@ func fetchResult(t *testing.T, apiURL string, jobID string) (int, []byte) {
 	return resp.StatusCode, body
 }
 
+// testLogWriter routes a worker's structured logs into t.Log, so a failure
+// in this specific worker -- as opposed to the many other things a shared
+// test binary logs -- is visible in this test's own output rather than
+// silently discarded.
+type testLogWriter struct{ t *testing.T }
+
+func (w testLogWriter) Write(p []byte) (int, error) {
+	w.t.Log(strings.TrimRight(string(p), "\n"))
+	return len(p), nil
+}
+
 // startResultWorker registers one real worker session, with an explicit
 // result threshold and a real object-store client, and returns a stop
 // function. It mirrors TestWorker_EndToEndAndDuplicateBrokerDeliveryCreateOneAttempt's
@@ -82,7 +93,7 @@ func startResultWorker(t *testing.T, apiURL string, broker queue.Broker, thresho
 		Queue: "default", PollWait: time.Second,
 		RetryAttempts: 3, RetryDelay: 10 * time.Millisecond, ErrorBackoff: 10 * time.Millisecond,
 		ResultInlineThresholdBytes: threshold, ResultsBucket: testResultsBucket,
-	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}, slog.New(slog.NewJSONHandler(testLogWriter{t}, nil)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
