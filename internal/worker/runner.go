@@ -250,7 +250,10 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) runSlot(intakeCtx, completionCtx context.Context, session workers.Session, slot int) error {
 	for intakeCtx.Err() == nil {
+		pollStarted := time.Now()
 		messages, err := r.broker.Receive(intakeCtx, 1, r.cfg.PollWait)
+		r.log.Info("poll cycle", slog.Int("slot", slot), slog.Int("messages", len(messages)),
+			slog.Duration("elapsed", time.Since(pollStarted)), slog.Bool("had_error", err != nil))
 		if err != nil {
 			if intakeCtx.Err() != nil {
 				return nil
