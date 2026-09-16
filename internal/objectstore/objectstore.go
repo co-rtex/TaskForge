@@ -13,13 +13,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+// requestTimeout bounds a single S3 request end to end. The SDK's own default
+// HTTP client (awshttp.BuildableClient, below) leaves its overall Timeout at
+// the zero value -- unbounded -- unless a caller sets one; only its
+// per-phase Expect-100-Continue wait is bounded by default. Without this, an
+// object store that accepts a connection but never answers (seen against a
+// local S3-compatible endpoint during development) hangs the request
+// forever, holding the worker's concurrency slot along with it. Ten seconds
+// matches the timeout internal/worker's control-plane HTTP client already
+// uses for the same reason.
+const requestTimeout = 10 * time.Second
 
 // Options configures an object-store client.
 type Options struct {
@@ -61,19 +74,29 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// WithTimeout keeps every other BuildableClient default (proxy from
+		// environment, TLS 1.2 minimum, connection pooling) and adds only the
+		// one missing bound; see requestTimeout's comment for why it exists.
+		o.HTTPClient = awshttp.NewBuildableClient().WithTimeout(requestTimeout)
 		if opts.Endpoint != "" {
 			o.BaseEndpoint = aws.String(opts.Endpoint)
 			// A local endpoint needs path-style addressing for an arbitrary
 			// bucket name -- LocalStack does not support virtual-hosted-style
 			// requests against it; real AWS S3 needs no such override.
 			o.UsePathStyle = true
-			// The SDK's default since v1.30 is to attach a trailing CRC32
-			// checksum to every PutObject via aws-chunked transfer encoding.
-			// LocalStack's S3 provider cannot parse that framing, and the
-			// request hangs rather than failing fast. "when required" is the
-			// pre-v1.30 behavior: a checksum is still sent for operations
-			// that need one, just not attached unconditionally to ones that
-			// merely support it. Real AWS S3 keeps the modern default.
+			// The SDK's default since v1.30 attaches a trailing CRC32
+			// checksum to every PutObject via aws-chunked transfer encoding
+			// -- framing some S3-compatible servers cannot parse. That path
+			// only ever engages over HTTPS (the SDK's checksum middleware
+			// checks req.IsHTTPS() before switching to a trailing checksum),
+			// so it never explains a hang against a plain-HTTP local
+			// endpoint; it is set here as defense in depth for a local
+			// endpoint later fronted by TLS, matching the pre-v1.30 behavior
+			// of computing a checksum only for operations that require one
+			// rather than every operation that merely supports one. Real AWS
+			// S3 keeps the modern default. See requestTimeout above for what
+			// actually bounds a request against an endpoint that accepts a
+			// connection but never answers.
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
