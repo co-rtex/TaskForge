@@ -250,10 +250,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) runSlot(intakeCtx, completionCtx context.Context, session workers.Session, slot int) error {
 	for intakeCtx.Err() == nil {
-		pollStarted := time.Now()
 		messages, err := r.broker.Receive(intakeCtx, 1, r.cfg.PollWait)
-		r.log.Info("poll cycle", slog.Int("slot", slot), slog.Int("messages", len(messages)),
-			slog.Duration("elapsed", time.Since(pollStarted)), slog.Bool("had_error", err != nil))
 		if err != nil {
 			if intakeCtx.Err() != nil {
 				return nil
@@ -267,7 +264,6 @@ func (r *Runner) runSlot(intakeCtx, completionCtx context.Context, session worke
 		if len(messages) == 0 {
 			continue
 		}
-		r.log.Info("received work notification", slog.Int("slot", slot), slog.String("broker_message_id", messages[0].ID))
 		if err := r.processMessage(completionCtx, session, messages[0]); err != nil {
 			return err
 		}
@@ -309,7 +305,6 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		// committed assignment instead of issuing a different claim.
 		ClaimRequestID: notification.EventID, Queue: notification.Queue,
 	}
-	r.log.Info("claiming", slog.String("claim_request_id", request.ClaimRequestID.String()), slog.String("queue", request.Queue))
 	var claim workers.ClaimResult
 	err = r.retry(ctx, func() error {
 		var err error
@@ -346,8 +341,6 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	}
 
 	assignment := claim.Assignment
-	r.log.Info("claimed job", slog.String("job_id", assignment.JobID.String()),
-		slog.String("attempt_id", assignment.AttemptID.String()), slog.String("job_type", assignment.JobType))
 	handler, ok := r.registry.Lookup(assignment.JobType)
 	if !ok {
 		// The control plane filters on the immutable registered handler set. This
@@ -406,7 +399,6 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		r.log.Warn("start attempt rejected", fenceLog(fence, slog.String("error", err.Error()))...)
 		return nil
 	}
-	r.log.Info("attempt started", fenceLog(fence, slog.Duration("remaining", start.Remaining))...)
 
 	// Lease authority is a cancelable context rather than a fixed deadline: the
 	// renewal loop owns it and cancels it the moment it can no longer prove this
@@ -461,11 +453,6 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	handlerResult, handlerErr := invokeHandler(handlerCtx, handler, Execution{
 		JobID: assignment.JobID, AttemptID: assignment.AttemptID, Payload: assignment.Payload,
 	})
-	if handlerErr != nil {
-		r.log.Info("handler returned", fenceLog(fence, slog.String("error", handlerErr.Error()))...)
-	} else {
-		r.log.Info("handler returned", fenceLog(fence, slog.Int("result_bytes", len(handlerResult)))...)
-	}
 	// Captured before the derived contexts are cancelled: cancelling first would
 	// make every successful handler look cancelled, while ignoring the value
 	// would let a cooperative timeout that returns nil be reported as success.
