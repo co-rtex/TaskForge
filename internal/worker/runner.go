@@ -264,6 +264,7 @@ func (r *Runner) runSlot(intakeCtx, completionCtx context.Context, session worke
 		if len(messages) == 0 {
 			continue
 		}
+		r.log.Info("received work notification", slog.Int("slot", slot), slog.String("broker_message_id", messages[0].ID))
 		if err := r.processMessage(completionCtx, session, messages[0]); err != nil {
 			return err
 		}
@@ -305,6 +306,7 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		// committed assignment instead of issuing a different claim.
 		ClaimRequestID: notification.EventID, Queue: notification.Queue,
 	}
+	r.log.Info("claiming", slog.String("claim_request_id", request.ClaimRequestID.String()), slog.String("queue", request.Queue))
 	var claim workers.ClaimResult
 	err = r.retry(ctx, func() error {
 		var err error
