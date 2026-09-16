@@ -35,3 +35,34 @@ services:
       - "127.0.0.1:9324:9324"
     volumes:
       - ./deploy/local/elasticmq.conf:/opt/elasticmq.conf:ro
+
+  objectstore:
+    # S3-compatible object store for large results. Real S3 semantics locally
+    # with no AWS account and no cost -- the same reasoning
+    # docs/adr/0005-elasticmq-for-local-broker.md gives for the broker,
+    # applied here to storage.
+    #
+    # MinIO was the original choice (see docs/adr/0015-result-storage.md),
+    # but its Docker Hub images are gone -- `docker pull minio/minio` and
+    # `docker pull minio/mc` both answer "repository does not exist" as of
+    # this milestone, independent of any local network policy. LocalStack's
+    # S3 provider is the replacement: a real, actively published,
+    # widely-used AWS-API-compatible emulator. Only this file and the
+    # equivalent local endpoint change; internal/objectstore speaks the
+    # genuine AWS S3 API against whatever endpoint it is given and has no
+    # MinIO-specific code to change.
+    #
+    # Pinned rather than :latest, exactly like postgres and elasticmq above.
+    image: localstack/localstack:4.14.0
+    environment:
+      # Scoped to S3 alone: the one AWS service this milestone needs, kept
+      # light rather than emulating the whole platform.
+      SERVICES: s3
+    ports:
+      # 4566 is LocalStack's single "edge" port for every emulated service.
+      - "127.0.0.1:4566:4566"
+    # No Docker healthcheck here, matching elasticmq above rather than
+    # postgres: scripts/wait-for-infra.sh probes LocalStack's real
+    # /_localstack/health endpoint from the host instead, the same way it
+    # already probes ElasticMQ's ListQueues action rather than relying on a
+    # binary this image may not ship.

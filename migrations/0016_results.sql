@@ -2,9 +2,9 @@
 --
 -- Milestone M5C: result storage. A small result is stored inline in
 -- PostgreSQL; a result at or above a configured threshold is stored in an
--- S3-compatible object store (MinIO locally, S3 in the cloud direction) and
--- this table records where. See docs/PROJECT_SPEC.md item 13 and
--- docs/adr/0015-result-storage.md.
+-- S3-compatible object store (LocalStack's S3 provider locally, S3 in the
+-- cloud direction) and this table records where. See
+-- docs/PROJECT_SPEC.md item 13 and docs/adr/0015-result-storage.md.
 --
 -- job_id is the primary key, not attempt_id. GET /v1/jobs/{job_id}/result is
 -- keyed by job id, and internal/workers.Store.Succeed -- the only writer of

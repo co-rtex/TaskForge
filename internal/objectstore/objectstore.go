@@ -1,10 +1,10 @@
 // Package objectstore is a thin S3-compatible client for large result bytes.
 //
 // It carries no domain knowledge of jobs, attempts, or scopes -- see
-// internal/results for that. The same code path serves MinIO locally and AWS
-// S3 in a deployment; only the endpoint and credentials differ, exactly as
-// internal/queue/sqsbroker serves ElasticMQ and AWS SQS. See
-// docs/adr/0015-result-storage.md.
+// internal/results for that. The same code path serves LocalStack's S3
+// provider locally and AWS S3 in a deployment; only the endpoint and
+// credentials differ, exactly as internal/queue/sqsbroker serves ElasticMQ
+// and AWS SQS. See docs/adr/0015-result-storage.md.
 package objectstore
 
 import (
@@ -24,12 +24,8 @@ import (
 // Options configures an object-store client.
 type Options struct {
 	// Endpoint overrides the AWS endpoint. Empty means real AWS.
-	Endpoint string
-	Region   string
-	// Bucket is ensured to exist at construction, so a misconfigured or
-	// unreachable bucket fails at startup rather than on the first result
-	// upload -- the same reasoning sqsbroker.New resolves its queue URL for.
-	Bucket          string
+	Endpoint        string
+	Region          string
 	AccessKeyID     string
 	SecretAccessKey string
 }
@@ -42,17 +38,18 @@ type Client struct {
 	client *s3.Client
 }
 
-// New ensures the configured bucket exists and returns a client.
+// New builds a client. It makes no network call itself: a read-only caller
+// (taskforge-api) can construct one without its process boot depending on
+// the object store being reachable, since only a request that actually
+// needs an object-located result ever touches it. A writer
+// (taskforge-worker) should call EnsureBucket once, separately, before it
+// starts accepting work.
 func New(ctx context.Context, opts Options) (*Client, error) {
-	if opts.Bucket == "" {
-		return nil, fmt.Errorf("bucket is required")
-	}
-
 	loadOpts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(opts.Region)}
 	if opts.AccessKeyID != "" {
-		// MinIO ignores credentials it doesn't recognize, but the SDK refuses to
-		// sign without them. Real deployments leave these empty and use the
-		// default chain (instance role, OIDC, or environment).
+		// LocalStack ignores credentials it doesn't recognize, but the SDK
+		// refuses to sign without them. Real deployments leave these empty and
+		// use the default chain (instance role, OIDC, or environment).
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(opts.AccessKeyID, opts.SecretAccessKey, ""),
 		))
@@ -66,21 +63,30 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		if opts.Endpoint != "" {
 			o.BaseEndpoint = aws.String(opts.Endpoint)
-			// MinIO does not support virtual-hosted-style addressing for
-			// arbitrary bucket names; real AWS S3 needs no such override.
+			// A local endpoint needs path-style addressing for an arbitrary
+			// bucket name -- LocalStack does not support virtual-hosted-style
+			// requests against it; real AWS S3 needs no such override.
 			o.UsePathStyle = true
 		}
 	})
 
-	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(opts.Bucket)}); err != nil {
+	return &Client{client: client}, nil
+}
+
+// EnsureBucket creates bucket if it does not already exist, tolerating a
+// concurrent creator. Call this once, before the first Put, so a
+// misconfigured or unreachable object store fails at worker startup rather
+// than on the first attempt to report a large result -- the same reasoning
+// sqsbroker.New resolves its queue URL for.
+func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
+	if _, err := c.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		var ownedByYou *types.BucketAlreadyOwnedByYou
 		var exists *types.BucketAlreadyExists
 		if !errors.As(err, &ownedByYou) && !errors.As(err, &exists) {
-			return nil, fmt.Errorf("ensure results bucket %q exists: %w", opts.Bucket, err)
+			return fmt.Errorf("ensure results bucket %q exists: %w", bucket, err)
 		}
 	}
-
-	return &Client{client: client}, nil
+	return nil
 }
 
 // Put uploads body under bucket and key, replacing any existing object at

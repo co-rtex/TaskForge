@@ -221,6 +221,7 @@ jobs:
           docker compose ps --all > "${out}/compose-ps.txt" 2>&1 || true
           docker compose logs --no-color --tail 400 postgres > "${out}/postgres.log" 2>&1 || true
           docker compose logs --no-color --tail 400 elasticmq > "${out}/elasticmq.log" 2>&1 || true
+          docker compose logs --no-color --tail 400 objectstore > "${out}/objectstore.log" 2>&1 || true
           # Echo the container inventory so the usual case needs no download.
           cat "${out}/compose-ps.txt" || true
 
@@ -284,6 +285,7 @@ jobs:
           docker compose ps --all > "${out}/compose-ps.txt" 2>&1 || true
           docker compose logs --no-color --tail 400 postgres > "${out}/postgres.log" 2>&1 || true
           docker compose logs --no-color --tail 400 elasticmq > "${out}/elasticmq.log" 2>&1 || true
+          docker compose logs --no-color --tail 400 objectstore > "${out}/objectstore.log" 2>&1 || true
           cat "${out}/compose-ps.txt" || true
 
       - name: Upload failure diagnostics

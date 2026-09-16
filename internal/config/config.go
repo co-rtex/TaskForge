@@ -122,7 +122,7 @@ func Load() (Config, error) {
 		BrokerSecretAccessKey: env("TASKFORGE_BROKER_SECRET_ACCESS_KEY", "local"),
 
 		ResultInlineThresholdBytes: envInt("TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES", 64*1024),
-		ResultsEndpoint:            env("TASKFORGE_RESULTS_ENDPOINT", "http://127.0.0.1:9000"),
+		ResultsEndpoint:            env("TASKFORGE_RESULTS_ENDPOINT", "http://127.0.0.1:4566"),
 		ResultsBucket:              env("TASKFORGE_RESULTS_BUCKET", "taskforge-results"),
 		ResultsRegion:              env("TASKFORGE_RESULTS_REGION", "us-east-1"),
 		ResultsAccessKeyID:         env("TASKFORGE_RESULTS_ACCESS_KEY_ID", "local"),

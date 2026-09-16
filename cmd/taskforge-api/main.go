@@ -65,13 +65,16 @@ func run() int {
 		return 1
 	}
 
+	// No network call here, deliberately: this process only ever reads an
+	// object-located result on demand, so its boot must not depend on the
+	// object store being reachable -- the same posture it already has
+	// toward the broker, which it never touches directly at all.
 	objects, err := objectstore.New(ctx, objectstore.Options{
 		Endpoint: cfg.ResultsEndpoint, Region: cfg.ResultsRegion,
-		Bucket: cfg.ResultsBucket, AccessKeyID: cfg.ResultsAccessKeyID,
-		SecretAccessKey: cfg.ResultsSecretAccessKey,
+		AccessKeyID: cfg.ResultsAccessKeyID, SecretAccessKey: cfg.ResultsSecretAccessKey,
 	})
 	if err != nil {
-		log.Error("connect to result object store", slog.String("error", err.Error()))
+		log.Error("configure result object store client", slog.String("error", err.Error()))
 		return 1
 	}
 
