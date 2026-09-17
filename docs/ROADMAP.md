@@ -207,8 +207,6 @@ limitation.
 evidence and [ADR-0014](adr/0014-worker-control-authentication.md) for the
 decision.
 
-## Current milestone — M5D: CLI and Python SDK
-
 ### M5C — Result storage
 **Objective.** Small and large results round-trip.
 **Deliverables.** Inline results in PostgreSQL with a defined threshold, large
@@ -227,14 +225,61 @@ leaves that object permanently orphaned: a storage cost, never a
 correctness problem, and left for later rather than fixed here. See
 ADR-0015's "Known limitation" section.
 
-### M5D — CLI and Python SDK
-**Objective.** Make TaskForge usable by an outside developer.
-**Deliverables.** `taskforge-cli`; a typed, installable Python SDK. Both obtain
-and present API keys rather than reimplementing the credential model.
-**Acceptance.** CLI exit codes are stable and output is machine-readable; the SDK
-places an idempotency key in the canonical header.
+M5D as originally written bundles two genuinely independent deliverables in
+two different languages: `taskforge-cli` (a new Go binary in the same
+module, needing no new toolchain) and a Python SDK (a first language this
+repository has never contained, needing its own dependency-management,
+lint/format, and CI-job decisions). Their own acceptance sentence already
+separates them by clause — "CLI exit codes are stable and output is
+machine-readable" is a fact about the CLI alone; "the SDK places an
+idempotency key in the canonical header" is a fact about the SDK alone —
+the same signal that justified M5A/M5B shipping independently. It is split
+below the same way M5 itself was split into M5A–M5D: each half ships on its
+own evidence, and the combined objective and acceptance criteria of the
+original M5D are preserved across M5D/M5E, not reduced.
+
+### M5D — CLI
+**Objective.** Make the TaskForge public API and its loopback-only
+credential-management routes usable by an outside developer from the
+command line, without reimplementing the credential model.
+**Deliverables.** `taskforge-cli` (`cmd/taskforge-cli`, `internal/cli`):
+commands for every implemented public route (job submission, read, result
+retrieval, cancel, retry, DLQ list and replay) and the API-key/worker-key
+management routes; a stable, documented, individually-tested exit-code
+contract; JSON output on stdout for success and on stderr for failure.
+**Acceptance.** CLI exit codes are stable and output is machine-readable.
 **Depends on.** M5C.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence.
+
+`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` are listed as
+V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 but are not yet
+implemented anywhere in this API (confirmed against
+[api/openapi.yaml](../api/openapi.yaml)); `taskforge-cli` therefore has no
+`jobs list` / `workers list` / `queues list` command; a CLI command with no
+backend route to call would be exactly the fabricated functionality
+[PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids. These commands land whenever
+those routes do.
+
+### M5E — Python SDK
+**Objective.** Make TaskForge usable by an outside Python developer, via a
+typed, installable SDK that obtains and presents API keys rather than
+reimplementing the credential model.
+**Deliverables.** A typed, installable Python SDK.
+**Acceptance.** The SDK places an idempotency key in the canonical header.
+**Depends on.** M5D.
 **Status:** not started.
+
+Introducing Python is a first for this repository (confirmed: zero `.py`
+files, no `setup.py`/`pyproject.toml`, anywhere in this tree as of M5D).
+That is a real infrastructure decision this milestone owns and has not yet
+made: dependency and build tooling (e.g. `pip`+`venv` vs. `poetry` vs.
+`uv`), a lint/format story, a packaging story for V1 (installable from this
+repository vs. published to PyPI), and whether it gets its own CI job or
+folds into an existing one in
+[.github/workflows/ci.yml](../.github/workflows/ci.yml). None of this is
+decided here; it is this milestone's first work, not an implicit side
+effect of "write an SDK".
 
 ---
 
@@ -248,7 +293,7 @@ bounded label cardinality; real liveness/readiness per service; the operator das
 **Acceptance.** A submission is traceable end to end; no unbounded metric labels; the
 dashboard reads live APIs and handles loading, empty, and error states; nothing is
 hardcoded.
-**Depends on.** M5D.
+**Depends on.** M5E.
 
 ### M7 — Full concurrency, restart, failure, and race suites
 **Objective.** Prove the invariants.

@@ -9,7 +9,7 @@ lifecycle, explicit state machines, idempotent submission, transactional
 database-to-broker delivery, leases and fencing, and crash recovery — rather than
 wrapping an existing queue framework.
 
-> ### Status: early development — milestone 5D of 8
+> ### Status: early development — milestone 5E of 8
 >
 > **What works today:** the complete durable job lifecycle. Idempotent immediate
 > and delayed submission with a recoverable transactional outbox; durable logical
@@ -28,9 +28,11 @@ wrapping an existing queue framework.
 > with a large result uploaded to an S3-compatible object store before the
 > attempt reports success and retrieved through the same scoped API key. A job
 > submitted under any authenticated scope is claimed and executed by a worker
-> registered for that same scope.
+> registered for that same scope; and a command-line client, `taskforge-cli`,
+> over the public API and the loopback-only credential-management routes,
+> with a stable, individually-tested exit-code contract.
 >
-> **What does not exist yet:** the CLI, the SDK, and the dashboard. Both
+> **What does not exist yet:** the Python SDK and the dashboard. Both
 > key-management surfaces stay unauthenticated and loopback-only, because each
 > is how its own credential type comes into existence.
 >
@@ -86,7 +88,7 @@ Needs Git, Go 1.25+, Docker, Docker Compose, and Make.
 make bootstrap   # create .env from the example, download dependencies
 make up          # start PostgreSQL, ElasticMQ, and the object store, wait until all are ready
 make migrate     # apply the schema
-make build       # compile ./bin/taskforge-{api,outbox,scheduler,migrate,worker,reconciler}
+make build       # compile ./bin/taskforge-{api,outbox,scheduler,migrate,worker,reconciler,cli}
 ```
 
 First, mint an API key and a worker key for the same scope. Both are returned
@@ -218,6 +220,39 @@ are not running.
 
 The same gates run on GitHub-hosted runners for every pull request targeting `main`
 and every push to `main` — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+## Try it with `taskforge-cli`
+
+Everything above through raw `curl` has a `taskforge-cli` equivalent. It talks to
+the same address `taskforge-api` binds to by default
+(`TASKFORGE_API_ADDR`, `--api-url` to override) and reads its credential from
+`TASKFORGE_CLI_API_KEY` or `--api-key`.
+
+```bash
+./bin/taskforge-cli api-keys create --scope local-dev --name my-laptop
+# {"id":"...","scope":"local-dev","name":"my-laptop","prefix":"...","created_at":"...","key":"tfk_..."}
+
+export TASKFORGE_CLI_API_KEY=tfk_...   # the "key" field above
+
+./bin/taskforge-cli worker-keys create --scope local-dev --name my-worker
+export TASKFORGE_WORKER_API_KEY=tfk_...   # the "key" field of THAT response; taskforge-worker reads this one
+
+./bin/taskforge-cli jobs submit --queue default --job-type demo.echo --payload '{"message":"hello"}'
+./bin/taskforge-cli jobs get <job_id>
+./bin/taskforge-cli jobs result <job_id>
+./bin/taskforge-cli jobs cancel <job_id>
+./bin/taskforge-cli dlq list
+./bin/taskforge-cli dlq replay <job_id>
+```
+
+A success response is JSON on stdout; a failure is a JSON error object on stderr
+and nothing on stdout. The process exit code is a small, stable, individually
+tested set documented in [internal/cli/exitcode.go](internal/cli/exitcode.go):
+`0` success, `1` CLI usage error, `2` the request was rejected as invalid, `3`
+unauthorized, `4` not found, `5` conflict (the operation cannot be applied given
+current state), `6` internal server error, `7` the server's own deadline elapsed,
+`8` could not reach the API at all, `9` a response this CLI version does not
+recognize. `taskforge-cli --help` lists every command and flag.
 
 ## Documentation
 
