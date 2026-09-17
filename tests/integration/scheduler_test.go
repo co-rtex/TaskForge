@@ -234,7 +234,7 @@ func TestScheduler_PromotesDueJobsWithExactlyOneFreshEvent(t *testing.T) {
 		require.Equal(t, 2, claim.Assignment.AttemptNumber)
 		replacement := assignmentFence(claim.Assignment)
 		startAttempt(t, store, replacement)
-		require.NoError(t, store.Succeed(ctx, testScope, replacement))
+		require.NoError(t, store.Succeed(ctx, testScope, replacement, nil))
 
 		require.Equal(t, "SUCCEEDED", readJob(t, fence.JobID).status)
 		require.Equal(t, []string{"FAILED", "SUCCEEDED"}, attemptHistory(t, fence.JobID))

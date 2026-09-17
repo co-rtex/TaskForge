@@ -207,17 +207,25 @@ limitation.
 evidence and [ADR-0014](adr/0014-worker-control-authentication.md) for the
 decision.
 
-## Current milestone — M5C: result storage
+## Current milestone — M5D: CLI and Python SDK
 
 ### M5C — Result storage
 **Objective.** Small and large results round-trip.
 **Deliverables.** Inline results in PostgreSQL with a defined threshold, large
-results in MinIO/S3, and the retrieval endpoint.
+results in an S3-compatible object store, and the retrieval endpoint.
 **Acceptance.** Small and large results round-trip; the threshold is explicit and
 tested on both sides of the boundary.
 **Depends on.** M5B, so result retrieval is authenticated on arrival rather than
 retrofitted onto an endpoint that serves job output.
-**Status:** not started.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and [ADR-0015](adr/0015-result-storage.md) for the decision.
+
+The object key a worker uploads a large result to is attempt-scoped, not
+job-scoped, by deliberate decision — see ADR-0015. An attempt whose object
+upload succeeds but whose process then dies before it reports success
+leaves that object permanently orphaned: a storage cost, never a
+correctness problem, and left for later rather than fixed here. See
+ADR-0015's "Known limitation" section.
 
 ### M5D — CLI and Python SDK
 **Objective.** Make TaskForge usable by an outside developer.

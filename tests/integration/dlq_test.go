@@ -355,7 +355,7 @@ func TestReplay_RefusesAJobThatIsNotDeadLettered(t *testing.T) {
 	_, err = jobStore().Replay(ctx, testScope, fence.JobID, "key")
 	require.ErrorIs(t, err, jobs.ErrNotDeadLettered)
 
-	require.NoError(t, store.Succeed(ctx, testScope, fence))
+	require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 	_, err = jobStore().Replay(ctx, testScope, fence.JobID, "key")
 	require.ErrorIs(t, err, jobs.ErrNotDeadLettered,
 		"a succeeded job has nothing to replay")
@@ -638,7 +638,7 @@ func TestCancel_HTTPSurfaceReportsBothShapes(t *testing.T) {
 
 	t.Run("a succeeded job is a stable conflict", func(t *testing.T) {
 		fence := claimedAndRunning(t, store, session, "cancel-http-succeeded")
-		require.NoError(t, store.Succeed(ctx, testScope, fence))
+		require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 		response, _ := cancel(t, fence.JobID)
 		require.Equal(t, http.StatusConflict, response.StatusCode)
 	})

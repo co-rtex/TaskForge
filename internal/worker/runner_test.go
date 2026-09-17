@@ -36,7 +36,7 @@ type fakeControl struct {
 	claim     func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error)
 	renew     func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error)
 	start     func(context.Context, workers.Fence) (workers.StartResult, error)
-	succeed   func(context.Context, workers.Fence) error
+	succeed   func(context.Context, workers.Fence, *workers.ResultRef) error
 	fail      func(context.Context, workers.FailureReport) (workers.OutcomeResult, error)
 	cancelAck func(context.Context, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 }
@@ -82,8 +82,8 @@ func (f *fakeControl) Start(ctx context.Context, fence workers.Fence) (workers.S
 	}
 	return f.start(ctx, fence)
 }
-func (f *fakeControl) Succeed(ctx context.Context, fence workers.Fence) error {
-	return f.succeed(ctx, fence)
+func (f *fakeControl) Succeed(ctx context.Context, fence workers.Fence, result *workers.ResultRef) error {
+	return f.succeed(ctx, fence, result)
 }
 func (f *fakeControl) Fail(ctx context.Context, report workers.FailureReport) (workers.OutcomeResult, error) {
 	if f.fail == nil {
@@ -174,7 +174,7 @@ func testAssignment(session workers.Session) *workers.Assignment {
 }
 
 func testRunner(control ControlPlane, broker queue.Broker, registry *Registry) *Runner {
-	return NewRunner(control, broker, registry, RunnerConfig{
+	return NewRunner(control, broker, registry, nil, RunnerConfig{
 		Queue: "default", PollWait: time.Second, RetryAttempts: 2,
 		ShutdownTimeout: time.Second,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -193,7 +193,7 @@ func TestProcessMessage_OrdersClaimAckStartHandlerAndSuccess(t *testing.T) {
 			events = append(events, "start")
 			return okStart(fence), nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			events = append(events, "succeed")
 			return nil
 		},
@@ -219,7 +219,7 @@ func TestProcessMessage_DeleteFailureStillExecutesDurableClaim(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded = true
 			return nil
 		},
@@ -247,7 +247,7 @@ func TestProcessMessage_CooperativeDeadlineCannotBeReportedAsSuccess(t *testing.
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -275,7 +275,7 @@ func TestProcessMessage_ExpiredExecutionWindowDoesNotInvokeHandler(t *testing.T)
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -356,7 +356,7 @@ func TestProcessMessage_RedeliveryRecoversAnAmbiguousCommittedClaim(t *testing.T
 			}
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment, Replayed: true}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 	}
 	broker := &fakeBroker{}
 	registry := NewRegistry()
@@ -389,7 +389,7 @@ func TestProcessMessage_ConcurrentDuplicateDeliveryExecutesOneLocalHandler(t *te
 			starts.Add(1)
 			return okStart(fence), nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeds.Add(1)
 			return nil
 		},
@@ -454,7 +454,7 @@ func TestRunner_SessionReplacementIsFatalAndDropsReadiness(t *testing.T) {
 	broker.messages <- queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")}
 	registry := NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", DemoEcho{}))
-	runner := NewRunner(control, broker, registry, RunnerConfig{
+	runner := NewRunner(control, broker, registry, nil, RunnerConfig{
 		Registration: workers.Registration{SessionID: session.ID}, Queue: "default",
 		PollWait: time.Second, RetryAttempts: 1, ShutdownTimeout: time.Second,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -488,7 +488,7 @@ func TestRunner_ShutdownDrainsAndReportsInFlightSuccess(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(ctx context.Context, _ workers.Fence) error {
+		succeed: func(ctx context.Context, _ workers.Fence, _ *workers.ResultRef) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -504,7 +504,7 @@ func TestRunner_ShutdownDrainsAndReportsInFlightSuccess(t *testing.T) {
 		<-release
 		return nil, nil
 	})))
-	runner := NewRunner(control, broker, registry, RunnerConfig{
+	runner := NewRunner(control, broker, registry, nil, RunnerConfig{
 		Registration: workers.Registration{SessionID: session.ID}, Queue: "default",
 		PollWait: time.Second, RetryAttempts: 1, ShutdownTimeout: time.Second,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -547,7 +547,7 @@ func TestRunner_ShutdownTimeoutBoundsUncooperativeHandler(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 	}
 	broker := &fakeBroker{messages: make(chan queue.Message, 1)}
 	broker.messages <- queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")}
@@ -557,7 +557,7 @@ func TestRunner_ShutdownTimeoutBoundsUncooperativeHandler(t *testing.T) {
 		<-release // intentionally ignore cancellation until the test releases us
 		return nil, ctx.Err()
 	})))
-	runner := NewRunner(control, broker, registry, RunnerConfig{
+	runner := NewRunner(control, broker, registry, nil, RunnerConfig{
 		Registration: workers.Registration{SessionID: session.ID}, Queue: "default",
 		PollWait: time.Second, RetryAttempts: 1, ShutdownTimeout: 30 * time.Millisecond,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -589,7 +589,7 @@ func TestRunner_LocalPoolNeverPollsPastItsBound(t *testing.T) {
 		assignment.AttemptNumber = int(sequence.Add(1))
 		return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 	}
-	control.succeed = func(context.Context, workers.Fence) error { return nil }
+	control.succeed = func(context.Context, workers.Fence, *workers.ResultRef) error { return nil }
 
 	broker := &fakeBroker{messages: make(chan queue.Message, 3)}
 	for i := 0; i < 3; i++ {
@@ -619,7 +619,7 @@ func TestRunner_LocalPoolNeverPollsPastItsBound(t *testing.T) {
 		return nil, nil
 	})))
 
-	runner := NewRunner(control, broker, registry, RunnerConfig{
+	runner := NewRunner(control, broker, registry, nil, RunnerConfig{
 		Registration: workers.Registration{SessionID: session.ID},
 		Queue:        "default", PollWait: time.Second, RetryAttempts: 1,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -717,7 +717,7 @@ func TestRunner_DuplicateDeliveryReleasesItsSlotBeforeLeaderExecution(t *testing
 			countFor(&starts, fence.AttemptID).Add(1)
 			return okStart(fence), nil
 		},
-		succeed: func(_ context.Context, fence workers.Fence) error {
+		succeed: func(_ context.Context, fence workers.Fence, _ *workers.ResultRef) error {
 			countFor(&succeeds, fence.AttemptID).Add(1)
 			if fence.AttemptID == slowAssignment.AttemptID {
 				close(slowSucceeded)

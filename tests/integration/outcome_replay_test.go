@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -99,13 +101,13 @@ func TestOutcomeReplay_CommittedHistoryIsRecognizedWithoutLiveAuthority(t *testi
 			fence := assignmentFence(claim.Assignment)
 			startAttempt(t, store, fence)
 
-			require.NoError(t, store.Succeed(ctx, testScope, fence))
+			require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 			committed := readOutcomeState(t, fence)
 			require.Equal(t, leaseOutcome{"SUCCEEDED", "SUCCEEDED", "COMPLETED"}, committed)
 
 			invalidate(t, store, registration, fence)
 
-			require.NoError(t, store.Succeed(ctx, testScope, fence),
+			require.NoError(t, store.Succeed(ctx, testScope, fence, nil),
 				"a committed success must still be recognized once its fence is no longer live")
 			require.Equal(t, committed, readOutcomeState(t, fence),
 				"a replay reads history; it must not write any part of it again")
@@ -284,7 +286,7 @@ func TestOutcomeReplay_RecognitionIsExactAndNothingElse(t *testing.T) {
 		// is therefore a mutation, and a replaced boot has no authority for one.
 		replaceSession(t, store, registration)
 
-		require.ErrorIs(t, store.Succeed(ctx, testScope, fence), workers.ErrFenceRejected)
+		require.ErrorIs(t, store.Succeed(ctx, testScope, fence, nil), workers.ErrFenceRejected)
 		_, err = store.Fail(ctx, testScope,
 			failureReport(fence, lifecycle.ClassRetryable, "upstream_5xx", "upstream returned 502"))
 		require.ErrorIs(t, err, workers.ErrFenceRejected)
@@ -380,7 +382,7 @@ func TestOutcomeReplay_AnswersTheDecisionThatCommittedNotWhatTheJobDidNext(t *te
 	second := assignmentFence(claim.Assignment)
 	require.NotEqual(t, first.AttemptID, second.AttemptID)
 	startAttempt(t, store, second)
-	require.NoError(t, store.Succeed(ctx, testScope, second))
+	require.NoError(t, store.Succeed(ctx, testScope, second, nil))
 
 	require.Equal(t, "SUCCEEDED", readState(t, second).job,
 		"the job really has moved on, which is what makes the replay below meaningful")
@@ -598,7 +600,7 @@ func TestOutcomeReplay_SubMillisecondRetryDelaysReplayIdentically(t *testing.T) 
 			second := assignmentFence(claim.Assignment)
 			require.NotEqual(t, first.AttemptID, second.AttemptID)
 			startAttempt(t, store, second)
-			require.NoError(t, store.Succeed(ctx, testScope, second))
+			require.NoError(t, store.Succeed(ctx, testScope, second, nil))
 			require.Equal(t, "SUCCEEDED", readState(t, second).job)
 
 			// The ambiguous first report, retried at last.
@@ -695,7 +697,7 @@ func TestOutcomeReplay_ZeroDelayRetryableFailureReplaysAsImmediateRetry(t *testi
 	second := assignmentFence(claim.Assignment)
 	require.NotEqual(t, first.AttemptID, second.AttemptID)
 	startAttempt(t, store, second)
-	require.NoError(t, store.Succeed(ctx, testScope, second))
+	require.NoError(t, store.Succeed(ctx, testScope, second, nil))
 	require.Equal(t, "SUCCEEDED", readState(t, second).job)
 
 	replayed, err := store.Fail(ctx, testScope, report)
@@ -709,4 +711,64 @@ func TestOutcomeReplay_ZeroDelayRetryableFailureReplaysAsImmediateRetry(t *testi
 	expected.Replayed = true
 	require.Equal(t, expected, replayed,
 		"the complete replay response must be the committed one, field for field")
+}
+
+// resultRow is a snapshot of one results row, read back to prove a replay
+// changes nothing about it rather than merely leaving the row count alone.
+type resultRow struct {
+	inlineBody string
+	sizeBytes  int64
+	createdAt  time.Time
+}
+
+func readResultRow(t *testing.T, jobID uuid.UUID) resultRow {
+	t.Helper()
+	var row resultRow
+	require.NoError(t, testPool.QueryRow(context.Background(), `
+		SELECT inline_body::text, size_bytes, created_at
+		FROM results WHERE job_id = $1`, jobID,
+	).Scan(&row.inlineBody, &row.sizeBytes, &row.createdAt))
+	return row
+}
+
+// TestSucceedReplay_DoesNotInsertASecondResult is the one fenced-method
+// change M5C makes to internal/workers.Store: Succeed's replay branch
+// returns before result is ever looked at, so a replayed call with a result
+// attached must not attempt a second results insert. The results table's
+// PRIMARY KEY (job_id) would reject a genuine second attempt outright, but
+// that is a backstop, not the proof this test wants -- the proof is that
+// the INSERT is never issued at all on the replay path. See
+// docs/adr/0015-result-storage.md.
+func TestSucceedReplay_DoesNotInsertASecondResult(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+
+	store := controlStore()
+	registration := workerRegistration("succeed-replay-result", 1, nil, []string{"demo.echo"})
+	session := registerWorker(t, store, registration)
+	jobID := createJob(t, "succeed-replay-result", "demo.echo", 50, nil)
+	claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+	require.NoError(t, err)
+	fence := assignmentFence(claim.Assignment)
+	startAttempt(t, store, fence)
+
+	result := &workers.ResultRef{
+		Location: results.LocationInline, Inline: json.RawMessage(`{"answer":42}`), SizeBytes: 13,
+	}
+
+	require.NoError(t, store.Succeed(ctx, testScope, fence, result))
+	require.Equal(t, 1, countRows(t, "results"), "the first success records exactly one result")
+	before := readResultRow(t, jobID)
+	require.JSONEq(t, `{"answer":42}`, before.inlineBody)
+
+	// The replay: the identical fence, the identical result. A worker retrying
+	// an ambiguous response sends exactly this -- it re-classified and, for a
+	// large result, would re-upload to the same deterministic key, but it
+	// never invents a different result for the same completed attempt.
+	require.NoError(t, store.Succeed(ctx, testScope, fence, result),
+		"a committed success must still be recognized once it has already committed")
+	require.Equal(t, 1, countRows(t, "results"),
+		"a replayed Succeed call must not attempt a second results insert")
+	require.Equal(t, before, readResultRow(t, jobID),
+		"a replay must not rewrite any part of the row that already committed")
 }

@@ -9,7 +9,7 @@ lifecycle, explicit state machines, idempotent submission, transactional
 database-to-broker delivery, leases and fencing, and crash recovery — rather than
 wrapping an existing queue framework.
 
-> ### Status: early development — milestone 5B of 8
+> ### Status: early development — milestone 5D of 8
 >
 > **What works today:** the complete durable job lifecycle. Idempotent immediate
 > and delayed submission with a recoverable transactional outbox; durable logical
@@ -21,16 +21,18 @@ wrapping an existing queue framework.
 > backoff and injected jitter; server-authoritative timeouts; cancellation; the
 > logical DLQ with listing, replay, and operator retry; a scheduler that promotes
 > due work and re-notifies queued jobs whose notification was lost; crash
-> recovery; scoped, revocable API-key authentication on the public API; and
-> scoped, revocable worker-key authentication of registration, with every later
+> recovery; scoped, revocable API-key authentication on the public API; scoped,
+> revocable worker-key authentication of registration, with every later
 > worker-control call trusting that session and a cheap revocation check
-> instead of a re-presented credential. A job submitted under any authenticated
-> scope is claimed and executed by a worker registered for that same scope.
+> instead of a re-presented credential; and small and large result storage,
+> with a large result uploaded to an S3-compatible object store before the
+> attempt reports success and retrieved through the same scoped API key. A job
+> submitted under any authenticated scope is claimed and executed by a worker
+> registered for that same scope.
 >
-> **What does not exist yet:** result storage, the CLI, the SDK, and the
-> dashboard. Both key-management surfaces stay unauthenticated and
-> loopback-only, because each is how its own credential type comes into
-> existence.
+> **What does not exist yet:** the CLI, the SDK, and the dashboard. Both
+> key-management surfaces stay unauthenticated and loopback-only, because each
+> is how its own credential type comes into existence.
 >
 > See [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) for exactly what is implemented
 > and verified at this commit.
@@ -82,7 +84,7 @@ Needs Git, Go 1.25+, Docker, Docker Compose, and Make.
 
 ```bash
 make bootstrap   # create .env from the example, download dependencies
-make up          # start PostgreSQL and ElasticMQ, wait until both are ready
+make up          # start PostgreSQL, ElasticMQ, and the object store, wait until all are ready
 make migrate     # apply the schema
 make build       # compile ./bin/taskforge-{api,outbox,scheduler,migrate,worker,reconciler}
 ```
@@ -156,8 +158,19 @@ distinguished them would let a caller probe for which key prefixes exist.
 Sending the same key again returns the same job with `200` instead of `201`; sending
 it with a different body returns `409`. The publisher delivers a `work.available`
 notification, and the worker claims the authoritative job from PostgreSQL, runs
-`demo.echo`, and commits `SUCCEEDED`. `GET /v1/jobs/{job_id}` shows the durable state;
-result bodies are M5.
+`demo.echo`, and commits `SUCCEEDED`. `GET /v1/jobs/{job_id}` shows the durable state.
+
+Read its result once it has succeeded:
+
+```bash
+curl http://127.0.0.1:8080/v1/jobs/<job_id>/result \
+  -H "Authorization: Bearer $TASKFORGE_API_KEY"
+```
+
+`demo.echo` returns an exact copy of the submitted payload, so this answers
+`{"message":"hello"}` — served identically whether the result was small
+enough to store inline in PostgreSQL or large enough to have been uploaded
+to the object store first; the caller never needs to know which.
 
 Submit one for later by adding `"scheduled_at": "2030-01-01T00:00:00Z"`. It stays
 `PENDING` and unadvertised until PostgreSQL says it is due, and the scheduler
@@ -199,8 +212,9 @@ make test        # unit and integration
 make test-race   # both, under the race detector
 ```
 
-`make test-integration` runs against the real PostgreSQL and the real broker started
-by `make up`. It fails rather than skipping when they are not running.
+`make test-integration` runs against the real PostgreSQL, the real broker, and the
+real object store started by `make up`. It fails rather than skipping when they
+are not running.
 
 The same gates run on GitHub-hosted runners for every pull request targeting `main`
 and every push to `main` — see [.github/workflows/ci.yml](.github/workflows/ci.yml).

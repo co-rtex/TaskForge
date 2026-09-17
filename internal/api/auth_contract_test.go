@@ -10,13 +10,14 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 )
 
-// publicOperations is the spec-side view of the same six routes publicRoutes
-// names on the handler side. The two lists existing separately is the point:
-// each is derived from a different source, and this file is where they have to
-// agree.
+// publicOperations is the spec-side view of the same seven routes
+// publicRoutes names on the handler side. The two lists existing separately
+// is the point: each is derived from a different source, and this file is
+// where they have to agree.
 var publicOperations = []struct{ method, path string }{
 	{"post", "/v1/jobs"},
 	{"get", "/v1/jobs/{job_id}"},
+	{"get", "/v1/jobs/{job_id}/result"},
 	{"post", "/v1/jobs/{job_id}/cancel"},
 	{"post", "/v1/jobs/{job_id}/retry"},
 	{"get", "/v1/dlq"},

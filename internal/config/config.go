@@ -61,6 +61,19 @@ type Config struct {
 	BrokerAccessKeyID     string
 	BrokerSecretAccessKey string
 
+	// Result storage. A result at or above ResultInlineThresholdBytes is
+	// stored in the object store named by Results*, rather than inline in
+	// PostgreSQL. Shared rather than worker-only, exactly like Broker*
+	// above: taskforge-api (GET /v1/jobs/{job_id}/result) and
+	// taskforge-worker (upload) each construct their own
+	// internal/objectstore client from the same connection settings.
+	ResultInlineThresholdBytes int
+	ResultsEndpoint            string
+	ResultsBucket              string
+	ResultsRegion              string
+	ResultsAccessKeyID         string
+	ResultsSecretAccessKey     string
+
 	OutboxAddr              string
 	OutboxBatchSize         int
 	OutboxPollInterval      time.Duration
@@ -108,6 +121,13 @@ func Load() (Config, error) {
 		BrokerAccessKeyID:     env("TASKFORGE_BROKER_ACCESS_KEY_ID", "local"),
 		BrokerSecretAccessKey: env("TASKFORGE_BROKER_SECRET_ACCESS_KEY", "local"),
 
+		ResultInlineThresholdBytes: envInt("TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES", 64*1024),
+		ResultsEndpoint:            env("TASKFORGE_RESULTS_ENDPOINT", "http://127.0.0.1:4566"),
+		ResultsBucket:              env("TASKFORGE_RESULTS_BUCKET", "taskforge-results"),
+		ResultsRegion:              env("TASKFORGE_RESULTS_REGION", "us-east-1"),
+		ResultsAccessKeyID:         env("TASKFORGE_RESULTS_ACCESS_KEY_ID", "local"),
+		ResultsSecretAccessKey:     env("TASKFORGE_RESULTS_SECRET_ACCESS_KEY", "local"),
+
 		OutboxAddr:              env("TASKFORGE_OUTBOX_ADDR", "127.0.0.1:8081"),
 		OutboxBatchSize:         envInt("TASKFORGE_OUTBOX_BATCH_SIZE", 50),
 		OutboxPollInterval:      envDuration("TASKFORGE_OUTBOX_POLL_INTERVAL", time.Second),
@@ -134,6 +154,8 @@ func (c Config) Validate() error {
 	req("TASKFORGE_API_ADDR", c.APIAddr)
 	req("TASKFORGE_BROKER_QUEUE_NAME", c.BrokerQueueName)
 	req("TASKFORGE_BROKER_REGION", c.BrokerRegion)
+	req("TASKFORGE_RESULTS_BUCKET", c.ResultsBucket)
+	req("TASKFORGE_RESULTS_REGION", c.ResultsRegion)
 	req("TASKFORGE_OUTBOX_ADDR", c.OutboxAddr)
 	req("TASKFORGE_RECONCILER_ADDR", c.ReconcilerAddr)
 	req("TASKFORGE_SCHEDULER_ADDR", c.SchedulerAddr)
@@ -152,6 +174,18 @@ func (c Config) Validate() error {
 
 	if c.MaxRequestBytes < 1024 {
 		problems = append(problems, "TASKFORGE_MAX_REQUEST_BYTES must be at least 1024")
+	}
+	// An inline result travels inside the fenced succeed request body, which
+	// is itself subject to TASKFORGE_MAX_REQUEST_BYTES. A threshold at or
+	// above that limit would let a worker classify a result as "small enough
+	// to inline" that its own reporting request can never actually deliver,
+	// so every such job would fail to report success and be abandoned to
+	// crash recovery despite having genuinely succeeded.
+	if c.ResultInlineThresholdBytes < 1 {
+		problems = append(problems, "TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES must be positive")
+	} else if int64(c.ResultInlineThresholdBytes) >= c.MaxRequestBytes {
+		problems = append(problems,
+			"TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES must be less than TASKFORGE_MAX_REQUEST_BYTES")
 	}
 	if c.APIRequestTimeout < 100*time.Millisecond || c.APIRequestTimeout > 5*time.Minute {
 		problems = append(problems, "TASKFORGE_API_REQUEST_TIMEOUT must be between 100ms and 5m")

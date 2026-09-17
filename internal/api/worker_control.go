@@ -14,6 +14,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -35,7 +36,10 @@ type WorkerControl interface {
 	Claim(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
 	RenewLease(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
 	Start(context.Context, string, workers.Fence) (workers.StartResult, error)
-	Succeed(context.Context, string, workers.Fence) error
+	// Succeed's result parameter is the one signature change M5C makes to
+	// this interface. A nil result means the job succeeded with nothing to
+	// record; see workers.ResultRef and docs/adr/0015-result-storage.md.
+	Succeed(context.Context, string, workers.Fence, *workers.ResultRef) error
 	Fail(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
 	AcknowledgeCancellation(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 	// SessionScope reads the scope and authenticating worker key a session was
@@ -309,6 +313,7 @@ type claimRequest struct {
 
 // AssignmentResponse is the committed authoritative payload plus its fence.
 type AssignmentResponse struct {
+	Scope                string          `json:"scope"`
 	JobID                string          `json:"job_id"`
 	Queue                string          `json:"queue"`
 	JobType              string          `json:"job_type"`
@@ -342,6 +347,7 @@ func toClaimResponse(result workers.ClaimResult) ClaimResponse {
 	}
 	if assignment := result.Assignment; assignment != nil {
 		response.Assignment = &AssignmentResponse{
+			Scope:                assignment.Scope,
 			JobID:                assignment.JobID.String(),
 			Queue:                assignment.Queue,
 			JobType:              assignment.JobType,
@@ -463,8 +469,96 @@ func (s *Server) handleStartAttempt(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// succeedAttemptRequest carries the five-part fence plus an optional result.
+// Result is nil, not an empty resultPayload, when the job succeeded with
+// nothing to record -- the field is simply absent from the request body.
+type succeedAttemptRequest struct {
+	JobID           string         `json:"job_id"`
+	LeaseID         string         `json:"lease_id"`
+	WorkerID        string         `json:"worker_id"`
+	WorkerSessionID string         `json:"worker_session_id"`
+	Result          *resultPayload `json:"result"`
+}
+
+// resultPayload is the wire shape of a fenced Succeed call's optional
+// result. Its fields mirror the results table's own columns exactly -- see
+// migrations/0016_results.sql -- so the value a worker sends is the value
+// results.InsertResultTx eventually stores, with no reinterpretation in
+// between. The worker decides location and, for an object-located result,
+// has already uploaded the bytes through internal/objectstore before this
+// request is ever sent; this server never uploads on a worker's behalf.
+type resultPayload struct {
+	Location       string          `json:"location"`
+	InlineBody     json.RawMessage `json:"inline_body,omitempty"`
+	ObjectBucket   string          `json:"object_bucket,omitempty"`
+	ObjectKey      string          `json:"object_key,omitempty"`
+	SizeBytes      int64           `json:"size_bytes"`
+	ChecksumSHA256 string          `json:"checksum_sha256,omitempty"`
+}
+
+// parseResultPayload converts the wire shape into the domain type
+// workers.Store.Succeed accepts, reusing results.Result's own Validate
+// rather than restating the location-shape rules a second time at this
+// boundary. A malformed result is reported the same way every other
+// worker-control validation problem is: a 422 naming the field.
+func parseResultPayload(payload *resultPayload) (*workers.ResultRef, []workers.FieldError) {
+	if payload == nil {
+		return nil, nil
+	}
+	ref := &workers.ResultRef{
+		Location:  results.Location(payload.Location),
+		Inline:    payload.InlineBody,
+		Bucket:    payload.ObjectBucket,
+		Key:       payload.ObjectKey,
+		SizeBytes: payload.SizeBytes,
+		Checksum:  payload.ChecksumSHA256,
+	}
+	check := results.Result{
+		Location: ref.Location, InlineBody: ref.Inline,
+		ObjectBucket: ref.Bucket, ObjectKey: ref.Key,
+		SizeBytes: ref.SizeBytes, ChecksumSHA256: ref.Checksum,
+	}
+	if err := check.Validate(); err != nil {
+		return nil, []workers.FieldError{{Field: "result", Message: err.Error()}}
+	}
+	return ref, nil
+}
+
+// handleSucceedAttempt records one fenced successful outcome and, when the
+// request carries one, the result it produced.
+//
+// It no longer goes through handleFencedTransition: Succeed's signature
+// diverged from the other bare-fence transitions the moment it gained a
+// result parameter, so it has its own body here, mirroring
+// handleFailAttempt's shape rather than reusing a helper built for a
+// signature this operation no longer has.
 func (s *Server) handleSucceedAttempt(w http.ResponseWriter, r *http.Request) {
-	s.handleFencedTransition(w, r, "succeed attempt", s.control.Succeed)
+	var request succeedAttemptRequest
+	if !s.decodeControlJSON(w, r, &request) {
+		return
+	}
+	fence, fields := parseFence(r.PathValue("attempt_id"), fenceRequest{
+		JobID: request.JobID, LeaseID: request.LeaseID,
+		WorkerID: request.WorkerID, WorkerSessionID: request.WorkerSessionID,
+	})
+	result, resultFields := parseResultPayload(request.Result)
+	fields = append(fields, resultFields...)
+	if len(fields) > 0 {
+		s.writeWorkerValidation(w, r, fields)
+		return
+	}
+
+	scope, ok := s.resolveWorkerControlScope(w, r, fence.SessionID)
+	if !ok {
+		return
+	}
+	if err := s.control.Succeed(r.Context(), scope, fence, result); err != nil {
+		s.writeWorkerControlError(w, r, "succeed attempt", err)
+		return
+	}
+	s.log.Info("succeed attempt",
+		append(fenceLogAttrs(fence), slog.Bool("has_result", result != nil))...)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type failAttemptRequest struct {
@@ -619,39 +713,6 @@ func fenceLogAttrs(fence workers.Fence, extra ...any) []any {
 		slog.String("worker_session_id", fence.SessionID.String()),
 	}
 	return append(attrs, extra...)
-}
-
-func (s *Server) handleFencedTransition(
-	w http.ResponseWriter,
-	r *http.Request,
-	op string,
-	transition func(context.Context, string, workers.Fence) error,
-) {
-	var request fenceRequest
-	if !s.decodeControlJSON(w, r, &request) {
-		return
-	}
-	fence, fields := parseFence(r.PathValue("attempt_id"), request)
-	if len(fields) > 0 {
-		s.writeWorkerValidation(w, r, fields)
-		return
-	}
-	scope, ok := s.resolveWorkerControlScope(w, r, fence.SessionID)
-	if !ok {
-		return
-	}
-	if err := transition(r.Context(), scope, fence); err != nil {
-		s.writeWorkerControlError(w, r, op, err)
-		return
-	}
-	s.log.Info(op,
-		slog.String("request_id", RequestIDFrom(r.Context())),
-		slog.String("job_id", fence.JobID.String()),
-		slog.String("attempt_id", fence.AttemptID.String()),
-		slog.String("lease_id", fence.LeaseID.String()),
-		slog.String("worker_id", fence.WorkerID.String()),
-		slog.String("worker_session_id", fence.SessionID.String()))
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func parseFence(attempt string, request fenceRequest) (workers.Fence, []workers.FieldError) {

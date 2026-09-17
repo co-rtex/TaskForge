@@ -34,7 +34,7 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 15)
+	require.Len(t, migrations, 16)
 	require.Equal(t, 14, migrations[13].Version)
 	require.Equal(t, "0014_api_keys.sql", migrations[13].Name)
 	require.Equal(t, 15, migrations[14].Version)
@@ -158,8 +158,8 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
-	require.NoError(t, err, "0014 and 0015 must apply to a database holding real M4 data")
-	require.Equal(t, 2, applied, "0014 and 0015 are pending from an M4 database")
+	require.NoError(t, err, "0014, 0015, and 0016 must apply to a database holding real M4 data")
+	require.Equal(t, 3, applied, "0014, 0015, and 0016 are pending from an M4 database")
 
 	t.Run("worker_sessions.worker_key_id exists, is nullable, and is NULL on every pre-existing row", func(t *testing.T) {
 		var nullCount, total int

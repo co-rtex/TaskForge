@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/results"
 )
 
 // StoreConfig is the server-owned policy a worker-control store enforces. None
@@ -596,9 +597,15 @@ func (s *Store) Start(ctx context.Context, scope string, fence Fence) (_ StartRe
 	}, nil
 }
 
-// Succeed atomically accepts one fenced successful outcome and releases both
-// queue and logical-worker capacity. An exact replay after success is a no-op.
-func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err error) {
+// Succeed atomically accepts one fenced successful outcome, releases both
+// queue and logical-worker capacity, and -- when result is non-nil --
+// records it in the results table inside this same transaction. An exact
+// replay after success is a no-op: it returns before result is ever looked
+// at, so a replayed call can never attempt a second results insert. That is
+// structural, not just a side effect of the table's PRIMARY KEY (job_id)
+// rejecting a duplicate: the INSERT statement itself is never reached on the
+// replay path. See TestSucceed_ReplayDoesNotInsertASecondResult.
+func (s *Store) Succeed(ctx context.Context, scope string, fence Fence, result *ResultRef) (err error) {
 	defer func() { err = classifyDatabaseError(err) }()
 
 	if err := ValidateFence(fence); err != nil {
@@ -675,6 +682,20 @@ func (s *Store) Succeed(ctx context.Context, scope string, fence Fence) (err err
 		return fmt.Errorf("release completed lease: %w", err)
 	} else if tag.RowsAffected() != 1 {
 		return ErrStateConflict
+	}
+
+	if result != nil {
+		if err := results.InsertResultTx(ctx, tx, results.Result{
+			JobID: fence.JobID, AttemptID: fence.AttemptID, Scope: scope,
+			Location:       result.Location,
+			InlineBody:     result.Inline,
+			ObjectBucket:   result.Bucket,
+			ObjectKey:      result.Key,
+			SizeBytes:      result.SizeBytes,
+			ChecksumSHA256: result.Checksum,
+		}); err != nil {
+			return fmt.Errorf("insert result: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

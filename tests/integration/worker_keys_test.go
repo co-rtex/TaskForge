@@ -439,7 +439,7 @@ func TestE2E_AWorkerRegisteredUnderAMatchingWorkerKeyExecutesTheJob(t *testing.T
 	// through its own control client so it presents workerKey rather than the
 	// stack's suite-wide default.
 	control := workerruntime.NewClient(stack.baseURL, &http.Client{Timeout: 10 * time.Second}, workerKey.Raw)
-	runner := workerruntime.NewRunner(control, stack.broker, registry, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, stack.broker, registry, nil, workerruntime.RunnerConfig{
 		Registration: workerRegistration("cross-scope-worker", 1, []string{"cpu"}, nil),
 		Queue:        "default", PollWait: time.Second,
 		RetryAttempts: 3, RetryDelay: 10 * time.Millisecond, ErrorBackoff: 10 * time.Millisecond,

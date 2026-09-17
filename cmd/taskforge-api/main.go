@@ -23,6 +23,8 @@ import (
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/objectstore"
+	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 	"github.com/co-rtex/TaskForge/internal/workerauth"
 	"github.com/co-rtex/TaskForge/internal/workers"
@@ -63,6 +65,19 @@ func run() int {
 		return 1
 	}
 
+	// No network call here, deliberately: this process only ever reads an
+	// object-located result on demand, so its boot must not depend on the
+	// object store being reachable -- the same posture it already has
+	// toward the broker, which it never touches directly at all.
+	objects, err := objectstore.New(ctx, objectstore.Options{
+		Endpoint: cfg.ResultsEndpoint, Region: cfg.ResultsRegion,
+		AccessKeyID: cfg.ResultsAccessKeyID, SecretAccessKey: cfg.ResultsSecretAccessKey,
+	})
+	if err != nil {
+		log.Error("configure result object store client", slog.String("error", err.Error()))
+		return 1
+	}
+
 	server := api.NewServer(
 		jobs.NewStore(pool),
 		api.Config{
@@ -78,7 +93,8 @@ func run() int {
 		LeaseDuration: cfg.LeaseDuration,
 		RetryPolicy:   cfg.RetryPolicy(),
 		Jitter:        jitter,
-	})).WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool))
+	})).WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool)).
+		WithResults(results.NewStore(pool), objects)
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,

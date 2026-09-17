@@ -82,10 +82,11 @@ func TestMigrations_ApplyCleanlyToAFreshDatabase(t *testing.T) {
 	})
 
 	// Tables for later milestones must not be created in advance. api_keys left
-	// this list in M5A, which put working behavior on it; results and
-	// audit_events are still unbuilt and must stay absent.
+	// this list in M5A and results left it in M5C, each when the milestone that
+	// put working behavior on it shipped; audit_events is still unbuilt and
+	// must stay absent.
 	t.Run("no speculative tables", func(t *testing.T) {
-		for _, table := range []string{"results", "audit_events"} {
+		for _, table := range []string{"audit_events"} {
 			var exists bool
 			require.NoError(t, conn.QueryRow(ctx,
 				`SELECT EXISTS (SELECT 1 FROM information_schema.tables

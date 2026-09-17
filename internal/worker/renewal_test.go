@@ -39,7 +39,7 @@ func renewingRunner(control ControlPlane, broker queue.Broker, registry *Registr
 	if cfg.SessionStaleAfter == 0 {
 		cfg.SessionStaleAfter = time.Minute
 	}
-	return NewRunner(control, broker, registry, cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return NewRunner(control, broker, registry, nil, cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 }
 
 // TestRenewal_LongHandlerSurvivesSeveralLeaseWindows is the property M3 exists
@@ -75,7 +75,7 @@ func TestRenewal_LongHandlerSurvivesSeveralLeaseWindowsWhileRenewalSucceeds(t *t
 				Remaining: 40 * time.Millisecond,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -140,7 +140,7 @@ func TestRenewal_RetriesReuseOneIdentityAndGeneration(t *testing.T) {
 				ExpiresAt: time.Now().Add(time.Minute), Remaining: time.Minute,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 	}
 
 	registry := NewRegistry()
@@ -190,7 +190,7 @@ func TestRenewal_DefinitiveLossCancelsTheHandlerAndPreventsSuccess(t *testing.T)
 				renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
 					return workers.RenewalResult{}, rejection
 				},
-				succeed: func(context.Context, workers.Fence) error {
+				succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 					succeeded.Store(true)
 					return nil
 				},
@@ -234,7 +234,7 @@ func TestRenewal_SessionLossIsFatalForTheWholeBoot(t *testing.T) {
 				renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
 					return workers.RenewalResult{}, rejection
 				},
-				succeed: func(context.Context, workers.Fence) error {
+				succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 					succeeded.Store(true)
 					return nil
 				},
@@ -274,7 +274,7 @@ func TestRenewal_UnresolvedTransientFailureStopsAtTheSafetyDeadline(t *testing.T
 			attempted.Add(1)
 			return workers.RenewalResult{}, &RemoteError{Status: 503, Code: "service_unavailable"}
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -330,7 +330,7 @@ func TestRenewal_DoesNotResetTheOverallJobTimeout(t *testing.T) {
 				ExpiresAt: time.Now().Add(time.Hour), Remaining: time.Hour,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -443,7 +443,7 @@ func TestHeartbeat_ContinuesThroughAGracefulDrain(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 	}
 
 	registry := NewRegistry()
@@ -565,7 +565,7 @@ func TestRenewal_AHungCallCannotOutliveTheAuthorityDeadline(t *testing.T) {
 		renew: func(ctx context.Context, _ workers.RenewalRequest) (workers.RenewalResult, error) {
 			return workers.RenewalResult{}, blocked.enter(ctx)
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -629,7 +629,7 @@ func TestRenewal_ALateSuccessCannotRestoreExpiredLocalAuthority(t *testing.T) {
 				ExpiresAt: time.Now().Add(time.Hour), Remaining: time.Hour,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},

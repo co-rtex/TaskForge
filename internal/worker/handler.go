@@ -117,8 +117,9 @@ func (r *Registry) Types() []string {
 }
 
 // DemoEcho is M2's single trusted handler. It returns an exact copy of the
-// authoritative payload in process. Result persistence is deliberately deferred
-// to M5, and the payload/result is never logged.
+// authoritative payload in process. Since M5C, runner.go classifies and
+// records that returned copy as the attempt's result; the payload/result
+// itself is still never logged.
 type DemoEcho struct{}
 
 func (DemoEcho) Execute(_ context.Context, execution Execution) (json.RawMessage, error) {

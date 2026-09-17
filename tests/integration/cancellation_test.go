@@ -158,7 +158,7 @@ func TestCancel_WhileLeasedOrRunningRequestsRatherThanTerminates(t *testing.T) {
 			// Every operation that could otherwise commit an outcome is now
 			// refused. This is what makes CANCEL_REQUESTED a decision rather than
 			// a hint.
-			require.ErrorIs(t, store.Succeed(ctx, testScope, fence), workers.ErrStateConflict)
+			require.ErrorIs(t, store.Succeed(ctx, testScope, fence, nil), workers.ErrStateConflict)
 			_, err = store.Fail(ctx, testScope,
 				failureReport(fence, lifecycle.ClassRetryable, "transient", ""))
 			require.ErrorIs(t, err, workers.ErrStateConflict)
@@ -216,7 +216,7 @@ func TestCancel_TerminalJobsAreAStableConflict(t *testing.T) {
 		session := registerWorker(t, store,
 			workerRegistration("cancel-succeeded", 1, nil, []string{"demo.echo"}))
 		fence := claimedAndRunning(t, store, session, "cancel-succeeded")
-		require.NoError(t, store.Succeed(ctx, testScope, fence))
+		require.NoError(t, store.Succeed(ctx, testScope, fence, nil))
 
 		_, err := jobStore().RequestCancel(ctx, testScope, fence.JobID)
 		require.ErrorIs(t, err, jobs.ErrJobNotCancelable)
@@ -453,7 +453,7 @@ func TestCancel_AnUncooperativeHandlerCannotCommitAfterwards(t *testing.T) {
 	finalized := readAttemptOutcome(t, fence.AttemptID)
 
 	// Everything the still-running handler's worker could try afterwards.
-	require.Error(t, store.Succeed(ctx, testScope, fence))
+	require.Error(t, store.Succeed(ctx, testScope, fence, nil))
 	_, err = store.Fail(ctx, testScope,
 		failureReport(fence, lifecycle.ClassRetryable, "transient", ""))
 	require.Error(t, err)
@@ -556,7 +556,7 @@ func TestContention_CancelVersusSuccess(t *testing.T) {
 		waitForDatabaseLock(t, fragmentCancelJob)
 
 		successErr := make(chan error, 1)
-		go func() { successErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { successErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentQueueLock)
 
 		release()
@@ -585,7 +585,7 @@ func TestContention_CancelVersusSuccess(t *testing.T) {
 			"NEW.status = 'SUCCEEDED'")
 
 		successErr := make(chan error, 1)
-		go func() { successErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { successErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentCancelJob)
 
 		cancelErr := make(chan error, 1)

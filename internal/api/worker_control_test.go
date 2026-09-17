@@ -25,7 +25,7 @@ type fakeWorkerControl struct {
 	claim        func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error)
 	renew        func(context.Context, string, workers.RenewalRequest) (workers.RenewalResult, error)
 	start        func(context.Context, string, workers.Fence) (workers.StartResult, error)
-	succeed      func(context.Context, string, workers.Fence) error
+	succeed      func(context.Context, string, workers.Fence, *workers.ResultRef) error
 	fail         func(context.Context, string, workers.FailureReport) (workers.OutcomeResult, error)
 	cancelAck    func(context.Context, string, workers.CancelAcknowledgment) (workers.OutcomeResult, error)
 	sessionScope func(context.Context, uuid.UUID) (string, *uuid.UUID, error)
@@ -46,8 +46,8 @@ func (f *fakeWorkerControl) RenewLease(ctx context.Context, scope string, req wo
 func (f *fakeWorkerControl) Start(ctx context.Context, scope string, fence workers.Fence) (workers.StartResult, error) {
 	return f.start(ctx, scope, fence)
 }
-func (f *fakeWorkerControl) Succeed(ctx context.Context, scope string, fence workers.Fence) error {
-	return f.succeed(ctx, scope, fence)
+func (f *fakeWorkerControl) Succeed(ctx context.Context, scope string, fence workers.Fence, result *workers.ResultRef) error {
+	return f.succeed(ctx, scope, fence, result)
 }
 func (f *fakeWorkerControl) Fail(ctx context.Context, scope string, report workers.FailureReport) (workers.OutcomeResult, error) {
 	return f.fail(ctx, scope, report)
@@ -90,6 +90,34 @@ func TestWorkerControl_ClaimResponseCarriesAckDecision(t *testing.T) {
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
 	require.Equal(t, string(workers.CapacityExhausted), response.Outcome)
 	require.False(t, response.SafeToAcknowledge)
+}
+
+// TestWorkerControl_ClaimResponseIncludesAssignmentScope proves the wire
+// response actually carries the scope workers.Store.Claim resolved, not just
+// that the Go struct on the server side has one. AssignmentResponse omitted
+// this field entirely until M5C needed a worker to know its own job's scope
+// (internal/worker/runner.go's object-store key) -- nothing before that ever
+// read it, so the gap was never observed.
+func TestWorkerControl_ClaimResponseIncludesAssignmentScope(t *testing.T) {
+	control := &fakeWorkerControl{
+		claim: func(context.Context, string, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{
+				Disposition: workers.Claimed,
+				Assignment:  &workers.Assignment{Scope: "acme-corp", JobType: "demo.echo"},
+			}, nil
+		},
+	}
+	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
+		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))
+	newWorkerControlHandler(control).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	var response ClaimResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.NotNil(t, response.Assignment)
+	require.Equal(t, "acme-corp", response.Assignment.Scope)
 }
 
 func TestWorkerControl_RejectsUnknownFieldsAndBadIdentifiers(t *testing.T) {

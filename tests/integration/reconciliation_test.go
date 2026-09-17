@@ -284,14 +284,14 @@ func TestReconcile_ReplacementClaimsAttemptTwoAndPreservesHistory(t *testing.T) 
 
 	replacementFence := assignmentFence(claim.Assignment)
 	startAttempt(t, store, replacementFence)
-	require.NoError(t, store.Succeed(context.Background(), testScope, replacementFence))
+	require.NoError(t, store.Succeed(context.Background(), testScope, replacementFence, nil))
 
 	require.Equal(t, []string{"ABANDONED", "SUCCEEDED"}, attemptHistory(t, fence.JobID))
 	require.Equal(t, []string{"EXPIRED", "COMPLETED"}, leaseHistory(t, fence.JobID))
 	require.Equal(t, 0, countActiveLeases(t))
 
 	// Every late mutation from the dead worker is still rejected.
-	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence), workers.ErrLeaseExpired)
+	require.ErrorIs(t, store.Succeed(context.Background(), testScope, fence, nil), workers.ErrLeaseExpired)
 	_, err = store.RenewLease(context.Background(), testScope, renewalRequest(fence, 0))
 	require.ErrorIs(t, err, workers.ErrLeaseExpired)
 }
@@ -617,7 +617,7 @@ func TestContention_RenewalVersusSuccess(t *testing.T) {
 		waitForDatabaseLock(t, fragmentRenewing)
 
 		succeedErr := make(chan error, 1)
-		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentQueueLock)
 
 		release()
@@ -648,7 +648,7 @@ func TestContention_RenewalVersusSuccess(t *testing.T) {
 			"taskforge_test_gate_succeed_first", "BEFORE UPDATE", "leases", whenCompleting)
 
 		succeedErr := make(chan error, 1)
-		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentComplete)
 
 		renewErr := make(chan error, 1)
@@ -818,7 +818,7 @@ func TestContention_SuccessVersusReconciliation(t *testing.T) {
 			"taskforge_test_gate_succeed_before_recon", "BEFORE UPDATE", "leases", whenCompleting)
 
 		succeedErr := make(chan error, 1)
-		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentComplete)
 		waitForServerTime(t, expiresAt.Add(50*time.Millisecond))
 
@@ -869,7 +869,7 @@ func TestContention_SuccessVersusReconciliation(t *testing.T) {
 		waitForDatabaseLock(t, fragmentExpire)
 
 		succeedErr := make(chan error, 1)
-		go func() { succeedErr <- store.Succeed(ctx, testScope, fence) }()
+		go func() { succeedErr <- store.Succeed(ctx, testScope, fence, nil) }()
 		waitForDatabaseLock(t, fragmentQueueLock)
 
 		release()
@@ -967,7 +967,7 @@ func TestReconcile_NoDeadlockUnderEveryConcurrentOperation(t *testing.T) {
 			if _, err := store.RenewLease(ctx, testScope, renewalRequest(fence, 0)); err != nil {
 				record("renew", err)
 			}
-			return store.Succeed(ctx, testScope, fence)
+			return store.Succeed(ctx, testScope, fence, nil)
 		})
 		spin("heartbeat", func() error {
 			_, err := store.Heartbeat(ctx, testScope,

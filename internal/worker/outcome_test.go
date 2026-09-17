@@ -84,7 +84,7 @@ func TestFailure_TrustedClassificationReachesTheControlPlane(t *testing.T) {
 						AttemptStatus: workers.AttemptFailed,
 					}, nil
 				},
-				succeed: func(context.Context, workers.Fence) error {
+				succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 					succeeded.Store(true)
 					return nil
 				},
@@ -240,7 +240,7 @@ func TestFailure_RetriesReuseOneOutcomeIdentity(t *testing.T) {
 	}
 
 	runner := NewRunner(control, &fakeBroker{},
-		handlerReturning(t, Retryable("upstream_5xx", "upstream returned 502")),
+		handlerReturning(t, Retryable("upstream_5xx", "upstream returned 502")), nil,
 		RunnerConfig{Queue: "default", PollWait: time.Second, RetryAttempts: 3, ShutdownTimeout: time.Second},
 		discardWorkerLogger())
 	require.NoError(t, runner.processMessage(context.Background(), session, advisoryMessage(t)))
@@ -298,13 +298,13 @@ func TestCancellation_DeliveredWhileExecutingStopsTheHandlerAndAcknowledges(t *t
 			failed.Store(true)
 			return workers.OutcomeResult{}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
 	}
 
-	runner := NewRunner(control, &fakeBroker{}, registry,
+	runner := NewRunner(control, &fakeBroker{}, registry, nil,
 		RunnerConfig{Queue: "default", PollWait: time.Second, RetryAttempts: 2, ShutdownTimeout: time.Second},
 		discardWorkerLogger())
 
@@ -381,7 +381,7 @@ func TestCancellation_ArrivingBeforeTheHandlerStartsIsNotLost(t *testing.T) {
 				AttemptStatus: workers.AttemptCanceled,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -467,7 +467,7 @@ func TestTimeout_WorkerCancelsLocallyAndReportsNothing(t *testing.T) {
 				TimeoutAt: now.Add(20 * time.Millisecond), Remaining: 20 * time.Millisecond,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			reported.Store(true)
 			return nil
 		},
@@ -526,7 +526,7 @@ func TestTimeout_LocalDeadlineComesFromTheServerMeasuredBudget(t *testing.T) {
 				Replayed: true,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 	}
 
 	runner := renewingRunner(control, &fakeBroker{}, registry, RunnerConfig{})
@@ -565,7 +565,7 @@ func TestOutcome_AuthorityLossIsNeverReportedAsCancellation(t *testing.T) {
 			renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
 				return workers.RenewalResult{}, workers.ErrLeaseExpired
 			},
-			succeed: func(context.Context, workers.Fence) error {
+			succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 				reported.Add(1)
 				return nil
 			},
@@ -613,7 +613,7 @@ func TestOutcome_AuthorityLossIsNeverReportedAsCancellation(t *testing.T) {
 				failed.Store(true)
 				return workers.OutcomeResult{}, nil
 			},
-			succeed: func(context.Context, workers.Fence) error { return nil },
+			succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -642,7 +642,7 @@ func TestOutcome_SuccessIsStillReportedWhenNothingWentWrong(t *testing.T) {
 		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
 			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error {
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
 			succeeded.Store(true)
 			return nil
 		},
@@ -740,7 +740,7 @@ func TestCancellation_WinningBeforeStartIsAcknowledgedFromTheTypedRefusal(t *tes
 				AttemptStatus: workers.AttemptCanceled,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { succeeded.Store(true); return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { succeeded.Store(true); return nil },
 		fail: func(context.Context, workers.FailureReport) (workers.OutcomeResult, error) {
 			failed.Store(true)
 			return workers.OutcomeResult{}, nil
@@ -812,7 +812,7 @@ func TestCancellation_TypedRefusalIsRecognizedOverTheWire(t *testing.T) {
 				AttemptStatus: workers.AttemptCanceled,
 			}, nil
 		},
-		succeed: func(context.Context, workers.Fence) error { return nil },
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 	}
 
 	runner := testRunner(control, &fakeBroker{}, registry)
@@ -854,7 +854,7 @@ func TestCancellation_UnrelatedStartConflictsAreStillDropped(t *testing.T) {
 					acknowledged.Store(true)
 					return workers.OutcomeResult{}, nil
 				},
-				succeed: func(context.Context, workers.Fence) error { return nil },
+				succeed: func(context.Context, workers.Fence, *workers.ResultRef) error { return nil },
 			}
 
 			runner := testRunner(control, &fakeBroker{}, registry)

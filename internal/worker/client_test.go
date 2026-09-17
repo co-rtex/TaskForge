@@ -59,6 +59,19 @@ func TestParseAssignment_RejectsNegativeLeaseWindow(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestParseAssignment_PreservesScope is the client's half of the same gap
+// TestWorkerControl_ClaimResponseIncludesAssignmentScope proves on the server:
+// AssignmentResponse.Scope must actually reach workers.Assignment.Scope, the
+// value prepareResult uses to build a large result's object-store key.
+func TestParseAssignment_PreservesScope(t *testing.T) {
+	assignment, err := parseAssignment(api.AssignmentResponse{
+		Scope: "acme-corp", JobID: uuid.NewString(), AttemptID: uuid.NewString(),
+		LeaseID: uuid.NewString(), WorkerID: uuid.NewString(), WorkerSessionID: uuid.NewString(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, "acme-corp", assignment.Scope)
+}
+
 // TestParseRenewal_RejectsAResponseThatCouldNotAnswerThisRequest is the client's
 // half of the renewal fence. A response naming another lease, or a generation
 // that does not follow the one the caller asked to advance, cannot be turned

@@ -20,6 +20,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/workerauth"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
@@ -40,7 +41,8 @@ func newAPI(t *testing.T) *httptest.Server {
 		LeaseDuration: 30 * time.Second,
 		RetryPolicy:   integrationRetryPolicy(),
 	})).WithAuth(auth.NewStore(testPool)).
-		WithWorkerAuth(workerauth.NewStore(testPool))
+		WithWorkerAuth(workerauth.NewStore(testPool)).
+		WithResults(results.NewStore(testPool), testObjects)
 	s := httptest.NewServer(srv.Handler())
 	t.Cleanup(s.Close)
 	return s

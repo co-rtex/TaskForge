@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/results"
 )
 
 // Stable domain errors exposed to the HTTP boundary.
@@ -207,6 +208,29 @@ type Fence struct {
 	LeaseID   uuid.UUID
 	WorkerID  uuid.UUID
 	SessionID uuid.UUID
+}
+
+// ResultRef is a fenced Succeed call's optional result. A nil ResultRef
+// means the job succeeded with no result recorded -- Store.Succeed writes no
+// results row at all in that case.
+//
+// The caller decides Location before calling Succeed: internal/worker/runner.go
+// classifies the handler's output with results.Classify and, for
+// LocationObject, has already uploaded it to the object store through
+// internal/objectstore, so this type carries only what
+// results.InsertResultTx needs to record -- Store.Succeed never touches the
+// object store itself. See docs/adr/0015-result-storage.md for why that
+// split exists.
+type ResultRef struct {
+	Location results.Location
+	// Inline is set only when Location is results.LocationInline.
+	Inline json.RawMessage
+	// Bucket, Key, and Checksum are set only when Location is
+	// results.LocationObject.
+	Bucket    string
+	Key       string
+	SizeBytes int64
+	Checksum  string
 }
 
 // HeartbeatRequest identifies the one process session reporting liveness. It

@@ -32,6 +32,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/database"
+	"github.com/co-rtex/TaskForge/internal/objectstore"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
 	"github.com/co-rtex/TaskForge/internal/workerauth"
@@ -41,9 +42,16 @@ const (
 	defaultDSN             = "postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable"
 	defaultBrokerEndpoint  = "http://127.0.0.1:9324"
 	defaultBrokerQueueName = "taskforge-work-available"
+	defaultResultsEndpoint = "http://127.0.0.1:4566"
+	testResultsBucket      = "taskforge-results"
 )
 
 var testPool *pgxpool.Pool
+
+// testObjects is a shared client against the real object store, exactly like
+// testPool is shared against real PostgreSQL. Tests that want their own
+// independent client use newObjectStore instead.
+var testObjects *objectstore.Client
 
 func dsn() string {
 	if v := os.Getenv("TASKFORGE_TEST_DATABASE_URL"); v != "" {
@@ -57,6 +65,13 @@ func brokerEndpoint() string {
 		return v
 	}
 	return defaultBrokerEndpoint
+}
+
+func resultsEndpoint() string {
+	if v := os.Getenv("TASKFORGE_RESULTS_ENDPOINT"); v != "" {
+		return v
+	}
+	return defaultResultsEndpoint
 }
 
 // TestMain fails loudly rather than skipping when infrastructure is missing. A
@@ -82,6 +97,18 @@ func TestMain(m *testing.M) {
 			brokerEndpoint(), err)
 		os.Exit(1)
 	}
+
+	objects, err := objectstore.New(ctx, objectStoreOptions())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "could not configure the results object-store client: %v\n", err)
+		os.Exit(1)
+	}
+	if err := objects.EnsureBucket(ctx, testResultsBucket); err != nil {
+		fmt.Fprintf(os.Stderr, "integration tests need an S3-compatible object store at %s\nrun `make up` first\ncause: %v\n",
+			resultsEndpoint(), err)
+		os.Exit(1)
+	}
+	testObjects = objects
 
 	// The public API authenticates from M5A onward, so this suite needs a real
 	// credential before any test runs.
@@ -111,6 +138,24 @@ func brokerOptions() sqsbroker.Options {
 		AccessKeyID:     "local",
 		SecretAccessKey: "local",
 	}
+}
+
+func objectStoreOptions() objectstore.Options {
+	return objectstore.Options{
+		Endpoint:        resultsEndpoint(),
+		Region:          "us-east-1",
+		AccessKeyID:     "local",
+		SecretAccessKey: "local",
+	}
+}
+
+// newObjectStore builds an independent object-store client, for a test that
+// wants its own rather than the shared testObjects.
+func newObjectStore(t *testing.T) *objectstore.Client {
+	t.Helper()
+	client, err := objectstore.New(context.Background(), objectStoreOptions())
+	require.NoError(t, err)
+	return client
 }
 
 func discardLogger() *slog.Logger {
@@ -285,7 +330,7 @@ func reset(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := testPool.Exec(ctx, `
-		TRUNCATE dlq_replays, dlq_entries, leases, job_attempts,
+		TRUNCATE dlq_replays, dlq_entries, leases, job_attempts, results,
 		         worker_sessions, workers, idempotency_records,
 		         outbox_events, jobs, queues, api_keys, worker_keys CASCADE`)
 	require.NoError(t, err)
