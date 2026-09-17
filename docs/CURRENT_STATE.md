@@ -13,8 +13,7 @@ records the implemented state through M5C, which is on the
 - **M4 — retry, timeout, cancellation, DLQ, replay, delayed jobs:** complete.
 - **M5A — database-backed API keys for the public surface:** complete.
 - **M5B — worker/control authentication:** complete.
-- **M5C — result storage:** implementation complete; hosted CI verification
-  in progress (see "### M5C gates" below for what has run so far).
+- **M5C — result storage:** complete.
 - **M5D — CLI and Python SDK:** not started.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into four slices and what each
@@ -1047,15 +1046,17 @@ complete in ~0.15s each.
 
 ### M5C gates
 
-Every gate below was run on the branch head, on 2026-09-16, in this
-sandbox. `test-integration` and `test-race` could not be run locally in
-this environment: this sandbox's Docker daemon can pull only
-already-cached images, and LocalStack's image is not cached here — every
-pull attempt (LocalStack itself, and two alternative S3-compatible test
-doubles) fails at blob fetch from a blocked registry host, independent of
-this project's own code. Hosted CI, which has unrestricted network access,
-is the substitute gate for those two; see the row-level notes below for
-its status as of this record.
+`gofmt`, `lint`, `build`, `test-unit`, the OpenAPI contract tests, and
+`docker compose config` were run locally on the branch head, on
+2026-09-16, after every fix below was in place. `test-integration` and
+`test-race` could not be run locally in this sandbox at all — its Docker
+daemon can pull only already-cached images, and LocalStack's image is not
+cached here; every pull attempt (LocalStack itself, and two alternative
+S3-compatible test doubles) failed at blob fetch from a blocked registry
+host, independent of this project's own code. Hosted CI, which has
+unrestricted network access, is the real gate for those two, and its
+result below is from commit `2506222` — the actual final head, after the
+three real fixes this section's "Debugging arc" recounts.
 
 | Command | Result | Real output |
 | --- | --- | --- |
@@ -1065,30 +1066,79 @@ its status as of this record.
 | `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/results` and `internal/worker` |
 | `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 |
 | `docker compose config --quiet` | PASS | exit 0 |
-| `make test-integration` | NOT RUN locally (see above) | hosted CI: three consecutive failures of `TestResults_LargeResultRoundTripsThroughTheObjectStore` on the pushes that introduced this milestone (`bee0f3c`/`d545591` against an unbounded client; `91e7a4b`'s checksum-mode change did not address it; `c67fee1`'s 10-second timeout was structurally correct but too generous for its own three retries to surface within the test's 15-second patience) — see [ADR-0015](adr/0015-result-storage.md); `725ba97` splits the bound by destination and adds a pre-upload log line; hosted re-run pending confirmation as of this record |
-| `make test-race` | NOT RUN locally (see above) | same hosted failures and the same fix; hosted re-run pending confirmation as of this record |
+| `make test-integration` (hosted CI) | PASS | `ok github.com/co-rtex/TaskForge/tests/integration 93.398s`, commit `2506222`, run [35145694272](https://github.com/co-rtex/TaskForge/actions/runs/35145694272) |
+| `make test-race` (hosted CI) | PASS | every unit package `ok`; `ok github.com/co-rtex/TaskForge/tests/integration 78.732s` under `-race`, same commit and run |
 
 Exact commands and complete output are recorded in the pull request.
+
+**Debugging arc.** Getting `test-integration`/`test-race` green took six
+pushes and three real, independent fixes, in this order:
+
+1. **Unbounded object-store HTTP client.** `internal/objectstore.New` used
+   the AWS SDK's default HTTP client, whose overall request `Timeout` is
+   the zero value — unbounded — unless a caller sets one. Against this
+   project's own CI, LocalStack accepted a `PutObject` connection and never
+   answered it, hanging the upload forever with no error. Fixed by setting
+   an explicit timeout (`internal/objectstore`'s `localRequestTimeout` /
+   `remoteRequestTimeout`, split by destination once the first, uniform
+   10-second bound proved too generous relative to the test's own
+   15-second patience for its three retries to ever surface within it).
+   The first diagnosis on the way to this one — aws-sdk-go-v2's
+   trailing-checksum default — was wrong, and is kept in
+   [ADR-0015](adr/0015-result-storage.md) alongside the real cause,
+   because the wrong turn is exactly what a future reader hitting the same
+   symptom needs.
+2. **Message starvation on a shared broker queue.** Checkpoint logging
+   added across three pushes (and removed once its job was done) proved
+   the worker's own `Receive()` calls were polling correctly the entire
+   time — the message the test published was simply never returned to
+   either of the test's own two worker slots. `deploy/local/elasticmq.conf`
+   sets `defaultVisibilityTimeout = 30 seconds` on the shared
+   `taskforge-work-available` queue every integration test uses unless it
+   opts out; a message left invisible there by some other test's abandoned
+   receive outlives this test's 15-second patience twice over. Fixed by
+   giving the results tests their own isolated queue via
+   `createIsolatedBrokerQueue`, the same helper `lifecycle_e2e_test.go`
+   already used for exactly this failure mode.
+3. **`scope` silently dropped from the claim response.** Fixing the queue
+   let the pipeline finally run far enough, in milliseconds, to hit a
+   third, genuinely different bug: `api.AssignmentResponse` never had a
+   `scope` field, so the uploaded object key came out
+   `results//<job_id>/<attempt_id>` — the scope segment empty — instead of
+   `results/<scope>/<job_id>/<attempt_id>`. Nothing before M5C ever needed
+   a worker to know its own claimed job's scope, so the gap was invisible
+   until this milestone's object-store key became the first consumer.
+   Fixed on both sides of the wire contract, with a regression test per
+   side, each confirmed to fail with its fix reverted before being
+   restored.
+
+None of the three was hypothetical: each was confirmed by reverting the
+fix and watching the corresponding test or assertion fail for exactly the
+reason claimed, not merely by writing a test that passed against the fix
+already in place.
 
 ### M5C coverage
 
 `internal/results` carries 5 top-level unit tests covering `Classify`'s
 threshold (inclusive on the object side), an independently-verified SHA-256
 test vector, and `Result.Validate`'s two well-formed shapes plus every
-malformed one. `internal/worker` grew from 55 to 60 top-level tests: the
-five new ones drive `prepareResult` directly against a fake object store —
-an empty handler result produces no result at all, a result below the
-threshold never touches the object store, one at or above it uploads
-before `prepareResult` returns, a retry-exhausted upload failure and a
-missing object store both refuse rather than proceed. `internal/api` grew
-from 69 to 76 top-level tests: the seven new ones drive
-`GET /v1/jobs/{job_id}/result` against fakes — an inline result served as
-its exact bytes, an object-located result proxied through a fake object
-store, a missing object store on an object-located row answering `500`
-rather than `404`, the shared not-found/malformed-id shape, authentication,
-a missing `Results` store answering `500` (the route is registered
-unconditionally, like every other public route, not conditionally like
-worker-control), and `405` on the wrong method. The integration package
+malformed one. `internal/worker` grew from 55 to 61 top-level tests: five
+drive `prepareResult` directly against a fake object store — an empty
+handler result produces no result at all, a result below the threshold
+never touches the object store, one at or above it uploads before
+`prepareResult` returns, a retry-exhausted upload failure and a missing
+object store both refuse rather than proceed — and one,
+`TestParseAssignment_PreservesScope`, is the client-side half of the
+scope-wire-contract regression covered below. `internal/api` grew from 69
+to 77 top-level tests: seven drive `GET /v1/jobs/{job_id}/result` against
+fakes — an inline result served as its exact bytes, an object-located
+result proxied through a fake object store, a missing object store on an
+object-located row answering `500` rather than `404`, the shared
+not-found/malformed-id shape, authentication, a missing `Results` store
+answering `500` (the route is registered unconditionally, like every other
+public route, not conditionally like worker-control), and `405` on the
+wrong method — and one, `TestWorkerControl_ClaimResponseIncludesAssignmentScope`,
+is the server-side half of that same regression. The integration package
 grew from 204 to 207 top-level tests: three new in `results_test.go` — the
 small-result and large-result end-to-end round trips, and the
 no-result-recorded `404` — each driving a real worker process against real
@@ -1096,15 +1146,25 @@ PostgreSQL, a real broker, and a real object store, plus signature-ripple
 updates to existing worker-control and outcome tests for `Succeed`'s new
 parameter.
 
-**Mutation evidence.** `Store.Succeed`'s replay guard was confirmed by
-deliberately duplicating the `results.InsertResultTx` call into the replay
-branch (the one that returns before ever reaching the real insert) and
-watching `TestSucceedReplay_DoesNotInsertASecondResult` fail with a real
-PostgreSQL `duplicate key value violates unique constraint "results_pkey"`
-error, then reverting. This proves the replay branch is safe by
-construction — it returns before `result` is ever looked at — not merely
-safe because the primary key would reject a second attempt at the same
-`job_id` if the code ever reached it.
+**Mutation evidence.** Three guards were each confirmed by deliberately
+breaking them and watching the corresponding test fail for the claimed
+reason, then reverting:
+
+- `Store.Succeed`'s replay guard: duplicating the `results.InsertResultTx`
+  call into the replay branch (the one that returns before ever reaching
+  the real insert) made `TestSucceedReplay_DoesNotInsertASecondResult` fail
+  with a real PostgreSQL `duplicate key value violates unique constraint
+  "results_pkey"` error. This proves the replay branch is safe by
+  construction — it returns before `result` is ever looked at — not merely
+  safe because the primary key would reject a second attempt at the same
+  `job_id` if the code ever reached it.
+- The server-side scope fix: removing `Scope: assignment.Scope` from
+  `toClaimResponse` made `TestWorkerControl_ClaimResponseIncludesAssignmentScope`
+  fail with `expected: "acme-corp", actual: ""`.
+- The client-side scope fix: removing `Scope: response.Scope` from
+  `parseAssignment`'s return made `TestParseAssignment_PreservesScope` fail
+  the identical way. Together these prove the fix closes the gap on both
+  sides of the wire, not just one.
 
 ### M4 gates
 

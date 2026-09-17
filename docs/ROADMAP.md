@@ -217,9 +217,8 @@ results in an S3-compatible object store, and the retrieval endpoint.
 tested on both sides of the boundary.
 **Depends on.** M5B, so result retrieval is authenticated on arrival rather than
 retrofitted onto an endpoint that serves job output.
-**Status:** implementation complete; hosted CI verification in progress —
-see [CURRENT_STATE.md](CURRENT_STATE.md) for the evidence gathered so far
-and [ADR-0015](adr/0015-result-storage.md) for the decision.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and [ADR-0015](adr/0015-result-storage.md) for the decision.
 
 The object key a worker uploads a large result to is attempt-scoped, not
 job-scoped, by deliberate decision — see ADR-0015. An attempt whose object

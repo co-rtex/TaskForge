@@ -272,19 +272,75 @@ seconds, an unvalidated placeholder — nothing in this repository deploys
 against real AWS S3 yet) for everything else. `internal/worker/runner.go`
 also gained one `Info`-level log line immediately before the upload
 attempt, so that even a failure this bound still cannot make visible in
-time leaves a trace of how far execution got.
+time still leaves a trace of how far execution got.
 
-This still does not explain *why* LocalStack's S3 gateway fails to answer
-a `PutObject` carrying a body at all, only that it does, reliably, across
-every push so far, against a body of a few hundred bytes — small enough
-that the well-documented large-payload LocalStack issues in this area do
-not obviously apply. Public LocalStack issue trackers document a
-recurring, multi-year pattern of `PutObject` hangs specifically on
-requests that carry a body, across unrelated LocalStack versions, which
-raises the possibility this is a server-side defect this project cannot
-fix from the client side at all — a possibility the next hosted CI run's
-actual error message (now reachable within the test's own window) should
-finally confirm or rule out, rather than another guess.
+At the time this record was written, that still left open *why*
+LocalStack's S3 gateway would fail to answer a `PutObject` carrying a body
+at all. It turned out not to, ever. The next push (after the section
+below's two further fixes) shows `PutObject` completing in single-digit
+milliseconds once the worker actually reached it — the object store was
+never broken, hung, or slow at any point in this whole arc. Every theory
+in this section about *why* LocalStack might reject or stall on a
+body-bearing request — the checksum default, the possibility of a
+server-side defect this project could not fix from the client side — was
+chasing a symptom the object store never actually produced. What every
+push through `725ba97` actually observed was a worker that never reached
+`prepareResult`'s upload call at all, for a reason with nothing to do with
+`internal/objectstore`; see below. The timeout split this section
+describes is kept, because bounding a request that previously had no limit
+at all is correct regardless of what caused this specific incident — but
+it fixed nothing in this milestone's actual failure, and this record says
+so rather than letting the fix's presence imply otherwise.
+
+### The real causes: a shared broker queue, then a dropped `scope` field
+
+Two more pushes, `cb42561` and `1432151`, found what `725ba97` could not,
+using the same discipline: add exactly enough logging to distinguish the
+remaining hypotheses, read what hosted CI actually shows, and change only
+what the evidence supports.
+
+Checkpoint logging bracketing every step from broker receipt through
+upload (added across `07bda21`, `bfa79d7`, and `847b158`, removed once its
+job was done) proved the worker's `Receive()` calls were polling the
+broker correctly the entire time, once a second per slot, with `messages:
+0` every single time — no hang, no error, and critically, the checkpoint
+immediately after a successful claim never fired either. The message
+`TestResults_LargeResultRoundTripsThroughTheObjectStore` published was
+never once returned to either of the test's own two worker slots.
+
+`deploy/local/elasticmq.conf` sets `defaultVisibilityTimeout = 30 seconds`
+on `taskforge-work-available`, the queue every integration test shares
+unless it explicitly opts out. `reset()`'s drain only removes what is
+visible at the instant it runs. A message left invisible on that shared
+queue by some other test's real worker — received but never deleted, for
+whatever reason that other test abandons it — stays invisible for a
+further 30 seconds from whenever it was received: twice this test's own
+15-second patience, however many pushes it took to actually observe it.
+`cb42561` gives both `TestResults_SmallResultRoundTripsInline` and
+`TestResults_LargeResultRoundTripsThroughTheObjectStore` an isolated
+queue via `createIsolatedBrokerQueue`, the same helper
+`lifecycle_e2e_test.go` already used for exactly this failure mode — not
+a novel fix, an existing, proven pattern this milestone's own tests had
+simply not adopted yet.
+
+That fix let the pipeline run end to end, in milliseconds, for the first
+time — and immediately hit a third, genuinely different bug:
+`api.AssignmentResponse` never had a `scope` field, so `toClaimResponse`
+never populated one and `parseAssignment` never read one back. The
+uploaded object key came out `results//<job_id>/<attempt_id>` — the scope
+segment empty — instead of `results/<scope>/<job_id>/<attempt_id>`.
+Nothing before this milestone ever needed a worker to know its own
+claimed job's scope; M5C's object-store key is the first consumer, so the
+gap was invisible on both sides of the wire contract until this milestone
+needed it. `1432151` adds `scope` to `AssignmentResponse`, `Assignment`'s
+OpenAPI schema, and both sides of the Go wire code, with one regression
+test per side, each confirmed to fail with its own fix reverted before
+being restored.
+
+Both fixes landed, hosted CI ran green across all three jobs on the
+resulting head, and stayed green after the diagnostic logging above was
+removed (`2506222`) — see [CURRENT_STATE.md](CURRENT_STATE.md)'s M5C
+gates section for the exact commands and real output.
 
 ## Known limitation: an abandoned attempt's uploaded object is orphaned, permanently
 
