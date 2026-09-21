@@ -36,8 +36,9 @@ the internal worker-control surface, with every later worker-control call
 trusting that session's identity and a cheap revocation check rather than a
 re-presented credential; inline and object-backed result storage with
 retrieval; and a command-line client (`taskforge-cli`) over the public API
-and the loopback-only credential-management routes. The Python SDK and the
-operator dashboard remain planned.
+and the loopback-only credential-management routes; and a typed, installable
+Python SDK (`taskforge-sdk`) over the same surface. The operator dashboard
+remains planned.
 
 ---
 

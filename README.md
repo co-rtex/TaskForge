@@ -256,6 +256,47 @@ current state), `6` internal server error, `7` the server's own deadline elapsed
 `8` could not reach the API at all, `9` a response this CLI version does not
 recognize. `taskforge-cli --help` lists every command and flag.
 
+## Try it with the Python SDK
+
+The same surface from Python. Installable from this clone; it is deliberately
+not published to PyPI before M8 (see
+[ADR-0016](docs/adr/0016-python-sdk-toolchain-and-client-configuration.md)).
+
+```bash
+pip install ./sdk/python     # Python 3.11+; one dependency, httpx
+```
+
+```python
+from taskforge import TaskForgeClient, NotFoundError
+
+# The /internal/v1 key routes are loopback-only and need no credential.
+with TaskForgeClient() as bootstrap:
+    created = bootstrap.api_keys.create(scope="local-dev", name="my-laptop")
+
+with TaskForgeClient(api_key=created.key) as client:
+    job = client.jobs.submit(
+        queue="default",
+        job_type="demo.echo",
+        payload={"message": "hello"},
+    )
+    print(job.id, job.status)        # JobStatus.QUEUED
+
+    try:
+        print(client.jobs.result(job.id))
+    except NotFoundError:
+        print("no result recorded yet")
+```
+
+It reads `TASKFORGE_SDK_API_URL` and `TASKFORGE_SDK_API_KEY` — its own
+variables. It never reads `TASKFORGE_API_ADDR` (the server's bind address) and
+never reads the CLI's variables: an SDK is a library inside your process, and a
+key exported for your shell's CLI should not be picked up ambiently.
+
+Failures raise a subclass of `TaskForgeError`, grouped by remediation the same
+way the CLI's exit codes are, and each class carries the matching `exit_code`.
+Full surface, error table, and idempotency semantics:
+[sdk/python/README.md](sdk/python/README.md).
+
 ## Documentation
 
 | Read this | For |
@@ -267,6 +308,7 @@ recognize. `taskforge-cli --help` lists every command and flag.
 | [docs/adr/README.md](docs/adr/README.md) | Why decisions were made |
 | [AGENTS.md](AGENTS.md) | Engineering rules for contributors |
 | [api/openapi.yaml](api/openapi.yaml) | The implemented HTTP endpoints |
+| [sdk/python/README.md](sdk/python/README.md) | The Python SDK: install, surface, errors, idempotency |
 
 ## Performance
 

@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "taskforge-sdk"
+version = "0.1.0"
+description = "Typed Python client for the TaskForge job-processing API."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Christian Cortez" }]
+keywords = ["taskforge", "jobs", "queue", "distributed-systems"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+
+# One runtime dependency, deliberately. httpx is chosen over urllib.request
+# for connection reuse, separate connect/read timeouts, inline type hints
+# (it ships py.typed), and httpx.MockTransport -- the seam every test in
+# this package drives the real client through. See
+# docs/adr/0016-python-sdk-toolchain-and-client-configuration.md.
+dependencies = ["httpx>=0.27,<1.0"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[project.urls]
+Homepage = "https://github.com/co-rtex/TaskForge"
+Repository = "https://github.com/co-rtex/TaskForge"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/taskforge"]
+
+# ---------------------------------------------------------------------------
+# Formatting and linting. `ruff format` is authoritative here exactly as
+# `gofmt` is on the Go side (AGENTS.md section 5); `ruff check` and
+# `mypy --strict` together are the `go vet` equivalent.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # isort
+  "UP",   # pyupgrade
+  "B",    # bugbear
+  "SIM",  # simplify
+  "RUF",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
