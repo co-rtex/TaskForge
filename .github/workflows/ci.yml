@@ -243,6 +243,59 @@ jobs:
         run: docker compose down -v --remove-orphans
 
   # ---------------------------------------------------------------------------
+  # Python SDK. Its own job, not folded into `checks`: that job sets up Go and
+  # caches by go.mod, and a Go failure and a Python failure sharing one status
+  # line reads badly -- the same reason `race` below is separate. It is not in
+  # `integration` either, because these tests drive the client through an
+  # httpx.MockTransport and need neither PostgreSQL nor the broker.
+  #
+  # This job installs and runs the SDK; it does not publish it. The SDK is
+  # installable from this repository and is deliberately not released to PyPI
+  # before M8 -- see docs/adr/0016. The workflow's read-only permission grant
+  # above stays the whole grant.
+  # ---------------------------------------------------------------------------
+  sdk:
+    name: Python SDK (format, lint, types, unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Never cancel 3.13 because 3.11 failed: which versions break is the
+      # information this matrix exists to produce.
+      fail-fast: false
+      matrix:
+        # The floor declared by requires-python, and a current release.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: sdk/python/pyproject.toml
+
+      - name: Report the resolved interpreter
+        run: |
+          set -euo pipefail
+          python --version
+          python -c 'import sys; print(sys.executable)'
+
+      - name: Install the SDK with its dev extras
+        # `make sdk-venv` builds the same virtualenv a developer gets locally,
+        # from the same pyproject.toml, with no CI-only dependency list.
+        run: make sdk-venv PYTHON=python
+
+      - name: Format, lint, and type check
+        run: make sdk-lint
+
+      - name: Unit tests
+        run: make sdk-test
+
+  # ---------------------------------------------------------------------------
   # Race detector. Separated from the integration job because it is the slowest
   # gate and its failures read very differently.
   # ---------------------------------------------------------------------------

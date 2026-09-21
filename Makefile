@@ -12,8 +12,18 @@ COMPOSE        ?= docker compose
 BIN_DIR        := bin
 INTEGRATION_PKG := ./tests/integration/...
 
+# Python SDK (sdk/python). Its gates are deliberately separate targets
+# rather than folded into fmt/lint/test: those stay Go-only so a Go
+# contributor -- and the fast CI job that runs them -- never needs a
+# provisioned virtualenv. See AGENTS.md section 4.
+SDK_DIR        := sdk/python
+SDK_VENV       := $(SDK_DIR)/.venv
+SDK_PY         := $(SDK_VENV)/bin/python
+PYTHON         ?= python3
+
 .PHONY: help bootstrap up down logs migrate fmt lint build \
-        test test-unit test-integration test-race clean
+        test test-unit test-integration test-race clean \
+        sdk-venv sdk-fmt sdk-lint sdk-test
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -62,6 +72,22 @@ test-integration: ## Run tests against real PostgreSQL and a real broker (needs 
 test-race: ## Run unit and integration tests under the race detector
 	$(GO) test -race ./...
 	$(GO) test -race -tags=integration -count=1 $(INTEGRATION_PKG)
+
+sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
+	$(PYTHON) -m venv $(SDK_VENV)
+	$(SDK_PY) -m pip install --quiet --upgrade pip
+	$(SDK_PY) -m pip install --quiet -e '$(SDK_DIR)[dev]'
+
+sdk-fmt: ## Format the Python SDK
+	$(SDK_PY) -m ruff format $(SDK_DIR)
+
+sdk-lint: ## Check Python SDK formatting, lint, and types
+	$(SDK_PY) -m ruff format --check $(SDK_DIR)
+	$(SDK_PY) -m ruff check $(SDK_DIR)
+	cd $(SDK_DIR) && .venv/bin/python -m mypy
+
+sdk-test: ## Run the Python SDK test suite
+	cd $(SDK_DIR) && .venv/bin/python -m pytest -q
 
 clean: ## Remove build output
 	rm -rf $(BIN_DIR)
