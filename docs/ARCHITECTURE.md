@@ -34,8 +34,10 @@ retry-waiting work; bounded recovery of stranded queued jobs; bounded
 surface; and scoped, revocable worker-key authentication of registration on
 the internal worker-control surface, with every later worker-control call
 trusting that session's identity and a cheap revocation check rather than a
-re-presented credential. Result storage, the CLI, the SDK, and the dashboard
-remain planned.
+re-presented credential; inline and object-backed result storage with
+retrieval; and a command-line client (`taskforge-cli`) over the public API
+and the loopback-only credential-management routes. The Python SDK and the
+operator dashboard remain planned.
 
 ---
 
@@ -98,7 +100,7 @@ single outbox publisher · a single reconciler instance.
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |
 | `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, classify and record their result (uploading a large one to the object store first), and report fenced outcomes including failures and cooperative cancellation. | **Built** for `demo.echo` |
 | `taskforge-reconciler` | Mark stale sessions, record due attempt timeouts, finalize unacknowledged cancellations, expire leases, abandon their attempts, and release capacity. | **Built**; general drift repair beyond these is later. |
-| `taskforge-cli` | Operator and developer command-line interface. | Planned (M5D) |
+| `taskforge-cli` | Operator and developer command-line interface over the public API and the loopback-only credential-management routes. | **Built** |
 
 Every component is safe to run with N replicas.
 

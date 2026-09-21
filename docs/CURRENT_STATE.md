@@ -1,9 +1,9 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M5B are merged into `main`; this document
-records the implemented state through M5C, which is on the
-`claude/taskforge-bounded-handoff-fwf0im` branch and its draft pull request.
+planned. Milestones M1 through M5C are merged into `main`; this document
+records the implemented state through M5D, which is on its own branch and
+draft pull request.
 
 ## Milestone status
 
@@ -14,14 +14,29 @@ records the implemented state through M5C, which is on the
 - **M5A — database-backed API keys for the public surface:** complete.
 - **M5B — worker/control authentication:** complete.
 - **M5C — result storage:** complete.
-- **M5D — CLI and Python SDK:** not started.
+- **M5D — CLI:** complete.
+- **M5E — Python SDK:** not started.
 
-[ROADMAP.md](ROADMAP.md) records why M5 is split into four slices and what each
-one owns.
+[ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and what each
+one owns, including why the CLI and the Python SDK — bundled under one M5D
+name in the original roadmap — were split into M5D and M5E: independently
+testable systems in two different language toolchains, the same reasoning
+that split the original undivided M5 into M5A–M5D.
 
 ## Runnable system
 
-Six binaries build and run:
+Seven binaries build and run:
+
+- `taskforge-cli` is a command-line client for the public API and the
+  loopback-only credential-management routes: job submission, read, result
+  retrieval, cancellation, retry, DLQ listing and replay, and API-key /
+  worker-key create, list, and revoke. It contains no domain logic and no
+  credential generation or verification of its own (`internal/cli` only ever
+  presents a key it was given, over HTTP, to routes already implemented by
+  `taskforge-api`). A success response is written as JSON to stdout; a
+  failure writes a JSON error object to stderr and prints nothing to stdout.
+  The process exit code is a small, closed, individually tested set — see
+  "M5D — CLI" below.
 
 - `taskforge-api` accepts idempotent immediate and delayed job submissions, job
   reads, small and large result retrieval, cancellation, DLQ listing, replay
@@ -857,6 +872,180 @@ regardless of where they are stored, with the same anti-oracle `404` shape
 table's own columns). [api/openapi.yaml](../api/openapi.yaml) is now
 `0.7.0-m5c`.
 
+## M5D — CLI
+
+### What changed
+
+`taskforge-cli` (`cmd/taskforge-cli`, wiring only, AGENTS.md section 3) and
+`internal/cli` (all logic) add a command-line client over every implemented
+public route and the loopback-only credential-management routes. No backend
+route, schema, or contract changed: this milestone is a pure new consumer of
+`api/openapi.yaml` `0.7.0-m5c`, which is unchanged.
+
+Commands: `jobs {submit,get,result,cancel,retry}`, `dlq {list,replay}`,
+`api-keys {create,list,revoke}`, `worker-keys {create,list,revoke}`. Each
+prints the server's JSON response bytes verbatim — to stdout on success, to
+stderr on failure — rather than re-deriving or re-encoding them, the same
+"proxy, don't re-derive" reasoning `GET /v1/jobs/{job_id}/result` already
+applies (ADR-0015).
+
+### The exit-code contract
+
+ROADMAP.md's acceptance criterion, "CLI exit codes are stable," is treated
+as a real contract with its own design section rather than an incidental
+detail, because once a script depends on a code's meaning, repurposing it
+is a breaking change to this CLI exactly as a response-shape change is to
+the HTTP API.
+
+Ten codes, `internal/cli/exitcode.go`, grouped by **remediation** — what a
+caller's script should actually do differently — not by HTTP status or by
+`api/openapi.yaml`'s `Error.code` enum one-for-one:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | `ExitSuccess` | The operation completed. |
+| 1 | `ExitUsageError` | taskforge-cli itself rejected the invocation; no HTTP request was made. |
+| 2 | `ExitRequestRejected` | The API rejected this specific request as malformed or invalid: `malformed_json`, `payload_too_large`, `validation_failed`, `invalid_cursor`. A different request is needed. |
+| 3 | `ExitUnauthorized` | `unauthorized` — the presented credential (or its absence) was refused. |
+| 4 | `ExitNotFound` | `not_found`. |
+| 5 | `ExitConflict` | `idempotency_conflict`, `job_not_cancelable`, `job_not_dead_lettered` — the operation cannot be applied given current state; retrying the identical request will not help. |
+| 6 | `ExitInternalError` | `internal_error` — sanitized server-side failure. |
+| 7 | `ExitServiceUnavailable` | `service_unavailable` — the request's own server-side deadline elapsed; endpoint-specific retry guidance is in the printed message. |
+| 8 | `ExitTransportError` | The request never reached the API at all (DNS, connection refused, TLS, client-side timeout). |
+| 9 | `ExitUnexpectedResponse` | A response this CLI does not recognize: an unexpected status, a non-JSON body, or an `Error.code` outside the reachable set below. Signals a version mismatch between this CLI and the server, and is deliberately never a fallback for a recognized failure that "wasn't handled." |
+
+`apiErrorExitCodes` is exhaustive for exactly the `Error.code` values a route
+this CLI calls can actually return — enumerated by hand against every
+response documented for `POST`/`GET /v1/jobs`, `/v1/jobs/{job_id}`,
+`/v1/jobs/{job_id}/result`, `/v1/jobs/{job_id}/cancel`,
+`/v1/jobs/{job_id}/retry`, `GET /v1/dlq`, `POST /v1/dlq/{job_id}/replay`,
+and the four `/internal/v1/{api-keys,worker-keys}*` routes — eleven values
+in total (`malformed_json`, `payload_too_large`, `validation_failed`,
+`invalid_cursor`, `unauthorized`, `not_found`, `idempotency_conflict`,
+`job_not_cancelable`, `job_not_dead_lettered`, `internal_error`,
+`service_unavailable`). The other eleven values in the API's 22-value
+`Error.code` enum belong to the worker-control surface this CLI never
+calls (`worker_session_conflict`, `worker_session_unavailable`,
+`claim_conflict`, `fence_rejected`, `lease_expired`, `renewal_conflict`,
+`attempt_timed_out`, `outcome_conflict`, `cancellation_requested`) or to
+cases no CLI-invoked route documents (`unknown_queue`,
+`method_not_allowed`).
+
+**Bounded and mutually exclusive, checked mechanically, not only by
+inspection.** `TestExitCodes_AreDistinct` asserts the named set has exactly
+ten members and that no two share a numeric value; `TestExitCodes_OnlySuccessIsZero`
+asserts `ExitSuccess == 0` and that no other named code, and no
+`apiErrorExitCodes` value, is ever `0`. `TestApiErrorExitCodes_CoversExactlyTheReachableSet`
+pins the eleven-entry map above so it cannot silently grow or shrink.
+
+**Every code has its own test asserting that specific numeric value** — not
+a shared "non-zero" assertion — driven through `Run()` against a real
+`httptest.Server`, i.e. through the actual product surface rather than the
+mapping table in isolation: `TestRun_ExitSuccess`,
+`TestRun_ExitUsageError(_UnknownCommand/_MissingSubmitFlags)`,
+`TestRun_ExitRequestRejected_{MalformedJSON,PayloadTooLarge,ValidationFailed,InvalidCursor}`,
+`TestRun_ExitUnauthorized`, `TestRun_ExitNotFound`,
+`TestRun_ExitConflict_{IdempotencyConflict,JobNotCancelable,JobNotDeadLettered}`,
+`TestRun_ExitInternalError`, `TestRun_ExitServiceUnavailable`,
+`TestRun_ExitTransportError`,
+`TestRun_ExitUnexpectedResponse_{UnknownErrorCode,NonJSONBody}` — eighteen
+tests for ten codes, because every multi-membership exit code (2, 5, 9) has
+one test per member, proving the grouping is deliberate rather than
+"whichever codes happened to be handled." `TestRun_FailurePrintsNothingToStdout`
+additionally proves the stdout/stderr split holds across every failure
+class in one place.
+
+This was also proved against the real, running stack, not only against
+fakes: minting a real API key, submitting a real job, then calling `jobs
+get` with a wrong key (`unauthorized` → exit `3`), `jobs get` on a
+nonexistent id (`not_found` → exit `4`), and `jobs retry` on a job that is
+not dead-lettered (`job_not_dead_lettered` → exit `5`) each produced the
+documented exit code against `taskforge-api` itself, not a stand-in.
+
+### Credential handling
+
+`taskforge-cli` obtains and presents credentials; it generates, parses, and
+verifies none of them. `api-keys create`/`worker-keys create` call the
+existing `POST /internal/v1/api-keys` / `POST /internal/v1/worker-keys`
+routes and print the one-time secret the server returns — the CLI does not
+store it anywhere itself. `--api-key` / `TASKFORGE_CLI_API_KEY` is sent as
+`Authorization: Bearer` on the public (`/v1`) routes only: `Client.do`
+(public routes) and `Client.doUnauthenticated` (the four key-management
+routes) are two distinct code paths, because those routes are themselves
+unauthenticated by design (ADR-0013, ADR-0014) and a client presenting an
+unrelated credential to them — even one the server would silently ignore —
+is still the wrong behavior. `TestCmdAPIKeysCreate_NeverSendsAuthorizationHeader`
+and `TestClient_OmitsAuthorizationHeaderWhenAPIKeyEmpty` pin this.
+
+### Which API address the CLI talks to
+
+`internal/cli.ResolveBaseURL(flagValue, envValue)` resolves `--api-url`,
+then `TASKFORGE_CLI_API_URL`, then the loopback default
+`http://127.0.0.1:8080`. Whichever is chosen must be an absolute http(s) URL
+with a host; anything else is a usage error (exit `1`) before any request is
+made.
+
+**`TASKFORGE_CLI_API_URL` is a purpose-built client-target variable, not a
+reuse of `TASKFORGE_API_ADDR`.** An earlier revision of this milestone
+reused `TASKFORGE_API_ADDR`; independent review found that a defect and it
+was reversed. `TASKFORGE_API_ADDR` is `taskforge-api`'s own **bind**
+address — read only by `cmd/taskforge-api` via `internal/config.go`, a bare
+`host:port` with no scheme, validated by `isLoopbackBind`. A bind address
+and a reachable client target are different shapes in general (a server can
+bind a wildcard no client can dial, and a client needs a scheme), so one
+name carrying both meanings would make each binary's reading of a shared
+`.env` line depend on which binary is reading it. The repository's
+established pattern for a client-facing address is `TASKFORGE_WORKER_API_URL`
+(`internal/config.go`'s `LoadWorker`, default `http://127.0.0.1:8080`, "must
+be an absolute http(s) URL"); `TASKFORGE_CLI_API_URL` follows that naming and
+that validation shape, and `taskforge-cli` never reads `TASKFORGE_API_ADDR`
+(`TestRun_IgnoresTheServersBindAddressVariable` sets it to a live server and
+proves the CLI dials `TASKFORGE_CLI_API_URL` instead). Only the default
+*value* (`127.0.0.1:8080`) is shared, pinned by
+`TestResolveBaseURL_DefaultMatchesTaskforgeAPIsOwnDefault`.
+
+**One deliberate difference from the worker's rule:** the CLI does not
+additionally require a loopback host. The worker's `must use a loopback
+host` rule is a permanent posture for a process that presents a worker key
+and whose health endpoint is never exposed off-host. For the CLI, `--api-url`
+exists so a later, non-local deployment milestone only has to change where
+the CLI points, not how it talks to the API — a loopback-only validator
+would defeat that. Loopback is the **default**, not a constraint, and it is
+a safe default for a sourced reason: [PROJECT_SPEC.md](PROJECT_SPEC.md) §4
+item 1 describes V1 as "Clone TaskForge and start it with Docker Compose
+and Make," and §5's success criteria require "the full local stack starts
+from a clean clone with only Git, Go, Docker, Docker Compose, and Make
+installed" — V1 has no non-local deployment target — and the server side
+enforces loopback itself (`TASKFORGE_API_ADDR`'s `isLoopbackBind` check, and
+the loopback-only `/internal/v1` routes, ADR-0013). `internal/cli/config.go`'s
+doc comment carries this same citation. Tests: `TestResolveBaseURL`,
+`TestResolveBaseURL_RejectsAnythingButAnAbsoluteHTTPURL` (including the old
+bind-address shape `127.0.0.1:8080`), `TestAPIURLEnv_IsNotTheServersBindAddressVariable`,
+`TestRun_APIURLFromEnvWhenFlagAbsent`, `TestRun_IgnoresTheServersBindAddressVariable`,
+and `TestRun_InvalidAPIURLIsAUsageErrorBeforeAnyRequest`.
+
+### What is missing, and why it is not stubbed
+
+`taskforge-cli` has no `jobs list`, `workers list`, or `queues list`
+command. `GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` are
+listed as V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4, but
+none is implemented anywhere in this API as of this milestone — confirmed
+against `api/openapi.yaml`, which declares no such path. A CLI command with
+no backend route to call would be exactly the fabricated functionality
+[PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids ("the dashboard, CLI, and SDK
+read live data. Nothing is fabricated or hardcoded"). These commands land
+whenever those routes do.
+
+### Breaking change
+
+**None.** This milestone adds a new binary and a new package; it changes no
+existing route, schema, or file outside documentation and `.env.example`.
+
+### API surface and contract
+
+Unchanged. `api/openapi.yaml` stays `0.7.0-m5c`: this CLI is a consumer of
+the existing contract, not a change to it.
+
 ## Verification
 
 ### M5A gates
@@ -1165,6 +1354,133 @@ reason, then reverting:
   `parseAssignment`'s return made `TestParseAssignment_PreservesScope` fail
   the identical way. Together these prove the fix closes the gap on both
   sides of the wire, not just one.
+
+### M5D gates
+
+`gofmt`, `lint`, `build`, `test-unit` (whole repository, including
+`internal/cli`), the OpenAPI contract tests, and `docker compose config`
+were run locally on the branch head, on 2026-09-16/17, against PostgreSQL
+16, ElasticMQ, and LocalStack started by `make up`.
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `gofmt -l .` after `make fmt` | PASS | empty — no tracked Go file rewritten |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make build` | PASS | seven binaries in `./bin`, including `taskforge-cli` |
+| `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/cli` (47 top-level tests) |
+| `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 — unaffected, run as a regression check since this milestone touches no API code |
+| `docker compose config --quiet` | PASS | exit 0 |
+| `make test-integration` | PASS | `ok github.com/co-rtex/TaskForge/tests/integration 75.726s`, re-run on the final head after the `TASKFORGE_CLI_API_URL` change |
+| `make test-race` | PASS | every unit package `ok`; `ok github.com/co-rtex/TaskForge/tests/integration 113.273s` under `-race`, on the final head, once the sandbox clock agreed with the host again |
+
+**An earlier local `test-race` run failed, for an environmental reason, and
+is kept on record.** Before the final head, a `make test-race` run failed two
+tests this milestone does not touch:
+`TestScheduler_PromotesDueJobsWithExactlyOneFreshEvent/a_delayed_job` and
+`TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries`. `git diff`
+touches nothing outside `internal/cli`, `cmd/taskforge-cli`, and
+documentation. The scheduler test computes an "already due" `available_at`
+from the **test process's** `time.Now()` with a one-second margin
+(`tests/integration/scheduler_test.go`), while `PromoteDueJobs` decides from
+**PostgreSQL's** `clock_timestamp()` — server time is authoritative by design
+(AGENTS.md section 6) — so it needs the two clocks to agree within about a
+second. Measured at the time, the Postgres container's clock was about 7
+seconds behind the host, and about 5 minutes 36 seconds behind after a full
+`make down && make up` (the skew was the Docker Desktop VM's clock, not a
+container's). Nothing was changed to make it pass. On the later follow-up
+the same two clocks agreed to the second (`04:18:54` host, `04:18:54.748`
+Postgres), and the identical `make test-race` passed on the first attempt.
+Hosted CI, whose runners keep correct time, was green on the original head
+as well — see the pull request.
+
+### M5D coverage
+
+`internal/cli` carries 47 top-level tests across four files. There is
+deliberately no server-side test change: this milestone adds a consumer,
+not a contract.
+
+**Exit-code contract** (`exitcode_test.go`): `TestExitCodes_AreDistinct` and
+`TestExitCodes_OnlySuccessIsZero` check the bounded/mutually-exclusive/
+zero-means-success properties mechanically over the named constant set
+rather than by inspection. `TestApiErrorExitCodes_CoversExactlyTheReachableSet`
+pins the eleven-entry reachable-code map. Eighteen `TestRun_Exit*` tests
+each assert one specific numeric exit value through `Run()` against a real
+`httptest.Server`, including one test per member of every
+multi-membership code (2, 5, 9), and `TestRun_FailurePrintsNothingToStdout`
+checks the stdout/stderr split across five representative failure classes
+in one table.
+
+**Client** (`client_test.go`): `Authorization` is sent when an API key is
+set and withheld when it is not; a wrong-route case
+(`TestCmdAPIKeysCreate_NeverSendsAuthorizationHeader`, in `run_test.go`)
+additionally proves a *configured* key is still withheld from the
+unauthenticated key-management routes specifically — this is the test that
+caught the one real product bug this milestone's own review process found
+(see below). `Idempotency-Key` is sent on job submission. IDs containing
+characters special to a URL (`?`, `=`, a space) are proved to survive as one
+literal path segment rather than being parsed as a query string.
+`TestClient_TransportErrorOnUnreachableHost` proves a `*TransportError` is
+returned, not a `*Response`, when nothing answers. `TestClient_ReturnsResponseForHTTPLevelFailures`
+proves the reverse: a 4xx/5xx is a `Response` like any other, for the
+caller to classify.
+
+**Configuration** (`config_test.go`): `TestResolveBaseURL` is a table
+covering flag-over-env precedence, the default, `https`, a non-loopback host
+being accepted (loopback is a default, not a constraint), and trailing-slash
+trimming. `TestResolveBaseURL_RejectsAnythingButAnAbsoluteHTTPURL` pins the
+validation shape shared with `TASKFORGE_WORKER_API_URL` — including the old
+bind-address shape (`127.0.0.1:8080`, `localhost:8080`), a missing scheme, a
+non-http scheme, and an empty host — for both the flag and the environment
+variable, asserting the error names whichever source was wrong.
+`TestResolveBaseURL_DefaultMatchesTaskforgeAPIsOwnDefault` pins that this
+CLI's fallback address is exactly `internal/config.Config`'s own default
+`127.0.0.1:8080`, so the two cannot silently drift apart, and
+`TestAPIURLEnv_IsNotTheServersBindAddressVariable` pins the variable name.
+
+**Commands** (`run_test.go`): `TestCommands_HappyPaths` drives all
+thirteen commands to their documented success status and asserts the
+server's JSON body reaches stdout unmodified. `TestCmdJobsSubmit_SendsExactRequestBody`
+asserts every field of the wire request, including repeated `--capability`
+flags collecting into an ordered slice and an omitted `--scheduled-at`
+producing no field at all rather than a null. `TestCmdJobsSubmit_GeneratesIdempotencyKeyWhenOmitted`
+and the malformed-payload test
+(`TestCmdJobsSubmit_RejectsMalformedPayloadWithoutCallingTheAPI`) prove a
+CLI-side validation failure never reaches the network — the recording
+server's own path field stays empty. `TestRun_APIKeyFlagOverridesEnv` and
+`TestRun_APIKeyFromEnvWhenFlagAbsent` cover the same precedence
+`TestResolveBaseURL` covers for the address, but for the credential.
+`TestRun_APIURLFromEnvWhenFlagAbsent` proves `TASKFORGE_CLI_API_URL` is read
+correctly end to end through `Run`, and `TestRun_IgnoresTheServersBindAddressVariable`
+proves `TASKFORGE_API_ADDR` is not (mutation-checked: switching `Run` back to
+reading `TASKFORGE_API_ADDR` fails it, `TestRun_APIURLFromEnvWhenFlagAbsent`,
+and `TestRun_InvalidAPIURLIsAUsageErrorBeforeAnyRequest`).
+
+**This milestone's own review found one real product bug before it ever
+reached the pull request, not after**: an early implementation set
+`Authorization` on every request whenever an API key was configured,
+including the four key-management routes that are unauthenticated by
+design. `TestCmdAPIKeysCreate_NeverSendsAuthorizationHeader` was written to
+prove the intended behavior, failed against that implementation, and the
+fix — a distinct `Client.doUnauthenticated` code path, never sharing a
+branch with the public-route path that reads `APIKey` — made it pass.
+This is recorded here rather than silently fixed and left unmentioned,
+because the failure was caught by a test whose entire purpose was to prove
+this exact property, which is the evidence this milestone's own exit-code
+and credential-handling design sections claim to have.
+
+**Real end-to-end evidence, against `taskforge-api` itself, not only
+fakes.** Beyond the unit-test suite above, this milestone's exit-code
+mapping was independently confirmed against a real running server: minting
+a real API key and worker key through `taskforge-cli api-keys create` /
+`worker-keys create`; submitting a real job and reading it back; a wrong
+key on `jobs get` answering `unauthorized` (exit `3`); a nonexistent job id
+on `jobs get` answering `not_found` (exit `4`); `jobs retry` on a job that
+is not dead-lettered answering `job_not_dead_lettered` (exit `5`); and
+`jobs cancel` called twice on the same job returning `200`
+`already_requested: true` the second time (exit `0`, not a conflict — a
+cancel-twice on the same job is one decision observed twice, not the
+`job_not_cancelable` case, which requires a job already `SUCCEEDED` or
+`DEAD_LETTERED`).
 
 ### M4 gates
 
@@ -1532,9 +1848,16 @@ exercised by a real hosted failure.
   limiting.
 - Key rotation and expiry are not implemented for either credential type. A
   key lives until it is revoked.
-- The CLI, the Python SDK, and the operator dashboard are M5D and M6. The DLQ has
+- The Python SDK and the operator dashboard are M5E and M6. The DLQ has
   a listing endpoint but no filtering beyond scope and no sorting beyond
   newest-first; operator search and bulk replay belong with the dashboard.
+- `taskforge-cli` has no `jobs list`, `workers list`, or `queues list`
+  command: `GET /v1/jobs`, `GET /v1/workers`, and `GET /v1/queues` are listed
+  as V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 but are not
+  implemented anywhere in this API yet (confirmed against
+  [api/openapi.yaml](../api/openapi.yaml) — no such path exists). A CLI
+  command with no backend route to call would be exactly the fabricated
+  functionality [PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids.
 - Metrics and tracing are M6.
 - Only `demo.echo` is registered as a production worker handler. Test-only
   handlers are injected through the existing registry seam and add no production
@@ -1575,13 +1898,9 @@ repository README.
 
 ## Next objective
 
-M5C: result storage. Both the public surface and worker registration now
-authenticate with real, scoped, revocable credentials, and a job submitted
-under any scope is claimed and executed by a worker registered for that same
-scope — M5A's recorded limitation is closed. What remains before results:
-`GET /v1/jobs/{job_id}` returns lifecycle fields only, with no result body and
-no richer attempt-history API.
-
-M5D (the CLI and Python SDK) follows, so that result retrieval is
-authenticated on arrival rather than retrofitted onto an endpoint that serves
-job output. See [ROADMAP.md](ROADMAP.md).
+M5E: the Python SDK. `taskforge-cli` (M5D) closes the CLI half of the
+original bundled M5D milestone; the SDK is the other, genuinely independent
+half, deferred to its own milestone because introducing Python is a first
+for this repository and needs its own dependency-management, lint/format,
+and CI-job decisions before any SDK code is written — see
+[ROADMAP.md](ROADMAP.md)'s M5E entry.
