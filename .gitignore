@@ -34,3 +34,10 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+
+# Python SDK build output (sdk/python). __pycache__/, *.egg-info/ and .venv/
+# are already ignored above.
+/sdk/python/dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
