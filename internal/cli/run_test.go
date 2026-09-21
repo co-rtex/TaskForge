@@ -218,10 +218,42 @@ func TestRun_APIKeyFromEnvWhenFlagAbsent(t *testing.T) {
 
 func TestRun_APIURLFromEnvWhenFlagAbsent(t *testing.T) {
 	server := newRecordingServer(t, http.StatusOK, `{}`)
-	t.Setenv("TASKFORGE_API_ADDR", strings.TrimPrefix(server.URL, "http://"))
+	t.Setenv("TASKFORGE_CLI_API_URL", server.URL)
 
 	var outBuf, errBuf strings.Builder
 	code := Run(context.Background(), []string{"jobs", "get", "job-1"}, &outBuf, &errBuf)
 	require.Equal(t, ExitSuccess, code, "stderr: %s", errBuf.String())
 	require.Equal(t, "/v1/jobs/job-1", server.lastPath)
+}
+
+// TestRun_IgnoresTheServersBindAddressVariable proves TASKFORGE_API_ADDR --
+// taskforge-api's own bind address -- no longer influences where the CLI
+// sends requests, even when it is set to a live server.
+func TestRun_IgnoresTheServersBindAddressVariable(t *testing.T) {
+	server := newRecordingServer(t, http.StatusOK, `{}`)
+	t.Setenv("TASKFORGE_API_ADDR", strings.TrimPrefix(server.URL, "http://"))
+	t.Setenv("TASKFORGE_CLI_API_URL", "http://127.0.0.1:1")
+
+	var outBuf, errBuf strings.Builder
+	code := Run(context.Background(), []string{"jobs", "get", "job-1"}, &outBuf, &errBuf)
+	require.Equal(t, ExitTransportError, code, "the CLI must dial TASKFORGE_CLI_API_URL, not TASKFORGE_API_ADDR")
+	require.Empty(t, server.lastPath)
+}
+
+func TestRun_InvalidAPIURLIsAUsageErrorBeforeAnyRequest(t *testing.T) {
+	for name, args := range map[string][]string{
+		"flag": {"--api-url", "127.0.0.1:8080", "jobs", "get", "job-1"},
+		"env":  {"jobs", "get", "job-1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "env" {
+				t.Setenv("TASKFORGE_CLI_API_URL", "127.0.0.1:8080")
+			}
+			var outBuf, errBuf strings.Builder
+			code := Run(context.Background(), args, &outBuf, &errBuf)
+			require.Equal(t, ExitUsageError, code)
+			require.Empty(t, outBuf.String())
+			require.Contains(t, errBuf.String(), "absolute http(s) URL")
+		})
+	}
 }

@@ -32,7 +32,7 @@ const DefaultRequestTimeout = 30 * time.Second
 type Client struct {
 	// BaseURL is the API's address, scheme included, with no trailing
 	// slash -- e.g. "http://127.0.0.1:8080". See ResolveBaseURL for how it
-	// is derived from --api-url / TASKFORGE_API_ADDR.
+	// is derived from --api-url / TASKFORGE_CLI_API_URL.
 	BaseURL string
 	// APIKey, when set, is sent as "Authorization: Bearer <APIKey>" on
 	// every request. Callers of the loopback-only key-management routes

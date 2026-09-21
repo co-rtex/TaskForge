@@ -980,29 +980,49 @@ and `TestClient_OmitsAuthorizationHeaderWhenAPIKeyEmpty` pin this.
 ### Which API address the CLI talks to
 
 `internal/cli.ResolveBaseURL(flagValue, envValue)` resolves `--api-url`,
-then `TASKFORGE_API_ADDR`, then the loopback default
-(`127.0.0.1:8080`, matching `internal/config.Config`'s own default for that
-variable). **`TASKFORGE_API_ADDR` is reused deliberately** — it is the same
-variable `internal/config.go` reads as `taskforge-api`'s own bind address,
-and `.env.example` carries exactly one line for it — rather than inventing
-a second variable naming the same address an operator's `.env` already
-has. Because a bind spec (`host:port`, no scheme) and a client target are
-different shapes, a bare value is interpreted as `http://` plus that value;
-a value that already names a scheme is used exactly as given.
+then `TASKFORGE_CLI_API_URL`, then the loopback default
+`http://127.0.0.1:8080`. Whichever is chosen must be an absolute http(s) URL
+with a host; anything else is a usage error (exit `1`) before any request is
+made.
 
-Loopback is safe to assume **as a default only**, which is why `--api-url`
-exists as an unconditional override: [PROJECT_SPEC.md](PROJECT_SPEC.md) §4
+**`TASKFORGE_CLI_API_URL` is a purpose-built client-target variable, not a
+reuse of `TASKFORGE_API_ADDR`.** An earlier revision of this milestone
+reused `TASKFORGE_API_ADDR`; independent review found that a defect and it
+was reversed. `TASKFORGE_API_ADDR` is `taskforge-api`'s own **bind**
+address — read only by `cmd/taskforge-api` via `internal/config.go`, a bare
+`host:port` with no scheme, validated by `isLoopbackBind`. A bind address
+and a reachable client target are different shapes in general (a server can
+bind a wildcard no client can dial, and a client needs a scheme), so one
+name carrying both meanings would make each binary's reading of a shared
+`.env` line depend on which binary is reading it. The repository's
+established pattern for a client-facing address is `TASKFORGE_WORKER_API_URL`
+(`internal/config.go`'s `LoadWorker`, default `http://127.0.0.1:8080`, "must
+be an absolute http(s) URL"); `TASKFORGE_CLI_API_URL` follows that naming and
+that validation shape, and `taskforge-cli` never reads `TASKFORGE_API_ADDR`
+(`TestRun_IgnoresTheServersBindAddressVariable` sets it to a live server and
+proves the CLI dials `TASKFORGE_CLI_API_URL` instead). Only the default
+*value* (`127.0.0.1:8080`) is shared, pinned by
+`TestResolveBaseURL_DefaultMatchesTaskforgeAPIsOwnDefault`.
+
+**One deliberate difference from the worker's rule:** the CLI does not
+additionally require a loopback host. The worker's `must use a loopback
+host` rule is a permanent posture for a process that presents a worker key
+and whose health endpoint is never exposed off-host. For the CLI, `--api-url`
+exists so a later, non-local deployment milestone only has to change where
+the CLI points, not how it talks to the API — a loopback-only validator
+would defeat that. Loopback is the **default**, not a constraint, and it is
+a safe default for a sourced reason: [PROJECT_SPEC.md](PROJECT_SPEC.md) §4
 item 1 describes V1 as "Clone TaskForge and start it with Docker Compose
 and Make," and §5's success criteria require "the full local stack starts
 from a clean clone with only Git, Go, Docker, Docker Compose, and Make
-installed" — V1 has no non-local deployment target, and
-`TASKFORGE_API_ADDR`'s own `Config.Validate` rule
-(`internal/config.go`'s `isLoopbackBind` check) enforces server-side that
-the address `taskforge-api` binds to is always loopback. `--api-url` is
-what lets a later, non-local deployment milestone change where this CLI
-points without changing how it talks to the API at all. See
-`internal/cli/config.go`'s own doc comment, which carries this same
-citation, and `TestResolveBaseURL` / `TestResolveBaseURL_DefaultMatchesTaskforgeAPIsOwnDefault`.
+installed" — V1 has no non-local deployment target — and the server side
+enforces loopback itself (`TASKFORGE_API_ADDR`'s `isLoopbackBind` check, and
+the loopback-only `/internal/v1` routes, ADR-0013). `internal/cli/config.go`'s
+doc comment carries this same citation. Tests: `TestResolveBaseURL`,
+`TestResolveBaseURL_RejectsAnythingButAnAbsoluteHTTPURL` (including the old
+bind-address shape `127.0.0.1:8080`), `TestAPIURLEnv_IsNotTheServersBindAddressVariable`,
+`TestRun_APIURLFromEnvWhenFlagAbsent`, `TestRun_IgnoresTheServersBindAddressVariable`,
+and `TestRun_InvalidAPIURLIsAUsageErrorBeforeAnyRequest`.
 
 ### What is missing, and why it is not stubbed
 
@@ -1347,7 +1367,7 @@ were run locally on the branch head, on 2026-09-16/17, against PostgreSQL
 | `gofmt -l .` after `make fmt` | PASS | empty — no tracked Go file rewritten |
 | `make lint` | PASS | `go vet ./...`, exit 0 |
 | `make build` | PASS | seven binaries in `./bin`, including `taskforge-cli` |
-| `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/cli` (43 top-level tests) |
+| `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/cli` (47 top-level tests) |
 | `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 — unaffected, run as a regression check since this milestone touches no API code |
 | `docker compose config --quiet` | PASS | exit 0 |
 | `make test-integration` | PASS | `ok github.com/co-rtex/TaskForge/tests/integration 140.016s`, one full clean run |
@@ -1391,7 +1411,7 @@ gate for `test-race` — see the pull request for its result.
 
 ### M5D coverage
 
-`internal/cli` carries 43 top-level tests across four files. There is
+`internal/cli` carries 47 top-level tests across four files. There is
 deliberately no server-side test change: this milestone adds a consumer,
 not a contract.
 
@@ -1421,12 +1441,17 @@ proves the reverse: a 4xx/5xx is a `Response` like any other, for the
 caller to classify.
 
 **Configuration** (`config_test.go`): `TestResolveBaseURL` is a table
-covering flag-over-env precedence, the default, the bare-`host:port`-gets-
-`http://`-prefix rule, a scheme-qualified value passed through unchanged,
-and trailing-slash trimming.
+covering flag-over-env precedence, the default, `https`, a non-loopback host
+being accepted (loopback is a default, not a constraint), and trailing-slash
+trimming. `TestResolveBaseURL_RejectsAnythingButAnAbsoluteHTTPURL` pins the
+validation shape shared with `TASKFORGE_WORKER_API_URL` — including the old
+bind-address shape (`127.0.0.1:8080`, `localhost:8080`), a missing scheme, a
+non-http scheme, and an empty host — for both the flag and the environment
+variable, asserting the error names whichever source was wrong.
 `TestResolveBaseURL_DefaultMatchesTaskforgeAPIsOwnDefault` pins that this
-CLI's fallback address is exactly `internal/config.Config`'s own
-`TASKFORGE_API_ADDR` default, so the two cannot silently drift apart.
+CLI's fallback address is exactly `internal/config.Config`'s own default
+`127.0.0.1:8080`, so the two cannot silently drift apart, and
+`TestAPIURLEnv_IsNotTheServersBindAddressVariable` pins the variable name.
 
 **Commands** (`run_test.go`): `TestCommands_HappyPaths` drives all
 thirteen commands to their documented success status and asserts the
@@ -1440,9 +1465,11 @@ CLI-side validation failure never reaches the network — the recording
 server's own path field stays empty. `TestRun_APIKeyFlagOverridesEnv` and
 `TestRun_APIKeyFromEnvWhenFlagAbsent` cover the same precedence
 `TestResolveBaseURL` covers for the address, but for the credential.
-`TestRun_APIURLFromEnvWhenFlagAbsent` proves `TASKFORGE_API_ADDR` is read
-correctly end to end through `Run`, not only through `ResolveBaseURL` in
-isolation.
+`TestRun_APIURLFromEnvWhenFlagAbsent` proves `TASKFORGE_CLI_API_URL` is read
+correctly end to end through `Run`, and `TestRun_IgnoresTheServersBindAddressVariable`
+proves `TASKFORGE_API_ADDR` is not (mutation-checked: switching `Run` back to
+reading `TASKFORGE_API_ADDR` fails it, `TestRun_APIURLFromEnvWhenFlagAbsent`,
+and `TestRun_InvalidAPIURLIsAUsageErrorBeforeAnyRequest`).
 
 **This milestone's own review found one real product bug before it ever
 reached the pull request, not after**: an early implementation set

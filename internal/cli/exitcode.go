@@ -84,7 +84,7 @@ const (
 	// ExitTransportError means the request never reached the API at all:
 	// DNS failure, connection refused, TLS failure, or a client-side
 	// timeout below the HTTP layer (see Client.do and TransportError).
-	// Remediation: check --api-url / TASKFORGE_API_ADDR and network
+	// Remediation: check --api-url / TASKFORGE_CLI_API_URL and network
 	// reachability. This is distinct from ExitServiceUnavailable, which
 	// means the API WAS reached and itself reported that its own deadline
 	// elapsed.

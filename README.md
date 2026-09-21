@@ -224,9 +224,11 @@ and every push to `main` — see [.github/workflows/ci.yml](.github/workflows/ci
 ## Try it with `taskforge-cli`
 
 Everything above through raw `curl` has a `taskforge-cli` equivalent. It talks to
-the same address `taskforge-api` binds to by default
-(`TASKFORGE_API_ADDR`, `--api-url` to override) and reads its credential from
-`TASKFORGE_CLI_API_KEY` or `--api-key`.
+`http://127.0.0.1:8080` by default, the address `taskforge-api` binds to out of
+the box (`TASKFORGE_CLI_API_URL` or `--api-url` to point it elsewhere; an
+absolute http(s) URL, like `TASKFORGE_WORKER_API_URL`). It reads its credential
+from `TASKFORGE_CLI_API_KEY` or `--api-key`. It never reads `TASKFORGE_API_ADDR`,
+which is `taskforge-api`'s own bind address, not a client target.
 
 ```bash
 ./bin/taskforge-cli api-keys create --scope local-dev --name my-laptop

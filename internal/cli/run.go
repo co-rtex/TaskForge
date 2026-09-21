@@ -20,9 +20,8 @@ Usage:
   taskforge-cli [--api-url URL] [--api-key KEY] <resource> <verb> [flags]
 
 Global flags:
-  --api-url string   API base URL. Overrides TASKFORGE_API_ADDR. A bare
-                      host:port is treated as http://host:port; a value
-                      naming a scheme is used as given.
+  --api-url string   API base URL, an absolute http(s) URL. Overrides
+                      TASKFORGE_CLI_API_URL. Default: http://127.0.0.1:8080.
   --api-key string   API key presented as "Authorization: Bearer". Overrides
                       TASKFORGE_CLI_API_KEY. Not sent to the /internal/v1
                       key-management routes, which are themselves
@@ -83,7 +82,7 @@ var commands = map[string]command{
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	globalFlags := flag.NewFlagSet("taskforge-cli", flag.ContinueOnError)
 	globalFlags.SetOutput(stderr)
-	apiURL := globalFlags.String("api-url", "", "API base URL (overrides TASKFORGE_API_ADDR)")
+	apiURL := globalFlags.String("api-url", "", "API base URL (overrides TASKFORGE_CLI_API_URL)")
 	apiKey := globalFlags.String("api-key", "", "API key (overrides TASKFORGE_CLI_API_KEY)")
 	globalFlags.Usage = func() { fmt.Fprint(stderr, usageText) }
 
@@ -108,7 +107,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return ExitUsageError
 	}
 
-	baseURL := ResolveBaseURL(*apiURL, os.Getenv("TASKFORGE_API_ADDR"))
+	baseURL, err := ResolveBaseURL(*apiURL, os.Getenv(APIURLEnv))
+	if err != nil {
+		return usageErrorf(stderr, "%v", err)
+	}
 	key := *apiKey
 	if key == "" {
 		key = os.Getenv("TASKFORGE_CLI_API_KEY")
