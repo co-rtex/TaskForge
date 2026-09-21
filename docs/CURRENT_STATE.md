@@ -1370,44 +1370,28 @@ were run locally on the branch head, on 2026-09-16/17, against PostgreSQL
 | `make test-unit` | PASS | every package `ok` (or `[no test files]`), including `internal/cli` (47 top-level tests) |
 | `go test -v -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | 18 top-level contract tests, exit 0 — unaffected, run as a regression check since this milestone touches no API code |
 | `docker compose config --quiet` | PASS | exit 0 |
-| `make test-integration` | PASS | `ok github.com/co-rtex/TaskForge/tests/integration 140.016s`, one full clean run |
-| `make test-race` | **NOT RUN locally** | blocked by this sandbox's own Docker Desktop VM clock, not by this milestone's code — see below |
+| `make test-integration` | PASS | `ok github.com/co-rtex/TaskForge/tests/integration 75.726s`, re-run on the final head after the `TASKFORGE_CLI_API_URL` change |
+| `make test-race` | PASS | every unit package `ok`; `ok github.com/co-rtex/TaskForge/tests/integration 113.273s` under `-race`, on the final head, once the sandbox clock agreed with the host again |
 
-**Why `test-race` could not be completed locally, and why that is not this
-milestone's problem.** A first `make test-race` run failed two tests
-neither this milestone touches:
-`TestScheduler_PromotesDueJobsWithExactlyOneFreshEvent/a_delayed_job` (a
-synchronous assertion, not a timing-eventuality one — `result.PromotedJobs`
-came back `0` where the test expects `1`) and
-`TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries` (a 60-second
-polled condition that never became true). `git diff` for this branch
+**An earlier local `test-race` run failed, for an environmental reason, and
+is kept on record.** Before the final head, a `make test-race` run failed two
+tests this milestone does not touch:
+`TestScheduler_PromotesDueJobsWithExactlyOneFreshEvent/a_delayed_job` and
+`TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries`. `git diff`
 touches nothing outside `internal/cli`, `cmd/taskforge-cli`, and
-documentation — neither failing test, nor `internal/scheduler`,
-`internal/workers`, or `internal/reconciler`, is touched by this change.
-
-Rerunning the scheduler test in isolation reproduced the identical failure
-deterministically, which ruled out ordinary test-order flakiness and
-pointed at the test's actual dependency: it computes an "already due"
-`available_at` from the **test process's** `time.Now()` with only a
-one-second margin
-(`soon := time.Now().Add(-time.Second)`,
-`tests/integration/scheduler_test.go`), while `PromoteDueJobs` decides
-eligibility from **PostgreSQL's** `clock_timestamp()` — server time is
-authoritative by design (AGENTS.md section 6), and the test relies on the
-two clocks agreeing within about a second. Querying
-`docker compose exec postgres psql -tAc 'SELECT clock_timestamp();'`
-alongside the host's own clock showed a real, measured skew: about 7
-seconds on the first measurement, and about 5 minutes 36 seconds after a
-full `make down && make up` cycle (confirming the skew is the
-Docker Desktop Linux VM's own clock, not any one container's — recreating
-the containers did not resync it). This is the identical class of sandbox
-limitation M5C's own gates section recorded for a different reason (this
-sandbox's Docker daemon only pulling already-cached images): a real
-constraint of this local environment, independent of this project's code,
-and not something this session is positioned to fix (resyncing a
-sandboxed VM's clock needs privileged host access this session does not
-have). Hosted CI, whose runners keep correct wall-clock time, is the real
-gate for `test-race` — see the pull request for its result.
+documentation. The scheduler test computes an "already due" `available_at`
+from the **test process's** `time.Now()` with a one-second margin
+(`tests/integration/scheduler_test.go`), while `PromoteDueJobs` decides from
+**PostgreSQL's** `clock_timestamp()` — server time is authoritative by design
+(AGENTS.md section 6) — so it needs the two clocks to agree within about a
+second. Measured at the time, the Postgres container's clock was about 7
+seconds behind the host, and about 5 minutes 36 seconds behind after a full
+`make down && make up` (the skew was the Docker Desktop VM's clock, not a
+container's). Nothing was changed to make it pass. On the later follow-up
+the same two clocks agreed to the second (`04:18:54` host, `04:18:54.748`
+Postgres), and the identical `make test-race` passed on the first attempt.
+Hosted CI, whose runners keep correct time, was green on the original head
+as well — see the pull request.
 
 ### M5D coverage
 
