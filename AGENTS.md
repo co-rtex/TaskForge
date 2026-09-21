@@ -30,8 +30,13 @@ evidence matter more than feature count.
 | Local orchestration | Docker Compose |
 | Migrations | Plain `.sql` files in `migrations/`, applied by the embedded runner in `internal/database` |
 | Tests | `go test`, `testify` assertions, real PostgreSQL + real broker for integration |
+| Python SDK | Python 3.11+, PEP 621 `pyproject.toml`, stdlib `venv` + `pip`, one runtime dependency (`httpx`) |
+| Python tooling | `ruff format` (authoritative), `ruff check`, `mypy --strict` |
 
 Required to build and run: Git, Go, Docker, Docker Compose, GNU Make.
+Additionally required to build or test the Python SDK in `sdk/python`: a
+Python 3.11+ interpreter. Running TaskForge itself never needs one. See
+[ADR-0016](docs/adr/0016-python-sdk-toolchain-and-client-configuration.md).
 
 ## 3. Directory conventions
 
@@ -41,6 +46,7 @@ internal/<domain>/     Library code. Not importable outside this module.
 migrations/            Versioned, forward-only SQL. Never edit an applied file.
 api/                   OpenAPI description of implemented endpoints only.
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
+sdk/python/            The Python SDK. Its own toolchain; see ADR-0016.
 docs/                  Canonical project context. See the links above.
 docs/adr/              Architecture Decision Records.
 ```
@@ -66,6 +72,17 @@ make test-unit         # no external dependencies
 make test-integration  # requires `make up`
 make test-race         # race detector
 make build             # compile all binaries into ./bin
+```
+
+The Python SDK has its own targets. They are deliberately **not** folded into
+`fmt`, `lint` and `test`, which stay Go-only so a Go contributor — and the fast
+CI job that runs them — never needs a provisioned virtualenv.
+
+```bash
+make sdk-venv          # create sdk/python/.venv and install with dev extras
+make sdk-fmt           # ruff format
+make sdk-lint          # ruff format --check + ruff check + mypy --strict
+make sdk-test          # pytest
 ```
 
 Targets are added only when the behavior behind them actually works.

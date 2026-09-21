@@ -2,7 +2,7 @@
 
 This document is the source of truth for what is runnable now and what remains
 planned. Milestones M1 through M5C are merged into `main`; this document
-records the implemented state through M5D, which is on its own branch and
+records the implemented state through M5E, which is on its own branch and
 draft pull request.
 
 ## Milestone status
@@ -15,7 +15,7 @@ draft pull request.
 - **M5B — worker/control authentication:** complete.
 - **M5C — result storage:** complete.
 - **M5D — CLI:** complete.
-- **M5E — Python SDK:** not started.
+- **M5E — Python SDK:** complete.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and what each
 one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -25,7 +25,15 @@ that split the original undivided M5 into M5A–M5D.
 
 ## Runnable system
 
-Seven binaries build and run:
+Seven binaries build and run, plus one installable library:
+
+- `taskforge-sdk` (`sdk/python`, import `taskforge`) is a typed Python
+  client over the same surface `taskforge-cli` covers. It is installed with
+  `pip install ./sdk/python` from a clone and is deliberately not published
+  to PyPI before M8 (ADR-0016). Like the CLI it contains no domain logic and
+  no credential generation or verification of its own. Failures raise a
+  `TaskForgeError` subclass carrying the matching `taskforge-cli` exit code.
+  See "M5E — Python SDK" below.
 
 - `taskforge-cli` is a command-line client for the public API and the
   loopback-only credential-management routes: job submission, read, result
@@ -1046,6 +1054,213 @@ existing route, schema, or file outside documentation and `.env.example`.
 Unchanged. `api/openapi.yaml` stays `0.7.0-m5c`: this CLI is a consumer of
 the existing contract, not a change to it.
 
+## M5E — Python SDK
+
+### What changed
+
+`sdk/python` adds `taskforge-sdk` (distribution name) / `taskforge` (import
+package): a typed, installable Python client over every implemented public
+route and the loopback-only credential-management routes. It is the first
+Python in this repository.
+
+No backend route, schema, or contract changed. Like M5D, this milestone
+adds a **consumer** of `api/openapi.yaml` `0.7.0-m5c`, not a change to it.
+
+Surface: `jobs.submit/get/result/cancel/retry`,
+`dlq.list/iter_entries/replay`, and `api_keys.create/list/revoke` plus
+`worker_keys.create/list/revoke` — twelve methods over the eleven routes,
+`dlq.iter_entries` being a client-side loop over `dlq.list` that follows the
+documented `next_cursor`.
+
+### The four infrastructure decisions this milestone owned
+
+[ROADMAP.md](ROADMAP.md)'s M5E entry named four decisions as this
+milestone's first work rather than a side effect of writing an SDK. All
+four are decided and recorded in
+[ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md):
+
+| Decision | Choice | Rejected |
+| --- | --- | --- |
+| Dependency and build tooling | PEP 621 `pyproject.toml`, `hatchling`, stdlib `venv` + `pip`, `src/` layout, no lockfile, one runtime dependency (`httpx`) | `poetry` and `uv` — each a new *mandatory* installer against [PROJECT_SPEC.md](PROJECT_SPEC.md) §5's enumerated prerequisites, each a second source of truth beside `pyproject.toml`. `urllib.request` (zero-dependency) — no connection reuse, and its error surface would force hand-deriving the transport-vs-deadline distinction `httpx.TransportError` gives directly. `requests` — no inline types, no mock-transport seam. |
+| Lint and format | `ruff format` authoritative, `ruff check` + `mypy --strict` clean, on their own `sdk-*` Make targets | `pyright` — a Node package, so npm would become a prerequisite for linting Python. Folding into `fmt`/`lint`/`test` — would make every Go contributor and the fast `checks` CI job depend on a provisioned virtualenv. |
+| Packaging for V1 | Installable from this repository (`pip install ./sdk/python`). **Not planned for PyPI before M8** — a scope boundary, not a TODO | Publishing now — irreversible name claim, and a release workflow holding a publish credential would contradict `ci.yml`'s own "no job … publishes a package" least-privilege grant, against an API still short of three V1 routes. |
+| CI placement | Its own `sdk` job, 3.11/3.13 matrix, SHA-pinned `setup-python` | Folding into `checks` (Go setup and Go caching; a Go failure and a Python failure would share one status line — the same reason `race` is already separate) or into `integration`/`race` (these tests need no PostgreSQL and no broker, so they must not wait on Compose). |
+
+Python floor is 3.11 (`requires-python = ">=3.11"`), which is also what
+makes `enum.StrEnum` and `typing.Self` available to the models.
+
+### Which API address and credential the SDK uses
+
+**`TASKFORGE_SDK_API_URL` and `TASKFORGE_SDK_API_KEY` — the SDK's own
+variables.** Precedence is the constructor argument, then the environment
+variable, then the loopback default `http://127.0.0.1:8080`, matching
+`internal/cli.ResolveBaseURL`. A resolved value that is not an absolute
+http(s) URL with a host raises `ConfigurationError` before any request.
+
+It reads **neither** `TASKFORGE_API_ADDR` (the server's own *bind* address —
+a bare `host:port`, validated as a loopback bind; the variable M5D
+mistakenly reused and then reversed) **nor** `taskforge-cli`'s
+`TASKFORGE_CLI_API_URL` / `TASKFORGE_CLI_API_KEY`.
+
+The credential half of that second exclusion is the load-bearing part, and
+it is the one place the SDK's reasoning genuinely differs from the CLI's
+rather than merely echoing it. `taskforge-cli` is a process a developer
+invokes deliberately. **An SDK is a library inside someone else's
+process.** A developer who exported `TASKFORGE_CLI_API_KEY` for their shell
+would otherwise have every Python process in that shell silently acquire
+that credential — including a `TaskForgeClient()` whose author believed it
+had none. Ambient credential pickup is defensible for a CLI and is not
+defensible for a library. `test_config.py` sets all four foreign variables
+to poison values and asserts the client still resolves to the loopback
+default.
+
+### The exception taxonomy
+
+Nine classes, `sdk/python/src/taskforge/errors.py`, mapped one-to-one onto
+the nine non-zero exit codes in `internal/cli/exitcode.go`. Exit `0` has no
+exception: success is a normal return.
+
+| Exception | `exit_code` | `Error.code` values |
+| --- | --- | --- |
+| `ConfigurationError` | 1 | none — raised before any request is made |
+| `RequestRejectedError` | 2 | `malformed_json`, `payload_too_large`, `validation_failed`, `invalid_cursor` |
+| `UnauthorizedError` | 3 | `unauthorized` |
+| `NotFoundError` | 4 | `not_found` |
+| `ConflictError` | 5 | `idempotency_conflict`, `job_not_cancelable`, `job_not_dead_lettered` |
+| `InternalServerError` | 6 | `internal_error` |
+| `ServiceUnavailableError` | 7 | `service_unavailable` |
+| `TransportError` | 8 | none — the API was never reached |
+| `UnexpectedResponseError` | 9 | anything outside the set above |
+
+All inherit `TaskForgeError`, so `except TaskForgeError` catches everything
+the SDK raises and nothing else. `APIError` subclasses carry `.code`,
+`.message`, `.http_status`, `.request_id`, `.details` and `.raw`.
+
+The grouping is by **remediation**, copied deliberately from
+`exitcode.go` rather than re-derived, so one table reviews both clients.
+`ConflictError` has no per-code subclasses for the same reason the CLI
+groups those three codes: "retrying the identical request will not help" is
+what they share, and a caller branches on `.code` for the rest.
+
+`.exit_code` exists so a script wrapping the SDK can `sys.exit(exc.exit_code)`
+and stay consistent with `taskforge-cli`. Python cannot import a Go
+constant, so the two tables are hand-maintained copies of one mapping;
+`test_errors.py::test_exit_codes_match_the_cli_contract` and
+`::test_api_error_map_covers_exactly_the_reachable_set` are what stop them
+drifting.
+
+### The idempotency contract — M5E's acceptance criterion
+
+ROADMAP.md's criterion is one sentence: "the SDK places an idempotency key
+in the canonical header." Concretely, and tested:
+
+- **Three methods take `idempotency_key`:** `jobs.submit`, `jobs.retry`,
+  `dlq.replay` — exactly the three routes `api/openapi.yaml` marks
+  `Idempotency-Key: required: true`.
+- **Omitted → generated:** `str(uuid.uuid4())`, matching `taskforge-cli`'s
+  `uuid.NewString()`. Asserted to be a version-4 UUID in canonical
+  lowercase hyphenated form, within the header's documented 1..255 bound.
+- **Supplied → verbatim**, including characters awkward in a URL.
+- **Placed in the `Idempotency-Key` request header and nowhere else** —
+  asserted absent from both the request body and the query string, which is
+  [PROJECT_SPEC.md](PROJECT_SPEC.md) §4's sentence discharged literally.
+- **No other method sends it**, asserted across `jobs.get`, `jobs.result`,
+  `jobs.cancel`, `dlq.list` and all six key routes. Cancellation
+  specifically has its own test: its identity is scope plus job id, so
+  cancelling twice is one decision observed twice.
+- **One generator, one setter.** `_jobs._key_or_new` is the only place a
+  key is generated; `_transport.Transport._send` is the only place the
+  header is set.
+
+A caller-supplied key that could not survive being written into an HTTP
+header — non-ASCII, a control character, or over 255 characters — raises
+`ConfigurationError` before any request. This was found by the test suite
+during implementation: without it, a non-ASCII key surfaced as a raw
+`UnicodeEncodeError` from inside `httpx`, an exception that is not a
+`TaskForgeError` and would escape a caller's `except TaskForgeError`.
+
+**A stated limitation, documented where a caller will read it.** An
+auto-generated key makes a submission *unique*, not *repeatable*: calling
+`submit()` twice with identical arguments and no key creates two jobs. A
+caller who needs a network-level retry to be safe must pass their own key
+and reuse it. `taskforge-cli` has the identical property; the SDK says so
+in the method docstring and in `sdk/python/README.md`.
+
+### Credential handling
+
+The SDK obtains and presents credentials and generates, parses, verifies,
+and persists none of them — the model stays server-side in `internal/auth`
+and `internal/workerauth` (ADR-0013, ADR-0014).
+
+As in `internal/cli/client.go`, the authenticated and unauthenticated
+request paths are **two distinct methods**: `Transport.request` presents
+`Authorization: Bearer` on the public `/v1` routes;
+`Transport.request_unauthenticated` never does, and is what all six
+`/internal/v1` key-management routes go through. Those routes are
+unauthenticated by design, and a client presenting a secret to a route that
+does not check it is wrong even though the server would ignore it.
+`test_auth.py` pins this, including the case that matters most — a
+credential *is* configured and is still withheld from the internal routes,
+in the same client that sends it to the public ones.
+
+### Response models
+
+Frozen dataclasses over the fields `api/openapi.yaml` marks required, each
+carrying **`.raw`**, the untouched decoded response.
+
+`.raw` exists because `taskforge-cli` gets a property for free that a typed
+model would otherwise lose: it prints the server's bytes, so a field a
+newer server adds is never dropped. Parsing here is therefore tolerant of
+unknown keys and strict about missing required ones — a missing required
+field, a wrongly typed field, or an unrecognized enum value raises
+`UnexpectedResponseError` (exit `9`) rather than being guessed at.
+
+`JobStatus`, `CancellationStatus` and `DLQReason` are `StrEnum`s, applying
+[AGENTS.md](../AGENTS.md) §5's "domain types are typed, not `string`" rule
+on the client side. The consequence is stated rather than hidden: **a server
+that adds a tenth job status breaks an older SDK's parse of a job in that
+status.** That is the same trade exit `9` already makes, and it is preferred
+over handing a caller a state their code has never heard of.
+
+`jobs.result()` deliberately returns the decoded JSON with no model:
+`api/openapi.yaml` documents that body as "whatever JSON value the job's
+`job_type` produces". A handler that produced a literal `null` is
+distinguished from an empty body, which is not valid JSON and raises.
+
+`WorkerKeySummary` / `WorkerKeyCreated` / `WorkerKeyRevoked` /
+`WorkerKeyList` are distinct subclasses rather than aliases of their
+`ApiKey*` counterparts, and a worker-key listing parses its entries into
+`WorkerKeySummary` at runtime, not merely in the annotation. The wire
+shapes are identical, but they are distinct credentials authenticating
+distinct surfaces (ADR-0014), and an alias would let a caller pass one where
+the other is meant and have it type-check.
+
+### What is missing, and why it is not stubbed
+
+The SDK has **no `jobs.list()`, `workers.list()`, or `queues.list()`**.
+`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` are V1-target
+routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 and remain unimplemented
+anywhere in this API — re-confirmed against `api/openapi.yaml` this
+milestone, which still declares no such path and is still `0.7.0-m5c`. This
+is unchanged since M5D. A method with no route to call would be exactly the
+fabricated functionality [PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids.
+`test_jobs.py::test_no_list_workers_or_queues_methods_exist` asserts their
+absence, so one cannot be added casually without a reviewer seeing it.
+
+There is no async client. It is not in any milestone and was not added
+speculatively.
+
+### Breaking change
+
+**None.** This milestone adds a new directory, four Make targets, and a CI
+job. It changes no existing route, schema, Go file, or behavior. The only
+edits outside `sdk/`, `Makefile` and `.github/` are documentation and
+`.env.example`.
+
+### API surface and contract
+
+Unchanged. `api/openapi.yaml` stays `0.7.0-m5c`.
+
 ## Verification
 
 ### M5A gates
@@ -1482,6 +1697,152 @@ cancel-twice on the same job is one decision observed twice, not the
 `job_not_cancelable` case, which requires a job already `SUCCEEDED` or
 `DEAD_LETTERED`).
 
+### M5E gates
+
+Run locally on the branch head on 2026-09-21, against PostgreSQL 16,
+ElasticMQ, and LocalStack started by `make up`, on Python 3.14.2 (the host
+interpreter; CI additionally covers 3.11 and 3.13).
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `gofmt -l .` after `make fmt` | PASS | empty — no tracked Go file rewritten |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make build` | PASS | seven binaries in `./bin` |
+| `make test-unit` | PASS | every package `ok` or `[no test files]` |
+| `go test -count=1 -run '^TestOpenAPI_' ./internal/api/` | PASS | `ok github.com/co-rtex/TaskForge/internal/api 0.513s` — run as a regression check; this milestone touches no Go |
+| `docker compose config --quiet` | PASS | exit 0 |
+| `make test-integration` | PASS | `ok github.com/co-rtex/TaskForge/tests/integration 74.605s` |
+| `make test-race` | PASS | every unit package `ok`; `ok github.com/co-rtex/TaskForge/tests/integration 89.426s` under `-race` |
+| `make sdk-lint` | PASS | `19 files already formatted`; `All checks passed!`; `Success: no issues found in 18 source files` |
+| `make sdk-test` | PASS | `139 passed in 0.12s` |
+
+**One integration run failed first, for a reason this milestone caused but
+did not introduce, and it is kept on record.** The first `make test-integration`
+failed two tests — `TestOutbox_SurvivesPublisherRestart`
+("should have 5 item(s), but has 6") and
+`TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath`. The cause was
+the real-stack verification below: it submitted real jobs and ran
+`taskforge-outbox` against the same PostgreSQL and the same ElasticMQ queue
+the integration suite drains, so leftover `work.available` notifications
+were still on the queue when the suite counted them. Nothing in the product
+was changed. After `docker compose down -v --remove-orphans`, `make up` and
+`make migrate` rebuilt the infrastructure from empty, the identical command
+passed on the first attempt. The lesson is about test-environment hygiene,
+not about outbox behavior: manual verification against the shared local
+broker must be followed by a teardown before the integration suite is
+trusted.
+
+### M5E coverage
+
+**139 test cases from 81 test functions across eight files**, every one
+driven through the real `TaskForgeClient` against an `httpx.MockTransport`
+— the product surface, never the mapping tables in isolation. This is the
+Python equivalent of `internal/cli`'s own decision to drive every exit-code
+test through `Run()` against a real `httptest.Server`.
+
+| File | Functions | Cases | Covers |
+| --- | --- | --- | --- |
+| `test_idempotency.py` | 8 | 26 | The acceptance criterion: the header is sent on exactly the three routes that require it, generated as a UUIDv4 when omitted, verbatim when supplied, absent from body and query, absent everywhere else, and unusable keys rejected before any request |
+| `test_errors.py` | 17 | 23 | One test per exception class through a public method, one per member of every multi-membership class, the exit-code table, the eleven-entry reachable-code map, and the transport-vs-service-unavailable distinction |
+| `test_models.py` | 12 | 31 | `.raw` preservation, one case per required field missing, unknown enum values, wrongly typed fields, frozen-ness |
+| `test_jobs.py` | 14 | 19 | Request shape, documented defaults, both success statuses, URL-hostile ids, result values including literal `null` |
+| `test_config.py` | 11 | 15 | Precedence, URL validation, and the poison-value test proving no foreign variable is read |
+| `test_dlq.py` | 8 | 9 | Listing, nullable entry fields, and cursor iteration to exhaustion |
+| `test_keys.py` | 7 | 7 | Both key surfaces, runtime type distinction, URL-hostile key ids |
+| `test_auth.py` | 4 | 9 | `Authorization` present on public routes, absent without a key, and withheld from all six internal routes even when configured |
+
+**One real product defect was found by the tests during implementation and
+fixed before this PR.** A caller-supplied non-ASCII `idempotency_key`
+escaped as a raw `UnicodeEncodeError` from inside `httpx` — not a
+`TaskForgeError`, so it would have broken the SDK's own
+`except TaskForgeError` contract. It is now a `ConfigurationError` raised
+before any request, alongside the length and control-character checks, with
+three parametrized cases per affected route.
+
+Two further failures during implementation were **test** bugs, not product
+bugs, and are recorded because the distinction matters: `httpx.Response(json=None)`
+means "no body", not "a body of literal `null`" (the two are genuinely
+different responses, and the SDK distinguishes them correctly), and httpx's
+`URL.path` percent-*decodes*, which would have hidden the very path
+escaping under test. Both assertions were corrected; no product code
+changed for either.
+
+**Real end-to-end evidence, against `taskforge-api` itself.** Every call
+below went through the installed SDK, over HTTP, to the real server — with
+`taskforge-api`, `taskforge-outbox` and a real `taskforge-worker` running:
+
+| Scenario | Observed |
+| --- | --- |
+| Mint an API key (`api_keys.create`, unauthenticated loopback route) | id `c4bbccb2-…`, scope `m5e-verify`, one-time secret returned |
+| Submit a job | `8260f16e-…`, `JobStatus.QUEUED` |
+| Read it back | same id, `JobStatus.QUEUED`, `default/demo.echo` |
+| **Full round trip with a real worker** | submitted `b604a183-…` → worker executed it → `JobStatus.SUCCEEDED` → `jobs.result()` returned `{'message': 'round trip through the python sdk'}` |
+| Idempotent resubmit (same key, same request) | the same job id returned both times |
+| Idempotency conflict (same key, different request) | `ConflictError`, `.code == "idempotency_conflict"`, `exit_code 5` |
+| Result before success | `NotFoundError`, `.code == "not_found"`, `exit_code 4` |
+| Cancel | `CancellationStatus.CANCELED`, `already_requested False`, job then `JobStatus.CANCELED` |
+| Wrong key | `UnauthorizedError`, `exit_code 3`, `request_id` present |
+| Unknown job id | `NotFoundError`, `exit_code 4` |
+| `jobs.retry` on a non-dead-lettered job | `ConflictError`, `.code == "job_not_dead_lettered"`, `exit_code 5` |
+| `dlq.list` / `iter_entries` | empty page parsed, `next_cursor None`, iteration terminated |
+| Worker key mint / list / revoke | `WorkerKeyCreated` / `WorkerKeyList` / `WorkerKeySummary` at runtime; second revoke reported `already_revoked True` |
+| Revoke the API key, then reuse it | `UnauthorizedError`, `exit_code 3` — revocation effective on the next request |
+
+**What the real-stack run could not cover, and why.** `dlq.replay` against a
+genuinely dead-lettered job was **not** exercised live. Producing a real DLQ
+entry requires a handler that *fails*, and only `demo.echo` is registered as
+a production worker handler — a job with an unregistered `job_type` is never
+claimed at all (session-bound eligibility, ADR-0006) and simply stays
+`QUEUED`, which is what was observed when attempted. Failing handlers are
+injected through the registry seam by the integration suite, not by the
+production binaries. `dlq.replay` is therefore covered by unit tests and by
+its live `job_not_dead_lettered` conflict path only. This is a gap in *this
+milestone's manual evidence*, not in the SDK, and M7 owns the automated
+end-to-end failure suites.
+
+### M5E known risks
+
+Recorded as risks, not worked around silently.
+
+- **Strict parsing is enforced, not tolerated.** `JobStatus` /
+  `CancellationStatus` / `DLQReason` reject unrecognized values, and the
+  `Error.code` map is exhaustive for the reachable set. A newer server that
+  adds a job status or an error code breaks an older SDK's parse rather than
+  degrading quietly. Deliberate, and the same trade exit `9` already makes;
+  `.raw` limits the blast radius to the enums and the required-field checks,
+  since everything the server sent is still reachable there.
+- **`httpx` is this repository's first third-party Python dependency**, with
+  its own release cadence and a 1.0 release ahead of it. The `<1.0` ceiling in
+  `pyproject.toml` is intentional and will need a considered bump rather than
+  an automatic one.
+- **The Go and Python error contracts are two hand-maintained copies of one
+  mapping.** Python cannot import a Go constant.
+  `test_exit_codes_match_the_cli_contract` and
+  `test_api_error_map_covers_exactly_the_reachable_set` pin the numbers and the
+  membership, but a reviewer changing `internal/cli/exitcode.go` has to know to
+  look here; the two files reference each other by name for that reason.
+- **`make lint` and `make test` stay Go-only.** A contributor can therefore
+  push Python that fails CI without a local signal unless they run
+  `make sdk-lint`. Mitigated by [AGENTS.md](../AGENTS.md) §4 and the `sdk` CI
+  job, not eliminated. The alternative — making every Go contributor provision
+  a virtualenv — was judged worse.
+- **`make sdk-venv` needs network access** on first run to fetch `httpx` and
+  the dev extras, unlike the Go modules already in the module cache. An offline
+  first run of that target fails.
+- **`dlq.replay` has no live-stack evidence** against a genuinely dead-lettered
+  job, for the reason given under "M5E coverage": no production handler can
+  fail. Unit-tested, and its conflict path is live-verified.
+- **A pre-existing inaccuracy in `internal/cli/exitcode.go`'s comment was
+  noticed and deliberately not fixed here.** That comment calls
+  `api/openapi.yaml`'s `Error.code` enum "the full 22-value enum" and lists
+  eleven unreachable values; the enum actually has 23 values and twelve are
+  unreachable from the CLI's routes (`state_conflict` is missing from the
+  list). The mapping itself — which codes the CLI handles and how — is
+  correct; only the count in the prose is wrong. It is left alone because this
+  milestone adds a consumer and touches no Go, and a comment-only Go edit here
+  would cross that boundary for no behavioral gain. `errors.py`'s equivalent
+  comment states 23 and 12 correctly.
+
 ### M4 gates
 
 The M4 tree passed these gates locally on 2026-09-01, against PostgreSQL 16 and
@@ -1823,13 +2184,19 @@ correctness, not speed. The benchmark table in
 
 ## Continuous integration
 
-Unchanged from M3. The same three jobs —
+**Four jobs as of M5E.** The three that have run since M3 —
 `Format, lint, build, unit and OpenAPI tests`,
 `Migrations and integration tests`, and `Race detector (unit and integration)` —
-run on GitHub-hosted Linux runners for every pull request targeting `main` and
-every push to `main`. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
-Each milestone's run is recorded in its own pull request; the M5B run is
-recorded in the M5B pull request.
+plus `Python SDK (format, lint, types, unit tests)`, added by M5E. All run on
+GitHub-hosted Linux runners for every pull request targeting `main` and every
+push to `main`. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+Each milestone's run is recorded in its own pull request.
+
+The `sdk` job runs a 3.11/3.13 matrix with `fail-fast: false`, pins
+`actions/setup-python` by commit SHA like every other action in the file, and
+needs neither PostgreSQL nor the broker. It installs and runs the SDK but
+publishes nothing, so the workflow's `contents: read` grant is still the whole
+grant.
 
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure.
@@ -1848,9 +2215,17 @@ exercised by a real hosted failure.
   limiting.
 - Key rotation and expiry are not implemented for either credential type. A
   key lives until it is revoked.
-- The Python SDK and the operator dashboard are M5E and M6. The DLQ has
-  a listing endpoint but no filtering beyond scope and no sorting beyond
-  newest-first; operator search and bulk replay belong with the dashboard.
+- The operator dashboard is M6. The DLQ has a listing endpoint but no
+  filtering beyond scope and no sorting beyond newest-first; operator search
+  and bulk replay belong with the dashboard.
+- The Python SDK is installable from this repository only. Publishing it to
+  PyPI is **not planned before M8** — a deliberate scope boundary recorded in
+  [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md), not an
+  outstanding task. There is also no async client; it is in no milestone and
+  was not added speculatively.
+- Neither `taskforge-cli` nor the Python SDK has a `jobs list`, `workers list`,
+  or `queues list` operation, because those three routes are still
+  unimplemented (see the next entry).
 - `taskforge-cli` has no `jobs list`, `workers list`, or `queues list`
   command: `GET /v1/jobs`, `GET /v1/workers`, and `GET /v1/queues` are listed
   as V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 but are not
@@ -1891,6 +2266,8 @@ moves.
 - PostgreSQL 16 on `localhost:5442`
 - ElasticMQ on `localhost:9324`
 - Docker Compose and Make
+- Python 3.11 or newer — **only** to build or test the Python SDK in
+  `sdk/python` (`make sdk-venv`). Running TaskForge itself never needs one.
 
 Run `make bootstrap`, `make up`, `make migrate`, and `make build`, then start the
 API, outbox publisher, scheduler, worker, and reconciler as shown in the
@@ -1898,9 +2275,15 @@ repository README.
 
 ## Next objective
 
-M5E: the Python SDK. `taskforge-cli` (M5D) closes the CLI half of the
-original bundled M5D milestone; the SDK is the other, genuinely independent
-half, deferred to its own milestone because introducing Python is a first
-for this repository and needs its own dependency-management, lint/format,
-and CI-job decisions before any SDK code is written — see
-[ROADMAP.md](ROADMAP.md)'s M5E entry.
+M6: observability and health. OpenTelemetry tracing across the full path,
+Prometheus metrics with bounded label cardinality, real liveness and readiness
+per service, and the operator dashboard — the last consumer of the public API
+that [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 item 15 names, now that the CLI
+(M5D) and the Python SDK (M5E) both exist. See [ROADMAP.md](ROADMAP.md)'s M6
+entry.
+
+M5E closes the original bundled M5D milestone in full: the CLI half shipped as
+M5D, the SDK half as M5E, and the four Python infrastructure decisions the
+roadmap flagged are recorded in
+[ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md) rather
+than deferred again.

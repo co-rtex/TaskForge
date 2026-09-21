@@ -268,18 +268,30 @@ reimplementing the credential model.
 **Deliverables.** A typed, installable Python SDK.
 **Acceptance.** The SDK places an idempotency key in the canonical header.
 **Depends on.** M5D.
-**Status:** not started.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md)
+for the decision.
 
-Introducing Python is a first for this repository (confirmed: zero `.py`
-files, no `setup.py`/`pyproject.toml`, anywhere in this tree as of M5D).
-That is a real infrastructure decision this milestone owns and has not yet
-made: dependency and build tooling (e.g. `pip`+`venv` vs. `poetry` vs.
-`uv`), a lint/format story, a packaging story for V1 (installable from this
-repository vs. published to PyPI), and whether it gets its own CI job or
-folds into an existing one in
-[.github/workflows/ci.yml](../.github/workflows/ci.yml). None of this is
-decided here; it is this milestone's first work, not an implicit side
-effect of "write an SDK".
+Introducing Python was a first for this repository, and the four
+infrastructure decisions it forced — dependency and build tooling, a
+lint/format story, a packaging story for V1, and its CI placement — were
+this milestone's first work rather than an implicit side effect of "write
+an SDK". All four are recorded in
+[ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md):
+PEP 621 with stdlib `venv`/`pip` and one runtime dependency (`httpx`),
+`ruff` plus `mypy --strict` on their own `sdk-*` Make targets, installable
+from this repository with PyPI publication deferred past V1, and its own CI
+job rather than a fold into an existing one.
+
+The SDK reads `TASKFORGE_SDK_API_URL` and `TASKFORGE_SDK_API_KEY`, its own
+variables — not `TASKFORGE_API_ADDR` and not the CLI's pair. A CLI is
+invoked deliberately; an SDK is a library inside someone else's process, so
+ambient credential pickup is a different risk there.
+
+`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` remain
+unimplemented, so the SDK has no `jobs.list()` / `workers.list()` /
+`queues.list()` method, for the same reason `taskforge-cli` has no such
+command.
 
 ---
 
