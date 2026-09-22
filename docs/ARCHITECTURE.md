@@ -41,7 +41,10 @@ Python SDK (`taskforge-sdk`) over the same surface; and the operator read
 surface — scope-filtered, keyset-paginated job listing, a job's attempt
 timeline, worker capacity and health including crashed and replaced sessions,
 and per-queue non-terminal depth — over the public API, the CLI, and the SDK
-alike. Tracing, metrics, and the operator dashboard remain planned.
+alike; and OpenTelemetry tracing from an API request through the submission
+transaction, the outbox, the broker notification, and into a worker's claim and
+handler execution, under one trace id. Metrics and the operator dashboard
+remain planned.
 
 ---
 
@@ -116,9 +119,19 @@ Every component is safe to run with N replicas.
 outbox, and logical DLQ state. See [ADR-0001](adr/0001-postgresql-as-authoritative-state.md).
 
 The broker holds **notifications only** — never authoritative job state. A broker
-message carries event id, schema version, event type, queue, a non-authoritative
-job-id hint, and trace metadata. It never carries the authoritative job payload; a
+message carries event id, schema version, event type, occurrence time, queue, a
+non-authoritative job-id hint, and — when the event continues a client request —
+the W3C trace context (`traceparent`, and `tracestate` when present) of the
+transaction that wrote it. It never carries the authoritative job payload; a
 worker always reads authoritative work through the control plane.
+
+The trace context is metadata about the causal chain and never about the work.
+A consumer that ignores it entirely still behaves correctly, which is exactly
+why it is safe on a lossy, duplicating channel when the job payload is not. It
+is absent on an event written before M6B, on any event written with tracing
+disabled, and on every server-initiated notification — replay, scheduler
+promotion, abandonment requeue — none of which continues a client's request. An
+absent trace means the consumer starts a new root span; it is never an error.
 
 Two distinct dead-letter concepts exist and must not be conflated:
 
@@ -737,13 +750,48 @@ terminal `CANCELED` is never left.
 
 ## 14. Observability — [PARTIAL]
 
-Structured JSON logging with correlation identifiers, and distinct liveness/readiness endpoints, are implemented. Tracing and metrics are planned (M6).
+Structured JSON logging with correlation identifiers, distinct liveness/readiness
+endpoints, and OpenTelemetry tracing are implemented. **Metrics are planned
+(M6C)**, and that is the only part of this section that is not built.
 
-OpenTelemetry traces span: API submission → PostgreSQL transaction → outbox → broker
-notification → claim → worker execution → result.
+OpenTelemetry traces span: API submission → PostgreSQL transaction → outbox →
+broker notification → claim → worker execution. One trace id covers all of them,
+including the process boundary between `taskforge-api` and `taskforge-worker`.
+
+That boundary is the part worth stating precisely, because it is not an
+in-process concern. `taskforge-outbox` publishes an event potentially long after
+the API process that wrote it has exited, so the submitting transaction's trace
+context is **committed to `outbox_events` in that same transaction** and travels
+to the broker from there — see §3 and migration 0018. Nothing about it is
+recoverable at publish time otherwise.
+
+Tracing is **disabled by default**. `TASKFORGE_OTEL_EXPORTER` selects `none` (the
+default), `stdout`, or `otlp`; with `none` no exporter is constructed, no
+background goroutine starts, and no endpoint is dialed. W3C trace context is
+propagated in every mode including `none`, because a process that exports
+nothing must still pass a caller's `traceparent` to the next hop.
+
+At every boundary trace context crosses — an inbound HTTP header, a persisted
+column, a broker envelope — one rule holds: **a value this system cannot parse is
+dropped, never propagated and never persisted.** The next span becomes a fresh
+root instead.
+
+Span names are bounded. A server span is named for its matched route pattern
+(`GET /v1/jobs/{job_id}`), never the raw path, so an identifier never becomes
+part of a name. Span *attributes* may carry job and attempt ids: the
+cardinality rule below is about metric labels specifically, and a span is
+exactly where a unique identifier belongs. No span carries SQL text, bind
+parameters, a job payload, a credential, or handler error text.
+
+Not traced, deliberately: the worker's own control-plane calls after the claim
+(start, renew, succeed, fail), and the Python SDK. Both are separate surfaces
+rather than oversights.
 
 Structured JSON logs carry request id, job id, attempt id, worker id, worker-session
-id, lease id, trace id, and queue. Never secrets; never unbounded payloads.
+id, lease id, trace id, and queue. Never secrets; never unbounded payloads. The
+trace id sits **beside** the request id and never replaces it: a request id is a
+user-facing token echoed in every error body, while a trace id links this
+process's work to another's.
 
 Metrics include submitted / completed / retried / dead-lettered counters; queued and
 running gauges; queue-wait, execution, and end-to-end duration histograms; worker
@@ -879,6 +927,15 @@ that an abandoned attempt's uploaded object is orphaned rather than
 reclaimed.
 
 **Planned:** `audit_events`.
+
+M6B adds no table. Migration 0018 adds two nullable columns to `outbox_events`,
+`traceparent` and `tracestate`, each with a `CHECK` pinning its shape — the W3C
+wire format for the first, a length bound for the second, which originates in a
+caller-supplied header. Deliberately not backfilled and deliberately unindexed:
+a trace id is not derivable from anything historical, a `NULL` is a complete
+answer meaning "start a new root", and nothing queries by either column. `ADD
+COLUMN` with no `DEFAULT` is catalog-only in PostgreSQL 11+, so no existing row
+was rewritten.
 
 M6A adds no table and no column. Migration 0017 is index-only: it creates the
 four indexes the operator read routes justify and drops one the M1 schema

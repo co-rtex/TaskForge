@@ -34,7 +34,7 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 17)
+	require.Len(t, migrations, 18)
 	require.Equal(t, 14, migrations[13].Version)
 	require.Equal(t, "0014_api_keys.sql", migrations[13].Name)
 	require.Equal(t, 15, migrations[14].Version)
@@ -115,9 +115,14 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 	// That column's effect is checked explicitly below instead of folded
 	// into a digest that would only prove the column exists, not that every
 	// pre-existing value survived untouched.
+	// outbox_events is absent here and gets its own column-restricted digest
+	// below, for exactly the reason worker_sessions already does: a later
+	// migration (M6B's 0018) added columns to it, so a whole-row digest would
+	// change on a pure schema addition and stop measuring what this test is
+	// about, which is whether any ROW changed.
 	tables := []string{
 		"queues", "jobs", "workers", "job_attempts",
-		"leases", "dlq_entries", "dlq_replays", "idempotency_records", "outbox_events",
+		"leases", "dlq_entries", "dlq_replays", "idempotency_records",
 	}
 	digest := func(t *testing.T, table string) string {
 		t.Helper()
@@ -156,11 +161,30 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 	}
 	beforeWorkerSessions := digestWorkerSessions(t)
 
+	// outbox_events, restricted to the columns that existed before 0018 added
+	// traceparent and tracestate. Same reasoning as worker_sessions above.
+	outboxColumns := `id, event_type, schema_version, payload, status, attempts,
+		available_at, claimed_at, published_at, last_error, created_at,
+		job_id, notification_generation`
+	digestOutboxEvents := func(t *testing.T) string {
+		t.Helper()
+		var sum *string
+		require.NoError(t, conn.QueryRow(ctx, fmt.Sprintf(
+			`SELECT md5(string_agg(row_data, '|' ORDER BY row_data))
+			 FROM (SELECT (%s)::text AS row_data FROM outbox_events) rows`,
+			outboxColumns)).Scan(&sum))
+		if sum == nil {
+			return "<empty>"
+		}
+		return *sum
+	}
+	beforeOutboxEvents := digestOutboxEvents(t)
+
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err, "0014, 0015, and 0016 must apply to a database holding real M4 data")
-	require.Equal(t, 4, applied,
-		"0014, 0015, 0016, and 0017 are pending from an M4 database")
+	require.Equal(t, 5, applied,
+		"0014, 0015, 0016, 0017, and 0018 are pending from an M4 database")
 
 	t.Run("worker_sessions.worker_key_id exists, is nullable, and is NULL on every pre-existing row", func(t *testing.T) {
 		var nullCount, total int
@@ -207,6 +231,8 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 			require.Equalf(t, before[table], digest(t, table),
 				"0014 or 0015 changed rows in %s; each must touch nothing but its own table", table)
 		}
+		require.Equal(t, beforeOutboxEvents, digestOutboxEvents(t),
+			"0014 or 0015 changed rows in outbox_events")
 	})
 
 	t.Run("re-running the upgrade is a no-op", func(t *testing.T) {
@@ -218,6 +244,8 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 			require.Equalf(t, before[table], digest(t, table), "a second run changed %s", table)
 		}
 		require.Equal(t, beforeWorkerSessions, digestWorkerSessions(t))
+		require.Equal(t, beforeOutboxEvents, digestOutboxEvents(t),
+			"a second run changed outbox_events")
 		var apiKeyRows, workerKeyRows int
 		require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM api_keys`).Scan(&apiKeyRows))
 		require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM worker_keys`).Scan(&workerKeyRows))

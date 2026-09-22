@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
 
 // Config is the shared configuration surface for the API, outbox, migration,
@@ -84,6 +85,12 @@ type Config struct {
 	OutboxBackoffJitter     float64
 
 	LogLevel string
+
+	// Tracing. Disabled by default: with OTelExporter unset or "none" no
+	// exporter is constructed, no goroutine starts, and no endpoint is dialed.
+	// See docs/ARCHITECTURE.md section 14 and internal/telemetry/tracing.go.
+	OTelExporter string
+	OTelEndpoint string
 }
 
 // Load reads configuration from the environment, applying defaults and then
@@ -138,6 +145,9 @@ func Load() (Config, error) {
 		OutboxBackoffJitter:     envFloat("TASKFORGE_OUTBOX_BACKOFF_JITTER", 0.2),
 
 		LogLevel: env("TASKFORGE_LOG_LEVEL", "info"),
+
+		OTelExporter: env("TASKFORGE_OTEL_EXPORTER", telemetry.ExporterNone),
+		OTelEndpoint: env("TASKFORGE_OTEL_ENDPOINT", ""),
 	}
 	return c, c.Validate()
 }
@@ -170,6 +180,21 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.SchedulerAddr) != "" && !isLoopbackBind(c.SchedulerAddr) {
 		problems = append(problems, "TASKFORGE_SCHEDULER_ADDR must bind to a loopback address until authentication is implemented")
+	}
+
+	// An unrecognized exporter is rejected rather than silently downgraded to
+	// "none". A typo that quietly disabled tracing could only be found by
+	// noticing an absence, which is the hardest kind of failure to notice.
+	switch c.OTelExporter {
+	case telemetry.ExporterNone, telemetry.ExporterStdout:
+	case telemetry.ExporterOTLP:
+		if strings.TrimSpace(c.OTelEndpoint) == "" {
+			problems = append(problems,
+				"TASKFORGE_OTEL_ENDPOINT must be set when TASKFORGE_OTEL_EXPORTER is \"otlp\"")
+		}
+	default:
+		problems = append(problems,
+			"TASKFORGE_OTEL_EXPORTER must be one of \"none\", \"stdout\", or \"otlp\"")
 	}
 
 	if c.MaxRequestBytes < 1024 {

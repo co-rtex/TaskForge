@@ -9,8 +9,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/co-rtex/TaskForge/internal/outbox"
+	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
 
 // Errors returned by Store that callers must distinguish.
@@ -22,6 +25,12 @@ var (
 	// ErrJobNotFound means no job with that id exists in the caller's scope.
 	ErrJobNotFound = errors.New("job not found")
 )
+
+// tracer records this package's spans. Taken from the global provider, which
+// is a delegating tracer, so a package-level value is correct even though the
+// real provider is installed later during process startup. It is a no-op when
+// tracing is disabled.
+var tracer = otel.Tracer(telemetry.TracerName)
 
 // Store persists jobs.
 type Store struct {
@@ -62,6 +71,21 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 	if !exists {
 		return SubmitResult{}, fmt.Errorf("%w: %q", ErrUnknownQueue, req.Queue)
 	}
+
+	// One span over the whole submission transaction: begin, the job insert,
+	// the idempotency insert, the outbox insert, and commit. Its parent is the
+	// request span, and it is the parent of nothing -- the outbox event carries
+	// this trace forward to another process rather than to a child span here.
+	//
+	// No SQL text, no bind parameters, and no payload are recorded. AGENTS.md
+	// section 10 already forbids that for logs; a span is the same disclosure
+	// with a different transport.
+	ctx, span := tracer.Start(ctx, "jobs.Submit")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("taskforge.queue", req.Queue),
+		attribute.String("taskforge.job_type", req.Type),
+	)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -127,6 +151,10 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 	if err != nil {
 		return SubmitResult{}, fmt.Errorf("insert job: %w", err)
 	}
+	// A job id is a span attribute, not a metric label: ARCHITECTURE.md section
+	// 14's cardinality rule is specifically about metric labels, and a span is
+	// exactly where a unique identifier belongs.
+	span.SetAttributes(attribute.String("taskforge.job_id", job.ID.String()))
 
 	var winnerJobID uuid.UUID
 	err = tx.QueryRow(ctx, `
@@ -139,6 +167,13 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Someone else owns this key. Discard our job and defer to them.
+		//
+		// This transaction rolls back, so the outbox row it would have written
+		// -- and the trace context on it -- is discarded with everything else.
+		// The winner's already-committed event carries the trace a client
+		// following this job will actually see. Recorded as a span event so a
+		// trace that appears to stop here is explained rather than puzzling.
+		span.AddEvent("submission lost the idempotency race")
 		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
 			return SubmitResult{}, fmt.Errorf("rollback losing submission: %w", rbErr)
 		}
@@ -152,7 +187,15 @@ func (s *Store) Submit(ctx context.Context, scope, key string, req NormalizedReq
 	// delayed job deliberately gets no event here; the scheduler writes one, also
 	// transactionally, when it promotes the job to QUEUED.
 	if job.Status == StatusQueued {
-		if _, err := outbox.InsertWorkAvailableTx(ctx, tx, job.ID, job.Queue, notificationGeneration); err != nil {
+		// The submitting request's trace context commits with the event, so the
+		// publisher -- a different process, running later -- continues this
+		// trace rather than starting an unrelated one. Both values are empty
+		// when tracing is disabled, which persists NULL and means "new root".
+		traceparent, tracestate := telemetry.InjectTraceContext(ctx)
+		trace := &outbox.TraceContext{Traceparent: traceparent, Tracestate: tracestate}
+		if _, err := outbox.InsertWorkAvailableTx(
+			ctx, tx, job.ID, job.Queue, notificationGeneration, trace,
+		); err != nil {
 			return SubmitResult{}, err
 		}
 	}

@@ -155,7 +155,7 @@ func (s *Store) promoteDueJob(ctx context.Context, jobID uuid.UUID) (bool, error
 	// Written in the same transaction as the promotion, so a job can never become
 	// claimable without the notification that wakes a worker for it — and a
 	// crash before commit leaves neither.
-	if _, err := outbox.InsertWorkAvailableTx(ctx, tx, jobID, queue, newGeneration); err != nil {
+	if _, err := outbox.InsertWorkAvailableTx(ctx, tx, jobID, queue, newGeneration, nil /* not a continuation of a client request; see InsertWorkAvailableTx */); err != nil {
 		return false, fmt.Errorf("record promotion notification: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -295,7 +295,7 @@ func (s *Store) renotifyStrandedJob(ctx context.Context, jobID uuid.UUID, after 
 	// Same generation, new event id. It advertises the same eligibility
 	// transition; the id differs because the old one may already have been
 	// consumed as a claim identity (ADR-0007).
-	if _, err := outbox.InsertWorkAvailableTx(ctx, tx, jobID, queue, generation); err != nil {
+	if _, err := outbox.InsertWorkAvailableTx(ctx, tx, jobID, queue, generation, nil /* not a continuation of a client request; see InsertWorkAvailableTx */); err != nil {
 		return false, fmt.Errorf("record re-notification: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

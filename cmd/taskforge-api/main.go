@@ -49,6 +49,29 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Tracing is configured before anything else does work, so every span this
+	// process emits belongs to one provider. Disabled by default: with
+	// TASKFORGE_OTEL_EXPORTER unset or "none" no exporter is built, no
+	// goroutine starts, and no endpoint is dialed.
+	tracing, err := telemetry.StartTracing(ctx, telemetry.TracingConfig{
+		Exporter: cfg.OTelExporter,
+		Endpoint: cfg.OTelEndpoint,
+		Service:  "taskforge-api",
+	}, os.Stdout)
+	if err != nil {
+		log.Error("configure tracing", slog.String("error", err.Error()))
+		return 1
+	}
+	// Deferred rather than placed on the graceful path, so it runs on every
+	// exit including an early error return. It is bounded, idempotent, and a
+	// no-op when tracing is disabled, and it deliberately survives ctx being
+	// canceled by SIGTERM so buffered spans still flush.
+	defer func() {
+		if err := tracing.Shutdown(ctx); err != nil {
+			log.Error("shut down tracing", slog.String("error", err.Error()))
+		}
+	}()
+
 	pool, err := database.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Error("connect to database", slog.String("error", err.Error()))

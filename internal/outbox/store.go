@@ -32,13 +32,23 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 // because the scheduler has to decide whether the CURRENT eligibility
 // transition still has an unpublished notification — and a hint buried in the
 // published JSON envelope is not something a correctness decision may rest on.
-// The wire contract is unchanged: neither column is serialized to the broker.
+// generation and job_id are still never serialized to the broker.
+//
+// trace is the W3C trace context of the transaction writing this event, or nil.
+// It commits here, with the event, because taskforge-outbox is a separate
+// process that may publish long after this one exited (ADR-0004's
+// publish-before-mark window), so there is no later moment at which it could be
+// recovered. nil is an ordinary value, not a degraded one: it means the
+// eventual consumer starts a new root span. Every server-initiated
+// notification — replay, scheduler promotion, abandonment requeue — passes nil
+// deliberately, because none of them continues a client's request.
 func InsertWorkAvailableTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	jobID uuid.UUID,
 	queue string,
 	generation int,
+	trace *TraceContext,
 ) (uuid.UUID, error) {
 	if generation < 1 {
 		return uuid.Nil, fmt.Errorf("work.available notification generation must be at least 1, got %d", generation)
@@ -47,12 +57,24 @@ func InsertWorkAvailableTx(
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("marshal outbox data: %w", err)
 	}
+	var traceparent, tracestate *string
+	// Both columns move together or neither does. A tracestate without a
+	// traceparent names no trace and would be meaningless on the wire, and the
+	// CHECK on traceparent only constrains the value when it is present.
+	if trace != nil && trace.Traceparent != "" {
+		traceparent = &trace.Traceparent
+		if trace.Tracestate != "" {
+			tracestate = &trace.Tracestate
+		}
+	}
 	id := uuid.New()
 	_, err = tx.Exec(ctx, `
 		INSERT INTO outbox_events (
-			id, event_type, schema_version, payload, job_id, notification_generation
-		) VALUES ($1, $2, $3, $4, $5, $6)`,
-		id, EventWorkAvailable, WorkAvailableSchemaVersion, raw, jobID, generation)
+			id, event_type, schema_version, payload, job_id, notification_generation,
+			traceparent, tracestate
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		id, EventWorkAvailable, WorkAvailableSchemaVersion, raw, jobID, generation,
+		traceparent, tracestate)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("insert outbox event: %w", err)
 	}
@@ -108,7 +130,8 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Durat
 		    available_at = now() + make_interval(secs => $2::double precision)
 		FROM due
 		WHERE o.id = due.id
-		RETURNING o.id, o.event_type, o.schema_version, o.payload, o.attempts, o.created_at`,
+		RETURNING o.id, o.event_type, o.schema_version, o.payload, o.attempts, o.created_at,
+		          o.traceparent, o.tracestate`,
 		limit, claimTimeout.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim due outbox events: %w", err)
@@ -118,8 +141,20 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Durat
 	var out []Event
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.ID, &e.Type, &e.SchemaVersion, &e.Data, &e.Attempts, &e.CreatedAt); err != nil {
+		var traceparent, tracestate *string
+		if err := rows.Scan(&e.ID, &e.Type, &e.SchemaVersion, &e.Data, &e.Attempts, &e.CreatedAt,
+			&traceparent, &tracestate); err != nil {
 			return nil, fmt.Errorf("scan outbox event: %w", err)
+		}
+		// A NULL traceparent leaves Trace nil, which the envelope omits and the
+		// consumer reads as "start a new root". A tracestate without a
+		// traceparent cannot occur -- the insert writes them together -- and is
+		// ignored here rather than being turned into a trace that names nothing.
+		if traceparent != nil {
+			e.Trace = &TraceContext{Traceparent: *traceparent}
+			if tracestate != nil {
+				e.Trace.Tracestate = *tracestate
+			}
 		}
 		out = append(out, e)
 	}

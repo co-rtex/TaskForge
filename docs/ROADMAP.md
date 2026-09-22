@@ -369,19 +369,42 @@ reconciliation marks a crashed worker's session `UNHEALTHY` and a replacement
 registration marks the prior one `OFFLINE`, so a listing built on that index
 would silently omit exactly the workers an operator opened the page to find.
 
-### M6B — OpenTelemetry tracing — **planned**
+### M6B — OpenTelemetry tracing
 **Objective.** One trace id follows a submission from the API through the
 PostgreSQL transaction, across the process boundary into `taskforge-outbox`,
 through the broker message, into the claim, and onto worker execution.
+**Deliverables.** `internal/telemetry` tracing provider with three exporter
+modes and a bounded shutdown; migration 0018's `outbox_events.traceparent` /
+`tracestate`; an optional envelope `trace` member; server spans on every route,
+named for the route pattern; a submission-transaction span; worker claim and
+execution spans; and the ARCHITECTURE §3 correction below.
 **Acceptance.** A submission is traceable end to end.
 **Depends on.** M6A, so a complete route surface is instrumented once.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence.
 
-Note for whoever picks this up: [ARCHITECTURE.md](ARCHITECTURE.md) §3 is marked
-`[IMPLEMENTED]` and states that a broker message carries "trace metadata". It
-does not — `outbox.Envelope` has five members and no trace field, and
-`outbox_events` has no trace column. Correcting that claim is part of this
-slice, and the trace context has to be persisted in the same transaction as the
-event, because the publisher is a separate process that runs later.
+The note this entry carried for its successor is now discharged.
+[ARCHITECTURE.md](ARCHITECTURE.md) §3 was marked `[IMPLEMENTED]` while claiming
+a broker message carries "trace metadata"; it did not, and now does. The trace
+context is persisted in the same transaction as the event, because
+`taskforge-outbox` is a separate process that publishes later and can recover
+it no other way.
+
+Two decisions M6B could not avoid are recorded in the code rather than as an
+ADR, each constraining one contract rather than future work. The **envelope is
+additive-only while the `data` member is versioned** — M6B's optional `trace`
+member therefore did not bump `WorkAvailableSchemaVersion`, and that
+distinction, previously unwritten, is now stated in `internal/outbox/event.go`.
+And the **server span is named from the matched route pattern**, which forced
+the tracing middleware into two parts: `net/http` populates `Request.Pattern`
+only inside `ServeMux.ServeHTTP`, on the exact pointer the mux is handed, so
+the name cannot be known where the span must start.
+
+Tracing is disabled by default and every trace boundary drops a value it cannot
+parse. Deliberately **not** in scope: the worker's own control-plane calls after
+the claim, tracing in the Python SDK, and trace context on server-initiated
+notifications (replay, scheduler promotion, abandonment requeue), none of which
+continues a client request.
 
 ### M6C — Prometheus metrics and the health residual — **planned**
 **Objective.** Expose the metric set [ARCHITECTURE.md](ARCHITECTURE.md) §14

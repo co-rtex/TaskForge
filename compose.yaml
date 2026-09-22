@@ -66,3 +66,24 @@ services:
     # /_localstack/health endpoint from the host instead, the same way it
     # already probes ElasticMQ's ListQueues action rather than relying on a
     # binary this image may not ship.
+
+  jaeger:
+    # Optional trace backend, for looking at a trace by hand. Deliberately
+    # behind a Compose profile: `make up` must not start it, because nothing in
+    # this system depends on it and the test suite asserts traces through an
+    # in-memory exporter rather than through a running collector.
+    #
+    #   docker compose --profile tracing up -d jaeger
+    #   TASKFORGE_OTEL_EXPORTER=otlp TASKFORGE_OTEL_ENDPOINT=http://127.0.0.1:4318 ...
+    #
+    # UI on http://127.0.0.1:16686.
+    #
+    # Pinned rather than :latest, exactly like postgres, elasticmq and
+    # localstack above.
+    image: jaegertracing/all-in-one:1.65.0
+    profiles: ["tracing"]
+    ports:
+      # OTLP/HTTP receiver -- what TASKFORGE_OTEL_ENDPOINT points at.
+      - "127.0.0.1:4318:4318"
+      # Jaeger's own query UI.
+      - "127.0.0.1:16686:16686"

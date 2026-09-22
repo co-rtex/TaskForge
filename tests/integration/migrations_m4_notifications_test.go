@@ -141,7 +141,7 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// The upgrade, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 9, applied, "0009 through 0017 are pending from 0008")
+	require.Equal(t, 10, applied, "0009 through 0018 are pending from 0008")
 
 	eventGeneration := func(id uuid.UUID) int {
 		var generation *int
@@ -442,8 +442,8 @@ func TestMigrations_PerJobReconstructionSurvivesMixedState(t *testing.T) {
 	// The upgrade, through the real runner: 0011 then 0012.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 7, applied,
-		"exactly 0011, 0012, 0013, 0014, 0015, 0016, and 0017 are pending from 0010")
+	require.Equal(t, 8, applied,
+		"exactly 0011 through 0018 are pending from 0010")
 
 	t.Run("M4-authored notification metadata is untouched", func(t *testing.T) {
 		require.Equal(t, advancedBefore, readNotificationState(t, ctx, conn, advancedJob),
@@ -520,7 +520,7 @@ func TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase(t *testing.
 	freshDSN := withFreshDatabase(t)
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 17, applied, "a fresh database applies every migration")
+	require.Equal(t, 18, applied, "a fresh database applies every migration")
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -617,17 +617,20 @@ func TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012(t *testing.
 	defer cancel()
 	conn, freshDSN := migrateThrough(t, ctx, 10)
 
-	// 0014 and 0015 add unrelated tables (api_keys, worker_keys) plus one
-	// nullable worker_sessions column, none of which the notification-history
-	// reconstruction under test touches. Applying them here, out of their
-	// eventual 11-12-13-14-15 order, is what lets the real control-plane
-	// Register/Claim/Start/Fail path below run at all: that code targets the
-	// current schema, and 0015 is what makes worker_sessions.worker_key_id
-	// exist. 0011, 0012, and 0013 -- the ones actually under test -- are
-	// still applied one at a time, later, against the jobs this test seeds
-	// while genuinely at schema 0010.
+	// 0014, 0015 and 0018 add unrelated tables (api_keys, worker_keys), one
+	// nullable worker_sessions column, and two nullable outbox_events columns,
+	// none of which the notification-history reconstruction under test touches.
+	// Applying them here, out of their eventual order, is what lets the real
+	// control-plane Register/Claim/Start/Fail path below run at all: that code
+	// targets the current schema. 0015 is what makes
+	// worker_sessions.worker_key_id exist, and 0018 is what makes
+	// outbox_events.traceparent exist for the current
+	// outbox.InsertWorkAvailableTx. 0011, 0012, and 0013 -- the ones actually
+	// under test -- are still applied one at a time, later, against the jobs
+	// this test seeds while genuinely at schema 0010.
 	applyMigration(t, ctx, conn, 14)
 	applyMigration(t, ctx, conn, 15)
+	applyMigration(t, ctx, conn, 18)
 	pool := poolFor(t, freshDSN)
 
 	const upgradeScope = "replay-upgrade"
@@ -802,6 +805,6 @@ func TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012(t *testing.
 		otherDSN := withFreshDatabase(t)
 		applied, err := database.Migrate(ctx, otherDSN, discardLogger())
 		require.NoError(t, err)
-		require.Equal(t, 17, applied, "0001 through 0017 apply to an empty database")
+		require.Equal(t, 18, applied, "0001 through 0018 apply to an empty database")
 	})
 }
