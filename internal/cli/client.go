@@ -152,6 +152,59 @@ func (c *Client) GetResult(ctx context.Context, jobID string) (*Response, error)
 	return c.do(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(jobID)+"/result", nil, nil)
 }
 
+// ListJobs calls GET /v1/jobs. An empty status, queue or cursor and a
+// limit <= 0 are all omitted, letting the server apply its own documented
+// defaults.
+func (c *Client) ListJobs(ctx context.Context, status, queue string, limit int, cursor string) (*Response, error) {
+	q := url.Values{}
+	if status != "" {
+		q.Set("status", status)
+	}
+	if queue != "" {
+		q.Set("queue", queue)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	path := "/v1/jobs"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return c.do(ctx, http.MethodGet, path, nil, nil)
+}
+
+// ListJobAttempts calls GET /v1/jobs/{job_id}/attempts. The route is
+// unpaginated -- a job's attempt count is bounded by max_attempts -- so it
+// takes no limit or cursor.
+func (c *Client) ListJobAttempts(ctx context.Context, jobID string) (*Response, error) {
+	return c.do(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(jobID)+"/attempts", nil, nil)
+}
+
+// ListWorkers calls GET /v1/workers.
+func (c *Client) ListWorkers(ctx context.Context, limit int, cursor string) (*Response, error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	path := "/v1/workers"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return c.do(ctx, http.MethodGet, path, nil, nil)
+}
+
+// ListQueues calls GET /v1/queues. The route is unpaginated -- no API
+// creates a queue -- so it takes no limit or cursor.
+func (c *Client) ListQueues(ctx context.Context) (*Response, error) {
+	return c.do(ctx, http.MethodGet, "/v1/queues", nil, nil)
+}
+
 // CancelJob calls POST /v1/jobs/{job_id}/cancel. The route takes no
 // request body.
 func (c *Client) CancelJob(ctx context.Context, jobID string) (*Response, error) {

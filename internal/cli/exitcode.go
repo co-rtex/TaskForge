@@ -105,9 +105,10 @@ const (
 // apiErrorExitCodes maps every api/openapi.yaml Error.code value that a
 // route this CLI calls can actually return to its exit code. It is
 // exhaustive for that reachable set -- verified line by line against every
-// response documented for POST/GET /v1/jobs, /v1/jobs/{job_id},
-// /v1/jobs/{job_id}/result, /v1/jobs/{job_id}/cancel,
-// /v1/jobs/{job_id}/retry, GET /v1/dlq, POST /v1/dlq/{job_id}/replay, and
+// response documented for POST/GET /v1/jobs, GET /v1/jobs/{job_id},
+// /v1/jobs/{job_id}/attempts, /v1/jobs/{job_id}/result,
+// /v1/jobs/{job_id}/cancel, /v1/jobs/{job_id}/retry, GET /v1/dlq,
+// POST /v1/dlq/{job_id}/replay, GET /v1/workers, GET /v1/queues, and
 // the four /internal/v1/{api-keys,worker-keys}* routes -- not for the full
 // 22-value enum in api/openapi.yaml's Error schema, most of which
 // (worker_session_conflict, claim_conflict, fence_rejected, lease_expired,
@@ -117,6 +118,11 @@ const (
 // documented-but-unreachable-here cases this CLI never triggers.
 // TestApiErrorExitCodes_CoversExactlyTheReachableSet pins this set so it
 // cannot silently drift from the routes above.
+//
+// M6A added four read routes and **no new error code**: they answer only
+// validation_failed, invalid_cursor, unauthorized, not_found, internal_error
+// and service_unavailable, every one of which was already reachable and
+// already mapped. The table below is therefore unchanged by that milestone.
 var apiErrorExitCodes = map[string]int{
 	"malformed_json":        ExitRequestRejected,
 	"payload_too_large":     ExitRequestRejected,
