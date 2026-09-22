@@ -181,12 +181,14 @@ func TestMigrations_M6AAddsNoColumnAndChangesNoRow(t *testing.T) {
 		}
 	}
 
-	// The migration is recorded, and it is the latest one.
-	var version int
+	// M6A's migration is recorded under its own version.
+	//
+	// This deliberately asserts 0017 is PRESENT rather than NEWEST. An earlier
+	// draft asserted newest, which made a test about M6A's migration fail the
+	// moment M6B added 0018 -- a test that breaks for a reason unrelated to what
+	// it is about.
 	var name string
 	require.NoError(t, testPool.QueryRow(ctx,
-		`SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1`).
-		Scan(&version, &name))
-	require.Equal(t, 17, version, "0017 must be the newest applied migration")
+		`SELECT name FROM schema_migrations WHERE version = 17`).Scan(&name))
 	require.Equal(t, "0017_operator_read_indexes.sql", name)
 }
