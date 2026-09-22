@@ -23,6 +23,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/objectstore"
 	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
@@ -112,6 +113,9 @@ func run() int {
 		Jitter:        jitter,
 	})
 
+	m := metrics.New("taskforge-api")
+	metrics.NewStateCollector(m, pool, log)
+
 	server := api.NewServer(
 		jobs.NewStore(pool),
 		api.Config{
@@ -123,7 +127,8 @@ func run() int {
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, pool) },
 		},
-	).WithWorkerControl(workerStore).
+	).WithMetrics(m).
+		WithWorkerControl(workerStore).
 		WithWorkerReads(workerStore).
 		WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool)).
 		WithResults(results.NewStore(pool), objects)

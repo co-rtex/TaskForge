@@ -814,6 +814,23 @@ func (s *Server) resolveWorkerControlScope(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) writeWorkerControlError(w http.ResponseWriter, r *http.Request, op string, err error) {
+	// A stale-authority refusal is counted here, at the HTTP boundary, rather
+	// than inside internal/workers. The store's job is to refuse the
+	// transition; adding a metric side effect to the fenced transition code
+	// would put observability inside the one place in this system that exists
+	// to be provably correct.
+	//
+	// The three errors below are one metric because they are one operational
+	// fact: a worker tried to commit something it could no longer prove it was
+	// allowed to commit. Which of the three fences caught it is in the error
+	// body and in the logs; an operator watching for "workers are losing races"
+	// wants the sum.
+	if s.metrics != nil && (errors.Is(err, workers.ErrFenceRejected) ||
+		errors.Is(err, workers.ErrLeaseExpired) ||
+		errors.Is(err, workers.ErrAttemptTimedOut)) {
+		s.metrics.StaleRejections.Inc()
+	}
+
 	var validation *workers.ValidationError
 	switch {
 	case errors.As(err, &validation):

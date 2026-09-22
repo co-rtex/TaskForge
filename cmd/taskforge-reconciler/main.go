@@ -20,6 +20,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/reconciler"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 	"github.com/co-rtex/TaskForge/internal/workers"
@@ -94,7 +95,13 @@ func run() int {
 		BatchSize:    cfg.ReconcilerBatchSize,
 	}, log)
 
-	healthServer := newHealthServer(cfg.ReconcilerAddr, pool, log)
+	m := metrics.New("taskforge-reconciler")
+	metrics.NewStateCollector(m, pool, log)
+	engine.WithMetrics(m)
+
+	healthServer := newHealthServer(cfg.ReconcilerAddr, log, m,
+		healthCheck{"postgres", func(ctx context.Context) error { return database.Ping(ctx, pool) }},
+	)
 	go func() {
 		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("health server failed", slog.String("error", err.Error()))

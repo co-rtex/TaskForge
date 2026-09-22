@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
@@ -56,9 +57,12 @@ type Server struct {
 	// provider after this point. With tracing disabled it is a no-op, so
 	// there is no enabled/disabled branch anywhere in the request path.
 	tracer trace.Tracer
-	cfg    Config
-	log    *slog.Logger
-	checks []ReadinessCheck
+	// metrics is optional. A nil one records nothing and changes no behavior,
+	// which is what keeps every pre-M6C test unchanged.
+	metrics *metrics.Metrics
+	cfg     Config
+	log     *slog.Logger
+	checks  []ReadinessCheck
 }
 
 // Results reads a job's recorded result. See internal/results.Store.
@@ -147,6 +151,20 @@ func (s *Server) WithResults(store Results, objects ObjectStore) *Server {
 	return s
 }
 
+// WithMetrics enables HTTP instrumentation and serves GET /metrics.
+//
+// The endpoint is registered on this same mux rather than on a separate admin
+// listener. TASKFORGE_API_ADDR is already validated as a loopback bind (see
+// internal/config.Validate), exactly like the four background services'
+// addresses, so /metrics crosses no boundary that the already-unauthenticated
+// /healthz and /readyz do not. docs/CURRENT_STATE.md records the one thing
+// that must be revisited before this process ever sits behind a real load
+// balancer.
+func (s *Server) WithMetrics(m *metrics.Metrics) *Server {
+	s.metrics = m
+	return s
+}
+
 // WithTracer overrides the tracer this server records spans with.
 //
 // Production never calls it: NewServer already takes the global delegating
@@ -190,6 +208,11 @@ func (s *Server) Handler() http.Handler {
 	// Health probes stay unauthenticated. They reveal nothing tenant-specific,
 	// and a liveness probe that needed a credential would report a healthy
 	// process as dead the moment that credential was revoked.
+	if s.metrics != nil {
+		// Unauthenticated, like the health probes beside it, and on this same
+		// already-loopback-bound listener. See WithMetrics.
+		mux.Handle("GET /metrics", s.metrics.Handler())
+	}
 	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
 	if s.keys != nil {
@@ -271,6 +294,10 @@ func (s *Server) Handler() http.Handler {
 	// and outside it nothing else changes: the request id still comes from the
 	// outermost layer, and both identities appear on the same line.
 	h = withLogging(s.log, h)
+	// Outside withRecovery, so it observes the sanitized 500 a panicking
+	// handler actually returns rather than the 200 an inner recorder would
+	// see. See withHTTPMetrics.
+	h = withHTTPMetrics(s.metrics, h)
 	h = withTracing(s.tracer, h)
 	h = withRequestID(h)
 	return h

@@ -7,21 +7,36 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/co-rtex/TaskForge/internal/database"
-	"github.com/co-rtex/TaskForge/internal/queue"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 )
 
-// newHealthServer exposes distinct liveness and readiness endpoints.
+// healthCheck is one named readiness dependency.
 //
-// Liveness reports only that the process exists. Readiness checks both
-// dependencies the publisher actually needs — it cannot do its job without
-// either — under a bounded timeout so a hung dependency cannot hang the probe.
-func newHealthServer(addr string, pool *pgxpool.Pool, broker queue.Broker, log *slog.Logger) *http.Server {
+// A closure rather than a concrete dependency, matching the shape
+// internal/api.ReadinessCheck already established. Before M6C these handlers
+// held a *pgxpool.Pool and called database.Ping inside themselves, which meant
+// the only way to exercise a failing dependency was to have a real PostgreSQL
+// that was actually down -- so there were no tests at all. A closure is
+// trivially substitutable, so every branch below is reachable from
+// `make test-unit` with no infrastructure.
+type healthCheck struct {
+	Name  string
+	Check func(context.Context) error
+}
+
+// newHealthServer exposes liveness, readiness, and metrics on one loopback
+// listener.
+//
+// Liveness reports only that the process exists. Readiness checks every
+// dependency under a bounded timeout so a hung one cannot hang the probe.
+// Metrics are served here rather than on a separate listener for the reason
+// docs/CURRENT_STATE.md records: every address in this system is already
+// validated as loopback-only, so this endpoint crosses no boundary that
+// /healthz and /readyz do not already cross.
+func newHealthServer(addr string, log *slog.Logger, m *metrics.Metrics, checks ...healthCheck) *http.Server {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeHealth(w, log, http.StatusOK, map[string]any{"status": "alive"})
 	})
 
@@ -29,17 +44,17 @@ func newHealthServer(addr string, pool *pgxpool.Pool, broker queue.Broker, log *
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		components := map[string]string{"postgres": "ok", "broker": "ok"}
+		components := make(map[string]string, len(checks))
 		ready := true
-		if err := database.Ping(ctx, pool); err != nil {
-			components["postgres"] = "unavailable"
-			ready = false
-			log.Warn("readiness: postgres unavailable", slog.String("error", err.Error()))
-		}
-		if err := broker.Ping(ctx); err != nil {
-			components["broker"] = "unavailable"
-			ready = false
-			log.Warn("readiness: broker unavailable", slog.String("error", err.Error()))
+		for _, check := range checks {
+			if err := check.Check(ctx); err != nil {
+				components[check.Name] = "unavailable"
+				ready = false
+				log.Warn("readiness check failed",
+					slog.String("component", check.Name), slog.String("error", err.Error()))
+				continue
+			}
+			components[check.Name] = "ok"
 		}
 
 		status, state := http.StatusOK, "ready"
@@ -48,6 +63,10 @@ func newHealthServer(addr string, pool *pgxpool.Pool, broker queue.Broker, log *
 		}
 		writeHealth(w, log, status, map[string]any{"status": state, "components": components})
 	})
+
+	if m != nil {
+		mux.Handle("GET /metrics", m.Handler())
+	}
 
 	return &http.Server{
 		Addr:              addr,

@@ -23,6 +23,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/scheduler"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
@@ -82,7 +83,13 @@ func run() int {
 		RenotifyAfter: cfg.SchedulerRenotifyAfter,
 	}, log)
 
-	healthServer := newHealthServer(cfg.SchedulerAddr, pool, log)
+	m := metrics.New("taskforge-scheduler")
+	metrics.NewStateCollector(m, pool, log)
+	engine.WithMetrics(m)
+
+	healthServer := newHealthServer(cfg.SchedulerAddr, log, m,
+		healthCheck{"postgres", func(ctx context.Context) error { return database.Ping(ctx, pool) }},
+	)
 	go func() {
 		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("health server failed", slog.String("error", err.Error()))
