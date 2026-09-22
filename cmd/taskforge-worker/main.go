@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/config"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/objectstore"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
@@ -129,7 +130,26 @@ func run() int {
 		ResultsBucket:              shared.ResultsBucket,
 	}, log)
 
-	healthServer := newHealthServer(workerConfig.HealthAddr, runner, control, broker, log)
+	m := metrics.New("taskforge-worker")
+	runner.WithMetrics(m)
+
+	// The object store joins readiness here, which it did not before M6C. M5C
+	// made this process depend on it -- a large result is uploaded before the
+	// attempt reports success -- so a worker that cannot reach it is not ready
+	// to take work, even though every other dependency is fine.
+	healthServer := newHealthServer(workerConfig.HealthAddr, log, m,
+		healthCheck{"session", func(context.Context) error {
+			if !runner.Ready() {
+				return errors.New("no current worker session")
+			}
+			return nil
+		}},
+		healthCheck{"control_plane", control.Ping},
+		healthCheck{"broker", broker.Ping},
+		healthCheck{"objectstore", func(ctx context.Context) error {
+			return objects.Ping(ctx, shared.ResultsBucket)
+		}},
+	)
 	listener, err := net.Listen("tcp", workerConfig.HealthAddr)
 	if err != nil {
 		log.Error("bind worker health server", slog.String("error", err.Error()))

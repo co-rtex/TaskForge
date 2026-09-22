@@ -18,6 +18,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/outbox"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
@@ -98,7 +99,14 @@ func run() int {
 		},
 	}, log, rand.New(rand.NewSource(time.Now().UnixNano())))
 
-	healthServer := newHealthServer(cfg.OutboxAddr, pool, broker, log)
+	m := metrics.New("taskforge-outbox")
+	metrics.NewStateCollector(m, pool, log)
+	publisher.WithMetrics(m)
+
+	healthServer := newHealthServer(cfg.OutboxAddr, log, m,
+		healthCheck{"postgres", func(ctx context.Context) error { return database.Ping(ctx, pool) }},
+		healthCheck{"broker", broker.Ping},
+	)
 	go func() {
 		if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("health server failed", slog.String("error", err.Error()))
