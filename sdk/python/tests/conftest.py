@@ -120,6 +120,87 @@ def dlq_entry_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
+def job_summary_body(**overrides: Any) -> dict[str, Any]:
+    """A JobSummary: every Job field EXCEPT payload."""
+    body: dict[str, Any] = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "queue": "default",
+        "job_type": "demo.echo",
+        "status": "QUEUED",
+        "priority": 50,
+        "max_attempts": 3,
+        "timeout_seconds": 300,
+        "required_capabilities": [],
+        "scheduled_at": None,
+        "available_at": "2026-09-21T10:00:00Z",
+        "cancel_requested_at": None,
+        "replayed_from_job_id": None,
+        "created_at": "2026-09-21T10:00:00Z",
+        "updated_at": "2026-09-21T10:00:00Z",
+    }
+    body.update(overrides)
+    return body
+
+
+def attempt_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "attempt_number": 1,
+        "status": "SUCCEEDED",
+        "worker_id": "55555555-5555-4555-8555-555555555555",
+        "worker_name": "local-worker",
+        "created_at": "2026-09-21T10:00:00Z",
+        "started_at": "2026-09-21T10:00:01Z",
+        "finished_at": "2026-09-21T10:00:02Z",
+        "timeout_at": "2026-09-21T10:05:01Z",
+        "failure_class": None,
+        "error_code": None,
+        "error_message": None,
+        "retry_delay_ms": None,
+        "retry_at": None,
+    }
+    body.update(overrides)
+    return body
+
+
+def worker_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "id": "55555555-5555-4555-8555-555555555555",
+        "name": "local-worker",
+        "status": "HEALTHY",
+        "worker_group": "default",
+        "hostname": "local-worker.local",
+        "concurrency_limit": 4,
+        "capabilities": ["cpu"],
+        "supported_job_types": ["demo.echo"],
+        "registered_at": "2026-09-21T10:00:00Z",
+        "last_heartbeat_at": "2026-09-21T10:00:05Z",
+        "ended_at": None,
+        "heartbeat_age_seconds": 1.25,
+        "active_leases": 0,
+    }
+    body.update(overrides)
+    return body
+
+
+def queue_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "name": "default",
+        "worker_group": "default",
+        "max_concurrency": 100,
+        "depth": {
+            "PENDING": 0,
+            "QUEUED": 2,
+            "LEASED": 0,
+            "RUNNING": 1,
+            "RETRY_WAIT": 0,
+            "CANCEL_REQUESTED": 0,
+        },
+    }
+    body.update(overrides)
+    return body
+
+
 def key_body(**overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "id": "33333333-3333-4333-8333-333333333333",

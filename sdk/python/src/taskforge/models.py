@@ -36,18 +36,29 @@ __all__ = [
     "ApiKeyList",
     "ApiKeyRevoked",
     "ApiKeySummary",
+    "Attempt",
+    "AttemptList",
+    "AttemptStatus",
     "Cancellation",
     "CancellationStatus",
     "DLQEntry",
     "DLQPage",
     "DLQReason",
+    "FailureClass",
     "Job",
+    "JobPage",
     "JobStatus",
+    "JobSummary",
+    "Queue",
+    "QueueList",
     "Replay",
+    "SessionStatus",
+    "Worker",
     "WorkerKeyCreated",
     "WorkerKeyList",
     "WorkerKeyRevoked",
     "WorkerKeySummary",
+    "WorkerPage",
 ]
 
 
@@ -83,6 +94,52 @@ class DLQReason(StrEnum):
 
     PERMANENT_FAILURE = "PERMANENT_FAILURE"
     ATTEMPTS_EXHAUSTED = "ATTEMPTS_EXHAUSTED"
+
+
+class AttemptStatus(StrEnum):
+    """One attempt's lifecycle, which is separate from the job's.
+
+    ``ABANDONED`` is what a crashed worker's attempt becomes. ``TIMED_OUT``
+    is server-authoritative and recorded by reconciliation -- a worker cannot
+    declare its own timeout.
+    """
+
+    LEASED = "LEASED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+    CANCELED = "CANCELED"
+    ABANDONED = "ABANDONED"
+
+
+class FailureClass(StrEnum):
+    """How an attempt ended, in retry-policy terms.
+
+    ``TIMED_OUT``, ``CANCELED`` and ``ABANDONED`` are server-authoritative;
+    ``RETRYABLE`` and ``PERMANENT`` come from a trusted handler.
+    """
+
+    RETRYABLE = "RETRYABLE"
+    PERMANENT = "PERMANENT"
+    TIMED_OUT = "TIMED_OUT"
+    CANCELED = "CANCELED"
+    ABANDONED = "ABANDONED"
+
+
+class SessionStatus(StrEnum):
+    """The server-owned health state of one worker process lifetime.
+
+    ``UNHEALTHY`` is what reconciliation marks a session whose heartbeat went
+    stale -- a crashed process. ``OFFLINE`` is a session a newer boot
+    replaced. ``GET /v1/workers`` lists both.
+    """
+
+    STARTING = "STARTING"
+    HEALTHY = "HEALTHY"
+    DRAINING = "DRAINING"
+    UNHEALTHY = "UNHEALTHY"
+    OFFLINE = "OFFLINE"
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +410,321 @@ class DLQPage:
         return cls(
             entries=tuple(DLQEntry.from_api(entry) for entry in entries),
             next_cursor=_optional_str(obj, "next_cursor"),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobSummary:
+    """One row of a job listing: every :class:`Job` field except ``payload``.
+
+    The omission is deliberate, not an oversight. A list endpoint that
+    returned payloads would let one request pull an unbounded amount of user
+    data, so the server never reads the payload for this route at all. Fetch
+    a single job with :meth:`taskforge.TaskForgeClient.jobs.get` when you
+    need its payload.
+    """
+
+    id: str
+    queue: str
+    job_type: str
+    status: JobStatus
+    priority: int
+    max_attempts: int
+    timeout_seconds: int
+    required_capabilities: Sequence[str]
+    scheduled_at: str | None
+    available_at: str
+    cancel_requested_at: str | None
+    replayed_from_job_id: str | None
+    created_at: str
+    updated_at: str
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "a job summary")
+        capabilities = _require(obj, "required_capabilities", "a job summary")
+        if not isinstance(capabilities, list):
+            raise _unexpected(
+                "a job summary field 'required_capabilities' must be a list", obj
+            )
+        return cls(
+            id=_str(obj, "id", "a job summary"),
+            queue=_str(obj, "queue", "a job summary"),
+            job_type=_str(obj, "job_type", "a job summary"),
+            status=_enum(JobStatus, obj, "status", "a job summary"),
+            priority=_int(obj, "priority", "a job summary"),
+            max_attempts=_int(obj, "max_attempts", "a job summary"),
+            timeout_seconds=_int(obj, "timeout_seconds", "a job summary"),
+            required_capabilities=tuple(str(c) for c in capabilities),
+            scheduled_at=_opt_str(obj, "scheduled_at", "a job summary"),
+            available_at=_str(obj, "available_at", "a job summary"),
+            cancel_requested_at=_opt_str(obj, "cancel_requested_at", "a job summary"),
+            replayed_from_job_id=_opt_str(obj, "replayed_from_job_id", "a job summary"),
+            created_at=_str(obj, "created_at", "a job summary"),
+            updated_at=_str(obj, "updated_at", "a job summary"),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobPage:
+    """One bounded, scope-filtered page of jobs, newest first.
+
+    A full page is not proof more exist; the presence of :attr:`next_cursor`
+    is. The cursor is opaque -- a position, not an authorization.
+
+    **A walk is not a snapshot.** A job's ``created_at`` is its transaction's
+    start time, so a submission that committed after a page was read can
+    carry a timestamp already behind the cursor and will not appear in that
+    walk. Keyset ordering guarantees no job present throughout a walk is
+    duplicated or skipped; it does not guarantee a walk observes a job that
+    became visible during it.
+    """
+
+    jobs: Sequence[JobSummary]
+    next_cursor: str | None
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "a job page")
+        jobs = _require(obj, "jobs", "a job page")
+        if not isinstance(jobs, list):
+            raise _unexpected("a job page field 'jobs' must be a list", obj)
+        return cls(
+            jobs=tuple(JobSummary.from_api(job) for job in jobs),
+            next_cursor=_optional_str(obj, "next_cursor"),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Attempt:
+    """One execution attempt of a job.
+
+    Session identifiers, lease identifiers, and outcome identities are
+    deliberately absent from this endpoint: every worker-control route except
+    registration trusts a session id as authority, so publishing one on a
+    public read would hand out an identifier that surface treats as a
+    credential. :attr:`worker_id` names a logical worker and authorizes
+    nothing.
+    """
+
+    id: str
+    attempt_number: int
+    status: AttemptStatus
+    worker_id: str
+    worker_name: str
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    timeout_at: str | None
+    failure_class: FailureClass | None
+    error_code: str | None
+    error_message: str | None
+    retry_delay_ms: int | None
+    retry_at: str | None
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "an attempt")
+        failure_class = obj.get("failure_class")
+        parsed_class: FailureClass | None = None
+        if failure_class is not None:
+            parsed_class = _enum(FailureClass, obj, "failure_class", "an attempt")
+        retry_delay = obj.get("retry_delay_ms")
+        if retry_delay is not None and (
+            not isinstance(retry_delay, int) or isinstance(retry_delay, bool)
+        ):
+            raise _unexpected(
+                "an attempt field 'retry_delay_ms' must be an integer or null", obj
+            )
+        return cls(
+            id=_str(obj, "id", "an attempt"),
+            attempt_number=_int(obj, "attempt_number", "an attempt"),
+            status=_enum(AttemptStatus, obj, "status", "an attempt"),
+            worker_id=_str(obj, "worker_id", "an attempt"),
+            worker_name=_str(obj, "worker_name", "an attempt"),
+            created_at=_str(obj, "created_at", "an attempt"),
+            started_at=_optional_str(obj, "started_at"),
+            finished_at=_optional_str(obj, "finished_at"),
+            timeout_at=_optional_str(obj, "timeout_at"),
+            failure_class=parsed_class,
+            error_code=_optional_str(obj, "error_code"),
+            error_message=_optional_str(obj, "error_message"),
+            retry_delay_ms=retry_delay,
+            retry_at=_optional_str(obj, "retry_at"),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptList:
+    """A job's full attempt timeline, oldest first.
+
+    Unpaginated: ``max_attempts`` is capped at 100 by the schema, so a
+    timeline is bounded by the job itself rather than by a page size. An
+    empty list is a real job that has never been attempted.
+    """
+
+    attempts: Sequence[Attempt]
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "an attempt list")
+        attempts = _require(obj, "attempts", "an attempt list")
+        if not isinstance(attempts, list):
+            raise _unexpected("an attempt list field 'attempts' must be a list", obj)
+        return cls(
+            attempts=tuple(Attempt.from_api(attempt) for attempt in attempts),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Worker:
+    """A logical worker joined to its most recent process session.
+
+    The session reported is the latest one **whatever its status**, so a
+    crashed worker (``UNHEALTHY``) and a replaced one (``OFFLINE``) both
+    appear.
+    """
+
+    id: str
+    name: str
+    status: SessionStatus
+    worker_group: str
+    hostname: str
+    concurrency_limit: int
+    capabilities: Sequence[str]
+    supported_job_types: Sequence[str]
+    registered_at: str
+    last_heartbeat_at: str
+    ended_at: str | None
+    heartbeat_age_seconds: float
+    active_leases: int
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "a worker")
+        capabilities = _require(obj, "capabilities", "a worker")
+        if not isinstance(capabilities, list):
+            raise _unexpected("a worker field 'capabilities' must be a list", obj)
+        job_types = _require(obj, "supported_job_types", "a worker")
+        if not isinstance(job_types, list):
+            raise _unexpected(
+                "a worker field 'supported_job_types' must be a list", obj
+            )
+        age = _require(obj, "heartbeat_age_seconds", "a worker")
+        if isinstance(age, bool) or not isinstance(age, (int, float)):
+            raise _unexpected(
+                "a worker field 'heartbeat_age_seconds' must be a number", obj
+            )
+        return cls(
+            id=_str(obj, "id", "a worker"),
+            name=_str(obj, "name", "a worker"),
+            status=_enum(SessionStatus, obj, "status", "a worker"),
+            worker_group=_str(obj, "worker_group", "a worker"),
+            hostname=_str(obj, "hostname", "a worker"),
+            concurrency_limit=_int(obj, "concurrency_limit", "a worker"),
+            capabilities=tuple(str(c) for c in capabilities),
+            supported_job_types=tuple(str(j) for j in job_types),
+            registered_at=_str(obj, "registered_at", "a worker"),
+            last_heartbeat_at=_str(obj, "last_heartbeat_at", "a worker"),
+            ended_at=_optional_str(obj, "ended_at"),
+            heartbeat_age_seconds=float(age),
+            active_leases=_int(obj, "active_leases", "a worker"),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPage:
+    """One bounded, scope-filtered page of workers, by name."""
+
+    workers: Sequence[Worker]
+    next_cursor: str | None
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "a worker page")
+        workers = _require(obj, "workers", "a worker page")
+        if not isinstance(workers, list):
+            raise _unexpected("a worker page field 'workers' must be a list", obj)
+        return cls(
+            workers=tuple(Worker.from_api(worker) for worker in workers),
+            next_cursor=_optional_str(obj, "next_cursor"),
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Queue:
+    """One queue and this scope's non-terminal depth in it.
+
+    :attr:`depth` is keyed by :class:`JobStatus` and carries **every**
+    non-terminal status, always, zero-filled. Terminal statuses are absent by
+    design.
+
+    :attr:`max_concurrency` is **queue-wide and shared across scopes**, while
+    :attr:`depth` counts only this credential's jobs. The two are not
+    comparable, and no queue-wide in-flight figure is reported, because that
+    would disclose another scope's load.
+    """
+
+    name: str
+    worker_group: str
+    max_concurrency: int
+    depth: Mapping[JobStatus, int]
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "a queue")
+        raw_depth = _object(_require(obj, "depth", "a queue"), "a queue depth")
+        depth: dict[JobStatus, int] = {}
+        for key, value in raw_depth.items():
+            try:
+                status = JobStatus(key)
+            except ValueError as exc:
+                raise _unexpected(
+                    f"a queue depth names {key!r}, which this SDK version does "
+                    f"not recognize as a job status",
+                    obj,
+                ) from exc
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise _unexpected(f"a queue depth for {key!r} must be an integer", obj)
+            depth[status] = value
+        return cls(
+            name=_str(obj, "name", "a queue"),
+            worker_group=_str(obj, "worker_group", "a queue"),
+            max_concurrency=_int(obj, "max_concurrency", "a queue"),
+            depth=depth,
+            raw=obj,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QueueList:
+    """Every queue, by name. Unpaginated: no API creates a queue."""
+
+    queues: Sequence[Queue]
+    raw: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_api(cls, payload: Any) -> Self:
+        obj = _object(payload, "a queue list")
+        queues = _require(obj, "queues", "a queue list")
+        if not isinstance(queues, list):
+            raise _unexpected("a queue list field 'queues' must be a list", obj)
+        return cls(
+            queues=tuple(Queue.from_api(queue) for queue in queues),
             raw=obj,
         )
 

@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from ._transport import Transport, new_idempotency_key
 from .errors import ConfigurationError
-from .models import Cancellation, Job, Replay
+from .models import AttemptList, Cancellation, Job, JobPage, Replay
 
 __all__ = ["Jobs"]
 
@@ -93,6 +93,69 @@ class Jobs:
         """
         response = self._transport.request("GET", f"/v1/jobs/{_path(job_id)}")
         return Job.from_api(response)
+
+    def list(
+        self,
+        *,
+        status: str | None = None,
+        queue: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> JobPage:
+        """Read one bounded, scope-filtered page of jobs, newest first.
+
+        ``GET /v1/jobs``. Pagination is keyset on ``(created_at DESC, id
+        DESC)``, so a page boundary can neither duplicate nor omit a job.
+
+        Entries are :class:`~taskforge.models.JobSummary`, which carries no
+        ``payload`` -- a list endpoint that returned payloads would let one
+        request pull an unbounded amount of user data. Use :meth:`get` for a
+        single job's payload.
+
+        ``status`` and ``queue`` narrow the listing; a queue that does not
+        exist matches nothing rather than raising. ``limit`` is 1..100, and
+        omitting it applies the server's own default.
+
+        .. warning::
+           A walk is not a snapshot. See
+           :class:`~taskforge.models.JobPage` for exactly what the keyset
+           ordering does and does not guarantee about a job that commits
+           while you are paging.
+
+        :raises RequestRejectedError: with code ``validation_failed`` for an
+            out-of-range limit or an unrecognized status or queue, or
+            ``invalid_cursor`` for a cursor this endpoint did not issue.
+        """
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        if queue is not None:
+            params["queue"] = queue
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = self._transport.request("GET", "/v1/jobs", params=params or None)
+        return JobPage.from_api(response)
+
+    def attempts(self, job_id: str) -> AttemptList:
+        """Read a job's full attempt timeline, oldest first.
+
+        ``GET /v1/jobs/{job_id}/attempts``. Unpaginated: ``max_attempts`` is
+        capped at 100 by the schema, so a timeline is bounded by the job
+        rather than by a page size.
+
+        The timeline includes attempts that never started, attempts a crashed
+        worker left behind (``ABANDONED``), and attempts reconciliation timed
+        out (``TIMED_OUT``) -- the ones that did not work are usually the
+        reason you are reading it.
+
+        :raises NotFoundError: when no such job exists *in this credential's
+            scope*. A malformed id and a job in another scope are
+            indistinguishable by design, exactly as in :meth:`get`.
+        """
+        response = self._transport.request("GET", f"/v1/jobs/{_path(job_id)}/attempts")
+        return AttemptList.from_api(response)
 
     def result(self, job_id: str) -> Any:
         """Read the exact JSON a handler produced for this job.
