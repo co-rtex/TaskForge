@@ -435,7 +435,7 @@ func (s *Store) finalizeAttempt(
 		if err != nil {
 			return OutcomeResult{}, err
 		}
-		if _, err := outbox.InsertWorkAvailableTx(ctx, tx, fence.JobID, state.queue, generation); err != nil {
+		if _, err := outbox.InsertWorkAvailableTx(ctx, tx, fence.JobID, state.queue, generation, nil /* not a continuation of a client request; see InsertWorkAvailableTx */); err != nil {
 			return OutcomeResult{}, fmt.Errorf("record recovery notification: %w", err)
 		}
 		return result, nil

@@ -308,7 +308,7 @@ func (s *Store) Replay(ctx context.Context, scope string, originalJobID uuid.UUI
 
 	// Same transaction as the replacement job and its identity, so a replay can
 	// never be durable without the notification that makes it reachable.
-	if _, err := outbox.InsertWorkAvailableTx(ctx, tx, replacement.ID, replacement.Queue, 1); err != nil {
+	if _, err := outbox.InsertWorkAvailableTx(ctx, tx, replacement.ID, replacement.Queue, 1, nil /* not a continuation of a client request; see InsertWorkAvailableTx */); err != nil {
 		return ReplayResult{}, fmt.Errorf("record replay notification: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
