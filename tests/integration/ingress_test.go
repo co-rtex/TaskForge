@@ -27,6 +27,18 @@ import (
 
 const testScope = "integration-test"
 
+// workerControlForAPI builds the store that serves BOTH the fenced internal
+// worker-control surface and the public GET /v1/workers read, exactly as
+// cmd/taskforge-api wires it. They are separate interfaces on the server so a
+// public read cannot reach a fenced transition, but one control plane backs
+// both -- a test server that wired only one of them would not be the binary.
+func workerControlForAPI() *workers.Store {
+	return workers.NewStore(testPool, workers.StoreConfig{
+		LeaseDuration: 30 * time.Second,
+		RetryPolicy:   integrationRetryPolicy(),
+	})
+}
+
 func newAPI(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := api.NewServer(
@@ -37,10 +49,9 @@ func newAPI(t *testing.T) *httptest.Server {
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, testPool) },
 		},
-	).WithWorkerControl(workers.NewStore(testPool, workers.StoreConfig{
-		LeaseDuration: 30 * time.Second,
-		RetryPolicy:   integrationRetryPolicy(),
-	})).WithAuth(auth.NewStore(testPool)).
+	).WithWorkerControl(workerControlForAPI()).
+		WithWorkerReads(workerControlForAPI()).
+		WithAuth(auth.NewStore(testPool)).
 		WithWorkerAuth(workerauth.NewStore(testPool)).
 		WithResults(results.NewStore(testPool), testObjects)
 	s := httptest.NewServer(srv.Handler())

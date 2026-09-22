@@ -252,14 +252,13 @@ contract; JSON output on stdout for success and on stderr for failure.
 **Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
 evidence.
 
-`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` are listed as
-V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 but are not yet
-implemented anywhere in this API (confirmed against
-[api/openapi.yaml](../api/openapi.yaml)); `taskforge-cli` therefore has no
-`jobs list` / `workers list` / `queues list` command; a CLI command with no
+`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` were listed as
+V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 but were not
+implemented anywhere in this API when M5D shipped, so `taskforge-cli` had no
+`jobs list` / `workers list` / `queues list` command: a CLI command with no
 backend route to call would be exactly the fabricated functionality
-[PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids. These commands land whenever
-those routes do.
+[PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids. **M6A implemented those routes
+and those commands**, closing this gap.
 
 ### M5E — Python SDK
 **Objective.** Make TaskForge usable by an outside Python developer, via a
@@ -288,24 +287,131 @@ variables — not `TASKFORGE_API_ADDR` and not the CLI's pair. A CLI is
 invoked deliberately; an SDK is a library inside someone else's process, so
 ambient credential pickup is a different risk there.
 
-`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` remain
-unimplemented, so the SDK has no `jobs.list()` / `workers.list()` /
-`queues.list()` method, for the same reason `taskforge-cli` has no such
-command.
+`GET /v1/jobs` (list), `GET /v1/workers`, and `GET /v1/queues` were still
+unimplemented when M5E shipped, so the SDK had no `jobs.list()` /
+`workers.list()` / `queues.list()` method, for the same reason `taskforge-cli`
+had no such command. **M6A implemented those routes and those methods**,
+closing this gap.
 
 ---
 
 ## Remaining V1 milestones
 
-### M6 — Observability and health
-**Objective.** Make behavior visible.
-**Deliverables.** OpenTelemetry tracing across the full path; Prometheus metrics with
-bounded label cardinality; real liveness/readiness per service; the operator dashboard
-(Overview, Jobs, Job detail with attempt timeline, Workers, Queues, DLQ).
-**Acceptance.** A submission is traceable end to end; no unbounded metric labels; the
-dashboard reads live APIs and handles loading, empty, and error states; nothing is
-hardcoded.
+## M6 — Observability and health
+
+M6 as originally written bundles four independently testable systems across
+three technical domains: OpenTelemetry tracing, Prometheus metrics,
+liveness/readiness per service, and a full operator dashboard — the last of
+which is a frontend in a language this repository has never contained, and
+which cannot read live data at all until four public routes exist that do not.
+It is split below the same way M5 was split into M5A–M5E: each slice ships on
+its own evidence, in the order that makes the earlier ones useful to the later
+ones. The objective and acceptance criteria of the original M6 are preserved
+across M6A–M6D, not reduced.
+
+Its acceptance sentence already separates by clause — "a submission is
+traceable end to end" is a fact about tracing alone, "no unbounded metric
+labels" about metrics alone, and "the dashboard reads live APIs ... nothing is
+hardcoded" about a dashboard that has live APIs to read. That last clause is
+what forces the first slice.
+
+One correction the split records rather than inherits. M6's original
+deliverable list says "real liveness/readiness per service", but every
+long-running service has exposed a distinct `GET /healthz` and `GET /readyz`
+pair since M1–M4 — see [ARCHITECTURE.md](ARCHITECTURE.md) §14, which is marked
+`[PARTIAL]` for exactly this reason and states that tracing and metrics are the
+parts that remain. The deliverable as written was stale. What is genuinely
+outstanding is narrower and moves to M6C: the four non-API health servers have
+no test coverage at all, and `taskforge-worker`'s readiness does not check the
+object store M5C made it depend on.
+
+### M6A — Operator read APIs
+**Objective.** Make job state, attempt history, worker capacity and health, and
+queue depth readable through the authenticated public API, the CLI, and the
+Python SDK.
+**Deliverables.** `GET /v1/jobs` (keyset-paginated, scope-filtered, no
+payloads); `GET /v1/jobs/{job_id}/attempts` (the full attempt timeline,
+unpaginated); `GET /v1/workers` (each worker joined to its most recent session
+whatever its status); `GET /v1/queues` (non-terminal depth per status);
+migration 0017's index set; `taskforge-cli jobs list` / `jobs attempts` /
+`workers list` / `queues list`; and the SDK's `jobs.list()`,
+`jobs.attempts()`, `workers.list()` and `queues.list()`.
+**Acceptance.** Every read is scope-isolated; keyset pagination neither
+duplicates nor omits a job present throughout a walk; list responses carry no
+payload and no session, lease, or outcome identifier; queue depth matches a
+direct count and excludes terminal statuses; a crashed or replaced worker is
+still listed.
 **Depends on.** M5E.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence.
+
+This slice is a genuine prerequisite rather than part of "the dashboard", and
+is named as one. `GET /v1/jobs`, `GET /v1/workers` and `GET /v1/queues` are
+V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 that M5D and M5E each
+deferred with the same sentence — "these commands land whenever those routes
+do" — and the dashboard's own acceptance clause ("reads live APIs ... nothing
+is hardcoded") is unsatisfiable without them. A fourth route,
+`GET /v1/jobs/{job_id}/attempts`, is required by M6D's "Job detail with attempt
+timeline" and by [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 item 4; it is a separate
+route rather than an expansion of `GET /v1/jobs/{job_id}`, following the
+precedent M5C set with `GET /v1/jobs/{job_id}/result` and the reason
+`JobResponse` already records in code: reading a job's status must not pull an
+unbounded body along with it.
+
+Two decisions M6A could not avoid are recorded in migration 0017 itself rather
+than as an ADR, because each constrains one query rather than future work.
+`GET /v1/jobs` needs **two** keyset indexes, not one: PostgreSQL 16 has no
+index skip scan, so an index with `status` between the equality column and the
+ordering columns cannot serve the unfiltered listing. And `GET /v1/workers`
+deliberately does **not** use `worker_sessions_one_current_per_worker_idx`,
+whose predicate is `status IN ('STARTING','HEALTHY','DRAINING')`:
+reconciliation marks a crashed worker's session `UNHEALTHY` and a replacement
+registration marks the prior one `OFFLINE`, so a listing built on that index
+would silently omit exactly the workers an operator opened the page to find.
+
+### M6B — OpenTelemetry tracing — **planned**
+**Objective.** One trace id follows a submission from the API through the
+PostgreSQL transaction, across the process boundary into `taskforge-outbox`,
+through the broker message, into the claim, and onto worker execution.
+**Acceptance.** A submission is traceable end to end.
+**Depends on.** M6A, so a complete route surface is instrumented once.
+
+Note for whoever picks this up: [ARCHITECTURE.md](ARCHITECTURE.md) §3 is marked
+`[IMPLEMENTED]` and states that a broker message carries "trace metadata". It
+does not — `outbox.Envelope` has five members and no trace field, and
+`outbox_events` has no trace column. Correcting that claim is part of this
+slice, and the trace context has to be persisted in the same transaction as the
+event, because the publisher is a separate process that runs later.
+
+### M6C — Prometheus metrics and the health residual — **planned**
+**Objective.** Expose the metric set [ARCHITECTURE.md](ARCHITECTURE.md) §14
+specifies, with an enforcement mechanism a reviewer can run rather than trust.
+**Acceptance.** No unbounded metric labels.
+**Depends on.** M6A. Independent of M6B.
+
+`job_type` is the one caller-reachable cardinality hole: `jobs.job_type` has no
+foreign key and no allowlist, only the regex `^[a-z0-9][a-z0-9._-]{0,127}$`, so
+an authenticated caller can mint a new label value per submission. `queue` is
+FK-constrained and safe; `scope` is bounded but is a tenancy identifier on an
+unauthenticated `/metrics`. This slice also carries the health residual
+described above.
+
+### M6D — Operator dashboard — **planned**
+**Objective.** Overview, Jobs, Job detail with attempt timeline, Workers,
+Queues, and DLQ, reading only M6A's live routes.
+**Acceptance.** The dashboard reads live APIs and handles loading, empty, and
+error states; nothing is hardcoded.
+**Depends on.** M6A for data; M6B and M6C for anything it links to.
+
+A frontend toolchain is a first for this repository in the way Python was for
+M5E, and deserves the same treatment [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md)
+gave that one: dependency and build tooling, a lint/format story, and CI
+placement each decided and recorded, not left as an implicit side effect of
+"build the dashboard". The binding constraint is
+[PROJECT_SPEC.md](PROJECT_SPEC.md) §5's prerequisite list, which ADR-0016 could
+discharge for Python by noting that running TaskForge never needs an
+interpreter — an escape that does not exist for a dashboard that is part of the
+running stack.
 
 ### M7 — Full concurrency, restart, failure, and race suites
 **Objective.** Prove the invariants.
@@ -317,7 +423,7 @@ exhaustion; process-restart durability; stranded-notification recovery. Plus
 `make demo` and `make demo-failure`.
 **Acceptance.** Every invariant in [ARCHITECTURE.md](ARCHITECTURE.md) §12 has a test
 that asserts durable state; the race detector is clean.
-**Depends on.** M6.
+**Depends on.** M6 (M6A complete; M6B-M6D planned).
 
 ### M8 — Load generator, measured benchmarks, CI hardening, ECS Terraform
 **Objective.** Measure reality and make deployment credible.

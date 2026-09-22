@@ -44,9 +44,12 @@ type Server struct {
 	workerKeys WorkerKeys
 	results    Results
 	objects    ObjectStore
-	cfg        Config
-	log        *slog.Logger
-	checks     []ReadinessCheck
+	// workerReads serves GET /v1/workers. Separate from control, which gates
+	// the fenced internal surface -- see WithWorkerReads.
+	workerReads WorkerReads
+	cfg         Config
+	log         *slog.Logger
+	checks      []ReadinessCheck
 }
 
 // Results reads a job's recorded result. See internal/results.Store.
@@ -140,7 +143,9 @@ func (s *Server) Handler() http.Handler {
 	// inside a middleware that would drift from the mux. Adding a public route
 	// without the wrapper is a visible omission on this screen.
 	mux.HandleFunc("POST /v1/jobs", s.requireAPIKey(s.handleSubmitJob))
+	mux.HandleFunc("GET /v1/jobs", s.requireAPIKey(s.handleListJobs))
 	mux.HandleFunc("GET /v1/jobs/{job_id}", s.requireAPIKey(s.handleGetJob))
+	mux.HandleFunc("GET /v1/jobs/{job_id}/attempts", s.requireAPIKey(s.handleListJobAttempts))
 	mux.HandleFunc("GET /v1/jobs/{job_id}/result", s.requireAPIKey(s.handleGetJobResult))
 	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.requireAPIKey(s.handleCancelJob))
 	// Operator retry IS DLQ replay: same service, same idempotency namespace. Two
@@ -149,6 +154,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{job_id}/retry", s.requireAPIKey(s.handleReplayJob))
 	mux.HandleFunc("GET /v1/dlq", s.requireAPIKey(s.handleListDLQ))
 	mux.HandleFunc("POST /v1/dlq/{job_id}/replay", s.requireAPIKey(s.handleReplayJob))
+	// The operator read surface (M6A). PROJECT_SPEC.md section 4 items 4 and 7
+	// name these; the dashboard, the CLI, and the SDK are all consumers of
+	// exactly these four routes and nothing else.
+	mux.HandleFunc("GET /v1/workers", s.requireAPIKey(s.handleListWorkers))
+	mux.HandleFunc("GET /v1/queues", s.requireAPIKey(s.handleListQueues))
 	// Health probes stay unauthenticated. They reveal nothing tenant-specific,
 	// and a liveness probe that needed a credential would report a healthy
 	// process as dead the moment that credential was revoked.
@@ -186,13 +196,16 @@ func (s *Server) Handler() http.Handler {
 	// the real ones reclaims those cases: a pattern that names a method is more
 	// specific, so it still wins for that method, and everything else falls
 	// through to here.
-	mux.HandleFunc("/v1/jobs", s.methodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/v1/jobs", s.methodNotAllowed(http.MethodGet, http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}", s.methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/v1/jobs/{job_id}/attempts", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/v1/jobs/{job_id}/result", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/v1/jobs/{job_id}/cancel", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/jobs/{job_id}/retry", s.methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/v1/dlq", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/v1/dlq/{job_id}/replay", s.methodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/v1/workers", s.methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/v1/queues", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/healthz", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
 	if s.keys != nil {

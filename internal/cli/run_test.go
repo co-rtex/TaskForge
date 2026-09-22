@@ -53,9 +53,13 @@ func TestCommands_HappyPaths(t *testing.T) {
 	}{
 		{"jobs submit", []string{"jobs", "submit", "--queue", "default", "--job-type", "demo.echo", "--payload", `{"message":"hi"}`}, jobSuccess},
 		{"jobs get", []string{"jobs", "get", "job-1"}, readSuccess},
+		{"jobs list", []string{"jobs", "list"}, readSuccess},
+		{"jobs attempts", []string{"jobs", "attempts", "job-1"}, readSuccess},
 		{"jobs result", []string{"jobs", "result", "job-1"}, readSuccess},
 		{"jobs cancel", []string{"jobs", "cancel", "job-1"}, readSuccess},
 		{"jobs retry", []string{"jobs", "retry", "job-1"}, jobSuccess},
+		{"workers list", []string{"workers", "list"}, readSuccess},
+		{"queues list", []string{"queues", "list"}, readSuccess},
 		{"dlq list", []string{"dlq", "list"}, readSuccess},
 		{"dlq replay", []string{"dlq", "replay", "job-1"}, jobSuccess},
 		{"api-keys create", []string{"api-keys", "create", "--scope", "s", "--name", "n"}, map[int]bool{201: true}},
@@ -157,9 +161,85 @@ func TestCmdDLQList_PassesLimitAndCursor(t *testing.T) {
 	require.Equal(t, "/v1/dlq?cursor=abc&limit=5", server.lastPath)
 }
 
+// The read routes must build exactly the query string api/openapi.yaml
+// documents -- an omitted flag sends no parameter at all, so the server
+// applies its own documented default rather than one this CLI invented.
+func TestCmdJobsList_BuildsTheDocumentedQueryString(t *testing.T) {
+	t.Run("all filters", func(t *testing.T) {
+		server := newRecordingServer(t, http.StatusOK, `{"jobs":[]}`)
+		code, _, stderr := run(t, server.Server, "jobs", "list",
+			"--status", "QUEUED", "--queue", "default", "--limit", "5", "--cursor", "abc")
+		require.Equal(t, ExitSuccess, code, "stderr: %s", stderr)
+		require.Equal(t, "/v1/jobs?cursor=abc&limit=5&queue=default&status=QUEUED", server.lastPath)
+		require.Equal(t, http.MethodGet, server.lastMethod)
+	})
+
+	t.Run("no filters sends no parameters", func(t *testing.T) {
+		server := newRecordingServer(t, http.StatusOK, `{"jobs":[]}`)
+		code, _, stderr := run(t, server.Server, "jobs", "list")
+		require.Equal(t, ExitSuccess, code, "stderr: %s", stderr)
+		require.Equal(t, "/v1/jobs", server.lastPath,
+			"an omitted flag must not become an empty parameter the server then has to interpret")
+	})
+}
+
+func TestCmdWorkersList_PassesLimitAndCursor(t *testing.T) {
+	server := newRecordingServer(t, http.StatusOK, `{"workers":[]}`)
+	code, _, stderr := run(t, server.Server, "workers", "list", "--limit", "5", "--cursor", "abc")
+	require.Equal(t, ExitSuccess, code, "stderr: %s", stderr)
+	require.Equal(t, "/v1/workers?cursor=abc&limit=5", server.lastPath)
+}
+
+// The two unpaginated routes take no limit or cursor, and must not invent
+// one. A flag this CLI does not define is a usage error, not a silently
+// ignored argument.
+func TestUnpaginatedReads_TakeNoPaginationFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		path string
+	}{
+		{"queues list", []string{"queues", "list"}, "/v1/queues"},
+		{"jobs attempts", []string{"jobs", "attempts", "job-1"}, "/v1/jobs/job-1/attempts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newRecordingServer(t, http.StatusOK, `{}`)
+			code, _, stderr := run(t, server.Server, tc.args...)
+			require.Equal(t, ExitSuccess, code, "stderr: %s", stderr)
+			require.Equal(t, tc.path, server.lastPath, "no query string at all")
+
+			withLimit := append(append([]string{}, tc.args...), "--limit", "5")
+			code, stdout, stderr := run(t, server.Server, withLimit...)
+			require.Equal(t, ExitUsageError, code,
+				"--limit is not a flag on an unpaginated route and must be rejected, not ignored")
+			require.Empty(t, stdout)
+			_ = stderr
+		})
+	}
+}
+
+// A positional argument on a list command is a usage error rather than a
+// silently dropped token -- `taskforge-cli jobs list job-1` almost certainly
+// means the caller wanted `jobs get`.
+func TestListCommands_RejectPositionalArguments(t *testing.T) {
+	server := newRecordingServer(t, http.StatusOK, `{}`)
+	for _, args := range [][]string{
+		{"jobs", "list", "extra"},
+		{"workers", "list", "extra"},
+		{"queues", "list", "extra"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			code, stdout, stderr := run(t, server.Server, args...)
+			require.Equal(t, ExitUsageError, code)
+			require.Empty(t, stdout)
+			require.Contains(t, stderr, "usage_error")
+		})
+	}
+}
+
 func TestRun_MissingJobIDArgument(t *testing.T) {
 	server := newRecordingServer(t, http.StatusOK, `{}`)
-	for _, verb := range []string{"get", "result", "cancel", "retry"} {
+	for _, verb := range []string{"get", "attempts", "result", "cancel", "retry"} {
 		t.Run(verb, func(t *testing.T) {
 			code, stdout, stderr := run(t, server.Server, "jobs", verb)
 			require.Equal(t, ExitUsageError, code)

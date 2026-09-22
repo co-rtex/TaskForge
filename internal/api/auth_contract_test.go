@@ -10,18 +10,28 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 )
 
-// publicOperations is the spec-side view of the same seven routes
+// publicOperations is the spec-side view of the same eleven routes
 // publicRoutes names on the handler side. The two lists existing separately
 // is the point: each is derived from a different source, and this file is
 // where they have to agree.
+//
+// Both lists are maintained BY HAND. Nothing walks the mux and compares it
+// with the document, so adding a route without adding it here leaves it
+// uncovered rather than failing a test. A real completeness gate needs a route
+// registry inside Handler(); it is recorded as follow-up work in
+// docs/CURRENT_STATE.md rather than claimed here.
 var publicOperations = []struct{ method, path string }{
 	{"post", "/v1/jobs"},
+	{"get", "/v1/jobs"},
 	{"get", "/v1/jobs/{job_id}"},
+	{"get", "/v1/jobs/{job_id}/attempts"},
 	{"get", "/v1/jobs/{job_id}/result"},
 	{"post", "/v1/jobs/{job_id}/cancel"},
 	{"post", "/v1/jobs/{job_id}/retry"},
 	{"get", "/v1/dlq"},
 	{"post", "/v1/dlq/{job_id}/replay"},
+	{"get", "/v1/workers"},
+	{"get", "/v1/queues"},
 }
 
 // TestOpenAPI_EveryPublicOperationRequiresAnAPIKey keeps the document from

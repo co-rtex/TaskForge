@@ -37,8 +37,11 @@ trusting that session's identity and a cheap revocation check rather than a
 re-presented credential; inline and object-backed result storage with
 retrieval; and a command-line client (`taskforge-cli`) over the public API
 and the loopback-only credential-management routes; and a typed, installable
-Python SDK (`taskforge-sdk`) over the same surface. The operator dashboard
-remains planned.
+Python SDK (`taskforge-sdk`) over the same surface; and the operator read
+surface — scope-filtered, keyset-paginated job listing, a job's attempt
+timeline, worker capacity and health including crashed and replaced sessions,
+and per-queue non-terminal depth — over the public API, the CLI, and the SDK
+alike. Tracing, metrics, and the operator dashboard remain planned.
 
 ---
 
@@ -877,6 +880,28 @@ reclaimed.
 
 **Planned:** `audit_events`.
 
+M6A adds no table and no column. Migration 0017 is index-only: it creates the
+four indexes the operator read routes justify and drops one the M1 schema
+created for a query that never used it.
+
+`jobs_scope_keyset_idx (scope, created_at DESC, id DESC)` and
+`jobs_scope_status_keyset_idx (scope, status, created_at DESC, id DESC)` are
+two indexes rather than one because PostgreSQL 16 has no index skip scan: with
+`status` between the equality column and the ordering columns, the second
+cannot produce `(created_at DESC, id DESC)` order for a query that does not
+constrain `status`. `jobs_scope_queue_depth_idx (scope, queue, status)` is
+partial on the six non-terminal statuses, so terminal history — which grows
+without bound and is never counted as depth — stays out of it entirely; the
+predicate is fixed SQL text while the Go side derives the same set from
+`Status.Terminal()`, and a test asserts the two agree in both directions.
+`worker_sessions_latest_per_worker_idx (worker_id, registered_at DESC, id DESC)`
+carries **no status predicate**, deliberately: it serves the "latest session
+for this worker" lookup, and restricting it to currently-eligible sessions the
+way `worker_sessions_one_current_per_worker_idx` does would hide exactly the
+crashed (`UNHEALTHY`) and replaced (`OFFLINE`) sessions an operator needs.
+0017 drops `jobs_scope_created_at_idx`, a strict prefix of its replacement that
+no query referenced.
+
 Tables are created in the milestone that puts working behavior on them, not in
 advance. Every index exists because an implemented query orders by exactly its
 columns and filters by exactly its predicate: eligibility and priority scans,
@@ -885,5 +910,9 @@ queue/worker capacity, expiring active leases, stale current-session heartbeats,
 due promotion of `PENDING` and `RETRY_WAIT` jobs, stranded queued
 re-notification, due running-attempt timeouts, a session's executing attempts
 for cancellation delivery, pending work events by job and generation, DLQ
-scope/keyset listing, and replay identity lookup. Indexes for attempt history
-and dashboard queries arrive only with the queries that justify them.
+scope/keyset listing, replay identity lookup, the scope-filtered job listing
+with and without a status filter, per-queue non-terminal depth, and the latest
+session per worker. The attempt timeline needed no new index: `job_attempts`
+already carries `UNIQUE (job_id, attempt_number)`, which serves it in its
+natural order. Indexes for the dashboard's own queries arrive only with the
+queries that justify them.

@@ -78,6 +78,17 @@ func run() int {
 		return 1
 	}
 
+	// One store serves both the fenced internal worker-control surface and the
+	// authenticated public GET /v1/workers read. They are separate interfaces
+	// on the server (WorkerControl, WorkerReads) so a public read cannot reach
+	// a fenced transition, but there is only ever one control plane behind
+	// them.
+	workerStore := workers.NewStore(pool, workers.StoreConfig{
+		LeaseDuration: cfg.LeaseDuration,
+		RetryPolicy:   cfg.RetryPolicy(),
+		Jitter:        jitter,
+	})
+
 	server := api.NewServer(
 		jobs.NewStore(pool),
 		api.Config{
@@ -89,11 +100,9 @@ func run() int {
 			Name:  "postgres",
 			Check: func(ctx context.Context) error { return database.Ping(ctx, pool) },
 		},
-	).WithWorkerControl(workers.NewStore(pool, workers.StoreConfig{
-		LeaseDuration: cfg.LeaseDuration,
-		RetryPolicy:   cfg.RetryPolicy(),
-		Jitter:        jitter,
-	})).WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool)).
+	).WithWorkerControl(workerStore).
+		WithWorkerReads(workerStore).
+		WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool)).
 		WithResults(results.NewStore(pool), objects)
 
 	httpServer := &http.Server{

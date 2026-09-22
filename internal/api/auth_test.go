@@ -83,12 +83,16 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Disca
 // shows up as a failure here rather than as an open endpoint.
 var publicRoutes = []struct{ method, path string }{
 	{http.MethodPost, "/v1/jobs"},
+	{http.MethodGet, "/v1/jobs"},
 	{http.MethodGet, "/v1/jobs/" + "11111111-1111-1111-1111-111111111111"},
+	{http.MethodGet, "/v1/jobs/11111111-1111-1111-1111-111111111111/attempts"},
 	{http.MethodGet, "/v1/jobs/11111111-1111-1111-1111-111111111111/result"},
 	{http.MethodPost, "/v1/jobs/11111111-1111-1111-1111-111111111111/cancel"},
 	{http.MethodPost, "/v1/jobs/11111111-1111-1111-1111-111111111111/retry"},
 	{http.MethodGet, "/v1/dlq"},
 	{http.MethodPost, "/v1/dlq/11111111-1111-1111-1111-111111111111/replay"},
+	{http.MethodGet, "/v1/workers"},
+	{http.MethodGet, "/v1/queues"},
 }
 
 // TestAuth_EveryPublicRouteRefusesAnUnauthenticatedRequest is the load-bearing

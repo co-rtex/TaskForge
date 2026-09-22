@@ -10,7 +10,9 @@ import httpx
 from ._dlq import DLQ
 from ._jobs import Jobs
 from ._keys import ApiKeys, WorkerKeys
+from ._queues import Queues
 from ._transport import DEFAULT_TIMEOUT_SECONDS, Transport
+from ._workers import Workers
 from .config import resolve_api_key, resolve_base_url
 
 __all__ = ["TaskForgeClient"]
@@ -48,11 +50,16 @@ class TaskForgeClient:
     caller who knows whether repeating a given call is safe -- the same
     decision ``taskforge-cli`` makes.
 
-    Not available yet, because the routes do not exist: listing jobs,
-    workers, or queues. ``GET /v1/jobs``, ``GET /v1/workers`` and
-    ``GET /v1/queues`` are V1 targets in ``docs/PROJECT_SPEC.md`` section 4
-    but are not implemented in this API. A method with no route to call
-    would be fabricated functionality, so these arrive when the routes do.
+    As of M6A the operator read surface is available: ``jobs.list()``,
+    ``jobs.attempts()``, ``workers.list()`` and ``queues.list()``, which
+    complete the public ``/v1`` routes ``docs/PROJECT_SPEC.md`` section 4
+    lists.
+
+    There are deliberately no cursor-following iterator helpers on those
+    listings beyond :meth:`taskforge.TaskForgeClient.dlq.iter_entries`. A
+    helper that silently walked every page would turn one documented request
+    into an arbitrary number of them; the cursor is documented and a caller
+    who wants every page can loop on it.
     """
 
     def __init__(
@@ -90,6 +97,10 @@ class TaskForgeClient:
         self.jobs = Jobs(self._transport)
         #: The logical dead-letter queue and replay.
         self.dlq = DLQ(self._transport)
+        #: Read-only worker capacity and health.
+        self.workers = Workers(self._transport)
+        #: Queue configuration and this scope's non-terminal depth.
+        self.queues = Queues(self._transport)
         #: Credentials for the public routes (loopback-only surface).
         self.api_keys = ApiKeys(self._transport)
         #: Credentials that register worker sessions (loopback-only surface).

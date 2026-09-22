@@ -32,9 +32,13 @@ Resources and verbs:
                  [--timeout-seconds] [--scheduled-at] [--capability]...
                  [--idempotency-key]
   jobs get       <job_id>
+  jobs list      [--status] [--queue] [--limit] [--cursor]
+  jobs attempts  <job_id>
   jobs result    <job_id>
   jobs cancel    <job_id>
   jobs retry     <job_id> [--idempotency-key]
+  workers list   [--limit] [--cursor]
+  queues list
   dlq list       [--limit] [--cursor]
   dlq replay     <job_id> [--idempotency-key]
   api-keys create   --scope --name
@@ -55,11 +59,16 @@ is stable and documented in internal/cli/exitcode.go and README.md.
 type command func(ctx context.Context, client *Client, args []string, stdout, stderr io.Writer) int
 
 var commands = map[string]command{
-	"jobs submit": cmdJobsSubmit,
-	"jobs get":    cmdJobsGet,
-	"jobs result": cmdJobsResult,
-	"jobs cancel": cmdJobsCancel,
-	"jobs retry":  cmdJobsRetry,
+	"jobs submit":   cmdJobsSubmit,
+	"jobs get":      cmdJobsGet,
+	"jobs list":     cmdJobsList,
+	"jobs attempts": cmdJobsAttempts,
+	"jobs result":   cmdJobsResult,
+	"jobs cancel":   cmdJobsCancel,
+	"jobs retry":    cmdJobsRetry,
+
+	"workers list": cmdWorkersList,
+	"queues list":  cmdQueuesList,
 
 	"dlq list":   cmdDLQList,
 	"dlq replay": cmdDLQReplay,

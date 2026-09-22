@@ -122,6 +122,80 @@ func cmdJobsRetry(ctx context.Context, c *Client, args []string, stdout, stderr 
 	return emit(resp, jobSuccess, stdout, stderr)
 }
 
+// cmdJobsList runs `jobs list`. The page is bounded by the server; this
+// command deliberately does NOT follow next_cursor itself. A CLI that
+// silently paged an unbounded listing would turn one documented request
+// into an arbitrary number of them, and a script that wants every page can
+// loop on the cursor it is handed.
+func cmdJobsList(ctx context.Context, c *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("jobs list", flag.ContinueOnError)
+	status := fs.String("status", "", "only jobs in this state (server-validated)")
+	queue := fs.String("queue", "", "only jobs in this queue")
+	limit := fs.Int("limit", 0, "page size, 1-100 (server default applies if omitted)")
+	cursor := fs.String("cursor", "", "next_cursor from a previous page")
+	if ok, code := parseFlags(fs, stderr, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageErrorf(stderr, "jobs list takes no positional arguments")
+	}
+	resp, err := c.ListJobs(ctx, *status, *queue, *limit, *cursor)
+	if err != nil {
+		return transportResult(err, stderr)
+	}
+	return emit(resp, readSuccess, stdout, stderr)
+}
+
+// cmdJobsAttempts runs `jobs attempts`. Unpaginated, like the route.
+func cmdJobsAttempts(ctx context.Context, c *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("jobs attempts", flag.ContinueOnError)
+	if ok, code := parseFlags(fs, stderr, args); !ok {
+		return code
+	}
+	if fs.NArg() != 1 {
+		return usageErrorf(stderr, "jobs attempts requires exactly one argument: <job_id>")
+	}
+	resp, err := c.ListJobAttempts(ctx, fs.Arg(0))
+	if err != nil {
+		return transportResult(err, stderr)
+	}
+	return emit(resp, readSuccess, stdout, stderr)
+}
+
+// cmdWorkersList runs `workers list`.
+func cmdWorkersList(ctx context.Context, c *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("workers list", flag.ContinueOnError)
+	limit := fs.Int("limit", 0, "page size, 1-100 (server default applies if omitted)")
+	cursor := fs.String("cursor", "", "next_cursor from a previous page")
+	if ok, code := parseFlags(fs, stderr, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageErrorf(stderr, "workers list takes no positional arguments")
+	}
+	resp, err := c.ListWorkers(ctx, *limit, *cursor)
+	if err != nil {
+		return transportResult(err, stderr)
+	}
+	return emit(resp, readSuccess, stdout, stderr)
+}
+
+// cmdQueuesList runs `queues list`. Unpaginated, like the route.
+func cmdQueuesList(ctx context.Context, c *Client, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("queues list", flag.ContinueOnError)
+	if ok, code := parseFlags(fs, stderr, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		return usageErrorf(stderr, "queues list takes no positional arguments")
+	}
+	resp, err := c.ListQueues(ctx)
+	if err != nil {
+		return transportResult(err, stderr)
+	}
+	return emit(resp, readSuccess, stdout, stderr)
+}
+
 func cmdDLQList(ctx context.Context, c *Client, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dlq list", flag.ContinueOnError)
 	limit := fs.Int("limit", 0, "page size, 1-100 (server default applies if omitted)")

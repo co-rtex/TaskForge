@@ -190,14 +190,25 @@ def test_submit_sends_accept_and_content_type() -> None:
     assert headers["content-type"] == "application/json"
 
 
-def test_no_list_workers_or_queues_methods_exist() -> None:
-    """Those routes are not implemented; a method for them would be fabricated."""
+def test_the_operator_read_surface_is_wired() -> None:
+    """M6A implemented the four routes this test used to assert were absent.
+
+    Through M5E this asserted that ``jobs.list``, ``client.workers`` and
+    ``client.queues`` did NOT exist, because a method with no route to call
+    would be fabricated functionality (PROJECT_SPEC.md section 5). The routes
+    exist now, so the assertion is inverted rather than deleted: the
+    namespaces must be reachable from the client, which is what stops a
+    future refactor from silently dropping one.
+
+    What each method actually does is covered in tests/test_reads.py.
+    """
     harness = build_client(json_response(200, job_body()))
     client = harness.client
 
-    assert not hasattr(client.jobs, "list")
-    assert not hasattr(client, "workers")
-    assert not hasattr(client, "queues")
+    assert callable(client.jobs.list)
+    assert callable(client.jobs.attempts)
+    assert callable(client.workers.list)
+    assert callable(client.queues.list)
 
 
 def test_client_is_a_context_manager() -> None:

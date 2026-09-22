@@ -1,8 +1,8 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M5C are merged into `main`; this document
-records the implemented state through M5E, which is on its own branch and
+planned. Milestones M1 through M5E are merged into `main`; this document
+records the implemented state through M6A, which is on its own branch and
 draft pull request.
 
 ## Milestone status
@@ -16,9 +16,10 @@ draft pull request.
 - **M5C — result storage:** complete.
 - **M5D — CLI:** complete.
 - **M5E — Python SDK:** complete.
+- **M6A — operator read APIs:** complete.
 
-[ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and what each
-one owns, including why the CLI and the Python SDK — bundled under one M5D
+[ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and M6 into
+four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
@@ -1261,6 +1262,148 @@ edits outside `sdk/`, `Makefile` and `.github/` are documentation and
 
 Unchanged. `api/openapi.yaml` stays `0.7.0-m5c`.
 
+## M6A — operator read APIs
+
+### What changed
+
+Four authenticated public reads, the indexes that justify them, and the CLI and
+SDK operations that consume them:
+
+| Route | Shape |
+| --- | --- |
+| `GET /v1/jobs` | keyset page, newest first, filters `status` and `queue` |
+| `GET /v1/jobs/{job_id}/attempts` | the full attempt timeline, oldest first, unpaginated |
+| `GET /v1/workers` | keyset page by name, each worker joined to its latest session |
+| `GET /v1/queues` | every queue with this scope's non-terminal depth per status |
+
+This closes a gap the roadmap recorded twice. M5D and M5E each deferred the
+CLI and SDK list operations with the same sentence — "these commands land
+whenever those routes do" — because a command with no backend route would be
+exactly the fabricated functionality [PROJECT_SPEC.md](PROJECT_SPEC.md) §5
+forbids. The routes exist now, so the commands and methods do.
+
+### Three things these responses deliberately do not carry
+
+**No payloads.** A list endpoint that returned payloads would let one request
+pull an unbounded amount of user data — the rule `DLQEntry` already stated. The
+payload is not merely dropped after the scan; it is never selected out of
+PostgreSQL for the listing at all, so a page of large payloads costs nothing
+between the API and the database either. `GET /v1/jobs/{job_id}` still returns
+it, one job at a time.
+
+**No session, lease, or outcome identifiers.** Every worker-control route
+except registration is unauthenticated and trusts the session identity its
+request already carries (ADR-0014). Publishing a `worker_session_id` on an
+authenticated public read would hand a caller an identifier that surface
+treats as authority. `worker_id` is published: it names a logical worker,
+matches what `GET /v1/workers` reports, and authorizes nothing.
+
+**No queue-wide in-flight figure.** `queues.max_concurrency` is shared by every
+scope while `depth` counts only the caller's own jobs, so the two are not
+comparable and no ratio or combined total of them is reported — that would
+disclose another scope's load.
+
+### `GET /v1/workers` reports the latest session, not the current one
+
+This is the design decision most easily gotten wrong, so it is stated plainly.
+`worker_sessions_one_current_per_worker_idx` (migration 0002) covers only
+`status IN ('STARTING','HEALTHY','DRAINING')`. Reconciliation moves a stale
+session to `UNHEALTHY` (`internal/workers/reconcile.go`) and a replacement
+registration moves the prior one to `OFFLINE` (`internal/workers/store.go`).
+A listing built on that index would therefore omit precisely the workers an
+operator opened the page to find: the one that just crashed and the one that
+was replaced.
+
+The implemented query instead takes the latest session per worker with a
+`LATERAL` ordered by `(registered_at DESC, id DESC)` and **no status
+predicate**, served by the new `worker_sessions_latest_per_worker_idx`. The
+inner join cannot drop a worker, because registration writes the `workers` row
+and its first session in one transaction.
+
+`heartbeat_age_seconds` is computed by PostgreSQL and floored at zero. The
+endpoint reports it and deliberately does not judge it: the staleness threshold
+that decides whether a worker is dead lives in the reconciler's configuration,
+and an API carrying its own copy would eventually disagree with the component
+that acts on it.
+
+### Pagination, and what it does not promise
+
+Keyset on `(created_at DESC, id DESC)` for jobs and on `name` for workers, with
+`LIMIT n+1` so the presence of a next page is a fact rather than a guess. The
+cursor is opaque — a position, not an authorization — and a cursor minted by
+one scope's walk presented by another returns only the second caller's own
+rows.
+
+One property is deliberately **not** promised, and is tested rather than merely
+documented. `jobs.created_at` defaults to `now()`, which in PostgreSQL is
+transaction-start time, so a submission that began before a page was read and
+committed after it carries a timestamp already behind the cursor. That job is
+not returned by the walk in progress and is returned by a fresh listing. What
+keyset ordering guarantees is that no job present throughout a walk is
+duplicated or skipped; it does not guarantee that a walk observes a job that
+became visible during it.
+`TestReadAPI_ConcurrentInsertsNeverDuplicateOrReorder` asserts both halves.
+
+### Migration 0017
+
+Index-only: no table, no column, no row changed.
+
+- `jobs_scope_keyset_idx (scope, created_at DESC, id DESC)` — the unfiltered
+  and queue-filtered listing.
+- `jobs_scope_status_keyset_idx (scope, status, created_at DESC, id DESC)` —
+  the status-filtered listing.
+- `jobs_scope_queue_depth_idx (scope, queue, status)` partial on the six
+  non-terminal statuses — queue depth.
+- `worker_sessions_latest_per_worker_idx (worker_id, registered_at DESC, id DESC)`
+  — the `LATERAL` above.
+- `DROP INDEX jobs_scope_created_at_idx` — superseded.
+
+**Why two job indexes rather than one.** PostgreSQL 16 has no index skip scan,
+so `(scope, status, created_at DESC, id DESC)` cannot serve a query that does
+not constrain `status`: with `status` between the equality column and the
+ordering columns, the planner must scan every status and sort. Measured rather
+than assumed — see the `EXPLAIN` evidence under "M6A coverage".
+
+**Why the dropped index is safe.** `jobs_scope_created_at_idx
+(scope, created_at DESC)` is a strict prefix of its replacement and was
+referenced nowhere but its own creating migration;
+`GET /v1/jobs/{job_id}` filters `id = $1 AND scope = $2` and is served by the
+primary key. Keeping it would have left an index no query justifies
+([AGENTS.md](../AGENTS.md) §6).
+
+The attempts read needed **no** new index: `job_attempts` already carries
+`UNIQUE (job_id, attempt_number)` from migration 0002, which serves the
+timeline query in its natural order. That is recorded in the migration
+alongside the indexes it does create, because "this query needs no index"
+deserves the same evidence as the converse.
+
+`jobs_scope_queue_depth_idx`'s partial predicate is fixed SQL text while
+`jobs.NonTerminalStatuses()` is derived at runtime from `Status.Terminal()`.
+`TestMigrations_M6ADepthPredicateMatchesTheDerivedStatusSet` asserts the two
+name exactly the same statuses in both directions, so a tenth job status cannot
+leave the predicate stale and silently turn the depth query into a full scan.
+
+### Breaking change
+
+None. Four routes were added, one index was replaced by a superset, and no
+existing response shape, status code, or error code changed. `GET /v1/jobs` now
+accepts `GET` as well as `POST`, so a request with neither verb answers `405`
+with `Allow: GET, POST` rather than `Allow: POST`.
+
+### API surface and contract
+
+`api/openapi.yaml` is version `0.8.0-m6a` and documents all four operations
+under `ApiKeyAuth` with the standard 401 and 503 responses. **No new error code
+was added**: the four routes answer only `validation_failed`, `invalid_cursor`,
+`unauthorized`, `not_found`, `internal_error` and `service_unavailable`, every
+one of which was already reachable, so `internal/cli`'s `apiErrorExitCodes`
+table is unchanged.
+
+A cursor this API did not issue answers **422 `invalid_cursor`**, not 400 —
+`writeFieldError` returns `StatusUnprocessableEntity`, the CLI maps
+`invalid_cursor` to `ExitRequestRejected` (2), and the SDK raises
+`RequestRejectedError`.
+
 ## Verification
 
 ### M5A gates
@@ -1843,6 +1986,118 @@ Recorded as risks, not worked around silently.
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
 
+### M6A gates
+
+All run locally on this branch. PostgreSQL 16, ElasticMQ, and LocalStack from
+`make up`; Go 1.27; Python 3.13 in `sdk/python/.venv`.
+
+| Command | Result |
+| --- | --- |
+| `make lint` | PASS — `gofmt` clean, `go vet ./...` silent |
+| `make build` | PASS — seven binaries into `./bin` |
+| `make test-unit` | PASS — every package `ok` |
+| `make migrate` | PASS — `migration applied version=17 name=0017_operator_read_indexes.sql`, `migrations complete applied=1` |
+| `make test-integration` | PASS — three consecutive runs: `ok ... 125.863s`, `120.056s`, `116.461s` |
+| `make test-race` | PASS — three consecutive runs: `ok ... 80.991s`, `78.490s`, `120.954s` |
+| `make sdk-lint` | PASS — `ruff format --check` 22 files, `ruff check` all passed, `mypy` success in 21 source files |
+| `make sdk-test` | PASS — 178 passed |
+| `docker compose config --quiet` | PASS — no output |
+
+### M6A coverage
+
+**New Go unit tests.** `internal/jobs/list_test.go` covers the cursor codec
+(round trip, UTC normalization, and every malformed shape it must refuse), the
+page-size clamp, filter validation including the deliberate choice that a
+nonexistent queue is not an invalid filter, and that `NonTerminalStatuses()` is
+exactly the complement of `Status.Terminal()`. `internal/workers/list_test.go`
+covers the worker cursor and pins that `UNHEALTHY` and `OFFLINE` lie outside
+the current-only index's predicate. `internal/api/read_handlers_test.go`
+covers validation ordering, the 422 codes, the 404 anti-oracle on the attempts
+route, the sanitized 500 for an unwired store, and — asserted on serialized
+JSON rather than on Go structs — that a job summary carries no `payload` key,
+that an attempt carries no session/lease/outcome identifier, that queue depth
+is zero-filled and excludes terminal statuses, and that an empty page omits
+`next_cursor` entirely.
+
+**New integration tests.** `tests/integration/read_api_test.go` (17 top-level
+tests) and `tests/integration/migrations_m6a_test.go` (4). Scope isolation is
+asserted for all three listings with two live credentials and durable row
+counts proving both tenants have data. Keyset pagination is exercised with
+every timestamp collapsed onto one instant so the id is the only tiebreak.
+Worker listing is asserted against a fixture containing one healthy, one
+reconciliation-marked `UNHEALTHY`, and one registration-replaced `OFFLINE`
+session. Queue depth is compared against a direct `SELECT count(*)` per
+`(scope, queue, status)` over a fixture spanning all nine statuses with another
+scope's jobs in the same queue.
+
+**Mutation checks.** Each mutation was applied, observed to fail the named
+test, and reverted; both mutated files were then confirmed byte-identical to
+their originals by `shasum -a 256` before proceeding.
+
+| Mutation | Test that caught it | Observed failure |
+| --- | --- | --- |
+| Drop `scope = $1` from `ListJobs` | `TestReadAPI_EveryReadIsScopeFiltered` | saw 5 jobs, expected 2 |
+| Drop the `id` keyset tiebreak | `TestReadAPI_KeysetPaginationHasNoDuplicatesOrOmissions` | 2 of 7 jobs returned |
+| Drop `LIMIT n+1` | `TestReadAPI_NextCursorIsAbsentOnlyOnTheLastPage` | a cursor advertised on a genuinely last page |
+| Join current-only sessions in `ListWorkers` | `TestReadAPI_WorkersIncludeCrashedAndReplacedSessions` | 2 workers listed, expected 3 — the crashed one vanished |
+| Count terminal statuses in queue depth | `TestReadAPI_QueueDepthMatchesDirectCounts` | `SUCCEEDED` present in `depth` |
+
+**Index usage — manual evidence, not a CI guarantee.** Measured once by hand
+against 12,024 seeded jobs across two scopes and three queues, after `ANALYZE`,
+with default planner settings. It is recorded because a reviewer should be able
+to see the indexes are used; it is **not** an automated assertion, because a
+plan over a small test table is a sequential scan regardless of how an index is
+defined. No performance claim is made from these numbers.
+
+| Query | Plan | Buffers |
+| --- | --- | --- |
+| `GET /v1/jobs`, unfiltered | `Index Scan using jobs_scope_keyset_idx` | 4 |
+| `GET /v1/jobs?status=QUEUED` | `Index Scan using jobs_scope_status_keyset_idx` | 8 |
+| `GET /v1/queues` depth | `Index Only Scan using jobs_scope_queue_depth_idx`, `Heap Fetches: 0` | 8 |
+| `GET /v1/workers` | `Index Scan using worker_sessions_latest_per_worker_idx` inside the `LATERAL` | — |
+
+The two-index decision was measured rather than assumed. With
+`jobs_scope_keyset_idx` dropped inside a rolled-back transaction, the
+unfiltered listing does **not** fall back to
+`jobs_scope_status_keyset_idx` — PostgreSQL 16 has no skip scan, so it runs a
+`Seq Scan` over 12,024 rows plus a top-N heapsort, touching 280 buffers instead
+of 4.
+
+One honest limitation in that evidence: the per-worker active-lease subquery
+planned as `Index Scan using leases_active_expiry_idx` with a filter on
+`worker_id` rather than using `leases_active_worker_idx`, because the `leases`
+table was empty in the measured fixture. No new index was added for it, since
+no measurement justifies one yet.
+
+### A flake this milestone introduced and fixed
+
+`make test-race` initially failed intermittently, twice in three full runs, on
+a **different** pre-existing test each time
+(`TestReconcile_NoDeadlockUnderEveryConcurrentOperation`, then
+`TestE2E_DelayedJobIsPromotedAndExecuted`). Neither is touched by M6A, so the
+tempting conclusion was an environment flake.
+
+It was not. The cause was M6A's own
+`TestReadAPI_ConcurrentInsertsNeverDuplicateOrReorder`, whose inserter
+goroutines originally ran an unbounded tight loop for as long as the page walk
+took, saturating the shared pgx pool; under the race detector that starved
+later timing-sensitive tests into failing. Established by elimination rather
+than by inspection: the base commit passed, and the full suite passed twice out
+of two with only that one test skipped.
+
+The fix bounds the load — three inserters with a fixed budget each and a
+one-millisecond yield between commits — which still interleaves commits with
+the walk, which is the property under test. With it, `make test-race` passed
+three consecutive times and `make test-integration` three consecutive times.
+Recorded here rather than quietly fixed, because a test that destabilizes its
+own suite is worth knowing about.
+
+One residual honesty note: during an earlier combined gate sweep,
+`make test-integration` failed once and the failing test name was not captured
+before the next run passed. Six consecutive clean full runs followed (three
+race, three integration), so the suite is stable as it stands, but that single
+failure has no recorded cause and is reported rather than omitted.
+
 ### M4 gates
 
 The M4 tree passed these gates locally on 2026-09-01, against PostgreSQL 16 and
@@ -2203,8 +2458,11 @@ exercised by a real hosted failure.
 
 ## Deliberately not implemented yet
 
-- Result bodies and richer attempt-history APIs are M5C.
-  `GET /v1/jobs/{job_id}` returns lifecycle fields, not attempt history.
+- `GET /v1/jobs/{job_id}` still returns lifecycle fields and not attempt
+  history. That is deliberate and unchanged by M6A: attempt history is served
+  by its own route, `GET /v1/jobs/{job_id}/attempts`, for the reason
+  `JobResponse` records in code and M5C applied to results — reading a job's
+  status must not pull an unbounded body along with it.
 - Worker registration authenticates, but every other worker-control route and
   both key-management surfaces (`/internal/v1/api-keys` and
   `/internal/v1/worker-keys`) remain unauthenticated by design, and every
@@ -2215,25 +2473,35 @@ exercised by a real hosted failure.
   limiting.
 - Key rotation and expiry are not implemented for either credential type. A
   key lives until it is revoked.
-- The operator dashboard is M6. The DLQ has a listing endpoint but no
+- The operator dashboard is M6D. The DLQ has a listing endpoint but no
   filtering beyond scope and no sorting beyond newest-first; operator search
   and bulk replay belong with the dashboard.
+- `README.md` line 35 ("What does not exist yet: the Python SDK and the
+  dashboard") is stale: the SDK shipped in M5E. It is deliberately not edited
+  here, because PR #10 rewrites that file wholesale and an edit in this branch
+  would conflict with the repository owner's own work.
 - The Python SDK is installable from this repository only. Publishing it to
   PyPI is **not planned before M8** — a deliberate scope boundary recorded in
   [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md), not an
   outstanding task. There is also no async client; it is in no milestone and
   was not added speculatively.
-- Neither `taskforge-cli` nor the Python SDK has a `jobs list`, `workers list`,
-  or `queues list` operation, because those three routes are still
-  unimplemented (see the next entry).
-- `taskforge-cli` has no `jobs list`, `workers list`, or `queues list`
-  command: `GET /v1/jobs`, `GET /v1/workers`, and `GET /v1/queues` are listed
-  as V1-target routes in [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 but are not
-  implemented anywhere in this API yet (confirmed against
-  [api/openapi.yaml](../api/openapi.yaml) — no such path exists). A CLI
-  command with no backend route to call would be exactly the fabricated
-  functionality [PROJECT_SPEC.md](PROJECT_SPEC.md) §5 forbids.
-- Metrics and tracing are M6.
+- The operator read surface is no longer missing. `GET /v1/jobs`,
+  `GET /v1/jobs/{job_id}/attempts`, `GET /v1/workers` and `GET /v1/queues`
+  landed in M6A, together with `taskforge-cli jobs list` / `jobs attempts` /
+  `workers list` / `queues list` and the SDK's `jobs.list()`,
+  `jobs.attempts()`, `workers.list()` and `queues.list()`. What remains absent
+  there is narrower and deliberate: no write operation, no search, no sorting
+  beyond keyset order, no cross-scope listing, no lifetime queue totals, and no
+  cursor-following iterator helpers on the SDK's new listings.
+- There is no automated check that the route table and `api/openapi.yaml`
+  describe the same set of routes. `publicRoutes` (in
+  `internal/api/auth_test.go`) and `publicOperations` (in
+  `internal/api/auth_contract_test.go`) are hand-maintained lists derived from
+  two different sources, and they are what makes them agree — but nothing walks
+  the mux, so a route added without being added to both is uncovered rather
+  than failing. A real completeness gate needs a route registry inside
+  `Handler()`; it is a small, separate change and is not claimed here.
+- Metrics are M6C and tracing is M6B.
 - Only `demo.echo` is registered as a production worker handler. Test-only
   handlers are injected through the existing registry seam and add no production
   surface.
@@ -2275,12 +2543,24 @@ repository README.
 
 ## Next objective
 
-M6: observability and health. OpenTelemetry tracing across the full path,
-Prometheus metrics with bounded label cardinality, real liveness and readiness
-per service, and the operator dashboard — the last consumer of the public API
-that [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 item 15 names, now that the CLI
-(M5D) and the Python SDK (M5E) both exist. See [ROADMAP.md](ROADMAP.md)'s M6
-entry.
+M6B: OpenTelemetry tracing across the full path — API submission, the
+PostgreSQL transaction, the outbox, the broker notification, the claim, and
+worker execution, under one trace id. See [ROADMAP.md](ROADMAP.md)'s M6B entry.
+
+Two findings from M6A are load-bearing for it. The trace context must be
+persisted in the same transaction as the outbox event, because
+`taskforge-outbox` is a separate process that publishes later and cannot
+recover the submitting request's context. And
+[ARCHITECTURE.md](ARCHITECTURE.md) §3 is marked `[IMPLEMENTED]` while stating
+that a broker message carries "trace metadata" — it does not:
+`outbox.Envelope` has five members and no trace field, and `outbox_events` has
+no trace column. Correcting that claim belongs to M6B, not to a documentation
+pass.
+
+M6C (metrics, plus the health residual) is independent of M6B and can precede
+it. M6D (the dashboard) depends on M6A for data and needs a frontend-toolchain
+decision recorded the way [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md)
+recorded Python's.
 
 M5E closes the original bundled M5D milestone in full: the CLI half shipped as
 M5D, the SDK half as M5E, and the four Python infrastructure decisions the

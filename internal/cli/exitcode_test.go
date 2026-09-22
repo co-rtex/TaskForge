@@ -68,6 +68,10 @@ func TestExitCodes_OnlySuccessIsZero(t *testing.T) {
 // here. This is the exact set reachable from every route
 // internal/cli/client.go calls, enumerated against api/openapi.yaml by
 // hand for the M5D handoff and re-verified here.
+//
+// M6A's four read routes (GET /v1/jobs, GET /v1/jobs/{job_id}/attempts,
+// GET /v1/workers, GET /v1/queues) added no code to this set: every error
+// they document was already reachable from an existing route.
 func TestApiErrorExitCodes_CoversExactlyTheReachableSet(t *testing.T) {
 	want := []string{
 		"malformed_json",
@@ -258,6 +262,130 @@ func TestRun_FailurePrintsNothingToStdout(t *testing.T) {
 			_, stdout, stderr := runAgainst(t, tc.status, tc.body, []string{"jobs", "get", "job-1"})
 			require.Empty(t, stdout)
 			require.NotEmpty(t, stderr)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M6A read commands: the exit-code contract, per command
+// ---------------------------------------------------------------------------
+
+// m6aReadCommands is every command M6A added. Each one must honor the same
+// exit-code contract the M5D commands do -- a new command that classified a
+// 404 differently would break a script that already branches on 4.
+var m6aReadCommands = map[string][]string{
+	"jobs list":     {"jobs", "list"},
+	"jobs attempts": {"jobs", "attempts", "job-1"},
+	"workers list":  {"workers", "list"},
+	"queues list":   {"queues", "list"},
+}
+
+// 422 invalid_cursor is exit 2. This is the case that matters most: a cursor
+// this API did not issue is 422, NOT 400, and a CLI that expected 400 would
+// fall through to ExitUnexpectedResponse and tell a script the server was the
+// wrong version.
+func TestM6AReads_InvalidCursorIsExitRequestRejected(t *testing.T) {
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runAgainst(t,
+				http.StatusUnprocessableEntity, errorBody("invalid_cursor"), args)
+			require.Equal(t, ExitRequestRejected, code)
+			require.Equal(t, 2, code, "the documented numeric value, not just the constant")
+			require.Empty(t, stdout, "a failure writes nothing to stdout")
+			require.Contains(t, stderr, "invalid_cursor")
+		})
+	}
+}
+
+// 422 validation_failed is the same class: change the input and retry.
+func TestM6AReads_ValidationFailedIsExitRequestRejected(t *testing.T) {
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, _ := runAgainst(t,
+				http.StatusUnprocessableEntity, errorBody("validation_failed"), args)
+			require.Equal(t, 2, code)
+			require.Empty(t, stdout)
+		})
+	}
+}
+
+func TestM6AReads_UnauthorizedIsExitUnauthorized(t *testing.T) {
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runAgainst(t,
+				http.StatusUnauthorized, errorBody("unauthorized"), args)
+			require.Equal(t, ExitUnauthorized, code)
+			require.Equal(t, 3, code)
+			require.Empty(t, stdout)
+			require.Contains(t, stderr, "unauthorized")
+		})
+	}
+}
+
+func TestM6AReads_NotFoundIsExitNotFound(t *testing.T) {
+	// Only the attempts route is addressed by id, so only it can answer 404
+	// for a real caller; the others are covered anyway, because the mapping
+	// must not depend on which command happened to receive the code.
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, _ := runAgainst(t, http.StatusNotFound, errorBody("not_found"), args)
+			require.Equal(t, ExitNotFound, code)
+			require.Equal(t, 4, code)
+			require.Empty(t, stdout)
+		})
+	}
+}
+
+// An API that was never reached is exit 8, distinct from the 503 the API
+// returns about its own deadline. A script retrying a transport failure and a
+// script retrying a server-deadline failure are doing different things.
+func TestM6AReads_UnreachableAPIIsExitTransportError(t *testing.T) {
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			var outBuf, errBuf strings.Builder
+			// A port nothing listens on, on the loopback interface.
+			full := append([]string{"--api-url", "http://127.0.0.1:1"}, args...)
+			code := Run(context.Background(), full, &outBuf, &errBuf)
+			require.Equal(t, ExitTransportError, code)
+			require.Equal(t, 8, code)
+			require.Empty(t, outBuf.String())
+			require.Contains(t, errBuf.String(), "transport_error")
+		})
+	}
+}
+
+// 503 stays distinct from 8: the API WAS reached and reported that its own
+// deadline elapsed. These reads commit nothing, so repeating them is safe --
+// but the exit code alone does not say so, the server's message does.
+func TestM6AReads_ServiceUnavailableIsExitServiceUnavailable(t *testing.T) {
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, _ := runAgainst(t,
+				http.StatusServiceUnavailable, errorBody("service_unavailable"), args)
+			require.Equal(t, ExitServiceUnavailable, code)
+			require.Equal(t, 7, code)
+			require.Empty(t, stdout)
+		})
+	}
+}
+
+// A success writes the server's bytes verbatim to stdout and nothing to
+// stderr -- "output is machine-readable" is the M5D acceptance criterion these
+// commands inherit.
+func TestM6AReads_SuccessWritesServerBytesToStdout(t *testing.T) {
+	bodies := map[string]string{
+		"jobs list":     `{"jobs":[],"next_cursor":"abc"}`,
+		"jobs attempts": `{"attempts":[]}`,
+		"workers list":  `{"workers":[]}`,
+		"queues list":   `{"queues":[]}`,
+	}
+	for name, args := range m6aReadCommands {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runAgainst(t, http.StatusOK, bodies[name], args)
+			require.Equal(t, ExitSuccess, code)
+			require.Equal(t, 0, code)
+			require.JSONEq(t, bodies[name], stdout)
+			require.Empty(t, stderr)
 		})
 	}
 }
