@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -42,6 +43,40 @@ type Reconciler struct {
 	store Store
 	cfg   Config
 	log   *slog.Logger
+	// metrics is optional; nil records nothing and changes no behavior.
+	metrics *metrics.Metrics
+}
+
+// WithMetrics enables instrumentation.
+func (r *Reconciler) WithMetrics(m *metrics.Metrics) *Reconciler {
+	r.metrics = m
+	return r
+}
+
+// repairKinds maps each durable repair reconciliation can commit to its label
+// value. The set is closed and comes from ReconcileStats' own fields, so the
+// `repair` label is bounded by a Go struct rather than by convention.
+//
+// Skipped is deliberately absent: a skipped candidate is one that no longer
+// qualified once its rows were locked, which is reconciliation correctly doing
+// nothing, not a repair.
+func (r *Reconciler) recordRepairs(result Result) {
+	if r.metrics == nil {
+		return
+	}
+	for kind, count := range map[string]int{
+		"stale_session": result.StaleSessions,
+		"expired_lease": result.ExpiredLeases,
+		"timed_out":     result.TimedOutAttempts,
+		"canceled":      result.CanceledAttempts,
+		"requeued":      result.RequeuedJobs,
+		"retry_waiting": result.RetryWaitingJobs,
+		"dead_lettered": result.DeadLetteredJobs,
+	} {
+		if count > 0 {
+			r.metrics.ReconcileRepairs.WithLabelValues(kind).Add(float64(count))
+		}
+	}
 }
 
 func New(store Store, cfg Config, log *slog.Logger) *Reconciler {
@@ -100,6 +135,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Result, error) {
 	if err != nil {
 		return result, fmt.Errorf("reconcile expired leases: %w", err)
 	}
+	r.recordRepairs(result)
 	return result, nil
 }
 

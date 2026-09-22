@@ -139,6 +139,25 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 	return nil
 }
 
+// Ping reports whether the object store is reachable and this bucket is
+// usable, for a readiness probe.
+//
+// HeadBucket, not CreateBucket: readiness must be a read. EnsureBucket exists
+// to create the bucket once at startup and is deliberately not reused here --
+// a probe that created infrastructure as a side effect would make "is this
+// process ready" a mutating question.
+//
+// No timeout is applied here. The client already carries its own bounded HTTP
+// timeout, and every readiness handler wraps its checks in a 2-second context
+// of its own, so adding a third bound would only create a number that has to
+// be kept consistent with two others.
+func (c *Client) Ping(ctx context.Context, bucket string) error {
+	if _, err := c.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		return fmt.Errorf("reach results bucket %q: %w", bucket, err)
+	}
+	return nil
+}
+
 // Put uploads body under bucket and key, replacing any existing object at
 // that key. TaskForge never reads back an object it did not write, and every
 // write today targets a deterministic key that already includes the

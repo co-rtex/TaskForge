@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 )
 
 // Store is the durable half of scheduling. Both operations are safe to run
@@ -41,6 +42,14 @@ type Scheduler struct {
 	store Store
 	cfg   Config
 	log   *slog.Logger
+	// metrics is optional; nil records nothing and changes no behavior.
+	metrics *metrics.Metrics
+}
+
+// WithMetrics enables instrumentation.
+func (s *Scheduler) WithMetrics(m *metrics.Metrics) *Scheduler {
+	s.metrics = m
+	return s
 }
 
 func New(store Store, cfg Config, log *slog.Logger) *Scheduler {
@@ -75,6 +84,13 @@ func (s *Scheduler) RunOnce(ctx context.Context) (Result, error) {
 	result.Add(promoted)
 	if err != nil {
 		return result, fmt.Errorf("promote due jobs: %w", err)
+	}
+
+	if s.metrics != nil && promoted.PromotedJobs > 0 {
+		// Counted from what the pass actually committed, not from what it
+		// attempted: a pass that failed partway still reports the rows it
+		// durably promoted before failing.
+		s.metrics.SchedulerPromotions.Add(float64(promoted.PromotedJobs))
 	}
 
 	renotified, err := s.store.RenotifyStrandedQueued(ctx, s.cfg.RenotifyAfter, s.cfg.BatchSize)

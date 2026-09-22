@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/results"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
@@ -109,6 +110,14 @@ type Runner struct {
 	// delegating provider, so it resolves to whatever cmd/taskforge-worker
 	// installs, and is a no-op when tracing is disabled.
 	tracer trace.Tracer
+	// metrics is optional; nil records nothing and changes no behavior.
+	metrics *metrics.Metrics
+}
+
+// WithMetrics enables instrumentation.
+func (r *Runner) WithMetrics(m *metrics.Metrics) *Runner {
+	r.metrics = m
+	return r
 }
 
 func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
@@ -514,9 +523,21 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		attribute.String("taskforge.job_type", assignment.JobType),
 		attribute.Int("taskforge.attempt_number", assignment.AttemptNumber),
 	)
+	handlerStarted := r.now()
 	handlerResult, handlerErr := invokeHandler(handlerCtx, handler, Execution{
 		JobID: assignment.JobID, AttemptID: assignment.AttemptID, Payload: assignment.Payload,
 	})
+	if r.metrics != nil {
+		// job_type is bounded against THIS process's own handler registry,
+		// which is the only authoritative, already-bounded set of job types
+		// anywhere in the system. Anything unregistered collapses to "other".
+		// The API deliberately has no equivalent metric, because it has no
+		// registry to bound the value against.
+		r.metrics.Execution.WithLabelValues(
+			assignment.Queue,
+			metrics.BoundJobType(r.registry.Types(), assignment.JobType),
+		).Observe(r.now().Sub(handlerStarted).Seconds())
+	}
 	// Ended before the outcome is classified, so the span measures the handler
 	// and not this process's bookkeeping. No handler error text is recorded:
 	// that text is exactly where payload fragments, credentials, and stack

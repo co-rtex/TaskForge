@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/queue"
 )
 
@@ -32,6 +33,16 @@ type Publisher struct {
 	cfg    PublisherConfig
 	log    *slog.Logger
 	rnd    *rand.Rand
+	// metrics is optional: a publisher built without one records nothing and
+	// behaves identically, which is what keeps every existing test unchanged.
+	metrics *metrics.Metrics
+}
+
+// WithMetrics enables instrumentation. Optional so a test can build a
+// publisher without one.
+func (p *Publisher) WithMetrics(m *metrics.Metrics) *Publisher {
+	p.metrics = m
+	return p
 }
 
 // Stats summarizes one pass of the loop.
@@ -144,6 +155,9 @@ func (p *Publisher) recordFailure(ctx context.Context, e Event, cause error) {
 	// visibility timeout with no explanation stored.
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
+	if p.metrics != nil {
+		p.metrics.OutboxPublishFailed.Inc()
+	}
 	if err := p.store.RecordFailure(recordCtx, e.ID, cause.Error(), delay); err != nil {
 		p.log.Error("could not record outbox failure",
 			slog.String("event_id", e.ID.String()),
