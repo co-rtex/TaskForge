@@ -180,10 +180,15 @@ func TestRouting(t *testing.T) {
 		wantCode     string
 		wantAllow    string
 	}{
-		{http.MethodGet, "/v1/jobs", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "POST"},
-		{http.MethodDelete, "/v1/jobs", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "POST"},
+		// /v1/jobs takes both verbs as of M6A: POST submits, GET lists. A
+		// method that is neither still answers 405 and now advertises both.
+		{http.MethodDelete, "/v1/jobs", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET, POST"},
+		{http.MethodPut, "/v1/jobs", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET, POST"},
 		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET"},
 		{http.MethodDelete, "/v1/jobs/" + strings.Repeat("a", 8), http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET"},
+		{http.MethodPost, "/v1/workers", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET"},
+		{http.MethodPost, "/v1/queues", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET"},
+		{http.MethodPost, "/v1/jobs/" + strings.Repeat("a", 8) + "/attempts", http.StatusMethodNotAllowed, CodeMethodNotAllowed, "GET"},
 		{http.MethodGet, "/v1/nope", http.StatusNotFound, CodeNotFound, ""},
 		{http.MethodGet, "/", http.StatusNotFound, CodeNotFound, ""},
 	}
