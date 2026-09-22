@@ -1,8 +1,8 @@
 package api
 
 import (
+	"bytes"
 	"context"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -22,17 +22,27 @@ import (
 // global state -- which is why Server.WithTracer exists.
 func tracedTestServer(t *testing.T) (http.Handler, *tracetest.InMemoryExporter) {
 	t.Helper()
+	handler, exporter, _ := tracedTestServerWithLogs(t)
+	return handler, exporter
+}
+
+// tracedTestServerWithLogs additionally captures the server's structured log,
+// for the one test that must PROVE which code path it exercised rather than
+// assume it.
+func tracedTestServerWithLogs(t *testing.T) (http.Handler, *tracetest.InMemoryExporter, *bytes.Buffer) {
+	t.Helper()
 	exporter := tracetest.NewInMemoryExporter()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
 
-	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	handler := NewServer(nil, Config{MaxRequestBytes: 1024}, log).
+	var logs bytes.Buffer
+	handler := NewServer(nil, Config{MaxRequestBytes: 1024},
+		slog.New(slog.NewJSONHandler(&logs, nil))).
 		WithAuth(acceptingKeys(testScope)).
 		WithResults(acceptingResults(), nil).
 		WithTracer(provider.Tracer("test")).
 		Handler()
-	return handler, exporter
+	return handler, exporter, &logs
 }
 
 // A span is named for the matched ROUTE PATTERN, never the raw path.
@@ -54,6 +64,59 @@ func TestTracing_SpanIsNamedForTheRoutePatternNotTheRawPath(t *testing.T) {
 	require.Equal(t, "GET /v1/jobs/{job_id}", spans[0].Name,
 		"the span must be named for the pattern; the raw path would put a uuid in every name")
 	require.NotContains(t, spans[0].Name, jobID)
+}
+
+// A panicking handler must still leave a correctly named span.
+//
+// This is the regression guard for a real defect. withSpanRoute originally
+// renamed the span on the line AFTER next.ServeHTTP. A handler that panics
+// unwinds straight past that to withRecovery -- which sits outside it -- so the
+// span kept its provisional method-only name for exactly the requests an
+// operator most wants to find in a trace. The rename is now deferred.
+//
+// The defect was originally surfaced by TestTracing_SpanIsNamedForTheRoutePattern
+// above, but only INCIDENTALLY: that test panics because tracedTestServer passes
+// a nil job store, which is a property of the harness rather than anything the
+// test states. Give the harness a real store and that coverage disappears with
+// nothing failing. This test makes the dependency explicit by asserting the
+// recovery actually happened, so the coverage cannot evaporate silently.
+func TestTracing_SpanSurvivesAPanickingHandler(t *testing.T) {
+	handler, exporter, logs := tracedTestServerWithLogs(t)
+
+	const jobID = "11111111-1111-4111-8111-111111111111"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, authorize(httptest.NewRequest(http.MethodGet, "/v1/jobs/"+jobID, nil)))
+
+	// First: prove this request really did panic. Without this, the test could
+	// pass while exercising an ordinary non-panicking path and prove nothing.
+	require.Contains(t, logs.String(), "panic recovered",
+		"this test is meaningless unless the handler actually panicked; "+
+			"if the test harness gained a real job store, panic a handler explicitly instead")
+
+	// The panic is still converted to a sanitized 500, unchanged by tracing.
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	body := decodeError(t, rec)
+	require.Equal(t, CodeInternal, body.Error.Code)
+	require.Equal(t, "internal error", body.Error.Message)
+	require.NotEmpty(t, body.Error.RequestID)
+
+	// And the span -- the actual regression -- is named for the matched route,
+	// not the provisional method-only name it would keep without the defer.
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	require.Equal(t, "GET /v1/jobs/{job_id}", spans[0].Name,
+		"a panicking handler must not leave the span with its provisional name")
+	require.NotContains(t, spans[0].Name, jobID)
+
+	// The route attribute is set on the same deferred path, so it must survive too.
+	var route string
+	for _, attr := range spans[0].Attributes {
+		if string(attr.Key) == "http.route" {
+			route = attr.Value.Emit()
+		}
+	}
+	require.Equal(t, "GET /v1/jobs/{job_id}", route,
+		"http.route is set alongside the rename and must survive a panic identically")
 }
 
 // An unrouted path must not become its own span name, or a scan of random

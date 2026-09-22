@@ -1486,8 +1486,17 @@ innermost once the mux has matched.
 `withSpanRoute` renames in a `defer`, not sequentially. A handler that panics
 unwinds straight past the call, and `withRecovery` sits outside it — so a
 sequential rename would be skipped for exactly the requests an operator most
-wants to find in a trace. This was a real defect caught by
-`TestTracing_SpanIsNamedForTheRoutePatternNotTheRawPath` before it shipped.
+wants to find in a trace.
+
+That defect surfaced through
+`TestTracing_SpanIsNamedForTheRoutePatternNotTheRawPath`, but only
+**incidentally**: that test panics because its harness passes a nil job store,
+which is a property of the harness rather than anything the test states. Review
+of this milestone correctly flagged that the coverage was therefore accidental
+and would vanish silently the moment the harness gained a real store.
+`TestTracing_SpanSurvivesAPanickingHandler` now covers it deliberately — and
+asserts the recovery log line first, so the test fails loudly if it ever stops
+exercising the panic path rather than passing while proving nothing.
 
 ### Execution nests under the claim
 
@@ -2104,6 +2113,7 @@ All run locally on this branch. PostgreSQL 16, ElasticMQ, and LocalStack from
 | `make lint` | PASS — `gofmt` clean, `go vet ./...` silent |
 | `make build` | PASS — seven binaries into `./bin` |
 | `make test-unit` | PASS — 13 packages `ok` (`internal/telemetry` now has tests) |
+| Review follow-up | `TestTracing_SpanSurvivesAPanickingHandler` added; verified to fail when the `defer` is reverted |
 | `make migrate` | PASS — `migration applied version=18 name=0018_outbox_trace_context.sql`, `migrations complete applied=1` |
 | `make test-integration` | PASS — `ok github.com/co-rtex/TaskForge/tests/integration 76.149s` |
 | `make test-race` | PASS — `ok … 86.639s`, no DATA RACE, provider shutdown clean |
@@ -2144,13 +2154,18 @@ and all three files then confirmed byte-identical to their originals by `diff`.
 | Persist no trace context on submission | `TestTracing_OneTraceIDReachesEveryHop`, `…PublishedEnvelopeCarriesTheTrace` | outbox row and envelope both carried no trace |
 | Worker ignores the envelope's trace | `TestTracing_OneTraceIDReachesEveryHop` | "the claim must continue the submitting trace, not start its own" |
 | Name the server span from the raw path | `TestTracing_SpanIsNamedForTheRoutePatternNotTheRawPath` | span named `GET /v1/jobs/11111111-…`, and every unrouted path got its own name |
+| Rename the span sequentially instead of in a `defer` | `TestTracing_SpanSurvivesAPanickingHandler` | a panicking handler left the span named `GET` |
 
 **Two defects this milestone's own tests caught before it shipped**, both
 recorded because neither would have been visible by inspection:
 
 - `withSpanRoute` renamed the span *after* `next.ServeHTTP` rather than in a
   `defer`, so a panicking handler — unwinding past it to `withRecovery` — left
-  the span with its provisional method-only name.
+  the span with its provisional method-only name. **Caught incidentally**, by a
+  test that panics only because its harness passes a nil store; review flagged
+  that as fragile, and `TestTracing_SpanSurvivesAPanickingHandler` now covers it
+  on purpose, asserting the recovery log line so the coverage cannot evaporate
+  unnoticed.
 - With no inbound trace, the claim and execution spans were two separate roots
   for one delivery, because the execution span was started from the
   pre-claim context.
