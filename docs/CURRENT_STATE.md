@@ -1,8 +1,8 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M5E are merged into `main`; this document
-records the implemented state through M6A, which is on its own branch and
+planned. Milestones M1 through M6A are merged into `main`; this document
+records the implemented state through M6B, which is on its own branch and
 draft pull request.
 
 ## Milestone status
@@ -17,6 +17,7 @@ draft pull request.
 - **M5D — CLI:** complete.
 - **M5E — Python SDK:** complete.
 - **M6A — operator read APIs:** complete.
+- **M6B — OpenTelemetry tracing:** complete.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and M6 into
 four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -1404,6 +1405,113 @@ A cursor this API did not issue answers **422 `invalid_cursor`**, not 400 —
 `invalid_cursor` to `ExitRequestRejected` (2), and the SDK raises
 `RequestRejectedError`.
 
+## M6B — OpenTelemetry tracing
+
+### What changed
+
+One trace id now follows a submission across every hop
+[ROADMAP.md](ROADMAP.md)'s M6B names: the API request, the PostgreSQL
+submission transaction, the persisted outbox row, the published broker
+envelope, the worker's claim, and handler execution.
+
+Tracing is **disabled by default**. `TASKFORGE_OTEL_EXPORTER` is `none`,
+`stdout`, or `otlp`; with `none` no exporter is constructed, no goroutine
+starts, and no endpoint is dialed. An unrecognized value is rejected at startup
+rather than silently downgraded — a typo that quietly disabled tracing could
+only be found by noticing an absence.
+
+### The process boundary, which is the whole difficulty
+
+`taskforge-outbox` publishes an event potentially long after the API process
+that wrote it has exited (ADR-0004's publish-before-mark window). There is no
+later moment at which it could ask the submitter for its trace context, so
+migration 0018 commits that context to `outbox_events` in the same transaction
+as the event itself — the same rule every other durable fact in this system
+follows.
+
+`traceparent` carries a `CHECK` pinning the exact W3C shape; `tracestate` is
+length-bounded because it originates in a caller-supplied header. Neither is
+backfilled and neither is indexed: a trace id is not derivable from anything
+historical, a `NULL` is a complete answer meaning "start a new root", and
+nothing queries by either column.
+
+### One rule at every boundary
+
+A value this system cannot parse is **dropped, never propagated and never
+persisted**. It holds for an inbound HTTP `traceparent`, for the persisted
+column, and for the envelope member. The next span becomes a fresh root
+instead.
+
+The propagator drops a malformed header before anything reaches PostgreSQL, so
+the database `CHECK` never fires on that path. Both halves are asserted:
+`TestTracing_MalformedInboundTraceparentIsNeverPersisted` proves the row is
+written with a fresh root rather than the junk, **and** that the constraint
+would in fact refuse the junk if anything wrote it directly.
+
+### Span names are bounded; span attributes are not the same question
+
+A server span is named for its matched route pattern (`GET /v1/jobs/{job_id}`),
+never the raw path. Span *attributes* do carry job and attempt ids, and that is
+correct: [ARCHITECTURE.md](ARCHITECTURE.md) §14's cardinality rule is about
+**metric labels** specifically, and a span is exactly where a unique identifier
+belongs. Conflating the two would have been a real mistake in the other
+direction — dropping the one identifier that makes a trace useful.
+
+No span carries SQL text, bind parameters, a job payload, a credential, or
+handler error text. That last one is deliberate: handler error text is where
+payload fragments, credentials and stack traces reliably appear, which is why
+`FailureError` already refuses to store it, and a span is the same disclosure
+with a different transport.
+
+### Two decisions recorded in code rather than as an ADR
+
+**The envelope is additive-only; the `data` member is versioned.** M6B's
+optional `trace` member therefore did not bump `WorkAvailableSchemaVersion`. An
+older consumer ignores an unknown JSON field, and a newer consumer reading an
+older envelope sees the member absent — which is the same thing it sees when
+the member is legitimately empty. That distinction was not written down
+anywhere before this milestone; it is now stated in `internal/outbox/event.go`,
+because a wire contract between two processes that can differ during a rolling
+restart needs it stated rather than assumed.
+
+**The tracing middleware is in two parts, and had to be.** `net/http` populates
+`Request.Pattern` inside `ServeMux.ServeHTTP`, on the exact `*Request` pointer
+the mux is handed — verified empirically, not assumed. So the pattern does not
+exist when an outer middleware runs, and it is written to a pointer no outer
+middleware holds, because `withTimeout` hands the mux its own copy. `withTracing`
+therefore starts the span outermost, where the whole request is inside it and
+where `withLogging` can read its trace id, and `withSpanRoute` renames it from
+innermost once the mux has matched.
+
+`withSpanRoute` renames in a `defer`, not sequentially. A handler that panics
+unwinds straight past the call, and `withRecovery` sits outside it — so a
+sequential rename would be skipped for exactly the requests an operator most
+wants to find in a trace. This was a real defect caught by
+`TestTracing_SpanIsNamedForTheRoutePatternNotTheRawPath` before it shipped.
+
+### Execution nests under the claim
+
+Both are children of the submitting trace when the envelope carried one. When
+it did not, an earlier draft produced a claim root and a *separate* execution
+root — two traces for one delivery. Making execution a child of the claim fixes
+that, matches [ARCHITECTURE.md](ARCHITECTURE.md) §14's stated chain literally
+("… → claim → worker execution"), and is semantically right besides: the lease
+the claim acquired is held throughout execution, so execution really does
+happen inside it.
+
+### Breaking change
+
+None. `outbox_events` gained two nullable columns; `InsertWorkAvailableTx`
+gained a parameter, which is internal; the envelope gained an optional member
+that older consumers ignore. No response shape, status code, or error code
+changed, and no behavior changes at all with tracing left at its default.
+
+One internal consequence worth naming: `InsertWorkAvailableTx` now writes
+columns that exist only from 0018 onward, so a test that builds a database at
+an older migration and then calls current code must apply 0018 as well.
+`TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012` already did
+this for 0014 and 0015 for the identical reason and now does it for 0018.
+
 ## Verification
 
 ### M5A gates
@@ -1986,6 +2094,87 @@ Recorded as risks, not worked around silently.
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
 
+### M6B gates
+
+All run locally on this branch. PostgreSQL 16, ElasticMQ, and LocalStack from
+`make up`; Go 1.27; Python 3.13 in `sdk/python/.venv`.
+
+| Command | Result |
+| --- | --- |
+| `make lint` | PASS — `gofmt` clean, `go vet ./...` silent |
+| `make build` | PASS — seven binaries into `./bin` |
+| `make test-unit` | PASS — 13 packages `ok` (`internal/telemetry` now has tests) |
+| `make migrate` | PASS — `migration applied version=18 name=0018_outbox_trace_context.sql`, `migrations complete applied=1` |
+| `make test-integration` | PASS — `ok github.com/co-rtex/TaskForge/tests/integration 76.149s` |
+| `make test-race` | PASS — `ok … 86.639s`, no DATA RACE, provider shutdown clean |
+| `make sdk-lint` / `make sdk-test` | PASS — unchanged by this milestone |
+| `docker compose config --quiet` | PASS — and `jaeger` is absent from the default service list |
+
+### M6B coverage
+
+**New unit tests.** `internal/telemetry/tracing_test.go` covers exporter
+selection (including that `none` registers **no** provider at all, rather than
+merely dropping spans), rejection of an unrecognized exporter, `otlp` requiring
+an endpoint, the stdout exporter actually emitting valid JSON carrying the
+service name, shutdown being safe when disabled / repeated / on a nil receiver,
+shutdown still flushing when handed an already-canceled context — which is the
+only way production ever calls it — the W3C round trip, and that every
+unparseable `traceparent` is dropped while a well-formed one is adopted. It
+also pins that propagation does **not** depend on the global propagator.
+
+`internal/api/tracing_test.go` covers route-pattern span naming, the bounded
+name for unrouted paths, attribute boundedness (asserting no query parameter or
+credential reaches an attribute), inbound-trace continuation, malformed-header
+rejection, and that a disabled server behaves identically.
+
+**New integration tests.** `tests/integration/tracing_test.go`, five tests. The
+acceptance criterion is `TestTracing_OneTraceIDReachesEveryHop`, which reads the
+persisted `outbox_events.traceparent` **from PostgreSQL** and the published
+envelope **off the broker**, rather than inferring either from in-process
+context — those two reads are what make it a statement about the system rather
+than about Go's context propagation. It also asserts the boundary in the other
+direction: worker *registration* continues no client request and must not join
+the submission's trace.
+
+**Mutation checks.** Each applied, observed to fail the named test, reverted,
+and all three files then confirmed byte-identical to their originals by `diff`.
+
+| Mutation | Test that caught it | Observed failure |
+| --- | --- | --- |
+| Persist no trace context on submission | `TestTracing_OneTraceIDReachesEveryHop`, `…PublishedEnvelopeCarriesTheTrace` | outbox row and envelope both carried no trace |
+| Worker ignores the envelope's trace | `TestTracing_OneTraceIDReachesEveryHop` | "the claim must continue the submitting trace, not start its own" |
+| Name the server span from the raw path | `TestTracing_SpanIsNamedForTheRoutePatternNotTheRawPath` | span named `GET /v1/jobs/11111111-…`, and every unrouted path got its own name |
+
+**Two defects this milestone's own tests caught before it shipped**, both
+recorded because neither would have been visible by inspection:
+
+- `withSpanRoute` renamed the span *after* `next.ServeHTTP` rather than in a
+  `defer`, so a panicking handler — unwinding past it to `withRecovery` — left
+  the span with its provisional method-only name.
+- With no inbound trace, the claim and execution spans were two separate roots
+  for one delivery, because the execution span was started from the
+  pre-claim context.
+
+### A test-isolation property worth knowing before writing more tracing tests
+
+`otel.SetTracerProvider` binds package-level delegating tracers through a
+`sync.Once` (`otel/internal/global/state.go`). Once any test installs a
+recording provider, every package-level tracer in that binary stays bound to it;
+swapping the global back to a no-op afterwards does **not** un-bind them.
+
+An earlier draft of the "tracing disabled" integration test did exactly that and
+passed in isolation while failing in the suite. It was replaced with
+`TestTracing_AnUntracedEventStillPublishesAndExecutesUnderAFreshRoot`, which
+produces an untraced event the way production does — through a server-initiated
+scheduler promotion — and is therefore order-independent. Production calls
+`SetTracerProvider` exactly once at startup, so this is purely a test property,
+but it is the kind that produces a flake rather than a failure.
+
+The "zero spans exported with the default" criterion is covered instead by
+`TestStartTracing_DisabledRegistersNoProvider` at the unit level, plus the fact
+that the entire existing suite runs with tracing at its default and is unchanged
+by this milestone.
+
 ### M6A gates
 
 All run locally on this branch. PostgreSQL 16, ElasticMQ, and LocalStack from
@@ -2501,7 +2690,12 @@ exercised by a real hosted failure.
   the mux, so a route added without being added to both is uncovered rather
   than failing. A real completeness gate needs a route registry inside
   `Handler()`; it is a small, separate change and is not claimed here.
-- Metrics are M6C and tracing is M6B.
+- Metrics are M6C. Tracing shipped in M6B, but three parts of it are
+  deliberately absent rather than pending: the worker's own control-plane calls
+  after the claim (start, renew, succeed, fail) are not traced, the Python SDK
+  has no tracing, and server-initiated notifications — replay, scheduler
+  promotion, abandonment requeue — carry no trace context, because none of them
+  continues a client request.
 - Only `demo.echo` is registered as a production worker handler. Test-only
   handlers are injected through the existing registry seam and add no production
   surface.
@@ -2543,27 +2737,24 @@ repository README.
 
 ## Next objective
 
-M6B: OpenTelemetry tracing across the full path — API submission, the
-PostgreSQL transaction, the outbox, the broker notification, the claim, and
-worker execution, under one trace id. See [ROADMAP.md](ROADMAP.md)'s M6B entry.
+M6C: Prometheus metrics, plus the health residual M6's split identified. See
+[ROADMAP.md](ROADMAP.md)'s M6C entry. It is independent of M6D and needs
+nothing from M6B.
 
-Two findings from M6A are load-bearing for it. The trace context must be
-persisted in the same transaction as the outbox event, because
-`taskforge-outbox` is a separate process that publishes later and cannot
-recover the submitting request's context. And
-[ARCHITECTURE.md](ARCHITECTURE.md) §3 is marked `[IMPLEMENTED]` while stating
-that a broker message carries "trace metadata" — it does not:
-`outbox.Envelope` has five members and no trace field, and `outbox_events` has
-no trace column. Correcting that claim belongs to M6B, not to a documentation
-pass.
+Two things M6B established are directly useful there. First, the cardinality
+distinction is now load-bearing in code as well as prose: span attributes carry
+job and attempt ids deliberately, while [ARCHITECTURE.md](ARCHITECTURE.md) §14's
+rule forbids them as **metric labels**. M6C must not read that rule as applying
+to both. Second, `jobs.job_type` remains the one caller-reachable cardinality
+hole — no foreign key, no allowlist, only a regex — so an authenticated caller
+can still mint a new value per submission.
 
-M6C (metrics, plus the health residual) is independent of M6B and can precede
-it. M6D (the dashboard) depends on M6A for data and needs a frontend-toolchain
-decision recorded the way [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md)
-recorded Python's.
+The health residual is unchanged and unaddressed: the four non-API health
+servers have no test coverage, `taskforge-worker`'s readiness does not check the
+object store M5C made it depend on, and `internal/objectstore` has no `Ping` for
+it to call.
 
-M5E closes the original bundled M5D milestone in full: the CLI half shipped as
-M5D, the SDK half as M5E, and the four Python infrastructure decisions the
-roadmap flagged are recorded in
-[ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md) rather
-than deferred again.
+M6D (the dashboard) depends on M6A for data and still needs a frontend-toolchain
+decision recorded the way
+[ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md) recorded
+Python's.
