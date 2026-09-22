@@ -41,10 +41,10 @@ Python SDK (`taskforge-sdk`) over the same surface; and the operator read
 surface — scope-filtered, keyset-paginated job listing, a job's attempt
 timeline, worker capacity and health including crashed and replaced sessions,
 and per-queue non-terminal depth — over the public API, the CLI, and the SDK
-alike; and OpenTelemetry tracing from an API request through the submission
+alike; Prometheus metrics with enforced label cardinality on every service; and
+OpenTelemetry tracing from an API request through the submission
 transaction, the outbox, the broker notification, and into a worker's claim and
-handler execution, under one trace id. Metrics and the operator dashboard
-remain planned.
+handler execution, under one trace id. The operator dashboard remains planned.
 
 ---
 
@@ -748,11 +748,10 @@ terminal `CANCELED` is never left.
 
 ---
 
-## 14. Observability — [PARTIAL]
+## 14. Observability — [IMPLEMENTED]
 
 Structured JSON logging with correlation identifiers, distinct liveness/readiness
-endpoints, and OpenTelemetry tracing are implemented. **Metrics are planned
-(M6C)**, and that is the only part of this section that is not built.
+endpoints, OpenTelemetry tracing, and Prometheus metrics are all implemented.
 
 OpenTelemetry traces span: API submission → PostgreSQL transaction → outbox →
 broker notification → claim → worker execution. One trace id covers all of them,
@@ -793,11 +792,85 @@ trace id sits **beside** the request id and never replaces it: a request id is a
 user-facing token echoed in every error body, while a trace id links this
 process's work to another's.
 
-Metrics include submitted / completed / retried / dead-lettered counters; queued and
-running gauges; queue-wait, execution, and end-to-end duration histograms; worker
-health and utilization; active and expired leases; scheduler promotions and claims;
-pending outbox events and publish failures; stale-completion rejections; and
-reconciliation repairs.
+### Metrics
+
+Every service exposes `GET /metrics` in Prometheus text exposition format. The
+four background services serve it on their existing health listener;
+`taskforge-api` serves it on its own. Both are unauthenticated, exactly like
+`/healthz` and `/readyz` beside them, and both are already validated as
+loopback binds — `TASKFORGE_API_ADDR` no less than the other four (see
+`internal/config.Validate`), so this endpoint crosses no boundary the health
+probes do not already cross. **That equivalence must be revisited before this
+API ever sits behind a real load balancer**, which is post-V1 cloud work.
+
+What is exposed:
+
+| Family | Kind | Labels |
+| --- | --- | --- |
+| `jobs_submitted_total`, `jobs_retried_total`, `claims_total` | counter | `queue` |
+| `jobs_completed_total` | counter | `queue`, `status` |
+| `jobs_dead_lettered_total` | counter | `queue`, `dlq_reason` |
+| `jobs_queued`, `jobs_running`, `leases_active` | gauge | `queue` |
+| `outbox_events_pending` | gauge | — |
+| `workers` | gauge | `worker_group`, `status` |
+| `execution_duration_seconds` | histogram | `queue`, `job_type` |
+| `http_requests_total` | counter | `method`, `route`, `code` |
+| `http_request_duration_seconds` | histogram | `method`, `route` |
+| `scheduler_promotions_total`, `outbox_publish_failures_total`, `stale_completion_rejections_total` | counter | — |
+| `reconciliation_repairs_total` | counter | `repair` |
+
+The job-lifecycle totals and every gauge are **read from PostgreSQL at scrape
+time**, not counted in process. Two things force that. These are facts about
+the whole system rather than about one replica, and every component here is
+safe to run with N replicas — an in-process counter would report one replica's
+share, and summing across replicas would still be wrong because a job submitted
+by one and completed by another was counted by neither for the transition it
+did not see. And deriving them touches no fenced-transition code: incrementing
+at the moment of a terminal transition would mean adding a side effect to the
+code that owns fencing and the transition matrix. Each is genuinely monotonic,
+which a counter requires: the rows counted are never deleted, and a terminal
+job never returns to a non-terminal state (invariant 2).
+
+A scrape therefore issues real queries, each bounded by the same two-second
+budget the readiness probes use. A failure degrades that metric's absence
+rather than the endpoint — a database outage must not also remove the metrics
+an operator is using to diagnose it.
+
+**Unbounded values — job ids, attempt ids, request ids — are never used as
+metric labels.** This is enforced rather than asserted. Every collector is
+built through one constructor that records its declared labels in a manifest
+and refuses a violating label at startup; two independent tests then check that
+manifest against an explicit allowlist (each entry carrying the bound that makes
+it safe) and against an independent denylist, so an allowlist edited carelessly
+still cannot readmit a forbidden name.
+
+`job_type` is the one label a caller can influence: `jobs.job_type` has no
+foreign key and no allowlist, so any authenticated caller can mint a new value
+per request. It is bounded against the emitting worker's **own handler
+registry**, which is already authoritative and already bounded, with anything
+unregistered collapsing to `other`. That is also why it appears only on
+worker-emitted metrics: the API has no registry to bound it against, so its
+metrics carry no `job_type` at all rather than a poorly bounded one.
+
+`scope` is forbidden for a different reason from the identifiers. It is bounded
+by the number of minted credentials, but it is a tenancy identifier on an
+unauthenticated endpoint, so a scrape would become a tenant-enumeration oracle
+— the disclosure the indistinguishable `401` already exists to prevent.
+
+The HTTP metrics reuse the route pattern M6B's span naming already computes,
+rather than deriving it again. They are recorded from **outside** the recovery
+middleware, so a panicking handler is counted with the sanitized `500` it
+actually returned; recorded further in, the same request was counted as `200`.
+
+**Two families §14 previously named are deliberately absent**, rather than
+being quietly approximated. `queue_wait_duration_seconds` and
+`end_to_end_duration_seconds` are histograms, so unlike the counters above they
+cannot be derived at scrape time — a histogram needs observations as they
+happen. Recording them means observing inside the claim and terminal-outcome
+transactions, which is fenced-transition code, or widening a wire contract to
+carry the timestamps outward. Both are real changes with their own review
+surface, and neither belonged in a milestone whose subject is cardinality.
+`docs/CURRENT_STATE.md` records what each would take.
 
 **Unbounded values — job ids, attempt ids, request ids — are never used as metric
 labels.**
@@ -806,6 +879,20 @@ Each service exposes **distinct** liveness and readiness endpoints. Liveness ans
 only whether the process is alive. Readiness reflects whether the process can do its
 job and checks its required dependencies with bounded timeouts. Liveness is an
 intentional unconditional `200`; readiness is not.
+
+`taskforge-worker` checks its session, the control plane, the broker, **and the
+object store**. The last of those was missing until M6C: M5C made this process
+depend on the object store — a large result is uploaded before the attempt
+reports success — but readiness never checked it, so a worker that could not
+reach the bucket reported itself ready and then failed every large-result job.
+
+Each background service's health server takes its dependencies as named
+`func(context.Context) error` checks, the shape `internal/api.ReadinessCheck`
+already used. Before M6C they held concrete pooled connections and pinged them
+inline, which meant a failing dependency could only be exercised against real
+infrastructure that was genuinely down — which is why none of the four had a
+single test. Every branch is now reachable from `make test-unit` with nothing
+running.
 
 ---
 

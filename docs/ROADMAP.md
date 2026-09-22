@@ -406,18 +406,49 @@ the claim, tracing in the Python SDK, and trace context on server-initiated
 notifications (replay, scheduler promotion, abandonment requeue), none of which
 continues a client request.
 
-### M6C — Prometheus metrics and the health residual — **planned**
+### M6C — Prometheus metrics and the health residual
 **Objective.** Expose the metric set [ARCHITECTURE.md](ARCHITECTURE.md) §14
-specifies, with an enforcement mechanism a reviewer can run rather than trust.
+specifies, with cardinality enforced by a mechanism a reviewer can run rather
+than a rule trusted by inspection; and close the health residual this split
+identified.
+**Deliverables.** `internal/metrics` with an allowlist, an independent denylist,
+a startup-time check and two enforcement tests; `GET /metrics` on all five
+services; HTTP request metrics reusing M6B's route-pattern computation;
+`objectstore.Ping` wired into the worker's readiness; the four background
+services' health servers refactored to named closure checks, and their first
+tests.
 **Acceptance.** No unbounded metric labels.
-**Depends on.** M6A. Independent of M6B.
+**Depends on.** M6A (the latest-session query shape). Independent of M6B.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence.
 
-`job_type` is the one caller-reachable cardinality hole: `jobs.job_type` has no
-foreign key and no allowlist, only the regex `^[a-z0-9][a-z0-9._-]{0,127}$`, so
-an authenticated caller can mint a new label value per submission. `queue` is
-FK-constrained and safe; `scope` is bounded but is a tenancy identifier on an
-unauthenticated `/metrics`. This slice also carries the health residual
-described above.
+Three decisions M6C could not avoid are recorded in code rather than as an ADR,
+each constraining one contract.
+
+`job_type` is the one caller-reachable label — `jobs.job_type` has no foreign
+key and no allowlist — and is bounded against the **worker's own handler
+registry** rather than a configured allowlist. The registry is already
+authoritative and already bounded; a configured list would be a second copy of
+it to keep in sync by hand. That is also why the label appears only on
+worker-emitted metrics: the API has no registry to bound it against.
+
+The job-lifecycle totals and every gauge are **derived from PostgreSQL at scrape
+time** rather than counted in process. They are facts about the whole system
+rather than one replica, and deriving them keeps instrumentation out of the
+fenced-transition code that owns correctness.
+
+`/metrics` sits on each service's **existing** listener rather than a new admin
+one. `TASKFORGE_API_ADDR` is already validated as a loopback bind exactly like
+the four background addresses, so there is no live trust-boundary difference to
+protect — and §14 records what must be revisited before this API sits behind a
+real load balancer.
+
+Two families §14 named are deliberately **not** built:
+`queue_wait_duration_seconds` and `end_to_end_duration_seconds`. Both are
+histograms, so unlike the counters they cannot be derived at scrape time, and
+recording them means either observing inside fenced-transition code or widening
+a wire contract. §14 and [CURRENT_STATE.md](CURRENT_STATE.md) both say so and
+say what each would take.
 
 ### M6D — Operator dashboard — **planned**
 **Objective.** Overview, Jobs, Job detail with attempt timeline, Workers,

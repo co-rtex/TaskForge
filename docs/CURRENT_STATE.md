@@ -1,8 +1,8 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M6A are merged into `main`; this document
-records the implemented state through M6B, which is on its own branch and
+planned. Milestones M1 through M6B are merged into `main`; this document
+records the implemented state through M6C, which is on its own branch and
 draft pull request.
 
 ## Milestone status
@@ -18,6 +18,7 @@ draft pull request.
 - **M5E — Python SDK:** complete.
 - **M6A — operator read APIs:** complete.
 - **M6B — OpenTelemetry tracing:** complete.
+- **M6C — Prometheus metrics and the health residual:** complete.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and M6 into
 four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -1521,6 +1522,175 @@ an older migration and then calls current code must apply 0018 as well.
 `TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012` already did
 this for 0014 and 0015 for the identical reason and now does it for 0018.
 
+## M6C — Prometheus metrics and the health residual
+
+### What changed
+
+All five services expose `GET /metrics`. The metric set is the one
+[ARCHITECTURE.md](ARCHITECTURE.md) §14 names, minus two families deliberately
+left out and said so (below). The health residual M6's split identified is
+closed: the worker's readiness now checks the object store, and all four
+background services have tests where they previously had none.
+
+### Cardinality is enforced, not asserted
+
+The acceptance criterion is "no unbounded metric labels", and the point of this
+milestone is that a reviewer can *check* that by running a test rather than by
+reading every call site.
+
+Three independent mechanisms, because one is not enough:
+
+- **A manifest built by construction.** Every collector goes through one
+  constructor that records its declared label names. Checking the manifest
+  rather than walking `Gather()` matters: `Gather()` reports only families that
+  have already emitted a sample, so a brand-new metric with a bad label — the
+  exact case to catch — would be invisible to it.
+- **An allowlist that demands a justification.** `AllowedLabels` maps each name
+  to the one-line bound that makes it safe. A label whose bound cannot be stated
+  in a line does not belong on a metric.
+- **An independent denylist.** `ForbiddenLabels` is checked separately, so an
+  allowlist edited carelessly still cannot readmit a forbidden name. A test also
+  asserts the two lists never overlap, since a name in both would make the other
+  two tests disagree and let running order decide.
+
+The constructor applies the same rule at startup and panics, so a violation is a
+process that will not start rather than something only a test would find.
+
+### `job_type`, and why the bound is the worker's registry
+
+`jobs.job_type` has no foreign key and no allowlist — only the regex
+`^[a-z0-9][a-z0-9._-]{0,127}$`, enforced identically in the schema and at
+submission validation. Any authenticated caller mints a new value per request.
+That is cardinality explosion from ordinary use, not abuse.
+
+It is bounded against `worker.Registry.Types()` — the emitting worker's own
+handler set, which is already authoritative, already bounded, and already what
+decides whether that process can run a job type at all. An earlier M6 draft
+proposed a `TASKFORGE_METRICS_JOB_TYPES` environment variable; that would have
+been a second copy of the registry kept in sync by hand across a process
+boundary.
+
+This is also why the label appears **only on worker-emitted metrics**. The API
+has no registry, so it cannot bound the value, and its metrics therefore carry
+no `job_type` at all rather than a poorly bounded one. A test pins which metrics
+may carry it, so a future one cannot acquire it by accident.
+
+Today `Registry.Types()` holds one entry (`demo.echo`), so the ceiling is 2.
+A test drives 10,000 distinct caller-supplied values through the bound and
+asserts the series count stays there.
+
+### Counters read from the database, not incremented in code
+
+The job-lifecycle totals and every gauge are derived from PostgreSQL at scrape
+time. Two reasons, both load-bearing.
+
+They are facts about the **whole system**, not one replica. Every component here
+is safe to run with N replicas, so an in-process counter would report one
+replica's share — and summing across replicas would still be wrong, because a
+job submitted by replica A and completed by replica B was counted by neither for
+the transition it did not observe.
+
+And it keeps instrumentation **out of fenced-transition code**. Incrementing at
+the moment of a terminal transition would mean editing the paths that own
+fencing and the transition matrix to add a side effect with nothing to do with
+correctness.
+
+Each is genuinely monotonic, which a Prometheus counter requires: jobs,
+attempts and dlq_entries are never deleted (every foreign key to them is
+`ON DELETE RESTRICT`), and a terminal job never returns to a non-terminal state
+(invariant 2). A counter that could decrease would be silently wrong in every
+`rate()` over it.
+
+The cost is that a scrape runs real queries. Each is bounded by the same
+two-second budget the readiness probes use, and a failure degrades that metric's
+absence rather than the endpoint — `promhttp` is configured `ContinueOnError`,
+so a database outage still serves the metrics an operator needs to diagnose it.
+That is asserted against a deliberately-closed pool.
+
+### Two families §14 named that this milestone did NOT build
+
+`queue_wait_duration_seconds` and `end_to_end_duration_seconds` are absent, and
+§14 has been corrected to say so rather than continuing to name them.
+
+Both are histograms. Unlike the counters above they cannot be derived at scrape
+time, because a histogram needs observations as they happen rather than a count
+of current rows. Recording them means one of two things, and both are larger
+than this milestone: observing inside the claim and terminal-outcome
+transactions, which is fenced-transition code; or widening the claim and outcome
+wire contracts to carry `available_at` and `created_at` outward so the boundary
+can observe them. Each is a real change with its own review surface, and neither
+belonged in a milestone whose subject is cardinality.
+
+`execution_duration_seconds` — the third histogram §14 names — **is** built,
+because the worker measures the handler itself and needs nothing from anyone.
+
+### A defect this milestone's own tests caught
+
+The HTTP metrics were first recorded in `withSpanRoute`, alongside the span
+rename, since both need the route pattern at the same single point. That
+reported **`code="200"` for a request that actually returned `500`**.
+
+`withRecovery` sits *outside* `withSpanRoute`, so a panicking handler unwinds
+past the inner recorder and the sanitized 500 is written to a writer that
+recorder never sees. This is worse than a missing metric: an operator watching
+error rates would have seen none at all.
+
+The fix splits the measurement across the two points where each half is actually
+knowable. `withSpanRoute` — still the only place that can know the route —
+publishes it outward through a pointer in the request context, and
+`withHTTPMetrics`, placed outside `withRecovery`, observes the real final
+status. A mutation moving the recording back inside `withRecovery` fails
+`TestMetrics_PanickingHandlerIsStillCounted`.
+
+### The health residual
+
+**`objectstore.Ping`** uses `HeadBucket`, not `CreateBucket`. Readiness must be
+a read; `EnsureBucket` exists to create the bucket once at startup, and a probe
+that created infrastructure as a side effect would make "is this process ready"
+a mutating question.
+
+**The worker now checks it.** M5C made this process depend on the object store
+— a large result is uploaded before the attempt reports success — but readiness
+never checked it, so a worker that could not reach the bucket reported itself
+ready and then failed every large-result job.
+
+**The four background health servers are testable, which required a refactor.**
+Each took its dependencies concretely (a `*pgxpool.Pool` it pinged inline), so
+exercising a failing dependency meant having real infrastructure that was
+genuinely down. That is why none of the four had a single test file. They now
+take named `func(context.Context) error` checks — the shape
+`internal/api.ReadinessCheck` already established — so every branch is reachable
+from `make test-unit` with nothing running. This is a deliberate design change,
+not an incidental one.
+
+Each service now asserts: liveness is unconditionally 200 with every dependency
+failing; readiness is 200 when all pass; readiness is 503 naming the right
+component when each dependency is failed **one at a time**, with the others
+still reporting `ok`; and `/metrics` parses as valid exposition format through a
+real parser rather than being string-matched.
+
+### `/metrics` placement: resolved, not deferred
+
+An earlier M6 draft treated this as an open decision needing a loopback-only
+admin listener for `taskforge-api`. It is not open. `TASKFORGE_API_ADDR` is
+**already** rejected unless it binds loopback (`internal/config.Validate`),
+identically to the four background addresses, so there is no live
+trust-boundary difference between the API's mux and a background service's
+health mux — and `/healthz` and `/readyz` are already unauthenticated on that
+same mux.
+
+So `/metrics` sits on the existing listener, unauthenticated, with no new
+address and no new env var. §14 records the one thing that must be revisited
+before this API ever sits behind a real load balancer, which is post-V1 work.
+
+### Breaking change
+
+None. No schema change and no migration — M6C is the first milestone since M5B
+to add neither. The four background `newHealthServer` signatures changed, but
+they are `package main` in their own binaries and have no callers outside them.
+Every component's `WithMetrics` is optional: a nil one records nothing and
+changes no behavior, which is what leaves every pre-M6C test unchanged.
+
 ## Verification
 
 ### M5A gates
@@ -2102,6 +2272,65 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M6C gates
+
+All run locally on this branch. PostgreSQL 16, ElasticMQ, and LocalStack from
+`make up`; Go 1.27; Python 3.13 in `sdk/python/.venv`.
+
+| Command | Result |
+| --- | --- |
+| `make lint` | PASS — `gofmt` clean, `go vet ./...` silent |
+| `make build` | PASS — seven binaries into `./bin` |
+| `make test-unit` | PASS — 18 packages `ok`, up from 13: `internal/metrics` plus the four `cmd/` binaries that had no tests at all |
+| `make migrate` | N/A — M6C adds no migration, the first milestone since M5B to add none |
+| `make test-integration` | PASS — `ok github.com/co-rtex/TaskForge/tests/integration 89.337s` |
+| `make test-race` | PASS — `ok … 96.478s`, no DATA RACE |
+| `make sdk-lint` | PASS — mypy success in 21 source files, unchanged by this milestone |
+| `make sdk-test` | PASS — 178 passed |
+| `docker compose config --quiet` | PASS |
+
+### M6C coverage
+
+**`internal/metrics`.** The enforcement tests check the manifest against the
+allowlist and, independently, against the denylist; a third asserts the two
+never overlap. `TestNew_PanicsOnAForbiddenLabel` proves the constructor applies
+the same rule at startup, which also proves the enforcement tests are not
+vacuous. `TestBoundJobType_CapsCardinalityAtTheRegistrySize` drives 10,000
+distinct caller-supplied job types through the bound.
+`TestJobTypeAppearsOnlyOnWorkerEmittedMetrics` pins which metrics may carry the
+one caller-influenced label.
+
+**`internal/api`.** Route-label correctness (pattern, never raw path), one
+bounded value for every unmatched path, the status code reaching the counter,
+a panicking handler still counted with its real 500, `/metrics` needing no
+credential, no forbidden label or leaked query parameter on any exposed series,
+and a server without instrumentation behaving exactly as before.
+
+**`cmd/taskforge-{outbox,scheduler,reconciler,worker}`.** The first tests these
+binaries have ever had. Liveness unconditional; readiness per-dependency,
+failed one at a time, asserting the other components still report `ok`;
+`/metrics` parsed by a real exposition-format parser. The worker additionally
+asserts the object-store failure in isolation — the specific residual this
+milestone closed.
+
+**`tests/integration`.** Durable counters checked against direct row counts;
+a live scrape carrying no forbidden label and no uuid-shaped label *value*; the
+worker gauge counting a reconciliation-marked `UNHEALTHY` session rather than
+only current ones; and `/metrics` still serving against a deliberately-closed
+pool, proving a database outage degrades gauges rather than the endpoint.
+
+**Mutation checks.** Each applied, observed to fail the named test, reverted,
+and the files confirmed byte-identical by `diff`.
+
+| Mutation | Test that caught it | Observed failure |
+| --- | --- | --- |
+| Add a `job_id` label to `http_requests_total` | `TestNoUnboundedLabels` | panic at construction: "label job_id is not in AllowedLabels; label job_id is forbidden" |
+| Add `job_id` to `AllowedLabels` to defeat the allowlist | `TestAllowedAndForbiddenDoNotOverlap` | the independent denylist still caught it |
+| Record HTTP metrics inside `withRecovery` | `TestMetrics_PanickingHandlerIsStillCounted` | the 500 was recorded as 200 |
+
+The second is the one worth noting: it is the attack the two-list design exists
+for. An allowlist alone would have accepted it.
 
 ### M6B gates
 
@@ -2705,7 +2934,7 @@ exercised by a real hosted failure.
   the mux, so a route added without being added to both is uncovered rather
   than failing. A real completeness gate needs a route registry inside
   `Handler()`; it is a small, separate change and is not claimed here.
-- Metrics are M6C. Tracing shipped in M6B, but three parts of it are
+- Tracing shipped in M6B, but three parts of it are
   deliberately absent rather than pending: the worker's own control-plane calls
   after the claim (start, renew, succeed, fail) are not traced, the Python SDK
   has no tracing, and server-initiated notifications — replay, scheduler
@@ -2752,24 +2981,25 @@ repository README.
 
 ## Next objective
 
-M6C: Prometheus metrics, plus the health residual M6's split identified. See
-[ROADMAP.md](ROADMAP.md)'s M6C entry. It is independent of M6D and needs
-nothing from M6B.
+M6D: the operator dashboard — Overview, Jobs, Job detail with attempt timeline,
+Workers, Queues, and DLQ, reading only M6A's live routes. See
+[ROADMAP.md](ROADMAP.md)'s M6D entry. It is the last slice of M6 and the last
+consumer of the public API [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 item 15 names.
 
-Two things M6B established are directly useful there. First, the cardinality
-distinction is now load-bearing in code as well as prose: span attributes carry
-job and attempt ids deliberately, while [ARCHITECTURE.md](ARCHITECTURE.md) §14's
-rule forbids them as **metric labels**. M6C must not read that rule as applying
-to both. Second, `jobs.job_type` remains the one caller-reachable cardinality
-hole — no foreign key, no allowlist, only a regex — so an authenticated caller
-can still mint a new value per submission.
-
-The health residual is unchanged and unaddressed: the four non-API health
-servers have no test coverage, `taskforge-worker`'s readiness does not check the
-object store M5C made it depend on, and `internal/objectstore` has no `Ping` for
-it to call.
-
-M6D (the dashboard) depends on M6A for data and still needs a frontend-toolchain
-decision recorded the way
+It still needs a frontend-toolchain decision recorded the way
 [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md) recorded
-Python's.
+Python's — dependency and build tooling, a lint/format story, and CI placement,
+each decided rather than left as a side effect of "build the dashboard". The
+binding constraint is [PROJECT_SPEC.md](PROJECT_SPEC.md) §5's prerequisite list,
+which ADR-0016 could discharge for Python by noting that running TaskForge never
+needs an interpreter — an escape that does not exist for a dashboard that is
+part of the running stack.
+
+Two smaller items are available to whoever wants them, neither blocking M6D:
+
+- `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
+  deliberately did not build. See its section above for exactly what each would
+  take; both are larger than they look because the clean recording points are
+  inside fenced-transition code.
+- `README.md` line 35 is still stale. Untouched through M6A, M6B and M6C because
+  PR #10 rewrites that file wholesale.
