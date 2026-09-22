@@ -14,6 +14,10 @@ import (
 type workNotification struct {
 	EventID uuid.UUID
 	Queue   string
+	// Trace is the submitting transaction's W3C trace context, or nil. It is
+	// advisory in exactly the way the rest of this envelope is: it changes no
+	// decision, and a nil simply means this worker's spans start a new root.
+	Trace *outbox.TraceContext
 }
 
 func decodeWorkNotification(body []byte) (workNotification, error) {
@@ -37,5 +41,5 @@ func decodeWorkNotification(body []byte) (workNotification, error) {
 	if data.Queue == "" {
 		return workNotification{}, fmt.Errorf("notification queue is empty")
 	}
-	return workNotification{EventID: eventID, Queue: data.Queue}, nil
+	return workNotification{EventID: eventID, Queue: data.Queue, Trace: envelope.Trace}, nil
 }

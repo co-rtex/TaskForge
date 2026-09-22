@@ -18,9 +18,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/results"
+	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
 
 // Config configures the HTTP server.
@@ -47,9 +50,15 @@ type Server struct {
 	// workerReads serves GET /v1/workers. Separate from control, which gates
 	// the fenced internal surface -- see WithWorkerReads.
 	workerReads WorkerReads
-	cfg         Config
-	log         *slog.Logger
-	checks      []ReadinessCheck
+	// tracer records one server span per request. It comes from the global
+	// provider, which is a delegating tracer: taking it here and using it
+	// later is correct even though cmd/taskforge-api installs the real
+	// provider after this point. With tracing disabled it is a no-op, so
+	// there is no enabled/disabled branch anywhere in the request path.
+	tracer trace.Tracer
+	cfg    Config
+	log    *slog.Logger
+	checks []ReadinessCheck
 }
 
 // Results reads a job's recorded result. See internal/results.Store.
@@ -68,7 +77,13 @@ func NewServer(store *jobs.Store, cfg Config, log *slog.Logger, checks ...Readin
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 25 * time.Second
 	}
-	return &Server{jobs: store, cfg: cfg, log: log, checks: checks}
+	return &Server{
+		jobs:   store,
+		cfg:    cfg,
+		log:    log,
+		checks: checks,
+		tracer: otel.Tracer(telemetry.TracerName),
+	}
 }
 
 // WithWorkerControl enables the implemented internal worker control surface.
@@ -132,10 +147,23 @@ func (s *Server) WithResults(store Results, objects ObjectStore) *Server {
 	return s
 }
 
+// WithTracer overrides the tracer this server records spans with.
+//
+// Production never calls it: NewServer already takes the global delegating
+// tracer, which resolves to whatever cmd/taskforge-api installs. It exists so
+// a test can record into its own provider without touching global state and
+// without racing another test that did the same.
+func (s *Server) WithTracer(tracer trace.Tracer) *Server {
+	s.tracer = tracer
+	return s
+}
+
 // Handler returns the fully wrapped HTTP handler.
 //
-// Order matters: request id is outermost so every later layer can log it, and
-// recovery sits inside it so a panic is logged with its request id.
+// Order matters: request id is outermost so every later layer can log it,
+// tracing sits just inside it so a span can carry that id and so the access log
+// can carry the trace id, and recovery sits inside both so a panic is logged
+// with both identities.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// Every public route is wrapped in requireAPIKey at registration, so the set
@@ -232,11 +260,18 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("/", s.handleNotFound)
 
+	// Innermost first. withSpanRoute must sit directly on the mux so it reads
+	// the pattern off the same *Request the mux wrote it to -- see its comment.
 	var h http.Handler = mux
+	h = withSpanRoute(h)
 	h = withBodyLimit(s.cfg.MaxRequestBytes, h)
 	h = withTimeout(s.cfg.RequestTimeout, h)
 	h = withRecovery(s.log, h)
+	// withLogging sits inside withTracing so its line can carry the trace id,
+	// and outside it nothing else changes: the request id still comes from the
+	// outermost layer, and both identities appear on the same line.
 	h = withLogging(s.log, h)
+	h = withTracing(s.tracer, h)
 	h = withRequestID(h)
 	return h
 }

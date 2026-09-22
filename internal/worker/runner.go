@@ -10,10 +10,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/results"
+	"github.com/co-rtex/TaskForge/internal/telemetry"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -101,6 +105,10 @@ type Runner struct {
 	// It is only ever used for local monotonic reasoning: PostgreSQL remains the
 	// authority for every durable decision.
 	now func() time.Time
+	// tracer records the claim and execution spans. Taken from the global
+	// delegating provider, so it resolves to whatever cmd/taskforge-worker
+	// installs, and is a no-op when tracing is disabled.
+	tracer trace.Tracer
 }
 
 func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
@@ -133,6 +141,7 @@ func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, ob
 		flights:  make(map[uuid.UUID]*deliveryFlight),
 		attempts: newAttemptRegistry(),
 		now:      time.Now,
+		tracer:   otel.Tracer(telemetry.TracerName),
 	}
 }
 
@@ -298,6 +307,20 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	}
 	defer r.endDelivery(notification.EventID, flight)
 
+	// Only the leader traces. A follower does no work of its own -- it waits on
+	// the leader's durable claim decision and acknowledges its own receipt --
+	// so a span for it would record waiting, not working.
+	//
+	// The trace continues the submitting transaction's, carried on the envelope
+	// because the API process that wrote it is long gone by now (ADR-0004). A
+	// nil or unparseable value leaves ctx unchanged and the spans below become
+	// a fresh root, which is the same rule every other trace boundary here
+	// follows.
+	if notification.Trace != nil {
+		ctx = telemetry.ExtractTraceContext(ctx,
+			notification.Trace.Traceparent, notification.Trace.Tracestate)
+	}
+
 	request := workers.ClaimRequest{
 		WorkerID: session.WorkerID, SessionID: session.ID,
 		// The durable outbox event identity survives broker redelivery and an
@@ -306,11 +329,36 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		ClaimRequestID: notification.EventID, Queue: notification.Queue,
 	}
 	var claim workers.ClaimResult
-	err = r.retry(ctx, func() error {
+	// One span over the whole retry loop rather than one per attempt. A retry
+	// here is this client re-asking for the SAME committed decision under one
+	// claim identity, not a second claim, and splitting it would suggest
+	// otherwise. The disposition is recorded on the span once it is known.
+	claimCtx, claimSpan := r.tracer.Start(ctx, "worker.Claim")
+	err = r.retry(claimCtx, func() error {
 		var err error
-		claim, err = r.control.Claim(ctx, request)
+		claim, err = r.control.Claim(claimCtx, request)
 		return err
 	})
+	if err == nil {
+		claimSpan.SetAttributes(
+			attribute.String("taskforge.queue", request.Queue),
+			attribute.String("taskforge.claim_disposition", string(claim.Disposition)),
+		)
+	}
+	claimSpan.End()
+	// Everything this delivery does from here nests under the claim.
+	//
+	// That is what ARCHITECTURE.md section 14 describes literally ("... ->
+	// claim -> worker execution -> result"), and it is what the lease actually
+	// means: the authority the claim acquired is held throughout execution, so
+	// execution really does happen inside it. It also makes an UNTRACED
+	// delivery coherent -- without it, a notification carrying no trace context
+	// produced a claim root and a separate execution root, two traces for one
+	// delivery.
+	//
+	// The claim span has already ended, which is fine: parentage is by span id
+	// and does not require the parent to still be open.
+	ctx = claimCtx
 	if err != nil {
 		if isSessionLost(err) {
 			sessionLost := fmt.Errorf("%w: %v", ErrSessionLost, err)
@@ -450,9 +498,31 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	handlerCtx, cancelHandler := context.WithCancelCause(executionCtx)
 	r.attempts.bind(fence.AttemptID, cancelHandler)
 
+	// The execution span covers the handler and nothing else, matching
+	// ARCHITECTURE.md section 14's stated span list exactly. It deliberately
+	// does NOT extend over the outcome report that follows: instrumenting the
+	// worker's control-plane calls is a separate, larger surface and is out of
+	// this milestone's scope.
+	//
+	// It is started from handlerCtx, so the handler's own context is the one
+	// carrying the span -- a trusted handler that starts its own spans nests
+	// under this one rather than beside it.
+	handlerCtx, executionSpan := r.tracer.Start(handlerCtx, "worker.Execute")
+	executionSpan.SetAttributes(
+		attribute.String("taskforge.job_id", assignment.JobID.String()),
+		attribute.String("taskforge.attempt_id", assignment.AttemptID.String()),
+		attribute.String("taskforge.job_type", assignment.JobType),
+		attribute.Int("taskforge.attempt_number", assignment.AttemptNumber),
+	)
 	handlerResult, handlerErr := invokeHandler(handlerCtx, handler, Execution{
 		JobID: assignment.JobID, AttemptID: assignment.AttemptID, Payload: assignment.Payload,
 	})
+	// Ended before the outcome is classified, so the span measures the handler
+	// and not this process's bookkeeping. No handler error text is recorded:
+	// that text is exactly where payload fragments, credentials, and stack
+	// traces reliably appear (see FailureError's own comment), and a span is
+	// the same disclosure as a log with a different transport.
+	executionSpan.End()
 	// Captured before the derived contexts are cancelled: cancelling first would
 	// make every successful handler look cancelled, while ignoring the value
 	// would let a cooperative timeout that returns nil be reported as success.
