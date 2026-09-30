@@ -474,7 +474,9 @@ inside a digest-pinned build image, so §5's list is unchanged and the host need
 no Node for anything. ADR-0017 records that and the other decisions M6D could
 not avoid: mounting under `/dashboard/` rather than `/`, so the existing JSON
 404 catch-all is untouched; the operator's key in `sessionStorage` behind a
-same-origin-only CSP; Biome as the single lint/format tool; and a CI job that
+same-origin-only CSP, with the origin it shares with the unauthenticated
+loopback key-administration routes recorded as an accepted limitation whose
+guard is the owner's decision; Biome as the single lint/format tool; and a CI job that
 runs the Make targets rather than `actions/setup-node`.
 
 Deliberately **not** in scope, as boundaries rather than TODOs: every write from

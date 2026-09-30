@@ -1709,7 +1709,7 @@ by version and index digest. `internal/dashboard` embeds the build and
 the toolchain, serving, credential, and CI decisions and the alternatives each
 rejected.
 
-No migration, no new endpoint, no new query, and no new credential. The
+No migration, no new API endpoint, no new query, and no new credential type. The
 dashboard is a client of routes that already existed.
 
 ### No new host prerequisite — by containment, not by amendment
@@ -1756,13 +1756,37 @@ immutably and the entry document is `no-cache`.
 The operator pastes a key minted exactly as for the CLI. It lives in
 `sessionStorage` only — tested: after entering one, `localStorage` is empty and
 no cookie exists — and every read sends it as a bearer token with
-`credentials: "omit"`. A script in the dashboard's origin could read it; the
-mitigation is a Content-Security-Policy on every dashboard response allowing
-only same-origin script, style, and fetch, with no `unsafe-inline` or
-`unsafe-eval`, no third-party script, and text-only rendering of payloads and
-error messages. `TestAssets_BuiltOutputIsSelfConsistent` fails if the built
-`index.html` ever contains an inline or off-origin script, so the build and the
-policy cannot quietly disagree. Live, the browser logged no CSP violation.
+`credentials: "omit"`.
+
+**What a script in the dashboard's origin could reach is more than that key.**
+The dashboard shares an origin with routes that take no credential at all: key
+administration (`GET`/`POST /internal/v1/api-keys` and
+`/internal/v1/worker-keys`, and their `.../{key_id}/revoke` routes), and the
+worker-control routes after registration, which trust a session id. Those
+routes do not check the request's `Content-Type`. So such a script could list
+every key, mint an API key or worker key for **any** scope, and revoke keys —
+full credential administration, not "this key's scope". The dashboard's own
+reads are scope-limited; its origin is not.
+
+That is an **accepted, loopback-only limitation**, recorded in
+[ADR-0017](adr/0017-dashboard-toolchain-and-serving.md). It rests on the same
+facts the unauthenticated routes already rested on: `TASKFORGE_API_ADDR` is
+validated as a loopback bind, and anyone on loopback can already call them
+directly. What the dashboard adds is a path to them through script injection
+in its page. A guard — refusing browser-originated `/internal/*` requests by
+`Origin` or `Sec-Fetch-Site`, or serving the dashboard from its own listener —
+moves a trust boundary, so it is the owner's decision and is deferred as a
+bounded follow-up; it must be settled before `taskforge-api` listens on
+anything but loopback.
+
+The mitigation against such a script running at all: a Content-Security-Policy
+on every dashboard response allowing only same-origin script, style, and fetch
+(quoted exactly in ADR-0017), with no `unsafe-inline` or `unsafe-eval`, no
+third-party script, and text-only rendering of payloads and error messages.
+`TestAssets_BuiltOutputIsSelfConsistent` fails if the built `index.html` ever
+contains an inline or off-origin script, so the build and the policy cannot
+quietly disagree. Live, the browser logged no CSP violation. The CSP makes such
+a script unlikely; it does not narrow what one could reach.
 
 ### Four states per view, and the request id
 
@@ -1796,14 +1820,26 @@ parameter the client sends with the real `api/openapi.yaml`. Removing
 `worker_name` from `Attempt`'s required list in the OpenAPI file fails it; so
 does changing a `FieldSpec` entry, at `tsc` time.
 
+Its boundary: it does **not** compare scalar types (`integer` against
+`number`, `date-time` against `string`) or array item schemas (that
+`JobPage.jobs` holds `JobSummary`). Those rest on the hand-written interfaces
+and review.
+
 ### Two things the Queues view refuses to imply
 
 `depth` counts this key's scope; `max_concurrency` is queue-wide across every
 scope. They are separate, labeled columns with a caption saying they are not
-comparable, and a test asserts no depth-over-limit ratio is rendered. Workers
-in `UNHEALTHY` and `OFFLINE` are listed with their status in text, not only
-color, and heartbeat age is shown as the API measured it without a
-client-side verdict.
+comparable, and a test asserts no depth-over-limit ratio is rendered.
+
+Workers are listed by whatever status `GET /v1/workers` reports, in text, not
+only color, and heartbeat age is shown as the API measured it without a
+client-side verdict. A crashed worker appears `UNHEALTHY`. A worker whose boot
+was replaced appears with its **newest** session's status — `HEALTHY` in
+practice, as M6A's own integration test pins — not `OFFLINE`; the test fixture
+models exactly that. `OFFLINE` is in the enum, so its label has a separate,
+explicitly rendering-only test. A status the dashboard does not know (a newer
+server during a rolling deploy) is counted on the Overview as unrecognized
+rather than dropped.
 
 ### Deliberate scope boundaries
 
@@ -1822,7 +1858,8 @@ These are boundaries, not TODOs:
   deferred.
 - No `dash-dev` hot-reload target: a containerized dev server must reach
   `taskforge-api` on host loopback, which does not work portably. The loop is
-  `make dash-test`, then `make dash-build` and a restart.
+  `make dash-test`, then `make dash-build`, `make build`, and a restart: the
+  dashboard is embedded at compile time.
 
 ### A defect this milestone's own checks caught
 
@@ -2435,7 +2472,7 @@ Node 24.21.0 inside `dashboard/Dockerfile` only; Python 3.14 in
 | `make test-integration` | PASS — `ok github.com/co-rtex/TaskForge/tests/integration 116.679s` |
 | `make test-race` | PASS — integration `ok … 99.543s`, no DATA RACE |
 | `make dash-lint` | PASS — `Checked 44 files … No fixes applied.`; `tsc --noEmit` silent |
-| `make dash-test` | PASS — `Test Files 10 passed (10)`, `Tests 74 passed (74)` |
+| `make dash-test` | PASS — `Test Files 10 passed (10)`, `Tests 79 passed (79)` after review fixes (74 at first review) |
 | `make dash-build` | PASS — `index.html` plus one hashed JS and one hashed CSS asset; `git status` clean afterwards |
 | `TASKFORGE_REQUIRE_BUILT_DASHBOARD=1 go test ./internal/dashboard/` | PASS — including `TestAssets_BuiltOutputIsSelfConsistent` against the real build |
 | `make sdk-lint` / `make sdk-test` | PASS — mypy clean in 21 files; 178 passed; unchanged by this milestone |
@@ -2460,6 +2497,7 @@ changed:
 | Drop `worker_name` from `Attempt.required` in `api/openapi.yaml` | `types.test.ts` | `× Attempt: same fields, same presence, same nullability` |
 | Render `{64}` in place of `queue.max_concurrency` | `hardcoded.test.ts` | `views/Queues.tsx: expected [ '64' ] to deeply equal []` |
 | Stop rendering `request_id` in `ErrorState` | the six views' error tests | `Tests 6 failed | 21 passed` |
+| Call `decodeURIComponent` unguarded in `parseRoute` | `App.test.tsx` router cases | `× /dashboard/jobs/%E0`, `× /dashboard/jobs/%zz` |
 | `payload: "optional"` in `JOB_FIELDS` | `tsc --noEmit` | `TS2322: Type '"optional"' is not assignable to type '"required"'` |
 
 **Live stack.** All five services plus a scripted worker driving only the real
@@ -2504,7 +2542,8 @@ browser requests were same-origin and returned 200.
 client routes, and assets are the JSON 404. Set: the entry document with its
 security headers; client routes fall back to it; hashed assets are immutable
 and top-level files are not; a missing asset and dotfiles are JSON 404s; seven
-unrouted API-shaped paths stay JSON 404s; API routes behave identically; the
+unrouted API-shaped paths stay JSON 404s; a client route with invalid UTF-8 is
+a JSON 404 before the router ever sees it; API routes behave identically; the
 root redirects only when enabled; writes are 405; HEAD has no body; every
 dashboard path shares the span name `GET /dashboard/`; and a missing entry
 document is a sanitized 500.
@@ -2514,9 +2553,12 @@ is preferred when present; the placeholder names `make dash-build` and has no
 script; and, against a real build, every referenced asset is under
 `/dashboard/`, exists in the embedded tree, and no script is inline.
 
-**`dashboard/src`.** Four states for each of six views; the client's URL
+**`dashboard/src`.** Four states for each of six views; a replaced worker
+shown by its newest session, and `OFFLINE` as a rendering-only case; an
+unrecognized worker status counted rather than dropped; the client's URL
 building, headers, and error mapping; the drift test; the hardcoded-values
-scan; key storage, forgetting, and routing in `App.test.tsx`.
+scan; key storage, forgetting, and routing in `App.test.tsx`, including
+malformed escapes answered as not-found instead of a thrown `URIError`.
 
 ### M6C gates
 
@@ -3154,6 +3196,20 @@ exercised by a real hosted failure.
   `/internal/v1/worker-keys`) remain unauthenticated by design, and every
   service still binds to loopback. Anyone who can reach loopback can still
   mint a credential of either kind for any scope.
+- Since M6D those routes share an origin with the dashboard, so script running
+  in the dashboard's page could administer credentials for every scope.
+  Accepted for loopback only; a browser-origin guard or a separate dashboard
+  listener is the owner's decision (see "M6D — operator dashboard" and
+  ADR-0017).
+- Those routes also check neither `Host` nor the request's origin, and the key
+  routes accept any `Content-Type`, so a website the operator visits can send a
+  cross-site request that mints or revokes a key (CSRF, with an unreadable
+  response), and DNS rebinding could read the response. This predates M6D
+  (it dates from M5A); the same guard would close it.
+- An `index.html` and its hashed assets come from one binary, so several
+  `taskforge-api` replicas behind a load balancer during a rolling deploy could
+  serve an entry document naming assets another replica lacks. Impossible on
+  today's single loopback process.
 - Authorization beyond scope is post-V1. A key carries exactly one scope and no
   permission set; there is no RBAC, no per-route permission, and no rate
   limiting.
@@ -3244,6 +3300,12 @@ twelve required scenarios, plus `make demo` and `make demo-failure`. See
 also be watched from the dashboard.
 
 Smaller items available to whoever wants them, none blocking M7:
+
+- **An owner decision, before any non-loopback deployment:** guard
+  `/internal/*` against browser-originated requests (`Origin` /
+  `Sec-Fetch-Site`) or serve the dashboard from its own listener. It closes
+  both the dashboard-origin exposure and the pre-existing CSRF / DNS-rebinding
+  exposure recorded above.
 
 - `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
   deliberately did not build. See its section above for exactly what each would

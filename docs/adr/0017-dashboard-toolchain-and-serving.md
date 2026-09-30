@@ -83,9 +83,43 @@ work. Content-hashed assets are cached immutably; the entry document is
 `no-cache`.
 
 **Same-origin is load-bearing, not a preference.** It removes CORS entirely:
-no `Access-Control-Allow-Origin` decision, no preflight, and no trust boundary
-moves. The dashboard adds no endpoint, no credential, and no server-side
-session; it is a static client of routes that already exist.
+no `Access-Control-Allow-Origin` decision and no preflight. The dashboard adds
+no API endpoint, no credential type, and no server-side session; it is a static
+client of routes that already exist.
+
+**Same-origin is also what defines its blast radius, and that radius is larger
+than the dashboard's own reads.** `taskforge-api`'s origin already serves
+routes that take no credential at all: key administration
+(`GET`/`POST /internal/v1/api-keys`, `POST /internal/v1/api-keys/{key_id}/revoke`,
+and the same three for `/internal/v1/worker-keys`), and the worker-control
+routes after registration, which trust a session id rather than a presented
+credential. Before M6D nothing on that origin ran script. Now a page does, so a
+script executing in it — which the CSP below exists to prevent — would not be
+limited to reading the operator's one scoped key: it could list every key, mint
+an API key or a worker key for any scope, and revoke keys. That is full
+credential administration for every scope. So a browser origin now sits beside
+those routes where none did, and this record says so rather than claiming no
+boundary moved.
+
+It is **accepted, for loopback only**, and the acceptance is bounded by facts
+that already held before M6D: `TASKFORGE_API_ADDR` is validated as a loopback
+bind, and anyone who can reach loopback can already call those routes directly
+([`CURRENT_STATE.md`](../CURRENT_STATE.md) "Deliberately not implemented yet").
+The dashboard adds a path to them through script injection in its own page, not
+a new population of callers. Whether to add a guard — refusing
+browser-originated requests to `/internal/*` by `Origin` or `Sec-Fetch-Site`,
+or serving the dashboard from its own listener so it no longer shares an origin
+with them — moves a trust boundary, and so is the owner's decision rather than
+this milestone's. It is deferred as its own bounded follow-up, and must be
+decided before `taskforge-api` listens on anything but loopback.
+
+A related exposure predates M6D and is recorded here because a browser is now an
+intended client. Those unauthenticated routes check neither `Host` nor the
+request's origin, and the key routes do not require a JSON `Content-Type`, so
+any website the operator visits can send a cross-site "simple" request that
+mints or revokes a key (CSRF; the response is unreadable cross-origin), and a
+DNS-rebinding attack could also read the response. The same guard would close
+both.
 
 ### Credential: the operator's own key, in `sessionStorage`, behind a strict CSP
 
@@ -96,14 +130,23 @@ bounded by the tab. Every read presents it as a bearer token with
 `credentials: "omit"`.
 
 The trade-off is recorded rather than hidden: a script running in the
-dashboard's origin could read that key. The mitigation is concrete. Every
-dashboard response carries a Content-Security-Policy of `default-src 'none';
-script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors
-'none'` (plus `base-uri`/`form-action 'none'`), with no `unsafe-inline` and no
-`unsafe-eval`; the dashboard loads no third-party script; payloads and error
-messages are rendered as React text, never as HTML; and a Go test asserts the
-built `index.html` contains no inline script, so the policy and the build
-cannot quietly disagree.
+dashboard's origin could read that key — and, as the serving section above
+states, could do considerably more than that with the unauthenticated routes on
+the same origin. The mitigation against such a script running at all is
+concrete. Every dashboard response carries exactly this
+Content-Security-Policy (`dashboardCSP` in `internal/api/dashboard.go`):
+
+```
+default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:;
+font-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none';
+form-action 'none'; frame-ancestors 'none'
+```
+
+It has no `unsafe-inline` and no `unsafe-eval`; the dashboard loads no
+third-party script; payloads and error messages are rendered as React text,
+never as HTML; and a Go test asserts the built `index.html` contains no inline
+script, so the policy and the build cannot quietly disagree. The CSP makes a
+same-origin script unlikely. It does not change what such a script could reach.
 
 ### Read-only, by two independent reasons
 
@@ -125,6 +168,12 @@ paired with a `FieldSpec` constant the TypeScript compiler forces to name
 exactly that interface's fields with their presence and nullability; a test
 compares those constants, every enum, and every route and query parameter the
 client sends against the real `api/openapi.yaml`.
+
+That is the test's boundary, stated rather than implied: it does **not** compare
+scalar types (`integer` against `number`, `date-time` against `string`) or array
+item schemas (that `JobPage.jobs` holds `JobSummary`). Those are checked by
+`tsc` against the hand-written interfaces only, and the interfaces are checked
+against the document only by review.
 
 ### Lint and format: Biome
 
@@ -205,15 +254,28 @@ without a job.
   `dashboard_built=false`. `make build` does not build the frontend; a
   developer who wants the dashboard runs `make dash-build` first.
 - There is no hot-reload development loop. Iterating on the frontend means
-  `make dash-test` for behavior and `make dash-build` plus a restart to see it.
+  `make dash-test` for behavior, and `make dash-build`, `make build`, and a
+  restart to see it — the dashboard is embedded at compile time.
 - The operator's API key is readable by script in the dashboard's origin for
   the life of the tab. The CSP, the absence of third-party script, and
   text-only rendering are the mitigation; the server-side proxy above is the
   remedy if that stops being enough.
-- The dashboard sees only its key's scope, exactly like the CLI and the SDK.
-  There is no cross-scope view.
+- **The dashboard's own reads see only its key's scope, exactly like the CLI and
+  the SDK. Its origin does not.** A script running in that origin could reach
+  the unauthenticated key-administration routes and administer credentials for
+  every scope. That is accepted for a loopback-only listener; a guard is the
+  owner's decision and a prerequisite for any non-loopback deployment.
+- The pre-existing CSRF and DNS-rebinding exposure of those routes is unchanged
+  by M6D, and recorded here and in CURRENT_STATE rather than fixed.
+- An `index.html` and its hashed assets come from one binary. Behind several
+  `taskforge-api` replicas during a rolling deploy, one replica's entry
+  document could name assets another replica does not have; and a newer
+  server could send an enum value an older client does not know (the Overview
+  counts an unrecognized worker status rather than dropping it). Neither can
+  happen on today's single loopback process.
 - `types.ts` and `api/openapi.yaml` are two hand-maintained copies of one
-  contract. The drift test pins them together; the Go contract tests already
-  pin the OpenAPI document to the handlers.
+  contract. The drift test pins their fields, presence, nullability, enums, and
+  parameters together — not scalar types or array item schemas; the Go
+  contract tests already pin the OpenAPI document to the handlers.
 - Any future frontend in this repository inherits these decisions, or
   supersedes this record.
