@@ -12,9 +12,11 @@ import { formatSeconds, PAGE_SIZE } from "../format";
 
 /**
  * GET /v1/workers: every logical worker joined to its most recent session,
- * whatever that session's status. UNHEALTHY (a crashed process) and OFFLINE (a
- * replaced boot) are listed and labeled like any other status, never filtered
- * out -- they are the workers an operator most often opens this page to find.
+ * whatever that session's status. Every status is listed and labeled in text,
+ * never filtered out. A crashed process appears UNHEALTHY -- the row an
+ * operator most often opens this page to find. A worker whose boot was
+ * replaced appears with its NEWEST session's status (HEALTHY in practice, as
+ * M6A's integration test pins), not the OFFLINE session it replaced.
  *
  * Heartbeat age is shown as the API measured it and is not judged here: the
  * threshold that decides a worker is dead lives in the reconciler's

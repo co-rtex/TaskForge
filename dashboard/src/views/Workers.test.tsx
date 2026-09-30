@@ -46,7 +46,8 @@ describe("Workers", () => {
     expect(rows).toHaveLength(3);
 
     const rowFor = (name: string) => within(loaded).getByText(name).closest("tr");
-    expect(rowFor(healthyWorker.name)?.textContent).toContain("HEALTHY");
+    // A badge class, not a substring: "UNHEALTHY" contains "HEALTHY".
+    expect(rowFor(healthyWorker.name)?.querySelector(".badge-healthy")).not.toBeNull();
     expect(rowFor(healthyWorker.name)?.textContent).toContain("3 / 8");
     // A crashed process is the row an operator opens this page to find. It is
     // listed, and says so in text, not only in color.
@@ -56,7 +57,8 @@ describe("Workers", () => {
     expect(rowFor(crashedWorker.name)?.textContent).toContain("4m 28s");
     // M6A reports a replaced worker's newest session, so it shows that
     // session's status and limit, not the OFFLINE one it replaced.
-    expect(rowFor(replacedWorker.name)?.textContent).toContain("HEALTHY");
+    expect(rowFor(replacedWorker.name)?.querySelector(".badge-healthy")).not.toBeNull();
+    expect(rowFor(replacedWorker.name)?.querySelector(".badge-unhealthy")).toBeNull();
     expect(rowFor(replacedWorker.name)?.textContent).toContain("1 / 6");
   });
 
