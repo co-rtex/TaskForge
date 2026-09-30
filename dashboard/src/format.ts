@@ -46,17 +46,27 @@ export function total(counts: Record<string, number>): number {
   return Object.values(counts).reduce((sum, count) => sum + count, 0);
 }
 
-/** Counts items by a key, preserving the order the keys are given in. */
+/**
+ * Counts items by a known key, preserving the order the keys are given in.
+ * A value outside `keys` -- a status a newer server added -- is counted in
+ * `unrecognized` rather than dropped or turned into NaN.
+ */
 export function countBy<T, K extends string>(
   items: readonly T[],
   keys: readonly K[],
-  keyOf: (item: T) => K,
-): Record<K, number> {
+  keyOf: (item: T) => string,
+): { counts: Record<K, number>; unrecognized: number } {
   const counts = Object.fromEntries(keys.map((key) => [key, 0])) as Record<K, number>;
+  let unrecognized = 0;
   for (const item of items) {
-    counts[keyOf(item)] += 1;
+    const key = keyOf(item);
+    if ((keys as readonly string[]).includes(key)) {
+      counts[key as K] += 1;
+    } else {
+      unrecognized += 1;
+    }
   }
-  return counts;
+  return { counts, unrecognized };
 }
 
 /** A job payload as indented JSON text. Displayed, never interpreted. */

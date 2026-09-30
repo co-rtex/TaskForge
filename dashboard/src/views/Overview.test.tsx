@@ -75,6 +75,27 @@ describe("Overview", () => {
     }
   });
 
+  it("counts a worker status it does not recognize instead of dropping it", async () => {
+    const { container } = renderWithClient(
+      <Overview />,
+      routes({
+        "/v1/queues": () => json(queueList),
+        // A status a newer server might add. The type says it cannot happen;
+        // a rolling deploy says it can.
+        "/v1/workers": () =>
+          json({
+            workers: [...workerPage.workers, { ...workerPage.workers[0], status: "RETIRED" }],
+          }),
+        "/v1/jobs": () => json(jobPage),
+      }),
+    );
+    const loaded = await expectLoaded(container);
+    expect(loaded.textContent).toContain(
+      "4 workers, by status. 1 with a status this dashboard does not recognize.",
+    );
+    expect(loaded.textContent).not.toContain("NaN");
+  });
+
   it("says so when the worker summary covers only the first page", async () => {
     const { container } = renderWithClient(
       <Overview />,

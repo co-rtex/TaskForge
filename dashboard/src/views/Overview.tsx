@@ -100,7 +100,11 @@ function OverviewWorkers({
   workers: readonly Worker[];
   truncated: boolean;
 }) {
-  const byStatus = countBy(workers, WORKER_STATUSES, (worker) => worker.status);
+  const { counts: byStatus, unrecognized } = countBy(
+    workers,
+    WORKER_STATUSES,
+    (worker) => worker.status,
+  );
   return (
     <article className="panel" aria-labelledby="overview-workers">
       <h2 id="overview-workers">
@@ -114,6 +118,8 @@ function OverviewWorkers({
             {truncated
               ? `The first ${workers.length} workers, by status. More exist; see Workers.`
               : `${workers.length} ${workers.length === 1 ? "worker" : "workers"}, by status.`}
+            {unrecognized > 0 &&
+              ` ${unrecognized} with a status this dashboard does not recognize.`}
           </p>
           <dl className="counts">
             {WORKER_STATUSES.map((status) => (

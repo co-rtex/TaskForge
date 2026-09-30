@@ -28,7 +28,8 @@ export function parseRoute(pathname: string): Route {
     return { name: "not_found" };
   }
   if (first === "jobs" && second !== undefined) {
-    return { name: "job", jobId: decodeURIComponent(second) };
+    const jobId = decodeSegment(second);
+    return jobId === null ? { name: "not_found" } : { name: "job", jobId };
   }
   if (second !== undefined) {
     return { name: "not_found" };
@@ -44,6 +45,20 @@ export function parseRoute(pathname: string): Route {
       return { name: "dlq" };
     default:
       return { name: "not_found" };
+  }
+}
+
+/**
+ * decodeURIComponent throws URIError on a malformed escape, and a throw during
+ * render would blank the whole app. taskforge-api already refuses the obvious
+ * cases (an invalid escape is a 400, invalid UTF-8 a JSON 404), but the router
+ * must not depend on that: history navigation never reaches the server.
+ */
+function decodeSegment(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
   }
 }
 

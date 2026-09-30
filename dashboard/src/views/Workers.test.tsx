@@ -36,7 +36,7 @@ describe("Workers", () => {
     await expectError(container, 503, "service_unavailable", "request deadline elapsed");
   });
 
-  it("lists crashed and replaced workers, each labeled by its own status", async () => {
+  it("lists a crashed worker as UNHEALTHY and a replaced one by its newest session", async () => {
     const { container } = renderWithClient(
       <Workers />,
       routes({ "/v1/workers": () => json(workerPage) }),
@@ -48,13 +48,31 @@ describe("Workers", () => {
     const rowFor = (name: string) => within(loaded).getByText(name).closest("tr");
     expect(rowFor(healthyWorker.name)?.textContent).toContain("HEALTHY");
     expect(rowFor(healthyWorker.name)?.textContent).toContain("3 / 8");
-    // UNHEALTHY and OFFLINE are the rows an operator opens this page to find.
-    // They are listed, and each says so in text, not only in color.
+    // A crashed process is the row an operator opens this page to find. It is
+    // listed, and says so in text, not only in color.
     expect(rowFor(crashedWorker.name)?.textContent).toContain("UNHEALTHY");
     expect(rowFor(crashedWorker.name)?.querySelector(".badge-unhealthy")).not.toBeNull();
-    expect(rowFor(replacedWorker.name)?.textContent).toContain("OFFLINE");
-    expect(rowFor(replacedWorker.name)?.querySelector(".badge-offline")).not.toBeNull();
     // Heartbeat age as the API measured it, formatted, not judged.
     expect(rowFor(crashedWorker.name)?.textContent).toContain("4m 28s");
+    // M6A reports a replaced worker's newest session, so it shows that
+    // session's status and limit, not the OFFLINE one it replaced.
+    expect(rowFor(replacedWorker.name)?.textContent).toContain("HEALTHY");
+    expect(rowFor(replacedWorker.name)?.textContent).toContain("1 / 6");
+  });
+
+  // Rendering only. OFFLINE is in the Worker.status enum, but M6A never returns
+  // it as a worker's latest status today (see the replacedWorker fixture). This
+  // pins that the value would still be labeled in text if it ever did.
+  it("labels OFFLINE in text, as a rendering-only case", async () => {
+    const { container } = renderWithClient(
+      <Workers />,
+      routes({
+        "/v1/workers": () => json({ workers: [{ ...crashedWorker, status: "OFFLINE" }] }),
+      }),
+    );
+    const loaded = await expectLoaded(container);
+    const row = within(loaded).getByText(crashedWorker.name).closest("tr");
+    expect(row?.textContent).toContain("OFFLINE");
+    expect(row?.querySelector(".badge-offline")).not.toBeNull();
   });
 });

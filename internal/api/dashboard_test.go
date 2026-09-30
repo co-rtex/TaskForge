@@ -134,6 +134,13 @@ func TestDashboard_AMissingAssetIsAStructuredNotFound(t *testing.T) {
 	requireStructuredNotFound(t, serve(h, http.MethodGet, "/dashboard/assets/"))
 }
 
+// Invalid UTF-8 in a client route never reaches the dashboard's router: the
+// server answers the JSON 404 itself. (A malformed escape is rejected earlier
+// still, by net/http, as a 400.) The router guards its own decode regardless.
+func TestDashboard_InvalidUTF8PathIsAStructuredNotFound(t *testing.T) {
+	requireStructuredNotFound(t, serve(newDashboardTestServer(t), http.MethodGet, "/dashboard/jobs/%E0"))
+}
+
 // Dotfiles ride along in the embedded tree (the committed .gitkeep is one) and
 // are never served.
 func TestDashboard_HiddenFilesAreNotServed(t *testing.T) {

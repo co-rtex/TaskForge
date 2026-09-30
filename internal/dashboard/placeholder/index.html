@@ -14,8 +14,10 @@
         embeds this notice instead of the dashboard. It shows no data.
       </p>
       <p>
-        Run <code>make dash-build</code> from the repository root, then rebuild or
-        restart <code>taskforge-api</code>. The build runs inside a pinned Node
+        Run <code>make dash-build</code> from the repository root, then rebuild
+        <code>taskforge-api</code> (<code>make build</code>) and start it again.
+        The dashboard is embedded at compile time, so restarting the binary you
+        already have is not enough. The build runs inside a pinned Node
         container; nothing beyond Docker is needed on this machine.
       </p>
     </main>

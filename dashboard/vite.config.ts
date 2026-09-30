@@ -11,7 +11,10 @@ export default defineConfig({
   base: BASE_PATH,
   build: {
     outDir: "../internal/dashboard/dist",
-    // Required explicitly because outDir is outside this project root.
+    // Required explicitly because outDir is outside this project root. It also
+    // deletes the committed dist/.gitkeep, which is why the supported path is
+    // `make dash-build`: that builds in a container and copies only the output
+    // back. Running `npm run build` on a host checkout leaves a dirty tree.
     emptyOutDir: true,
     // internal/api treats everything under assets/ as content-hashed:
     // cached forever, and a miss there is a 404 rather than a client route.

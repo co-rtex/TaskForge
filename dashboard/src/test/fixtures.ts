@@ -115,12 +115,20 @@ export const crashedWorker: Worker = {
   active_leases: 0,
 };
 
+/**
+ * A worker whose earlier boot was replaced by a newer one. GET /v1/workers
+ * reports the NEWEST session -- tests/integration/read_api_test.go pins this
+ * as HEALTHY, never OFFLINE -- so that is what this fixture carries: the new
+ * session's status, limit, and open ended_at.
+ */
 export const replacedWorker: Worker = {
-  ...crashedWorker,
+  ...healthyWorker,
   id: "3c4d5e6f-7081-4923-8a4b-5c6d7e8f90a1",
   name: "fixture-worker-replaced",
-  status: "OFFLINE",
   hostname: "fixture-host-replaced",
+  concurrency_limit: 6,
+  active_leases: 1,
+  registered_at: "2026-09-30T12:02:00Z",
 };
 
 export const workerPage: WorkerPage = {

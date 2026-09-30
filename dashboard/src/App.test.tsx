@@ -95,6 +95,10 @@ describe("parseRoute", () => {
     ["/dashboard/jobs/", { name: "jobs" }],
     ["/dashboard/jobs/abc", { name: "job", jobId: "abc" }],
     ["/dashboard/jobs/abc/attempts", { name: "not_found" }],
+    // Malformed escapes: decodeURIComponent throws on both; the router must not.
+    ["/dashboard/jobs/%E0", { name: "not_found" }],
+    ["/dashboard/jobs/%zz", { name: "not_found" }],
+    ["/dashboard/jobs/a%2Fb", { name: "job", jobId: "a/b" }],
     ["/dashboard/workers", { name: "workers" }],
     ["/dashboard/queues", { name: "queues" }],
     ["/dashboard/dlq", { name: "dlq" }],
