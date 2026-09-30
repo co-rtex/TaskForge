@@ -296,6 +296,74 @@ jobs:
         run: make sdk-test
 
   # ---------------------------------------------------------------------------
+  # Operator dashboard. Its own job for the reason `sdk` has one: a different
+  # toolchain, and a Go failure and a frontend failure sharing one status line
+  # reads badly. Not in `integration`: its tests drive the real client through
+  # a stubbed fetch and need neither PostgreSQL nor the broker.
+  #
+  # There is deliberately no actions/setup-node. Every step runs the same Make
+  # target a developer runs, and each builds a stage of dashboard/Dockerfile,
+  # whose pinned image is the single declaration of the Node version -- the
+  # same "no second source of truth" rule the header applies to Go. What this
+  # job proves is therefore what a contributor gets, Node never on the path.
+  # See docs/adr/0017.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    name: Dashboard (format, lint, types, tests, build, embed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report the resolved toolchain
+        run: |
+          set -euo pipefail
+          docker version --format 'docker {{.Server.Version}}'
+          grep -m1 '^FROM node' dashboard/Dockerfile
+
+      - name: Format, lint, and type check
+        run: make dash-lint
+
+      - name: Unit tests
+        run: make dash-test
+
+      - name: Build
+        run: make dash-build
+
+      - name: The build leaves every tracked file untouched
+        run: |
+          set -euo pipefail
+          # Build output lands in internal/dashboard/dist, which is ignored
+          # except for the committed .gitkeep go:embed needs. A build that
+          # modified a tracked file would dirty every contributor's tree.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::make dash-build modified the working tree"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Embed the build into taskforge-api
+        env:
+          # Turns TestAssets_BuiltOutputIsSelfConsistent's skip into a
+          # failure, so this step cannot pass by having embedded nothing.
+          TASKFORGE_REQUIRE_BUILT_DASHBOARD: "1"
+        run: |
+          set -euo pipefail
+          go test -count=1 -v -run '^TestAssets_' ./internal/dashboard/
+          go test -count=1 -run '^TestDashboard_' ./internal/api/
+          go build -o "${RUNNER_TEMP}/taskforge-api" ./cmd/taskforge-api
+
+  # ---------------------------------------------------------------------------
   # Race detector. Separated from the integration job because it is the slowest
   # gate and its failures read very differently.
   # ---------------------------------------------------------------------------
