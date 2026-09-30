@@ -450,22 +450,39 @@ recording them means either observing inside fenced-transition code or widening
 a wire contract. §14 and [CURRENT_STATE.md](CURRENT_STATE.md) both say so and
 say what each would take.
 
-### M6D — Operator dashboard — **planned**
+### M6D — Operator dashboard
 **Objective.** Overview, Jobs, Job detail with attempt timeline, Workers,
 Queues, and DLQ, reading only M6A's live routes.
+**Deliverables.** `dashboard/` (React + TypeScript + Vite) with a hand-written
+client and a drift test against `api/openapi.yaml`; `dashboard/Dockerfile` as
+the whole Node toolchain; `internal/dashboard`'s `go:embed` with a committed
+not-built placeholder; `internal/api`'s optional `WithDashboard`, serving
+same-origin under `/dashboard/`; `make dash-fmt` / `dash-lint` / `dash-test` /
+`dash-build`; a `dashboard` CI job; and
+[ADR-0017](adr/0017-dashboard-toolchain-and-serving.md).
 **Acceptance.** The dashboard reads live APIs and handles loading, empty, and
 error states; nothing is hardcoded.
 **Depends on.** M6A for data; M6B and M6C for anything it links to.
+**Status:** complete — see [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence. **With it, M6 as a whole is complete:** every clause of the original
+M6 objective and acceptance sentence is now discharged by one of M6A–M6D.
 
-A frontend toolchain is a first for this repository in the way Python was for
-M5E, and deserves the same treatment [ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md)
-gave that one: dependency and build tooling, a lint/format story, and CI
-placement each decided and recorded, not left as an implicit side effect of
-"build the dashboard". The binding constraint is
-[PROJECT_SPEC.md](PROJECT_SPEC.md) §5's prerequisite list, which ADR-0016 could
-discharge for Python by noting that running TaskForge never needs an
-interpreter — an escape that does not exist for a dashboard that is part of the
-running stack.
+The binding constraint this entry named — [PROJECT_SPEC.md](PROJECT_SPEC.md)
+§5's prerequisite list, with no ADR-0016-style "running never needs it" escape
+available — is met by containment rather than by amendment: Node runs only
+inside a digest-pinned build image, so §5's list is unchanged and the host needs
+no Node for anything. ADR-0017 records that and the other decisions M6D could
+not avoid: mounting under `/dashboard/` rather than `/`, so the existing JSON
+404 catch-all is untouched; the operator's key in `sessionStorage` behind a
+same-origin-only CSP; Biome as the single lint/format tool; and a CI job that
+runs the Make targets rather than `actions/setup-node`.
+
+Deliberately **not** in scope, as boundaries rather than TODOs: every write from
+the browser (cancel, retry, replay, bulk replay), because each requires a
+caller-chosen `Idempotency-Key` whose browser-side minting is its own design
+question and because it would stack on a new credential story in the same
+milestone; free-text search; auto-refresh, websockets, and SSE; and a
+server-side credential proxy.
 
 ### M7 — Full concurrency, restart, failure, and race suites
 **Objective.** Prove the invariants.
@@ -477,7 +494,7 @@ exhaustion; process-restart durability; stranded-notification recovery. Plus
 `make demo` and `make demo-failure`.
 **Acceptance.** Every invariant in [ARCHITECTURE.md](ARCHITECTURE.md) §12 has a test
 that asserts durable state; the race detector is clean.
-**Depends on.** M6 (M6A complete; M6B-M6D planned).
+**Depends on.** M6 (complete).
 
 ### M8 — Load generator, measured benchmarks, CI hardening, ECS Terraform
 **Objective.** Measure reality and make deployment credible.
