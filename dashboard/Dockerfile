@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # The dashboard's entire Node toolchain. Node never runs on the host:
 # `make dash-lint`, `make dash-test`, and `make dash-build` each build one stage
 # of this file, and only `dash-build` copies anything back -- the static output,
@@ -10,6 +8,10 @@
 # The build context is the repository root, because the type-drift test reads
 # api/openapi.yaml. Dockerfile.dockerignore beside this file is an allowlist:
 # the dashboard's source and that one document are all that enter the context.
+#
+# There is deliberately no "# syntax=" line. It would fetch a Dockerfile
+# frontend image by floating tag on every build, an unpinned dependency beside
+# the pinned one below; nothing here needs more than the builtin frontend.
 
 # Pinned by version AND by multi-platform index digest, like every image
 # compose.yaml runs and every action ci.yml uses. The digest is what makes the
