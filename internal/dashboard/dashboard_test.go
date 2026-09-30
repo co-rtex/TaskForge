@@ -65,12 +65,17 @@ func TestPlaceholder_SaysItIsNotBuiltAndCarriesNoScript(t *testing.T) {
 	require.NotContains(t, strings.ToLower(page), "<script")
 }
 
-var assetReference = regexp.MustCompile(`(?:src|href)="([^"]+)"`)
+var (
+	assetReference = regexp.MustCompile(`(?:src|href)="([^"]+)"`)
+	scriptTag      = regexp.MustCompile(`<script\b[^>]*>`)
+)
 
 // A real build must be internally consistent: every asset index.html references
 // is under the /dashboard/ base the server mounts it at, and is actually present
 // in the embedded tree. A Vite base-path mismatch fails here rather than as a
-// blank page in a browser.
+// blank page in a browser. And every script is an external same-origin file:
+// the server's CSP allows no inline script, so an inline one would be a page
+// that silently does nothing.
 func TestAssets_BuiltOutputIsSelfConsistent(t *testing.T) {
 	assets, built := Assets()
 	if !built {
@@ -85,8 +90,14 @@ func TestAssets_BuiltOutputIsSelfConsistent(t *testing.T) {
 
 	refs := assetReference.FindAllStringSubmatch(string(index), -1)
 	require.NotEmpty(t, refs, "a built index.html references at least its entry script")
+	for _, tag := range scriptTag.FindAllString(string(index), -1) {
+		require.Contains(t, tag, ` src="/dashboard/`, "inline or off-origin script %q", tag)
+	}
 	for _, ref := range refs {
 		url := ref[1]
+		if strings.HasPrefix(url, "data:") {
+			continue // the empty icon; the CSP's img-src allows data:
+		}
 		require.True(t, strings.HasPrefix(url, "/dashboard/"),
 			"asset %q is outside the /dashboard/ mount; check vite.config.ts base", url)
 		name := strings.TrimPrefix(url, "/dashboard/")
