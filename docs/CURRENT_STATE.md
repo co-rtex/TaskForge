@@ -1,9 +1,9 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M6B are merged into `main`; this document
-records the implemented state through M6C, which is on its own branch and
-draft pull request.
+planned. Milestones M1 through M6C are merged into `main`; this document
+records the implemented state through M6D, which is on its own branch and
+draft pull request. M6D is the last slice of M6, so M6 as a whole is complete.
 
 ## Milestone status
 
@@ -19,6 +19,7 @@ draft pull request.
 - **M6A — operator read APIs:** complete.
 - **M6B — OpenTelemetry tracing:** complete.
 - **M6C — Prometheus metrics and the health residual:** complete.
+- **M6D — operator dashboard:** complete. With it, **M6 is complete.**
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and M6 into
 four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -63,7 +64,10 @@ Seven binaries build and run, plus one installable library:
   been revoked. The loopback-only worker-key management routes mint and revoke
   those credentials. `taskforge-api` never depends on the result object store
   being reachable at boot; only a request that needs an object-located result
-  does.
+  does. It also serves the read-only operator dashboard, compiled into the
+  binary, same-origin under `/dashboard/` — see "M6D — operator dashboard"
+  below. A binary built before `make dash-build` serves a page saying the
+  dashboard has not been built, and logs `dashboard_built=false`.
 - `taskforge-outbox` publishes durable work-availability events to ElasticMQ.
 - `taskforge-scheduler` promotes due delayed and retry-waiting jobs and
   re-notifies stranded queued work. It holds no broker connection.
@@ -1691,6 +1695,186 @@ they are `package main` in their own binaries and have no callers outside them.
 Every component's `WithMetrics` is optional: a nil one records nothing and
 changes no behavior, which is what leaves every pre-M6C test unchanged.
 
+## M6D — operator dashboard
+
+### What changed
+
+Six read-only views — Overview, Jobs, Job detail with its attempt timeline,
+Workers, Queues, and DLQ — reading only the public `/v1` routes M6A shipped,
+with the operator's own API key. The frontend is React + TypeScript built by
+Vite in `dashboard/`; its whole Node toolchain is `dashboard/Dockerfile`, pinned
+by version and index digest. `internal/dashboard` embeds the build and
+`internal/api`'s optional `WithDashboard` serves it same-origin under
+`/dashboard/`. [ADR-0017](adr/0017-dashboard-toolchain-and-serving.md) records
+the toolchain, serving, credential, and CI decisions and the alternatives each
+rejected.
+
+No migration, no new API endpoint, no new query, and no new credential type. The
+dashboard is a client of routes that already existed.
+
+### No new host prerequisite — by containment, not by amendment
+
+[PROJECT_SPEC.md](PROJECT_SPEC.md) §5's list — Git, Go, Docker, Docker Compose,
+Make — is unchanged. Every `dash-*` Make target builds a stage of
+`dashboard/Dockerfile`; `node_modules/` never exists on the host, and only
+`dash-build` writes anything back (the static output, into the ignored
+`internal/dashboard/dist/`). This was verified rather than inferred, twice:
+
+- the Go gates (`make fmt` with no diff, `make lint`, `make build`, `make test`
+  including integration) ran green in a `golang:1.25` container in which
+  `command -v node` fails, on a fresh clone;
+- a fresh clone was taken from clean infrastructure to a served, built
+  dashboard with `PATH` restricted to symlinks for Git, Go, Docker, and Make
+  plus `/usr/bin:/bin`, where `node`, `npm`, and `npx` are absent. See "M6D
+  gates" below.
+
+### Mounted under `/dashboard/`, not `/` — and why that is the fix
+
+`taskforge-api` already answered every unrouted path with a structured JSON 404
+from a catch-all at `"/"`. A single-page app at the root would need its entry
+document as the fallback for every non-file path, which would turn a mistyped
+`/v1/...` into HTML unless the fallback carried a list of API-shaped
+exclusions — a second copy of the route table that would drift. Under a prefix
+there is nothing to exclude: with the dashboard enabled, every path outside
+`/dashboard/` except the bare root (which redirects to it) is answered exactly
+as before, including `/v1/nonexistent`'s JSON 404.
+
+`WithDashboard` is optional in exactly the way `WithMetrics` is. Unset, no
+pattern is registered, so every pre-M6D test — including M6B's
+`TestTracing_UnroutedRequestsShareOneBoundedSpanName` — passes unmodified. One
+subtree pattern means every client route shares one span name and one metric
+`route` label.
+
+Inside the mount: a real file is served; a missing file under `assets/` is a
+JSON 404, never HTML the browser would execute as script; dotfiles (the
+committed `.gitkeep` is embedded) are never served; any other path gets the
+entry document, so reloads and deep links work. Hashed assets are cached
+immutably and the entry document is `no-cache`.
+
+### The credential, and what protects it
+
+The operator pastes a key minted exactly as for the CLI. It lives in
+`sessionStorage` only — tested: after entering one, `localStorage` is empty and
+no cookie exists — and every read sends it as a bearer token with
+`credentials: "omit"`.
+
+**What a script in the dashboard's origin could reach is more than that key.**
+The dashboard shares an origin with routes that take no credential at all: key
+administration (`GET`/`POST /internal/v1/api-keys` and
+`/internal/v1/worker-keys`, and their `.../{key_id}/revoke` routes), and the
+worker-control routes after registration, which trust a session id. Those
+routes do not check the request's `Content-Type`. So such a script could list
+every key, mint an API key or worker key for **any** scope, and revoke keys —
+full credential administration, not "this key's scope". The dashboard's own
+reads are scope-limited; its origin is not.
+
+That is an **accepted, loopback-only limitation**, recorded in
+[ADR-0017](adr/0017-dashboard-toolchain-and-serving.md). It rests on the same
+facts the unauthenticated routes already rested on: `TASKFORGE_API_ADDR` is
+validated as a loopback bind, and anyone on loopback can already call them
+directly. What the dashboard adds is a path to them through script injection
+in its page. A guard — refusing browser-originated `/internal/*` requests by
+`Origin` or `Sec-Fetch-Site`, or serving the dashboard from its own listener —
+moves a trust boundary, so it is the owner's decision and is deferred as a
+bounded follow-up; it must be settled before `taskforge-api` listens on
+anything but loopback.
+
+The mitigation against such a script running at all: a Content-Security-Policy
+on every dashboard response allowing only same-origin script, style, and fetch
+(quoted exactly in ADR-0017), with no `unsafe-inline` or `unsafe-eval`, no
+third-party script, and text-only rendering of payloads and error messages.
+`TestAssets_BuiltOutputIsSelfConsistent` fails if the built `index.html` ever
+contains an inline or off-origin script, so the build and the policy cannot
+quietly disagree. Live, the browser logged no CSP violation. The CSP makes such
+a script unlikely; it does not narrow what one could reach.
+
+### Four states per view, and the request id
+
+Every view renders loading, empty, error, and loaded as four distinct DOM
+states, and each view has a test for each — 24 state tests. "Empty" is a
+successful response with zero rows, never a spinner or an error. The error
+state renders the server's HTTP status, `error.code`, `error.message`, and
+`request_id`; each view's error test asserts all four. Removing the request id
+from the component fails exactly those six tests. Live, the unknown-job error
+state rendered request id `41db1461-ae47-447e-b78a-ff13c9a7f01c`, and that
+exact id is on `taskforge-api`'s log line for the 404.
+
+The client never invents a server code: a non-TaskForge error body keeps
+`code` null, and an unreachable API has no status at all rather than a
+fabricated one.
+
+### "Nothing is hardcoded", as a check
+
+`hardcoded.test.ts` scans every shipped source file and fails on a UUID, an
+RFC 3339 timestamp, or any string from the test fixtures (whose free-text
+values all carry a `fixture` marker); and it forbids every numeric literal but
+0 and 1 in views and components, so any number shown came from the API.
+Writing a queue's limit into the Queues view as the literal `64` fails it.
+
+### Type drift against `api/openapi.yaml`
+
+`types.ts` is hand-written. Each interface has a `FieldSpec` constant that
+`tsc` forces to list exactly its fields with their presence and nullability;
+`types.test.ts` compares those, every enum, and every route and query
+parameter the client sends with the real `api/openapi.yaml`. Removing
+`worker_name` from `Attempt`'s required list in the OpenAPI file fails it; so
+does changing a `FieldSpec` entry, at `tsc` time.
+
+Its boundary: it does **not** compare scalar types (`integer` against
+`number`, `date-time` against `string`) or array item schemas (that
+`JobPage.jobs` holds `JobSummary`). Those rest on the hand-written interfaces
+and review.
+
+### Two things the Queues view refuses to imply
+
+`depth` counts this key's scope; `max_concurrency` is queue-wide across every
+scope. They are separate, labeled columns with a caption saying they are not
+comparable, and a test asserts no depth-over-limit ratio is rendered.
+
+Workers are listed by whatever status `GET /v1/workers` reports, in text, not
+only color, and heartbeat age is shown as the API measured it without a
+client-side verdict. A crashed worker appears `UNHEALTHY`. A worker whose boot
+was replaced appears with its **newest** session's status — `HEALTHY` in
+practice, as M6A's own integration test pins — not `OFFLINE`; the test fixture
+models exactly that. `OFFLINE` is in the enum, so its label has a separate,
+explicitly rendering-only test. A status the dashboard does not know (a newer
+server during a rolling deploy) is counted on the Overview as unrecognized
+rather than dropped.
+
+### Deliberate scope boundaries
+
+These are boundaries, not TODOs:
+
+- **No write from the browser** — no cancel, retry, replay, or bulk replay.
+  Each such route requires a caller-chosen `Idempotency-Key`, and how a browser
+  should mint and reuse one across a double click or an ambiguous timeout is a
+  design question of its own; doing it here would also stack a destructive
+  action on a brand-new browser credential story. The DLQ view names
+  `taskforge-cli dlq replay` instead.
+- No free-text search, no auto-refresh, websockets, or SSE — every view has an
+  explicit Refresh control.
+- No server-side credential proxy. It is the stronger posture and the natural
+  next step if the dashboard ever leaves loopback; ADR-0017 records why it is
+  deferred.
+- No `dash-dev` hot-reload target: a containerized dev server must reach
+  `taskforge-api` on host loopback, which does not work portably. The loop is
+  `make dash-test`, then `make dash-build`, `make build`, and a restart: the
+  dashboard is embedded at compile time.
+
+### A defect this milestone's own checks caught
+
+The clean-clone run found that `dashboard/Dockerfile`'s
+`# syntax=docker/dockerfile:1` line made every build resolve a Dockerfile
+frontend image **by floating tag** — an unpinned dependency beside the
+digest-pinned Node image, in a file claiming to pin the whole toolchain. It was
+removed; the per-Dockerfile `.dockerignore` allowlist still holds under the
+builtin frontend (363 kB of build context against a 193 MB `bin/` beside it).
+
+### Breaking change
+
+None. No schema change, no migration, no API change. `WithDashboard` is
+additive and optional.
+
 ## Verification
 
 ### M5A gates
@@ -2272,6 +2456,109 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M6D gates
+
+Run locally on the branch, 2026-09-30. PostgreSQL 16, ElasticMQ, and LocalStack
+from `make up`; Go 1.27 on the host and Go 1.25.14 in the clean container;
+Node 24.21.0 inside `dashboard/Dockerfile` only; Python 3.14 in
+`sdk/python/.venv`.
+
+| Command | Result |
+| --- | --- |
+| `make lint` | PASS — `gofmt` clean, `go vet ./...` silent |
+| `make build` | PASS — seven binaries into `./bin` |
+| `make test-unit` | PASS — 19 packages `ok`, up from 18: `internal/dashboard` |
+| `make test-integration` | PASS — `ok github.com/co-rtex/TaskForge/tests/integration 116.679s` |
+| `make test-race` | PASS — integration `ok … 99.543s`, no DATA RACE |
+| `make dash-lint` | PASS — `Checked 44 files … No fixes applied.`; `tsc --noEmit` silent |
+| `make dash-test` | PASS — `Test Files 10 passed (10)`, `Tests 79 passed (79)` after review fixes (74 at first review) |
+| `make dash-build` | PASS — `index.html` plus one hashed JS and one hashed CSS asset; `git status` clean afterwards |
+| `TASKFORGE_REQUIRE_BUILT_DASHBOARD=1 go test ./internal/dashboard/` | PASS — including `TestAssets_BuiltOutputIsSelfConsistent` against the real build |
+| `make sdk-lint` / `make sdk-test` | PASS — mypy clean in 21 files; 178 passed; unchanged by this milestone |
+| `docker compose config --quiet` | PASS |
+| Go gates in `golang:1.25`, no Node, fresh clone | PASS — `command -v node` fails; `make fmt` changed nothing; `make lint`, `make build`, `make test` (integration `ok … 82.709s`) green |
+| Clean clone, `PATH` without Node | PASS — `go build ./cmd/...` with only `dist/.gitkeep`; placeholder served and `dashboard_built=false`; `make dash-build` left the tree clean; rebuilt API served the real dashboard (`dashboard_built=true`); `GET /v1/queues` 200 same-origin; `GET /v1/nonexistent` the JSON 404 |
+
+One gate needed a second run, recorded rather than smoothed over: in a
+**bridged** container, `TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries`
+failed because it spawns real binaries without passing
+`TASKFORGE_RESULTS_ENDPOINT`, so the spawned worker dialed the container's own
+loopback for the object store. That is the test harness meeting container
+networking, not Node; with `--network host` the same fresh clone passed `make
+test` in full, and the test passed on the host in both `test-integration` and
+`test-race`.
+
+**Mutation evidence**, each run in a throwaway container so the tree never
+changed:
+
+| Mutation | Caught by | Observed |
+| --- | --- | --- |
+| Drop `worker_name` from `Attempt.required` in `api/openapi.yaml` | `types.test.ts` | `× Attempt: same fields, same presence, same nullability` |
+| Render `{64}` in place of `queue.max_concurrency` | `hardcoded.test.ts` | `views/Queues.tsx: expected [ '64' ] to deeply equal []` |
+| Stop rendering `request_id` in `ErrorState` | the six views' error tests | `Tests 6 failed | 21 passed` |
+| Call `decodeURIComponent` unguarded in `parseRoute` | `App.test.tsx` router cases | `× /dashboard/jobs/%E0`, `× /dashboard/jobs/%zz` |
+| `payload: "optional"` in `JOB_FIELDS` | `tsc --noEmit` | `TS2322: Type '"optional"' is not assignable to type '"required"'` |
+
+**Live stack.** All five services plus a scripted worker driving only the real
+internal control routes (register, heartbeat, claim, start, fail). Seeded
+through `taskforge-cli` and that worker: five `demo.echo` jobs a real worker
+completed; a job failed `RETRYABLE`, retried after the server's 1150 ms
+backoff, then failed `PERMANENT` into the DLQ; a `max_attempts=1` job whose
+worker stopped heartbeating, which the reconciler timed out into the DLQ as
+`ATTEMPTS_EXHAUSTED`; a replay of the permanent failure; a job needing a
+capability no worker has; a delayed job; and a canceled one. Each view was
+then read in a browser from the running `taskforge-api` and matched the CLI's
+answers:
+
+- **Overview** — "1 queue, 3 non-terminal jobs visible to this key"; PENDING 1,
+  QUEUED 2; "4 workers, by status", HEALTHY 1, UNHEALTHY 3; the ten most recent
+  jobs.
+- **Jobs** — all eleven jobs, newest first, with status, priority, and the
+  delayed job's future `available_at`.
+- **Job detail** — the dead-lettered job's two attempts oldest first:
+  `FAILED`/`RETRYABLE`/`upstream_unavailable` with "Retry delay 1.1s", then
+  `FAILED`/`PERMANENT`/`invalid_recipient`. The replacement job links back
+  through "Replayed from" and shows "No attempts yet."
+- **Workers** — the healthy echo worker, a gracefully stopped one, and the two
+  scripted workers, the last three `UNHEALTHY` with `ended_at` set.
+- **Queues** — `default`: PENDING 1, QUEUED 2, depth 3, max concurrency 100 in
+  its own column.
+- **DLQ** — both entries with reason, "#1 of 1 TIMED_OUT" / "#2 of 3 FAILED",
+  error code and message, and replay counts 0 and 1.
+
+Before any job existed, the same views rendered their empty states live
+("No jobs have been submitted.", "No workers have registered.", "The
+dead-letter queue is empty."), and `default` with all-zero depth — a real
+migration-seeded row, correctly shown as data rather than as empty. `OFFLINE`
+could not be produced as a worker's latest status live (a graceful stop leaves
+the session to go stale; `OFFLINE` marks a session a newer boot replaced, which
+is then not the latest), so its rendering rests on the Workers view test. All
+browser requests were same-origin and returned 200.
+
+### M6D coverage
+
+**`internal/api/dashboard_test.go`.** Unset: `/`, `/dashboard`, `/dashboard/`,
+client routes, and assets are the JSON 404. Set: the entry document with its
+security headers; client routes fall back to it; hashed assets are immutable
+and top-level files are not; a missing asset and dotfiles are JSON 404s; seven
+unrouted API-shaped paths stay JSON 404s; a client route with invalid UTF-8 is
+a JSON 404 before the router ever sees it; API routes behave identically; the
+root redirects only when enabled; writes are 405; HEAD has no body; every
+dashboard path shares the span name `GET /dashboard/`; and a missing entry
+document is a sanitized 500.
+
+**`internal/dashboard`.** The committed state serves the placeholder; a build
+is preferred when present; the placeholder names `make dash-build` and has no
+script; and, against a real build, every referenced asset is under
+`/dashboard/`, exists in the embedded tree, and no script is inline.
+
+**`dashboard/src`.** Four states for each of six views; a replaced worker
+shown by its newest session, and `OFFLINE` as a rendering-only case; an
+unrecognized worker status counted rather than dropped; the client's URL
+building, headers, and error mapping; the drift test; the hardcoded-values
+scan; key storage, forgetting, and routing in `App.test.tsx`, including
+malformed escapes answered as not-found instead of a thrown `URIError`.
 
 ### M6C gates
 
@@ -2872,10 +3159,11 @@ correctness, not speed. The benchmark table in
 
 ## Continuous integration
 
-**Four jobs as of M5E.** The three that have run since M3 —
+**Five jobs as of M6D.** The three that have run since M3 —
 `Format, lint, build, unit and OpenAPI tests`,
 `Migrations and integration tests`, and `Race detector (unit and integration)` —
-plus `Python SDK (format, lint, types, unit tests)`, added by M5E. All run on
+plus `Python SDK (format, lint, types, unit tests)`, added by M5E, and
+`Dashboard (format, lint, types, tests, build, embed)`, added by M6D. All run on
 GitHub-hosted Linux runners for every pull request targeting `main` and every
 push to `main`. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 Each milestone's run is recorded in its own pull request.
@@ -2885,6 +3173,13 @@ The `sdk` job runs a 3.11/3.13 matrix with `fail-fast: false`, pins
 needs neither PostgreSQL nor the broker. It installs and runs the SDK but
 publishes nothing, so the workflow's `contents: read` grant is still the whole
 grant.
+
+The `dashboard` job has no `actions/setup-node`: it runs `make dash-lint`,
+`make dash-test`, and `make dash-build`, so the pinned image in
+`dashboard/Dockerfile` stays the one declaration of the Node version. It then
+asserts the build left the tree clean and embeds it with
+`TASKFORGE_REQUIRE_BUILT_DASHBOARD=1`, which turns the built-output test's skip
+into a failure.
 
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure.
@@ -2901,14 +3196,29 @@ exercised by a real hosted failure.
   `/internal/v1/worker-keys`) remain unauthenticated by design, and every
   service still binds to loopback. Anyone who can reach loopback can still
   mint a credential of either kind for any scope.
+- Since M6D those routes share an origin with the dashboard, so script running
+  in the dashboard's page could administer credentials for every scope.
+  Accepted for loopback only; a browser-origin guard or a separate dashboard
+  listener is the owner's decision (see "M6D — operator dashboard" and
+  ADR-0017).
+- Those routes also check neither `Host` nor the request's origin, and the key
+  routes accept any `Content-Type`, so a website the operator visits can send a
+  cross-site request that mints or revokes a key (CSRF, with an unreadable
+  response), and DNS rebinding could read the response. This predates M6D
+  (it dates from M5A); the same guard would close it.
+- An `index.html` and its hashed assets come from one binary, so several
+  `taskforge-api` replicas behind a load balancer during a rolling deploy could
+  serve an entry document naming assets another replica lacks. Impossible on
+  today's single loopback process.
 - Authorization beyond scope is post-V1. A key carries exactly one scope and no
   permission set; there is no RBAC, no per-route permission, and no rate
   limiting.
 - Key rotation and expiry are not implemented for either credential type. A
   key lives until it is revoked.
-- The operator dashboard is M6D. The DLQ has a listing endpoint but no
-  filtering beyond scope and no sorting beyond newest-first; operator search
-  and bulk replay belong with the dashboard.
+- The operator dashboard is read-only by design — no cancel, retry, replay, or
+  bulk replay from the browser, and no search. See "M6D — operator dashboard"
+  above for why each is a boundary rather than a TODO. The DLQ listing still
+  has no filtering beyond scope and no sorting beyond newest-first.
 - `README.md` line 35 ("What does not exist yet: the Python SDK and the
   dashboard") is stale: the SDK shipped in M5E. It is deliberately not edited
   here, because PR #10 rewrites that file wholesale and an edit in this branch
@@ -2974,32 +3284,36 @@ moves.
 - Docker Compose and Make
 - Python 3.11 or newer — **only** to build or test the Python SDK in
   `sdk/python` (`make sdk-venv`). Running TaskForge itself never needs one.
+- No Node, ever. The dashboard's `make dash-*` targets run it inside Docker.
 
-Run `make bootstrap`, `make up`, `make migrate`, and `make build`, then start the
-API, outbox publisher, scheduler, worker, and reconciler as shown in the
-repository README.
+Run `make bootstrap`, `make up`, `make migrate`, `make dash-build`, and
+`make build`, then start the API, outbox publisher, scheduler, worker, and
+reconciler as shown in the repository README. The dashboard is at
+`http://127.0.0.1:8080/dashboard/`; it asks for an API key created with
+`taskforge-cli api-keys create`.
 
 ## Next objective
 
-M6D: the operator dashboard — Overview, Jobs, Job detail with attempt timeline,
-Workers, Queues, and DLQ, reading only M6A's live routes. See
-[ROADMAP.md](ROADMAP.md)'s M6D entry. It is the last slice of M6 and the last
-consumer of the public API [PROJECT_SPEC.md](PROJECT_SPEC.md) §4 item 15 names.
+M7: full concurrency, restart, failure, and race suites — automation for all
+twelve required scenarios, plus `make demo` and `make demo-failure`. See
+[ROADMAP.md](ROADMAP.md)'s M7 entry. M6 is complete; every M7 scenario can now
+also be watched from the dashboard.
 
-It still needs a frontend-toolchain decision recorded the way
-[ADR-0016](adr/0016-python-sdk-toolchain-and-client-configuration.md) recorded
-Python's — dependency and build tooling, a lint/format story, and CI placement,
-each decided rather than left as a side effect of "build the dashboard". The
-binding constraint is [PROJECT_SPEC.md](PROJECT_SPEC.md) §5's prerequisite list,
-which ADR-0016 could discharge for Python by noting that running TaskForge never
-needs an interpreter — an escape that does not exist for a dashboard that is
-part of the running stack.
+Smaller items available to whoever wants them, none blocking M7:
 
-Two smaller items are available to whoever wants them, neither blocking M6D:
+- **An owner decision, before any non-loopback deployment:** guard
+  `/internal/*` against browser-originated requests (`Origin` /
+  `Sec-Fetch-Site`) or serve the dashboard from its own listener. It closes
+  both the dashboard-origin exposure and the pre-existing CSRF / DNS-rebinding
+  exposure recorded above.
 
 - `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
   deliberately did not build. See its section above for exactly what each would
   take; both are larger than they look because the clean recording points are
   inside fenced-transition code.
-- `README.md` line 35 is still stale. Untouched through M6A, M6B and M6C because
-  PR #10 rewrites that file wholesale.
+- `README.md` line 35 is still stale ("the Python SDK and the dashboard" do not
+  exist yet). Untouched through M6A–M6D because PR #10 rewrites that file
+  wholesale.
+- `TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries` does not pass
+  `TASKFORGE_RESULTS_ENDPOINT` to the binaries it spawns, so it cannot run in a
+  bridged container against host infrastructure (see "M6D gates").

@@ -21,9 +21,20 @@ SDK_VENV       := $(SDK_DIR)/.venv
 SDK_PY         := $(SDK_VENV)/bin/python
 PYTHON         ?= python3
 
+# Operator dashboard (dashboard/). Every target runs Node inside the pinned
+# image dashboard/Dockerfile names, so the host needs Docker -- already a
+# prerequisite -- and never Node. Like the SDK's, these are deliberately
+# separate from fmt/lint/test, which stay Go-only. See docs/adr/0017.
+DOCKER         ?= docker
+DASH_DIR       := dashboard
+DASH_BUILD     := $(DOCKER) build --file $(DASH_DIR)/Dockerfile
+DASH_DIST      := internal/dashboard/dist
+DASH_TOOLS     := taskforge-dashboard-tools
+
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        sdk-venv sdk-fmt sdk-lint sdk-test
+        sdk-venv sdk-fmt sdk-lint sdk-test \
+        dash-fmt dash-lint dash-test dash-build
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -88,6 +99,27 @@ sdk-lint: ## Check Python SDK formatting, lint, and types
 
 sdk-test: ## Run the Python SDK test suite
 	cd $(SDK_DIR) && .venv/bin/python -m pytest -q
+
+# --no-cache-filter re-runs the named stage every time. Without it, an
+# unchanged tree would print a cached layer and the checks would not actually
+# have run.
+dash-lint: ## Check dashboard formatting, lint, and types (in a pinned Node container)
+	$(DASH_BUILD) --target lint --no-cache-filter lint --progress plain .
+
+dash-test: ## Run the dashboard test suite (in a pinned Node container)
+	$(DASH_BUILD) --target test --no-cache-filter test --progress plain .
+
+dash-build: ## Build the dashboard into internal/dashboard/dist for go:embed
+	find $(DASH_DIST) -mindepth 1 ! -name .gitkeep -delete
+	$(DASH_BUILD) --target dist --output type=local,dest=$(DASH_DIST) .
+	@test -f $(DASH_DIST)/index.html || { echo "dash-build produced no index.html"; exit 1; }
+	@echo "dashboard built into $(DASH_DIST); rebuild taskforge-api to embed it"
+
+dash-fmt: ## Format the dashboard source in place (in a pinned Node container)
+	$(DASH_BUILD) --target source --tag $(DASH_TOOLS) --quiet .
+	$(DOCKER) run --rm --user "$$(id -u):$$(id -g)" \
+		--volume "$(CURDIR)/$(DASH_DIR):/work" --workdir /work \
+		$(DASH_TOOLS) /repo/dashboard/node_modules/.bin/biome format --write .
 
 clean: ## Remove build output
 	rm -rf $(BIN_DIR)

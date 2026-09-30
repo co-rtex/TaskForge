@@ -1,0 +1,411 @@
+/* Plain CSS, one file. Served as a same-origin stylesheet, so the CSP's
+   style-src 'self' holds with no 'unsafe-inline'. */
+
+:root {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --text: #1d1d1b;
+  --muted: #6b6b66;
+  --border: #deded8;
+  --accent: #2f5fb3;
+  --ok: #1f7a4a;
+  --warn: #9a6200;
+  --bad: #b3261e;
+  --neutral: #5a5a55;
+  --ok-bg: #e5f3eb;
+  --warn-bg: #fbf0dc;
+  --bad-bg: #fbe6e4;
+  --neutral-bg: #ececea;
+  --info-bg: #e6edf9;
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --surface: #1f1f1d;
+    --text: #ececea;
+    --muted: #a3a39c;
+    --border: #3a3a36;
+    --accent: #8fb0ee;
+    --ok: #7fd3a4;
+    --warn: #f0c270;
+    --bad: #f2a29b;
+    --neutral: #c4c4bd;
+    --ok-bg: #173325;
+    --warn-bg: #3a2c10;
+    --bad-bg: #3d1a17;
+    --neutral-bg: #2c2c29;
+    --info-bg: #1b2a45;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a {
+  color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+code,
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+}
+
+.app-header nav ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.app-header nav a {
+  text-decoration: none;
+}
+
+.app-header nav a[aria-current="page"] {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.forget-key {
+  margin-left: auto;
+}
+
+main {
+  padding: 1.5rem;
+  max-width: 1400px;
+}
+
+.view-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.view-header h1 {
+  margin: 0 0 0.75rem;
+  font-size: 1.5rem;
+}
+
+.view-actions {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.panel-wide {
+  grid-column: 1 / -1;
+}
+
+.panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.5rem;
+  margin: 0;
+}
+
+.counts div {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.counts dd {
+  margin: 0;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0;
+}
+
+.fields dt {
+  color: var(--muted);
+}
+
+.fields dd {
+  margin: 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+caption {
+  caption-side: top;
+  text-align: left;
+  color: var(--muted);
+  padding: 0 0 0.5rem;
+}
+
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+thead th {
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.state {
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin: 0 0 1rem;
+}
+
+.state-title {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.state-loading {
+  color: var(--muted);
+}
+
+.state-empty {
+  background: var(--neutral-bg);
+}
+
+.state-error {
+  background: var(--bad-bg);
+  border: 1px solid var(--bad);
+}
+
+.error-fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.error-fields dd {
+  margin: 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.note {
+  color: var(--muted);
+}
+
+.payload {
+  background: var(--neutral-bg);
+  border-radius: 6px;
+  padding: 0.75rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 1rem;
+  border-left: 2px solid var(--border);
+}
+
+.timeline-entry {
+  position: relative;
+  padding: 0 0 1rem 1rem;
+}
+
+.timeline-entry::before {
+  content: "";
+  position: absolute;
+  left: -1.4rem;
+  top: 0.4rem;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.timeline-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.4rem;
+  font-weight: 600;
+}
+
+.key-form {
+  max-width: 640px;
+}
+
+.key-form form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.key-form input {
+  min-width: 22rem;
+}
+
+/* Badges: the status text is always the label; color is only a second cue. */
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--neutral);
+  background: var(--neutral-bg);
+  white-space: nowrap;
+}
+
+.badge-succeeded,
+.badge-healthy {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.badge-running,
+.badge-leased,
+.badge-queued,
+.badge-starting {
+  color: var(--accent);
+  background: var(--info-bg);
+}
+
+.badge-retry-wait,
+.badge-pending,
+.badge-draining,
+.badge-cancel-requested,
+.badge-retryable {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.badge-dead-lettered,
+.badge-failed,
+.badge-timed-out,
+.badge-abandoned,
+.badge-unhealthy,
+.badge-permanent,
+.badge-permanent-failure,
+.badge-attempts-exhausted {
+  color: var(--bad);
+  background: var(--bad-bg);
+}
+
+.badge-offline,
+.badge-canceled {
+  color: var(--neutral);
+  background: var(--neutral-bg);
+}

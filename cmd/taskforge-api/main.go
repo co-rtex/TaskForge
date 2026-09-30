@@ -5,6 +5,10 @@
 // database-backed worker key -- see docs/adr/0014-worker-control-authentication.md.
 // The key-management routes for both credential types are unauthenticated
 // operator plumbing, so the process still binds to loopback only.
+//
+// It also serves the operator dashboard's embedded static assets under
+// /dashboard/, same-origin with the API the dashboard reads -- see
+// docs/adr/0017-dashboard-toolchain-and-serving.md.
 package main
 
 import (
@@ -20,6 +24,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/api"
 	"github.com/co-rtex/TaskForge/internal/auth"
 	"github.com/co-rtex/TaskForge/internal/config"
+	"github.com/co-rtex/TaskForge/internal/dashboard"
 	"github.com/co-rtex/TaskForge/internal/database"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
@@ -113,6 +118,11 @@ func run() int {
 		Jitter:        jitter,
 	})
 
+	// The dashboard is embedded at compile time. Before `make dash-build` has
+	// run, Assets is a single page saying so, which is logged here so an
+	// operator who sees it knows it is a build state and not a fault.
+	dashboardAssets, dashboardBuilt := dashboard.Assets()
+
 	m := metrics.New("taskforge-api")
 	metrics.NewStateCollector(m, pool, log)
 
@@ -131,7 +141,8 @@ func run() int {
 		WithWorkerControl(workerStore).
 		WithWorkerReads(workerStore).
 		WithAuth(auth.NewStore(pool)).WithWorkerAuth(workerauth.NewStore(pool)).
-		WithResults(results.NewStore(pool), objects)
+		WithResults(results.NewStore(pool), objects).
+		WithDashboard(dashboardAssets)
 
 	httpServer := &http.Server{
 		Addr:    cfg.APIAddr,
@@ -148,7 +159,9 @@ func run() int {
 	go func() {
 		log.Info("api listening",
 			slog.String("addr", cfg.APIAddr),
-			slog.Int64("max_request_bytes", cfg.MaxRequestBytes))
+			slog.Int64("max_request_bytes", cfg.MaxRequestBytes),
+			slog.String("dashboard_path", api.DashboardPath),
+			slog.Bool("dashboard_built", dashboardBuilt))
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

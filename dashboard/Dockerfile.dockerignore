@@ -1,0 +1,10 @@
+# The build context for dashboard/Dockerfile is the repository root, and this
+# file is an allowlist: the dashboard's own source and the OpenAPI document its
+# type-drift test reads are the whole of what reaches the Docker daemon. .env,
+# .git, Go sources, and build output never do.
+*
+!dashboard/
+!api/openapi.yaml
+dashboard/node_modules
+dashboard/Dockerfile
+dashboard/Dockerfile.dockerignore

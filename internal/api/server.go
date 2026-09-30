@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -60,9 +61,13 @@ type Server struct {
 	// metrics is optional. A nil one records nothing and changes no behavior,
 	// which is what keeps every pre-M6C test unchanged.
 	metrics *metrics.Metrics
-	cfg     Config
-	log     *slog.Logger
-	checks  []ReadinessCheck
+	// dashboard is optional, like metrics. Nil registers no dashboard pattern
+	// and leaves the catch-all's JSON 404 answering "/" and everything under
+	// DashboardPath -- see WithDashboard.
+	dashboard fs.FS
+	cfg       Config
+	log       *slog.Logger
+	checks    []ReadinessCheck
 }
 
 // Results reads a job's recorded result. See internal/results.Store.
@@ -215,6 +220,16 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
+	if s.dashboard != nil {
+		// Static files and nothing else: the dashboard reads only the /v1
+		// routes above, with the operator's own key, like any other client.
+		// One subtree pattern, so every dashboard path shares one bounded span
+		// name and metric route label however many client routes it has.
+		mux.HandleFunc("GET "+DashboardPath, s.handleDashboard)
+		// {$} matches the bare root only. Every other unrouted path still
+		// falls through to the catch-all below.
+		mux.HandleFunc("GET /{$}", s.handleDashboardRoot)
+	}
 	if s.keys != nil {
 		mux.HandleFunc("POST /internal/v1/api-keys", s.handleCreateAPIKey)
 		mux.HandleFunc("GET /internal/v1/api-keys", s.handleListAPIKeys)
@@ -259,6 +274,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/queues", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/healthz", s.methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
+	if s.dashboard != nil {
+		mux.HandleFunc(DashboardPath, s.methodNotAllowed(http.MethodGet))
+	}
 	if s.keys != nil {
 		// 405 is answered before authentication, deliberately. "This path does
 		// not accept DELETE" is a fact about the route table, not about the

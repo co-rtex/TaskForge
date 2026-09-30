@@ -44,7 +44,10 @@ and per-queue non-terminal depth — over the public API, the CLI, and the SDK
 alike; Prometheus metrics with enforced label cardinality on every service; and
 OpenTelemetry tracing from an API request through the submission
 transaction, the outbox, the broker notification, and into a worker's claim and
-handler execution, under one trace id. The operator dashboard remains planned.
+handler execution, under one trace id; and a read-only operator dashboard,
+embedded in `taskforge-api` and served same-origin under `/dashboard/`, that
+reads exactly those public routes with the operator's own key (see
+[ADR-0017](adr/0017-dashboard-toolchain-and-serving.md)).
 
 ---
 
@@ -101,13 +104,14 @@ single outbox publisher · a single reconciler instance.
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations. | **Built** |
+| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations; serve the embedded operator dashboard's static files under `/dashboard/`. | **Built** |
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |
 | `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, classify and record their result (uploading a large one to the object store first), and report fenced outcomes including failures and cooperative cancellation. | **Built** for `demo.echo` |
 | `taskforge-reconciler` | Mark stale sessions, record due attempt timeouts, finalize unacknowledged cancellations, expire leases, abandon their attempts, and release capacity. | **Built**; general drift repair beyond these is later. |
 | `taskforge-cli` | Operator and developer command-line interface over the public API and the loopback-only credential-management routes. | **Built** |
+| Operator dashboard | Read-only browser client of the public `/v1` read routes, compiled into `taskforge-api`. No endpoint, credential, or query of its own; it presents the operator's API key exactly as the CLI does. | **Built** |
 
 Every component is safe to run with N replicas.
 
@@ -910,6 +914,7 @@ running.
 | Large results | LocalStack's S3 provider locally, S3 in cloud | Keeps unbounded blobs out of PostgreSQL. See [ADR-0015](adr/0015-result-storage.md) for why LocalStack rather than MinIO. |
 | Cache | None initially | Redis is not authoritative state and has no measured need yet. |
 | HTTP | Go standard library | Routing needs are modest; a framework would add opacity. |
+| Operator dashboard | React + TypeScript + Vite, built in a digest-pinned Node container, embedded with `go:embed` | Same-origin, so no CORS; no Node on the host for anything. See [ADR-0017](adr/0017-dashboard-toolchain-and-serving.md). |
 | Cloud direction | AWS ECS + RDS + SQS + S3 + ALB, via Terraform | Kubernetes is post-V1 and not required for V1. |
 
 Redis is never authoritative job state. Paid infrastructure is never provisioned
@@ -1058,5 +1063,5 @@ scope/keyset listing, replay identity lookup, the scope-filtered job listing
 with and without a status filter, per-queue non-terminal depth, and the latest
 session per worker. The attempt timeline needed no new index: `job_attempts`
 already carries `UNIQUE (job_id, attempt_number)`, which serves it in its
-natural order. Indexes for the dashboard's own queries arrive only with the
-queries that justify them.
+natural order. The dashboard (M6D) added no index and no query: it reads the
+M6A routes above and nothing else.

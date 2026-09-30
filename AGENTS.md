@@ -32,11 +32,17 @@ evidence matter more than feature count.
 | Tests | `go test`, `testify` assertions, real PostgreSQL + real broker for integration |
 | Python SDK | Python 3.11+, PEP 621 `pyproject.toml`, stdlib `venv` + `pip`, one runtime dependency (`httpx`) |
 | Python tooling | `ruff format` (authoritative), `ruff check`, `mypy --strict` |
+| Operator dashboard | React + TypeScript built by Vite, embedded into `taskforge-api` with `go:embed`; Node runs **only** inside the digest-pinned image in `dashboard/Dockerfile` |
+| Dashboard tooling | Biome (`biome ci`, authoritative formatter and linter), `tsc --noEmit`, Vitest |
 
 Required to build and run: Git, Go, Docker, Docker Compose, GNU Make.
 Additionally required to build or test the Python SDK in `sdk/python`: a
 Python 3.11+ interpreter. Running TaskForge itself never needs one. See
 [ADR-0016](docs/adr/0016-python-sdk-toolchain-and-client-configuration.md).
+The dashboard adds **no host prerequisite at all** — not to build, test, lint,
+format, or run it. Every `dash-*` target runs Node inside Docker, which is
+already required, and `node_modules/` never exists on the host. See
+[ADR-0017](docs/adr/0017-dashboard-toolchain-and-serving.md).
 
 ## 3. Directory conventions
 
@@ -47,6 +53,10 @@ migrations/            Versioned, forward-only SQL. Never edit an applied file.
 api/                   OpenAPI description of implemented endpoints only.
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
 sdk/python/            The Python SDK. Its own toolchain; see ADR-0016.
+dashboard/             The operator dashboard's frontend source. Its own
+                       toolchain, containerized; see ADR-0017.
+internal/dashboard/    go:embed of the dashboard build. Only dist/.gitkeep and
+                       the not-built placeholder page are committed.
 docs/                  Canonical project context. See the links above.
 docs/adr/              Architecture Decision Records.
 ```
@@ -84,6 +94,20 @@ make sdk-fmt           # ruff format
 make sdk-lint          # ruff format --check + ruff check + mypy --strict
 make sdk-test          # pytest
 ```
+
+The dashboard's targets follow the same rule for the same reason, and each
+runs inside the pinned Node image rather than on the host.
+
+```bash
+make dash-fmt          # biome format --write, in place
+make dash-lint         # biome ci + tsc --noEmit
+make dash-test         # vitest
+make dash-build        # build into internal/dashboard/dist for go:embed
+```
+
+A `taskforge-api` built before `make dash-build` serves a page saying the
+dashboard has not been built. Rebuild the binary after `make dash-build` to
+embed the real one.
 
 Targets are added only when the behavior behind them actually works.
 

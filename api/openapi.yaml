@@ -18,6 +18,12 @@ info:
     routes `docs/PROJECT_SPEC.md` section 4 lists. An endpoint is never
     documented here before it works.
 
+    Deliberately not described here: the operator dashboard's static files
+    (`GET /dashboard/`, and `GET /` redirecting to it) that `taskforge-api`
+    serves as of milestone M6D, and `GET /metrics` from M6C. Neither is an API
+    operation a client integrates against; see
+    `docs/adr/0017-dashboard-toolchain-and-serving.md`.
+
     ## Authentication
 
     **Every `/v1` operation requires an API key.** Present it as
