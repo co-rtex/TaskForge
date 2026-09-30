@@ -41,3 +41,9 @@ Thumbs.db
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Dashboard build output (`make dash-build`). Only .gitkeep is tracked, which is
+# what lets go:embed -- and so every binary -- compile on a clean clone before
+# the frontend has ever been built. See internal/dashboard.
+/internal/dashboard/dist/*
+!/internal/dashboard/dist/.gitkeep
