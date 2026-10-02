@@ -236,13 +236,18 @@ func (d *demo) durableView(ctx context.Context, jobID string) (durableView, []at
 // fencingPhase freezes a worker mid-job, lets its attempt be abandoned and
 // finished by another worker, and then lets the frozen one wake up.
 //
-// A frozen process is the case a kill does not cover: it is not dead, it still
-// holds its memory and its idea that it owns the job, and when it wakes it is
-// going to act on that. What stops it is not anything the worker does; the
-// stored state refuses it. The pass condition is therefore the durable outcome,
-// read after the worker has had time to act, and not anything in its log.
+// A frozen process is the case a kill does not cover: it is not dead, and it
+// still holds its memory and its idea that it owns the job. Two things stand
+// between it and a stale report, and either is enough. The worker checks its own
+// lease deadline before it reports, and a freeze longer than the lease has let
+// that pass, so the real worker stops itself; and if it did send a stale call,
+// the stored state would refuse it (tests/integration's late-completion test
+// sends exactly that). With unmodified binaries this phase exercises the first.
+//
+// The pass condition is the durable outcome either way: read after the worker
+// has had time to act, and not anything in its log.
 func (d *demo) fencingPhase(ctx context.Context) {
-	d.say("--- Phase 2: a frozen worker wakes up and acts on a job it no longer owns ---")
+	d.say("--- Phase 2: a worker is frozen mid-job, and wakes after the job has moved on ---")
 
 	workerC, nameC, err := d.startWorker(ctx, "c", 1)
 	if err != nil {
@@ -369,8 +374,8 @@ func (d *demo) fencingPhase(ctx context.Context) {
 // plane with an error code, which is matched on here. But a worker frozen for
 // longer than its lease has also let its own monotonic lease deadline pass, and
 // the real worker checks that before it reports anything: it stops itself and
-// never sends the stale call. Both leave the stored state untouched; this
-// demonstration, with unmodified binaries, reliably produces the second.
+// never sends the stale call. Both leave the stored state untouched; in every run
+// observed, this demonstration with unmodified binaries produced the second.
 func (d *demo) illustrateRefusal(p *proc) {
 	data, err := os.ReadFile(p.log)
 	if err != nil {
