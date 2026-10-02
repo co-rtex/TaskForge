@@ -52,6 +52,8 @@ internal/<domain>/     Library code. Not importable outside this module.
 migrations/            Versioned, forward-only SQL. Never edit an applied file.
 api/                   OpenAPI description of implemented endpoints only.
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
+tests/verification/    Infrastructure-free checks over the repository's own
+                       documentation: the verification-matrix drift check.
 sdk/python/            The Python SDK. Its own toolchain; see ADR-0016.
 dashboard/             The operator dashboard's frontend source. Its own
                        toolchain, containerized; see ADR-0017.
@@ -168,6 +170,9 @@ Targets are added only when the behavior behind them actually works.
   must match the branch head.
 - Record an architectural decision as an ADR when it constrains future work or has
   a real tradeoff. Do not write an ADR for a small coding choice.
+- A milestone's status line must not depend on merge state. Write "complete; see
+  PR #N", never "on its own branch and draft pull request": a document cannot keep
+  merge state current, and the pull request is the record of it.
 
 ## 9. Verification honesty
 

@@ -511,8 +511,8 @@ and before the `405`; `/v1`, `/dashboard/`, `/metrics` and the health probes are
 unchanged; and a refused request keeps its route pattern as its span name and
 metric label.
 **Depends on.** M6D, whose dashboard origin made the exposure larger.
-**Status:** implemented, on its own branch and draft pull request — see
-[CURRENT_STATE.md](CURRENT_STATE.md) for the evidence and for what remains open.
+**Status:** complete; see PR #17 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains open.
 
 Deliberately **not** in scope: authentication on `/internal`, CORS headers, a
 separate listener, a configurable Host allowlist, and guarding the whole
@@ -521,16 +521,57 @@ belong with M8's deployment work, which has to revisit the loopback bind and the
 Host rule together.
 
 ### M7 — Full concurrency, restart, failure, and race suites
-**Objective.** Prove the invariants.
-**Deliverables.** Automation for all twelve required scenarios: end-to-end success;
-worker crash and replacement; late-completion rejection; concurrent duplicate
-submission; idempotency conflict; outbox recovery after broker outage; duplicate
-broker delivery; concurrent worker claims; cancel-vs-success race; timeout and retry
-exhaustion; process-restart durability; stranded-notification recovery. Plus
-`make demo` and `make demo-failure`.
-**Acceptance.** Every invariant in [ARCHITECTURE.md](ARCHITECTURE.md) §12 has a test
-that asserts durable state; the race detector is clean.
-**Depends on.** M6 (complete).
+
+M7 as originally written bundles two different things: proving the invariants,
+and two demonstration targets (`make demo`, `make demo-failure`). The first is an
+audit of what the tests already prove and the closing of what they do not; the
+second is new runnable behavior whose handlers raise a trust-boundary question
+the first never touches. It is split the same way M5 and M6 were, so each slice
+ships on its own evidence. The original objective, deliverables, and acceptance
+sentence are preserved across M7A and M7B, not reduced. M7 as a whole is
+complete when both slices are.
+
+#### M7A — Invariant and scenario proof audit
+**Objective.** Prove the invariants: establish, row by row, which test proves
+each reliability invariant and each required scenario, and close every row whose
+test does not assert durable state.
+**Deliverables.** An audit of all eighteen invariants in
+[ARCHITECTURE.md](ARCHITECTURE.md) §12 and all twelve required scenarios, recorded
+in [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md); a new or extended test in
+`tests/integration` for every gap the audit found; a drift check over the matrix
+that needs no infrastructure and runs under `make test-unit` and in CI; and the
+real-binary crash test's environment made hermetic. The twelve required
+scenarios are: end-to-end success; worker crash and replacement; late-completion
+rejection; concurrent duplicate submission; idempotency conflict; outbox recovery
+after broker outage; duplicate broker delivery; concurrent worker claims;
+cancel-vs-success race; timeout and retry exhaustion; process-restart
+durability; stranded-notification recovery.
+**Acceptance.** Every invariant in [ARCHITECTURE.md](ARCHITECTURE.md) §12 has a
+test that asserts durable state; the race detector is clean.
+**Depends on.** M6 (complete) and M6E.
+**Status:** complete; see PR #18 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence.
+
+Deliberately **not** in scope: any production code, any demo handler, any new
+Make target, and the route-table-versus-OpenAPI completeness check, which is
+deferred to M8 (see below).
+
+#### M7B — `make demo` and `make demo-failure`
+**Objective.** Two runnable demonstrations of the system's behavior, one of
+success and one of failure and recovery.
+**Deliverables.** `make demo` and `make demo-failure`, and whatever handlers they
+need.
+**Acceptance.** Set in M7B's own handoff, once the decision below is made.
+**Depends on.** M7A.
+**Status:** not started.
+
+The demo-handler trust decision is still open, and it is why M7B gets its own
+handoff rather than riding along with M7A. [AGENTS.md](../AGENTS.md) §10 says
+TaskForge executes only trusted handlers registered in its own binary, and today
+`demo.echo` is the only one: a failure demonstration needs handlers that fail,
+stall, or outlive their budget, and whether those become production handlers
+in `taskforge-worker`, and what bounds them if so, is a decision about a trust
+boundary rather than about a Make target.
 
 ### M8 — Load generator, measured benchmarks, CI hardening, ECS Terraform
 **Objective.** Measure reality and make deployment credible.
@@ -542,6 +583,13 @@ validated (not applied) Terraform for ALB, ECS services, RDS, SQS, S3, secrets, 
 [PROJECT_SPEC.md](PROJECT_SPEC.md) §7 with recorded results; CI is green and no
 workflow is permanently failing; `terraform validate` passes without applying.
 **Depends on.** M7.
+
+**Deferred here from M7A.** A check that the route table and `api/openapi.yaml`
+describe the same set of routes. Today that agreement rests on hand-maintained,
+one-directional route maps in `internal/api/deadline_contract_test.go`, and a
+route added without being added to them is uncovered rather than failing. A real
+gate needs a route registry inside `Handler()`; see
+[CURRENT_STATE.md](CURRENT_STATE.md).
 
 ---
 

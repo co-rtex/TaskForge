@@ -1,10 +1,12 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M6D are merged into `main`; this document
-records the implemented state through M6E, which is on its own branch and
-draft pull request. M6 as a whole was already complete with M6D, its last slice;
-M6E is a follow-up to it, not a fifth slice.
+planned. It records the implemented state through M7A. Each milestone's line
+below says whether it is complete and names the pull request that holds its
+review; none says anything about merge state, which a document cannot keep
+current. M6 as a whole was already complete with M6D, its last slice; M6E is a
+follow-up to it, not a fifth slice. M7 is split into M7A, the proof audit, and
+M7B, the demonstration targets, and is complete when both are.
 
 ## Milestone status
 
@@ -21,13 +23,19 @@ M6E is a follow-up to it, not a fifth slice.
 - **M6B — OpenTelemetry tracing:** complete.
 - **M6C — Prometheus metrics and the health residual:** complete.
 - **M6D — operator dashboard:** complete. With it, **M6 is complete.**
-- **M6E — browser-origin guard on the internal surface:** implemented on its
-  own branch and draft pull request. A follow-up to M6 that closes the two
-  exposures [ADR-0017](adr/0017-dashboard-toolchain-and-serving.md) recorded;
-  M6's own objective was discharged by M6A–M6D and is not reopened.
+- **M6E — browser-origin guard on the internal surface:** complete; see PR #17.
+  A follow-up to M6 that closes the two exposures
+  [ADR-0017](adr/0017-dashboard-toolchain-and-serving.md) recorded; M6's own
+  objective was discharged by M6A–M6D and is not reopened.
+- **M7A — invariant and scenario proof audit:** complete; see PR #18. Every
+  reliability invariant and required scenario is mapped to a test that asserts
+  durable state in [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md); no
+  production code changed.
+- **M7B — `make demo` and `make demo-failure`:** not started. Its demo-handler
+  trust decision is still open, so it gets its own handoff.
 
-[ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and M6 into
-four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
+[ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
+and M7 into two, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
@@ -2039,6 +2047,125 @@ that branches on `Error.code` and treats an unknown code as a protocol error see
 `origin_refused` only if it sends a browser-marked or non-loopback request, which
 no shipped client does.
 
+## M7A — invariant and scenario proof audit
+
+M7 is split into M7A, this milestone, and M7B; [ROADMAP.md](ROADMAP.md) records
+why. M7A asks one question of every reliability invariant in
+[ARCHITECTURE.md](ARCHITECTURE.md) §12 and every required scenario in M7: which
+test proves it, and does that test read durable PostgreSQL state after the
+operation? The answer is [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md).
+
+**No production code changed.** Nothing under `cmd/`, nothing in `internal/`
+outside `_test.go` files, no migration, no change to `api/openapi.yaml`, nothing
+in `sdk/` or `dashboard/`, and no Make target. This section keeps four things
+apart: what the audit found, what was added, what evidence exists for it, and
+what is still limited.
+
+### Audit results
+
+A row counts as covered only if its test asserts **durable state**: a SQL query
+or a store read made after the operation. A test that checks only an HTTP
+status, a response body, or in-memory state does not count, whatever its name
+says. Of the thirty rows, **twenty-two were already covered** and **eight were
+closed** by a new or extended test. None is `STOPPED`: no gap test exposed a
+production defect, so nothing was stopped on and the matrix claims every row.
+
+What the audit found about the candidates it was given, and about the rows it
+closed:
+
+| Row | Finding |
+| --- | --- |
+| S1 | Covered, but `TestE2E_APIKeyDrivesTheWholeLifecycle` is weaker than its name: it reads the job's status, its attempt count, and its scope, never the attempt's or the lease's status. `TestWorker_EndToEndAndDuplicateBrokerDeliveryCreateOneAttempt` joins attempt and lease status after a real publisher, broker, and worker, and carries the row. |
+| S2 | Covered. The real-binary crash test already asserts attempt history, lease history, and the two attempts' session ids from PostgreSQL, not only the final status, so it needed no strengthening. It was changed only for hermeticity. |
+| S3 | **Closed.** No candidate did what the row says. `TestFail_IsFencedByEveryIdentifier` presents random identifiers, not a stale attempt's own. `TestStaleSession_CanDoNothingAtAll` asserts error values and the session fence, not that any row is unchanged. `TestReconcile_ReplacementClaimsAttemptTwoAndPreservesHistory` sends attempt 1's late success only after the job has already succeeded and never sends a failure, so it cannot tell a stale report from a finished job. |
+| S11, I17 | **Closed.** The API and the outbox publisher had restart tests and the worker had a real `SIGKILL` test. The scheduler and the reconciler had none: the existing "unobserved commit" tests rerun a pass, which is not a process dying mid-scan. |
+| I18 | **Closed.** `TestHeartbeat_UsesPostgreSQLTimeAndIsMonotonic` shows the stored time is PostgreSQL's, but the request has no time field, so that is equally true if worker time is merely absent. It passes under a mutation that makes a worker-supplied header authoritative (see the coverage table). |
+| I2 | **Closed.** One operation at a time against one terminal status, and the scheduler only ever against a job canceled out of `PENDING`: never against `SUCCEEDED` or `DEAD_LETTERED`, and never through re-notification. |
+| I5 | **Closed.** An attempt number was seen only as a value `Claim` returned, and only 1 and 2. |
+| I13 | **Closed.** The retry decision was shown persisted, but nothing restarted the scheduler across a `RETRY_WAIT`. |
+| I15 | **Closed.** Capacity is not a counter, so a literal negative is impossible; no test checked the property that matters, that a release reported twice frees one slot. |
+| I3 | Covered, with a limitation (below): the index definition and contested claims, not a refused insert. |
+| I8 | Covered by the two `WaitingAcrossExpiry` tests, which read the rows back. `TestStaleSession_CanDoNothingAtAll` and `TestExpiredLeaseCannotStart` assert refusals but not unchanged rows, and are not cited. |
+
+### What was added
+
+All in `tests/` and `docs/`:
+
+- `tests/integration/late_completion_test.go` — `TestLateCompletion_AfterReassignmentIsRejectedAndOnlyTheReplacementCommits` (S3, I8, I9). Over the worker's real HTTP client: attempt 1's lease expires, reconciliation abandons it, a second session claims attempt 2, and attempt 1's success and failure are both refused with `lease_expired` while attempt 2 is still running. Every durable row is compared before and after. Attempt 2 then succeeds: the job is `SUCCEEDED`, attempt 1 `ABANDONED`, exactly one result exists and it is attempt 2's, and the `SUCCEEDED` attempt and `COMPLETED` lease rows carry attempt 2's attempt, worker, session, and lease identifiers. (The `jobs` row has no fence columns, so "the final row carries attempt 2's fence values" is asserted on those rows and on `results.attempt_id`.)
+- `tests/integration/restart_durability_test.go` — `TestSchedulerRestart_RetryWaitSurvivesAndIsPromotedExactlyOnce` and `TestReconcilerRestart_MidScanCrashLeavesNoPartialRepairAndTheReplacementFinishesIt` (S11, I13, I16, I17). The reconciler is crashed **mid-scan**, not between scans, and deterministically: a barrier parks the second of two repairs inside its transaction and the server terminates that connection. The scheduler's backoff is made due with PostgreSQL's clock, and passes are counted rather than slept on.
+- `tests/integration/time_authority_test.go` — `TestWorkerSuppliedTimeIsNeverAuthoritative` (I18). Offers a worker-supplied time to the heartbeat, claim, start, renewal, success, failure, and cancellation-acknowledgment requests, in the body and in headers.
+- `tests/integration/invariant_proofs_test.go` — `TestInvariant_TerminalJobsStayTerminalUnderEveryMutator` (I2), `TestInvariant_AttemptNumbersIncreaseWithoutGapsAndAreUniquePerJob` (I5), and `TestInvariant_ReleasingCapacityNeverAdmitsPastTheLimit` (I15), plus `durableSnapshot`, a whole-job before/after comparison.
+- `tests/integration/worker_process_crash_test.go` — changed. The environment is built by functions and now pins `TASKFORGE_RESULTS_ENDPOINT`; `startService` asserts, on the exact environment it hands the operating system, that every endpoint the binary dials is set to where the suite reaches that service; and `TestWorkerProcessCrash_EnvironmentPinsEveryLoopbackDefault` derives the variables with a loopback default from `internal/config` with `go/parser` and requires each to be pinned or named, with a reason, as one no spawned binary reads. Which endpoints each binary dials was read off `cmd/*/main.go`: the API takes the database and the object store, the publisher the database and the broker, the reconciler and scheduler the database, and the worker the broker, the object store, and the API URL. `TASKFORGE_RESULTS_ENDPOINT` was the only one missing.
+- `tests/verification/matrix_test.go` and `docs/VERIFICATION_MATRIX.md` — the matrix and its drift check, which runs inside `make test-unit` and so in CI's first job.
+
+### Evidence
+
+All of this ran on code commit `0d5bb05`; later commits on the branch change
+documentation only. Gate outputs are under "M7A gates".
+
+**Every new or changed test was caught by a production-code mutation**, each
+applied by a script that asserted the edit landed exactly once, shown by
+`git diff`, run, reverted, and confirmed with a clean `git status`. The diffs and
+failing output are in the pull request's handoff.
+
+| Test | Mutation | Observed |
+| --- | --- | --- |
+| `TestLateCompletion_…` | `fenceState.leaseUsable()` returns `true` | Fails on the late success: expected `lease_expired`, got `state_conflict`. The late call is **still refused** — the status precondition is a second layer, and the `UPDATE` predicates a third — so this mutation changes the reason, not the outcome, and the test pins the reason. |
+| `TestSchedulerRestart_…` | the promotion scan excludes `RETRY_WAIT` | "the restarted scheduler promotes the due retry" never became true within 15s |
+| `TestReconcilerRestart_…` | the abandonment path's `Commit` becomes a `Rollback` | "the repair that committed before the crash is durable": `QUEUED/ABANDONED/EXPIRED` expected, `RUNNING/RUNNING/ACTIVE` found |
+| `TestWorkerSuppliedTimeIsNeverAuthoritative` | (a) `decodeControlJSON` drops `DisallowUnknownFields` | a body time is accepted: `400` expected, `200` found. By itself this only breaks the documented contract, since the time would still be ignored |
+| | (b) the heartbeat honors a worker-supplied `Date` header, across `types.go`, `heartbeat.go`, `worker_control.go` | the stored heartbeat is in 2099 and the assertion fails. `TestHeartbeat_UsesPostgreSQLTimeAndIsMonotonic` **passes** under the same mutation |
+| `TestInvariant_TerminalJobs…` | the promotion scan and its in-lock recheck admit `SUCCEEDED` | "a terminal job is never promoted": zero expected, one found |
+| `TestInvariant_AttemptNumbers…` | `Claim` allocates `max(attempt_number) + 2` | caught, but earlier than the numbers assertion: the budget arithmetic consumes `attempt_number`, so the job exhausts its budget and the test stops at `makeRetryDue` |
+| `TestInvariant_ReleasingCapacity…` | the worker-capacity check `>=` becomes `>` | all five `worker limit` subtests fail (`CAPACITY_EXHAUSTED` expected, `CLAIMED` found); none of the `queue limit` subtests did, which is why the two ledgers are exercised apart |
+| the drift check | (a) delete the `S9` row | "S9 is missing from the matrix" |
+| | (b) rename `TestSubmit_SameKeyDifferentRequestIsAConflict` | the rows that name it, I11 and S5, each report it is no longer a test function |
+| the crash test's hermeticity | remove the `TASKFORGE_RESULTS_ENDPOINT` pin (the pre-fix environment; a test-code revert, since the fix is in test code) | `startService` fails before spawning: "`taskforge-api` would take `TASKFORGE_RESULTS_ENDPOINT` from its loopback default", and the loopback-default test fails for the same variable |
+
+**Flake evidence.** `go test -tags integration -race -count=10` over
+`TestLateCompletion_`, `TestSchedulerRestart_`, `TestReconcilerRestart_`,
+`TestWorkerSuppliedTimeIsNeverAuthoritative`, `TestInvariant_` and
+`TestWorkerProcessCrash_EnvironmentPinsEveryLoopbackDefault`: each of the eight
+top-level tests passed 10 of 10, with no `DATA RACE` and no failure. The
+real-binary crash test, which this milestone changed, passed 10 of 10 under
+`-race` in 129.2s.
+
+**Hermeticity.** The assertions above are the evidence that the spawned binaries
+are pinned. A run of the suite inside a **bridged container** against
+infrastructure on the host was **not reproduced** here, so the original failure
+was not re-observed and its fix was not observed passing there.
+
+### Limitations
+
+- **The drift check proves existence, not that a test is load-bearing.** A test
+  that still exists and no longer proves its row passes it. The mutation results
+  above are a point-in-time record; nothing in CI re-runs them.
+- **A "restart" of the scheduler and the reconciler is a connection pool, an
+  engine, and a loop, stopped and replaced in one test process.** Only the worker
+  has a real-binary kill test. The reconciler's replacement runs one `RunOnce`
+  pass rather than its timer loop, because the loop holds no state between
+  passes.
+- **I3's database enforcement is evidenced by the index definition,** not by an
+  insert PostgreSQL refuses. I5's is stronger: the test asks for a duplicate and
+  gets `23505`.
+- **I15 is tested as "a release is worth one slot",** because capacity is derived
+  from `ACTIVE` leases and a literal negative cannot occur.
+- **The late-completion rejection is layered,** so a mutation of any one layer
+  changes the error code but not the outcome. The test pins the code; see the
+  table.
+- **The route table and `api/openapi.yaml` are still not checked against each
+  other.** That is deferred to M8 and recorded under "Deliberately not
+  implemented yet". M7A did not touch the hand-maintained maps.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot
+  contain its own CI result: the pull request's checks are the record.
+- **M7B is not started** and has an open decision about demo-handler trust; see
+  "Next objective".
+
+### Breaking change
+
+None. No production code, schema, API, CLI, SDK, dashboard, or configuration
+changed.
+
 ## Verification
 
 ### M5A gates
@@ -2621,6 +2748,27 @@ Recorded as risks, not worked around silently.
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
 
+### M7A gates
+
+Run locally on the branch, 2026-10-02, against code commit `0d5bb05`.
+PostgreSQL 16, ElasticMQ and the object store from `make up`, on Go 1.27.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS — `gofmt -w .` changed no Go file (`git status -- '*.go'` empty) |
+| `make lint` | PASS — `go vet ./...` silent |
+| `make build` | PASS — `go build -o bin/ ./cmd/...` |
+| `make test-unit` | PASS — 21 packages `ok`, up from 20: `tests/verification`. With `GOFLAGS='-count=1 -v'` the output carries `--- PASS: TestVerificationMatrix_EveryRowResolves` and its line "verification matrix: 30 rows (I1-I18, S1-S12), 41 distinct tests resolved to real test functions" |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  105.740s`. The suite took 85.255s on the untouched base, and 88.712s on the previous commit |
+| `make test-race` | PASS — 21 packages `ok` under `-race`; `ok  .../tests/integration  98.400s`; no `DATA RACE` |
+| `go test -tags integration -race -count=10 -run '<new tests>' ./tests/integration/` | PASS — `TestLateCompletion_`, `TestSchedulerRestart_`, `TestReconcilerRestart_`, `TestWorkerSuppliedTimeIsNeverAuthoritative`, `TestInvariant_` (three tests) and `TestWorkerProcessCrash_EnvironmentPinsEveryLoopbackDefault`: each 10 of 10, no `DATA RACE` |
+| `go test -tags integration -race -count=10 -run TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries ./tests/integration/` | PASS — 10 of 10, `ok … 129.229s`, no `DATA RACE` |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test` | NOT RUN — M7A changes nothing in `sdk/` or `dashboard/` |
+
+The mutation results are under "Evidence" in the M7A section. Hosted CI on the
+final head is not recorded here, because a commit cannot contain its own CI
+result: the pull request's checks are the record.
+
 ### M6E gates
 
 Run locally on the branch, 2026-10-01, against code commit `c90b269`.
@@ -2692,7 +2840,9 @@ failed because it spawns real binaries without passing
 loopback for the object store. That is the test harness meeting container
 networking, not Node; with `--network host` the same fresh clone passed `make
 test` in full, and the test passed on the host in both `test-integration` and
-`test-race`.
+`test-race`. M7A fixed the harness: the test now pins
+`TASKFORGE_RESULTS_ENDPOINT` and asserts it on the spawned environment. A
+bridged run was not repeated; see "M7A".
 
 **Mutation evidence**, each run in a throwaway container so the tree never
 changed:
@@ -3386,6 +3536,9 @@ asserts the build left the tree clean and embeds it with
 `TASKFORGE_REQUIRE_BUILT_DASHBOARD=1`, which turns the built-output test's skip
 into a failure.
 
+The M7A drift check (`tests/verification`) runs inside `make test-unit`, so it
+runs in the first job; no job was added.
+
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure.
 
@@ -3453,6 +3606,13 @@ exercised by a real hosted failure.
   the mux, so a route added without being added to both is uncovered rather
   than failing. A real completeness gate needs a route registry inside
   `Handler()`; it is a small, separate change and is not claimed here.
+  **M7A recorded this as deferred to M8** and did not touch the maps. Two
+  hand-maintained, one-directional maps in
+  `internal/api/deadline_contract_test.go` are what keeps the document from
+  falling behind the handlers — `TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode`
+  (line 236) and `TestOpenAPI_DocumentsEveryImplementedPublicRoute` (line 364) —
+  and each walks from its list into the document, never from the mux into the
+  list. [ROADMAP.md](ROADMAP.md) carries the deferral under M8.
 - Tracing shipped in M6B, but three parts of it are
   deliberately absent rather than pending: the worker's own control-plane calls
   after the claim (start, renew, succeed, fail) are not traced, the Python SDK
@@ -3503,20 +3663,20 @@ reconciler as shown in the repository README. The dashboard is at
 
 ## Next objective
 
-M7: full concurrency, restart, failure, and race suites — automation for all
-twelve required scenarios, plus `make demo` and `make demo-failure`. See
-[ROADMAP.md](ROADMAP.md)'s M7 entry. M6 is complete; every M7 scenario can now
-also be watched from the dashboard.
+M7B: `make demo` and `make demo-failure`. See [ROADMAP.md](ROADMAP.md)'s M7B
+entry. It is not started, and it has an open decision that is why it gets its own
+handoff: whether the failure demonstration's handlers become production handlers
+in `taskforge-worker`, and what bounds them if they do, which is a question
+about the trust boundary [AGENTS.md](../AGENTS.md) §10 draws rather than about a
+Make target. M7A closed the proof audit; every M7 scenario can also be watched
+from the dashboard.
 
-Smaller items available to whoever wants them, none blocking M7:
+Smaller items available to whoever wants them, none blocking M7B:
 
 - `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
   deliberately did not build. See its section above for exactly what each would
   take; both are larger than they look because the clean recording points are
   inside fenced-transition code.
 - `README.md` line 35 is still stale ("the Python SDK and the dashboard" do not
-  exist yet). Untouched through M6A–M6D because PR #10 rewrites that file
+  exist yet). Untouched through M7A because PR #10 rewrites that file
   wholesale.
-- `TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries` does not pass
-  `TASKFORGE_RESULTS_ENDPOINT` to the binaries it spawns, so it cannot run in a
-  bridged container against host infrastructure (see "M6D gates").
