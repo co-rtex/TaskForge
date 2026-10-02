@@ -228,8 +228,8 @@ func TestAuth_AServerWithNoCredentialStoreRefusesEverything(t *testing.T) {
 
 	t.Run("key management is not registered", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/v1/api-keys",
-			strings.NewReader(`{"scope":"s","name":"n"}`)))
+		handler.ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/api-keys",
+			strings.NewReader(`{"scope":"s","name":"n"}`))))
 		require.Equal(t, http.StatusNotFound, recorder.Code)
 	})
 }

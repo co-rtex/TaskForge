@@ -82,7 +82,7 @@ func TestWorkerControl_ClaimResponseCarriesAckDecision(t *testing.T) {
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))
+	request := internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
 	newWorkerControlHandler(control).ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusOK, recorder.Code)
 
@@ -110,7 +110,7 @@ func TestWorkerControl_ClaimResponseIncludesAssignmentScope(t *testing.T) {
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))
+	request := internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
 	newWorkerControlHandler(control).ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusOK, recorder.Code)
 
@@ -126,8 +126,8 @@ func TestWorkerControl_RejectsUnknownFieldsAndBadIdentifiers(t *testing.T) {
 
 	t.Run("unknown field", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims",
-			strings.NewReader(`{"unexpected":true}`))
+		request := internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims",
+			strings.NewReader(`{"unexpected":true}`)))
 		handler.ServeHTTP(recorder, request)
 		require.Equal(t, http.StatusBadRequest, recorder.Code)
 		require.Equal(t, CodeMalformedJSON, decodeError(t, recorder).Error.Code)
@@ -135,8 +135,8 @@ func TestWorkerControl_RejectsUnknownFieldsAndBadIdentifiers(t *testing.T) {
 
 	t.Run("bad session id", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		request := authorizeWorker(httptest.NewRequest(http.MethodPut, "/internal/v1/worker-sessions/not-a-uuid",
-			strings.NewReader(`{}`)))
+		request := authorizeWorker(internalRequest(httptest.NewRequest(http.MethodPut, "/internal/v1/worker-sessions/not-a-uuid",
+			strings.NewReader(`{}`))))
 		handler.ServeHTTP(recorder, request)
 		require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
 		require.Equal(t, CodeValidationFailed, decodeError(t, recorder).Error.Code)
@@ -144,8 +144,8 @@ func TestWorkerControl_RejectsUnknownFieldsAndBadIdentifiers(t *testing.T) {
 
 	t.Run("claim reports every semantic field problem", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(
-			`{"worker_id":"bad","worker_session_id":"bad","claim_request_id":"bad","queue":"Bad Queue"}`))
+		request := internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(
+			`{"worker_id":"bad","worker_session_id":"bad","claim_request_id":"bad","queue":"Bad Queue"}`)))
 		handler.ServeHTTP(recorder, request)
 		require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
 		body := decodeError(t, recorder)
@@ -169,7 +169,7 @@ func TestWorkerControl_MapsSessionAndFenceConflictsToStableCodes(t *testing.T) {
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	claimRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(claimRecorder,
-		httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(claimBody)))
+		internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(claimBody))))
 	require.Equal(t, http.StatusConflict, claimRecorder.Code)
 	require.Equal(t, CodeSessionUnavailable, decodeError(t, claimRecorder).Error.Code)
 
@@ -177,8 +177,8 @@ func TestWorkerControl_MapsSessionAndFenceConflictsToStableCodes(t *testing.T) {
 	fenceBody := `{"job_id":"` + uuid.NewString() + `","lease_id":"` + uuid.NewString() +
 		`","worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() + `"}`
 	fenceRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(fenceRecorder, httptest.NewRequest(http.MethodPost,
-		"/internal/v1/attempts/"+attemptID+"/start", strings.NewReader(fenceBody)))
+	handler.ServeHTTP(fenceRecorder, internalRequest(httptest.NewRequest(http.MethodPost,
+		"/internal/v1/attempts/"+attemptID+"/start", strings.NewReader(fenceBody))))
 	require.Equal(t, http.StatusConflict, fenceRecorder.Code)
 	require.Equal(t, CodeFenceRejected, decodeError(t, fenceRecorder).Error.Code)
 }
@@ -199,8 +199,8 @@ func TestWorkerControl_TransitionUsesThePathAttemptID(t *testing.T) {
 	body := `{"job_id":"` + uuid.NewString() + `","lease_id":"` + uuid.NewString() +
 		`","worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() + `"}`
 	recorder := httptest.NewRecorder()
-	newWorkerControlHandler(control).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost,
-		"/internal/v1/attempts/"+attemptID.String()+"/start", strings.NewReader(body)))
+	newWorkerControlHandler(control).ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost,
+		"/internal/v1/attempts/"+attemptID.String()+"/start", strings.NewReader(body))))
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, attemptID, got.AttemptID)
 
@@ -275,7 +275,7 @@ func TestWorkerControl_ExpiredContextDoesNotMaskUnrelatedFailures(t *testing.T) 
 			body := fmt.Sprintf(
 				`{"worker_id":%q,"worker_session_id":%q,"claim_request_id":%q,"queue":"default"}`,
 				uuid.NewString(), uuid.NewString(), uuid.NewString())
-			request := httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))
+			request := internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
 
 			// The request context is already past its deadline before the handler
 			// runs, which is exactly the state that used to force a 503.

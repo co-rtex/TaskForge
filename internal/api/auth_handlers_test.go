@@ -34,7 +34,7 @@ func doJSON(t *testing.T, h http.Handler, method, path, body string) *httptest.R
 	} else {
 		reader = strings.NewReader(body)
 	}
-	request := httptest.NewRequest(method, path, reader)
+	request := internalRequest(httptest.NewRequest(method, path, reader))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, request)
@@ -119,8 +119,8 @@ func TestCreateAPIKey_HasNoIdempotencyIdentity(t *testing.T) {
 	}, nil)
 
 	for i := 0; i < 2; i++ {
-		request := httptest.NewRequest(http.MethodPost, "/internal/v1/api-keys",
-			strings.NewReader(`{"scope":"tenant-a","name":"ops"}`))
+		request := internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/api-keys",
+			strings.NewReader(`{"scope":"tenant-a","name":"ops"}`)))
 		// Sent deliberately: an Idempotency-Key must be ignored here, not honored.
 		request.Header.Set("Idempotency-Key", "the-same-key-twice")
 		recorder := httptest.NewRecorder()
