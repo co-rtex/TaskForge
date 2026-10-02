@@ -706,11 +706,22 @@ plus the transactional recovery event are the record of what happened; a dedicat
 
 ## 12. Reliability invariants — [IMPLEMENTED]
 
-Each of these must have an automated test. All eighteen are implemented and
-tested as of M4. Invariants 13 and 14 were M4's to close: retry scheduling is
-durable PostgreSQL state that no process holds, and a canceled job cannot later
-become successful because `CANCEL_REQUESTED` stops success from committing and
-terminal `CANCELED` is never left.
+Each of these must have an automated test that asserts durable state. All
+eighteen are implemented, and [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
+maps each to the tests that prove it and the line where they read PostgreSQL.
+That is a weaker claim than this section made before M7A's audit, which said
+all eighteen were "tested as of M4": six did not have a test that proved them.
+I2 (a terminal job stays terminal) had been tried against one operation at a
+time, and the scheduler only against a job canceled out of `PENDING`; I5 (attempt numbers) was seen only as a
+value a claim returned; I13 (retry survives a restart) and I17 (no property
+depends on memory) had no restart test for the scheduler or the reconciler; I15
+(capacity cannot go negative) had no test of a release reported twice; and I18
+(worker-supplied time is not authoritative) was shown only by the absence of a
+time field, never by offering one. M7A closed each. Invariants 13 and 14 were
+M4's to close: retry scheduling is durable PostgreSQL state that no process
+holds, and a canceled job cannot later become successful because
+`CANCEL_REQUESTED` stops success from committing and terminal `CANCELED` is never
+left.
 
 1. PostgreSQL is authoritative for all control-plane state.
 2. A terminal job never returns to a non-terminal state.

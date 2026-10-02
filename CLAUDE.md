@@ -18,6 +18,7 @@ Do not duplicate these. Link to the owner instead.
 | Architecture, invariants, failure semantics | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) + accepted ADRs |
 | Milestone sequence and future work | [docs/ROADMAP.md](docs/ROADMAP.md) |
 | What is actually implemented and verified | [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) |
+| Invariant/scenario → test traceability | [docs/VERIFICATION_MATRIX.md](docs/VERIFICATION_MATRIX.md) |
 
 ---
 

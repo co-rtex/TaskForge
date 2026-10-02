@@ -52,6 +52,8 @@ internal/<domain>/     Library code. Not importable outside this module.
 migrations/            Versioned, forward-only SQL. Never edit an applied file.
 api/                   OpenAPI description of implemented endpoints only.
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
+tests/verification/    Infrastructure-free checks over the repository's own
+                       documentation: the verification-matrix drift check.
 sdk/python/            The Python SDK. Its own toolchain; see ADR-0016.
 dashboard/             The operator dashboard's frontend source. Its own
                        toolchain, containerized; see ADR-0017.
