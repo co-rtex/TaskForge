@@ -170,6 +170,9 @@ Targets are added only when the behavior behind them actually works.
   must match the branch head.
 - Record an architectural decision as an ADR when it constrains future work or has
   a real tradeoff. Do not write an ADR for a small coding choice.
+- A milestone's status line must not depend on merge state. Write "complete; see
+  PR #N", never "on its own branch and draft pull request": a document cannot keep
+  merge state current, and the pull request is the record of it.
 
 ## 9. Verification honesty
 
