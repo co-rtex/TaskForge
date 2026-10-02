@@ -85,8 +85,12 @@ func requireWithin(t *testing.T, got, lo, hi time.Time, what string) {
 // goes further and OFFERS a worker-supplied time to each call, two ways:
 //
 //   - in the body. api/openapi.yaml documents unknown fields on these routes as
-//     a 400, so each is refused, and the job's complete durable state must be
-//     byte-for-byte unchanged afterwards;
+//     a 400, so each is refused and writes nothing. For claim, start, renewal,
+//     success, failure and cancellation acknowledgment that is checked against
+//     durableSnapshot: the job's rows in jobs, job_attempts, leases, results,
+//     dlq_entries and outbox_events must be byte-for-byte unchanged afterwards.
+//     The heartbeat touches the session row, which durableSnapshot does not
+//     read, so it is checked against the stored last_heartbeat_at instead;
 //   - in headers (Date and custom ones), which an HTTP server accepts and must
 //     simply ignore, so the call succeeds and what it stores must still be
 //     PostgreSQL's reading, bracketed by the database clock around the call.

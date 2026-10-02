@@ -109,7 +109,8 @@ func TestLateCompletion_AfterReassignmentIsRejectedAndOnlyTheReplacementCommits(
 	requireControlRejection(t, err, api.CodeLeaseExpired)
 
 	require.Equal(t, beforeLate, durableSnapshot(t, jobID),
-		"two refused reports must leave every durable row byte-for-byte as it was")
+		"two refused reports must leave the job's rows in jobs, job_attempts, leases, "+
+			"results, dlq_entries and outbox_events byte-for-byte as they were")
 	var retained int
 	require.NoError(t, testPool.QueryRow(ctx,
 		`SELECT count(*) FROM job_attempts WHERE outcome_request_id = $1`,
