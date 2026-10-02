@@ -120,7 +120,7 @@ func (r *Registry) Types() []string {
 	return types
 }
 
-// DemoEcho is M2's single trusted handler. It returns an exact copy of the
+// DemoEcho is M2's first trusted handler. It returns an exact copy of the
 // authoritative payload in process. Since M5C, runner.go classifies and
 // records that returned copy as the attempt's result; the payload/result
 // itself is still never logged.
