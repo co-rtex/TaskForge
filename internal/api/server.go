@@ -230,15 +230,20 @@ func (s *Server) Handler() http.Handler {
 		// falls through to the catch-all below.
 		mux.HandleFunc("GET /{$}", s.handleDashboardRoot)
 	}
+	// Every /internal pattern -- the real routes below and their method-less 405
+	// fallbacks further down -- is registered through handleInternal, which puts
+	// the browser-origin guard outside whatever else the route carries. The set
+	// of guarded routes is therefore this registration list and nothing else, and
+	// registering an /internal pattern any other way is a visible omission here.
 	if s.keys != nil {
-		mux.HandleFunc("POST /internal/v1/api-keys", s.handleCreateAPIKey)
-		mux.HandleFunc("GET /internal/v1/api-keys", s.handleListAPIKeys)
-		mux.HandleFunc("POST /internal/v1/api-keys/{key_id}/revoke", s.handleRevokeAPIKey)
+		s.handleInternal(mux, "POST /internal/v1/api-keys", s.handleCreateAPIKey)
+		s.handleInternal(mux, "GET /internal/v1/api-keys", s.handleListAPIKeys)
+		s.handleInternal(mux, "POST /internal/v1/api-keys/{key_id}/revoke", s.handleRevokeAPIKey)
 	}
 	if s.workerKeys != nil {
-		mux.HandleFunc("POST /internal/v1/worker-keys", s.handleCreateWorkerKey)
-		mux.HandleFunc("GET /internal/v1/worker-keys", s.handleListWorkerKeys)
-		mux.HandleFunc("POST /internal/v1/worker-keys/{key_id}/revoke", s.handleRevokeWorkerKey)
+		s.handleInternal(mux, "POST /internal/v1/worker-keys", s.handleCreateWorkerKey)
+		s.handleInternal(mux, "GET /internal/v1/worker-keys", s.handleListWorkerKeys)
+		s.handleInternal(mux, "POST /internal/v1/worker-keys/{key_id}/revoke", s.handleRevokeWorkerKey)
 	}
 	if s.control != nil {
 		// Registration alone is wrapped in requireWorkerKey: every other
@@ -246,14 +251,14 @@ func (s *Server) Handler() http.Handler {
 		// identity the request already carries rather than a fresh credential.
 		// See requireWorkerKey's doc comment for why that asymmetry is
 		// deliberate.
-		mux.HandleFunc("PUT /internal/v1/worker-sessions/{worker_session_id}", s.requireWorkerKey(s.handleRegisterWorkerSession))
-		mux.HandleFunc("POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.handleHeartbeat)
-		mux.HandleFunc("POST /internal/v1/claims", s.handleClaim)
-		mux.HandleFunc("POST /internal/v1/leases/{lease_id}/renew", s.handleRenewLease)
-		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/start", s.handleStartAttempt)
-		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/succeed", s.handleSucceedAttempt)
-		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/fail", s.handleFailAttempt)
-		mux.HandleFunc("POST /internal/v1/attempts/{attempt_id}/cancel", s.handleCancelAttempt)
+		s.handleInternal(mux, "PUT /internal/v1/worker-sessions/{worker_session_id}", s.requireWorkerKey(s.handleRegisterWorkerSession))
+		s.handleInternal(mux, "POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.handleHeartbeat)
+		s.handleInternal(mux, "POST /internal/v1/claims", s.handleClaim)
+		s.handleInternal(mux, "POST /internal/v1/leases/{lease_id}/renew", s.handleRenewLease)
+		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/start", s.handleStartAttempt)
+		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/succeed", s.handleSucceedAttempt)
+		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/fail", s.handleFailAttempt)
+		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/cancel", s.handleCancelAttempt)
 	}
 
 	// ServeMux answers an unmatched method with a plain-text 405 and an unmatched
@@ -278,26 +283,28 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc(DashboardPath, s.methodNotAllowed(http.MethodGet))
 	}
 	if s.keys != nil {
-		// 405 is answered before authentication, deliberately. "This path does
+		// 405 is answered before authentication, deliberately -- but after the
+		// browser-origin guard, which handleInternal puts outside it: a
+		// browser-marked DELETE is refused 403, not told which methods exist. "This path does
 		// not accept DELETE" is a fact about the route table, not about the
 		// caller, so it discloses nothing a reader of the OpenAPI document does
 		// not already have.
-		mux.HandleFunc("/internal/v1/api-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
-		mux.HandleFunc("/internal/v1/api-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/api-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/api-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
 	}
 	if s.workerKeys != nil {
-		mux.HandleFunc("/internal/v1/worker-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
-		mux.HandleFunc("/internal/v1/worker-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/worker-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/worker-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
 	}
 	if s.control != nil {
-		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))
-		mux.HandleFunc("/internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.methodNotAllowed(http.MethodPost))
-		mux.HandleFunc("/internal/v1/claims", s.methodNotAllowed(http.MethodPost))
-		mux.HandleFunc("/internal/v1/leases/{lease_id}/renew", s.methodNotAllowed(http.MethodPost))
-		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/start", s.methodNotAllowed(http.MethodPost))
-		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/succeed", s.methodNotAllowed(http.MethodPost))
-		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/fail", s.methodNotAllowed(http.MethodPost))
-		mux.HandleFunc("/internal/v1/attempts/{attempt_id}/cancel", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))
+		s.handleInternal(mux, "/internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/claims", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/leases/{lease_id}/renew", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/start", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/succeed", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/fail", s.methodNotAllowed(http.MethodPost))
+		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/cancel", s.methodNotAllowed(http.MethodPost))
 	}
 	mux.HandleFunc("/", s.handleNotFound)
 
@@ -319,6 +326,25 @@ func (s *Server) Handler() http.Handler {
 	h = withTracing(s.tracer, h)
 	h = withRequestID(h)
 	return h
+}
+
+// handleInternal registers an /internal pattern with the browser-origin guard
+// as its OUTERMOST layer.
+//
+// Outermost means outside requireWorkerKey and outside methodNotAllowed, so a
+// browser-marked request is refused 403 before it can be authenticated, before
+// it can learn which methods a path allows, and before any handler reads its
+// body. It sits inside the mux rather than around it so that a refused request
+// still carries its route pattern, which withSpanRoute turns into the span name
+// and the metric label; a guard outside the mux would run before the pattern
+// existed and every refusal would be labelled "unmatched".
+//
+// Every /internal pattern goes through here, including the method-less
+// fallbacks. TestServer_EveryInternalPatternIsRegisteredThroughTheGuard pins
+// that, and TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation
+// proves the result for every operation api/openapi.yaml documents.
+func (s *Server) handleInternal(mux *http.ServeMux, pattern string, handler http.HandlerFunc) {
+	mux.HandleFunc(pattern, s.refuseBrowserOrigin(handler))
 }
 
 // JobResponse is the public representation of a job. It deliberately excludes
