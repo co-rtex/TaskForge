@@ -476,7 +476,7 @@ not avoid: mounting under `/dashboard/` rather than `/`, so the existing JSON
 404 catch-all is untouched; the operator's key in `sessionStorage` behind a
 same-origin-only CSP, with the origin it shares with the unauthenticated
 loopback key-administration routes recorded as an accepted limitation whose
-guard is the owner's decision; Biome as the single lint/format tool; and a CI job that
+guard was left as the owner's decision, and has since been built as M6E; Biome as the single lint/format tool; and a CI job that
 runs the Make targets rather than `actions/setup-node`.
 
 Deliberately **not** in scope, as boundaries rather than TODOs: every write from
@@ -485,6 +485,40 @@ caller-chosen `Idempotency-Key` whose browser-side minting is its own design
 question and because it would stack on a new credential story in the same
 milestone; free-text search; auto-refresh, websockets, and SSE; and a
 server-side credential proxy.
+
+### M6E — Browser-origin guard on the internal surface (follow-up to ADR-0017)
+**Label.** A follow-up to M6, **not** a fifth slice of it. M6's objective and
+acceptance sentence were already discharged in full by M6A–M6D, and this entry
+does not reopen them. It exists because [ADR-0017](adr/0017-dashboard-toolchain-and-serving.md)
+recorded two exposures it deliberately did not fix and named a bounded
+follow-up for them.
+**Objective.** Close the two exposures ADR-0017 recorded: a script in the
+dashboard's origin reaching the unauthenticated `/internal` key administration,
+and cross-site CSRF and DNS rebinding against those routes, which dates from
+M5A.
+**Deliverables.** A stateless guard on every registered `/internal/v1` route
+that refuses, with `403` and the new `Error.code` `origin_refused`, a request
+carrying `Sec-Fetch-Site` or `Origin` (any value) or addressed to a non-loopback
+`Host`, before authentication, before the `405`, and before any handler reads
+the body; the shared `internal/loopback` predicate the bind rule and the Host
+rule both call; the `403` documented on all 14 `/internal` operations and in the
+`Error.code` enum; the CLI and Python SDK mappings; and
+[ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md).
+**Acceptance.** Every operation `api/openapi.yaml` documents under `/internal`
+refuses each browser marking with `403`, without reaching a handler or a
+dependency; loopback Hosts pass untouched; the guard runs before authentication
+and before the `405`; `/v1`, `/dashboard/`, `/metrics` and the health probes are
+unchanged; and a refused request keeps its route pattern as its span name and
+metric label.
+**Depends on.** M6D, whose dashboard origin made the exposure larger.
+**Status:** implemented, on its own branch and draft pull request — see
+[CURRENT_STATE.md](CURRENT_STATE.md) for the evidence and for what remains open.
+
+Deliberately **not** in scope: authentication on `/internal`, CORS headers, a
+separate listener, a configurable Host allowlist, and guarding the whole
+listener, which would also close DNS rebinding's read of `/metrics`. The last two
+belong with M8's deployment work, which has to revisit the loopback bind and the
+Host rule together.
 
 ### M7 — Full concurrency, restart, failure, and race suites
 **Objective.** Prove the invariants.

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
+	"github.com/co-rtex/TaskForge/internal/loopback"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
 
@@ -400,7 +401,7 @@ func (c WorkerConfig) Validate() error {
 	parsed, err := url.Parse(c.APIBaseURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		problems = append(problems, "TASKFORGE_WORKER_API_URL must be an absolute http(s) URL")
-	} else if !isLoopbackHost(parsed.Hostname()) {
+	} else if !loopback.IsLoopbackHost(parsed.Hostname()) {
 		// Permanent, not a stand-in for authentication: the worker health
 		// endpoint and the API's own loopback bind (see Config.Validate) are
 		// deliberately never exposed off-host, worker key or not.
@@ -596,13 +597,5 @@ func envSet(key, def string) []string {
 
 func isLoopbackBind(address string) bool {
 	host, _, err := net.SplitHostPort(address)
-	return err == nil && isLoopbackHost(host)
-}
-
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return err == nil && loopback.IsLoopbackHost(host)
 }

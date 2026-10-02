@@ -33,7 +33,7 @@ func deadline503Message(t *testing.T) string {
 		uuid.NewString(), uuid.NewString(), uuid.NewString())
 	recorder := httptest.NewRecorder()
 	newWorkerControlHandler(control).ServeHTTP(recorder,
-		httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
+		internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))))
 	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 
 	var envelope ErrorBody

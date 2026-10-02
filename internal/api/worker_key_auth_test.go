@@ -20,8 +20,8 @@ import (
 func registrationRequest() *http.Request {
 	body := `{"worker_name":"w","hostname":"h","worker_group":"default",` +
 		`"concurrency_limit":1,"capabilities":[],"supported_job_types":[]}`
-	return httptest.NewRequest(http.MethodPut,
-		"/internal/v1/worker-sessions/"+uuid.NewString(), strings.NewReader(body))
+	return internalRequest(httptest.NewRequest(http.MethodPut,
+		"/internal/v1/worker-sessions/"+uuid.NewString(), strings.NewReader(body)))
 }
 
 // TestRequireWorkerKey_RegistrationRefusesAnUnauthenticatedRequest is the
@@ -124,8 +124,8 @@ func TestRequireWorkerKey_AServerWithNoWorkerKeyStoreRefusesRegistrationOnly(t *
 
 	heartbeatBody := `{"worker_id":"` + uuid.NewString() + `"}`
 	heartbeatRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(heartbeatRecorder, httptest.NewRequest(http.MethodPost,
-		"/internal/v1/worker-sessions/"+uuid.NewString()+"/heartbeat", strings.NewReader(heartbeatBody)))
+	handler.ServeHTTP(heartbeatRecorder, internalRequest(httptest.NewRequest(http.MethodPost,
+		"/internal/v1/worker-sessions/"+uuid.NewString()+"/heartbeat", strings.NewReader(heartbeatBody))))
 	require.Equal(t, http.StatusOK, heartbeatRecorder.Code,
 		"heartbeat authenticates the session, not a presented credential, so it must stay reachable")
 	require.True(t, heartbeatCalled)
@@ -161,7 +161,7 @@ func TestResolveWorkerControlScope_RefusesANonRegisterCallWhoseWorkerKeyWasRevok
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
+	handler.ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))))
 
 	require.Equal(t, http.StatusUnauthorized, recorder.Code)
 	require.Equal(t, CodeUnauthorized, decodeError(t, recorder).Error.Code)
@@ -196,7 +196,7 @@ func TestResolveWorkerControlScope_ANonRevokedWorkerKeySucceeds(t *testing.T) {
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
+	handler.ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))))
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, "tenant-a", gotScope)
@@ -229,7 +229,7 @@ func TestResolveWorkerControlScope_FailsClosedWhenNoWorkerKeyStoreCanCheckRevoca
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
+	handler.ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))))
 
 	require.Equal(t, http.StatusUnauthorized, recorder.Code)
 	require.False(t, claimCalled)
@@ -258,7 +258,7 @@ func TestResolveWorkerControlScope_ASessionWithNoWorkerKeyIsNeverTreatedAsRevoke
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
+	handler.ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))))
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, "tenant-a", gotScope)
@@ -281,7 +281,7 @@ func TestResolveWorkerControlScope_PropagatesAnUnknownSessionAsTheExistingConfli
 	body := `{"worker_id":"` + uuid.NewString() + `","worker_session_id":"` + uuid.NewString() +
 		`","claim_request_id":"` + uuid.NewString() + `","queue":"default"}`
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body)))
+	handler.ServeHTTP(recorder, internalRequest(httptest.NewRequest(http.MethodPost, "/internal/v1/claims", strings.NewReader(body))))
 
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Equal(t, CodeSessionUnavailable, decodeError(t, recorder).Error.Code)

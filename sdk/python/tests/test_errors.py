@@ -75,6 +75,7 @@ def test_api_error_map_covers_exactly_the_reachable_set() -> None:
         "payload_too_large": RequestRejectedError,
         "validation_failed": RequestRejectedError,
         "invalid_cursor": RequestRejectedError,
+        "origin_refused": RequestRejectedError,
         "unauthorized": UnauthorizedError,
         "not_found": NotFoundError,
         "idempotency_conflict": ConflictError,
@@ -83,7 +84,7 @@ def test_api_error_map_covers_exactly_the_reachable_set() -> None:
         "internal_error": InternalServerError,
         "service_unavailable": ServiceUnavailableError,
     } == API_ERROR_EXCEPTIONS
-    assert len(API_ERROR_EXCEPTIONS) == 11
+    assert len(API_ERROR_EXCEPTIONS) == 12
 
 
 # --- one test per class, through the public surface -----------------------
@@ -104,6 +105,22 @@ def test_request_rejected(status: int, code: str) -> None:
         harness.client.jobs.get("job-1")
     assert raised.value.code == code
     assert raised.value.exit_code == 2
+
+
+def test_origin_refused_is_a_rejected_request_not_an_auth_failure() -> None:
+    """The /internal browser-origin guard's 403, through a route that reaches it.
+
+    It maps to the class the CLI pins to exit code 2 (ExitRequestRejected), not
+    to UnauthorizedError: the guard is not authentication, and no credential
+    can fix it.
+    """
+    harness = build_client(api_error(403, "origin_refused"))
+    with pytest.raises(RequestRejectedError) as raised:
+        harness.client.api_keys.create(scope="local-dev", name="my-laptop")
+    assert raised.value.code == "origin_refused"
+    assert raised.value.http_status == 403
+    assert raised.value.exit_code == 2
+    assert not isinstance(raised.value, UnauthorizedError)
 
 
 def test_unauthorized() -> None:

@@ -83,6 +83,34 @@ info:
     session has been revoked. See "Worker-key authentication" below and
     `docs/adr/0014-worker-control-authentication.md`.
 
+    ### The browser-origin guard
+
+    Every `/internal/v1` operation, including the one that requires a worker key,
+    is also guarded against being driven by a web browser. A request is refused
+    with `403` and code `origin_refused` when any of these is true, checked in
+    this order:
+
+    1. It carries a `Sec-Fetch-Site` header, with any value (including `none`
+       and an empty value).
+    2. It carries an `Origin` header, with any value (including `null` and this
+       API's own origin).
+    3. Its `Host` is not a loopback host: `localhost` (any case, with or without
+       a trailing dot) or a loopback IP address, with an optional numeric port.
+       An empty or unparseable `Host` is refused.
+
+    No client of this surface — the CLI, the Python SDK, a worker — sends either
+    header or a non-loopback `Host`, so none is affected. A web page or script
+    is: a browser labels its requests, and a DNS-rebinding page cannot make a
+    browser send a loopback `Host`.
+
+    The guard is **not authentication** and adds no credential. It runs before
+    authentication, before the `405` answer for an unsupported method, and
+    before any handler reads the body, so a refused request attempts nothing.
+    It applies to `/internal/v1` only, not to `/v1`. A client that reaches the
+    API through a hostname alias for loopback sees `403` here: address it as
+    `127.0.0.1`, `[::1]`, or `localhost`. See
+    `docs/adr/0018-browser-origin-guard-on-the-internal-surface.md`.
+
     ### Worker-key authentication
 
     A worker key is a second, distinct credential: verified against its own
@@ -1273,6 +1301,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiKeyCreated' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: |
             The body was not a single valid JSON object, or it contained an
@@ -1352,6 +1396,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiKeyList' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '422':
           description: '`limit` was not an integer between 1 and 200.'
           content:
@@ -1400,6 +1460,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiKeyRevoked' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '404':
           description: No key with that id.
           content:
@@ -1474,6 +1550,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkerKeyCreated' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: |
             The body was not a single valid JSON object, or it contained an
@@ -1550,6 +1642,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkerKeyList' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '422':
           description: '`limit` was not an integer between 1 and 200.'
           content:
@@ -1600,6 +1708,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkerKeyRevoked' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '404':
           description: No key with that id.
           content:
@@ -1662,6 +1786,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/WorkerSession' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -1776,6 +1916,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Heartbeat' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -1889,6 +2045,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Renewal' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -1979,6 +2151,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ClaimResponse' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -2076,6 +2264,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AttemptStart' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -2187,6 +2391,22 @@ paths:
             schema: { $ref: '#/components/schemas/SucceedRequest' }
       responses:
         '204': { description: Accepted, or an exact already-accepted replay. }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -2312,6 +2532,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Outcome' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -2422,6 +2658,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Outcome' }
+        '403':
+          description: |
+            The browser-origin guard refused the request. Code `origin_refused`.
+            The request carried a `Sec-Fetch-Site` or `Origin` header, or its
+            `Host` was not a loopback host. The refusal happens before
+            authentication and before the body is read, so nothing was
+            attempted. Repeating the identical request is refused identically:
+            send it from a non-browser client addressed to a loopback host. See
+            "The browser-origin guard" under Authentication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: origin_refused
+                  message: this endpoint only accepts requests from a non-browser client addressed to a loopback host
         '400':
           description: Malformed JSON or an unknown field.
           content:
@@ -3546,6 +3798,7 @@ components:
                 - job_not_dead_lettered
                 - invalid_cursor
                 - cancellation_requested
+                - origin_refused
               description: Stable machine-readable code. Branch on this, not on `message`.
             message: { type: string }
             details:

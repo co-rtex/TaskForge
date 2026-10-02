@@ -32,12 +32,15 @@ const (
 	ExitUsageError = 1
 
 	// ExitRequestRejected means the API told this specific request it was
-	// malformed or invalid, and a DIFFERENT request is needed before
-	// retrying: HTTP 400 malformed_json, HTTP 413 payload_too_large, and
-	// HTTP 422 validation_failed / invalid_cursor. All four share one
-	// remediation -- change the input and resubmit -- which is what makes
-	// them one class rather than four; retrying the identical request
-	// will fail identically every time.
+	// malformed, invalid, or refused before it was looked at, and a
+	// DIFFERENT request is needed before retrying: HTTP 400 malformed_json,
+	// HTTP 413 payload_too_large, HTTP 422 validation_failed /
+	// invalid_cursor, and HTTP 403 origin_refused (the /internal
+	// browser-origin guard, which this CLI trips only if it is pointed at a
+	// non-loopback --api-url hostname; it never sends the headers the guard
+	// refuses). All five share one remediation -- change the request and
+	// resubmit -- which is what makes them one class rather than five;
+	// retrying the identical request will fail identically every time.
 	ExitRequestRejected = 2
 
 	// ExitUnauthorized means the presented credential (or its absence) was
@@ -109,8 +112,8 @@ const (
 // /v1/jobs/{job_id}/attempts, /v1/jobs/{job_id}/result,
 // /v1/jobs/{job_id}/cancel, /v1/jobs/{job_id}/retry, GET /v1/dlq,
 // POST /v1/dlq/{job_id}/replay, GET /v1/workers, GET /v1/queues, and
-// the four /internal/v1/{api-keys,worker-keys}* routes -- not for the full
-// 22-value enum in api/openapi.yaml's Error schema, most of which
+// the /internal/v1/{api-keys,worker-keys}* routes -- not for the full
+// 24-value enum in api/openapi.yaml's Error schema, most of which
 // (worker_session_conflict, claim_conflict, fence_rejected, lease_expired,
 // renewal_conflict, attempt_timed_out, outcome_conflict,
 // cancellation_requested, worker_session_unavailable, unknown_queue,
@@ -123,11 +126,16 @@ const (
 // validation_failed, invalid_cursor, unauthorized, not_found, internal_error
 // and service_unavailable, every one of which was already reachable and
 // already mapped. The table below is therefore unchanged by that milestone.
+//
+// M6E added one: origin_refused, the 403 every /internal/v1 operation can now
+// answer. The key-administration routes this CLI calls are among them, so it
+// became reachable here and joined ExitRequestRejected.
 var apiErrorExitCodes = map[string]int{
 	"malformed_json":        ExitRequestRejected,
 	"payload_too_large":     ExitRequestRejected,
 	"validation_failed":     ExitRequestRejected,
 	"invalid_cursor":        ExitRequestRejected,
+	"origin_refused":        ExitRequestRejected,
 	"unauthorized":          ExitUnauthorized,
 	"not_found":             ExitNotFound,
 	"idempotency_conflict":  ExitConflict,

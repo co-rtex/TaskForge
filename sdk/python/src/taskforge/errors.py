@@ -14,7 +14,8 @@ Exception                     exit_code  ``Error.code`` values it covers
 :class:`RequestRejectedError` 2          ``malformed_json``,
                                          ``payload_too_large``,
                                          ``validation_failed``,
-                                         ``invalid_cursor``
+                                         ``invalid_cursor``,
+                                         ``origin_refused``
 :class:`UnauthorizedError`    3          ``unauthorized``
 :class:`NotFoundError`        4          ``not_found``
 :class:`ConflictError`        5          ``idempotency_conflict``,
@@ -144,10 +145,17 @@ class APIError(TaskForgeError):
 class RequestRejectedError(APIError):
     """The API rejected this specific request as malformed or invalid.
 
-    Covers ``malformed_json``, ``payload_too_large``, ``validation_failed``
-    and ``invalid_cursor``. All four share one remediation -- send a
-    *different* request -- which is what makes them one class; retrying the
-    identical request will fail identically every time.
+    Covers ``malformed_json``, ``payload_too_large``, ``validation_failed``,
+    ``invalid_cursor`` and ``origin_refused``. All five share one remediation
+    -- send a *different* request -- which is what makes them one class;
+    retrying the identical request will fail identically every time.
+
+    ``origin_refused`` is the ``/internal`` browser-origin guard's ``403``. It
+    is not an authentication failure and no credential fixes it: the request
+    carried a ``Sec-Fetch-Site`` or ``Origin`` header, or was addressed to a
+    ``Host`` that is not loopback. This SDK sends neither header, so it can
+    only see this by being pointed at a hostname alias for loopback; address
+    the API as ``127.0.0.1``, ``[::1]`` or ``localhost`` instead.
     """
 
     exit_code = 2
@@ -234,14 +242,17 @@ class UnexpectedResponseError(APIError):
 
 #: Every ``api/openapi.yaml`` ``Error.code`` a route this SDK calls can
 #: actually return, mapped to the exception it raises. Exhaustive for that
-#: reachable set -- not for the API's full 23-value enum, most of which
+#: reachable set -- not for the API's full 24-value enum, most of which
 #: belongs to the worker-control surface this SDK never calls
 #: (``worker_session_conflict``, ``worker_session_unavailable``,
 #: ``claim_conflict``, ``fence_rejected``, ``lease_expired``,
 #: ``state_conflict``, ``renewal_conflict``, ``attempt_timed_out``,
 #: ``outcome_conflict``, ``cancellation_requested``) or to cases no
 #: SDK-invoked route documents (``unknown_queue``, ``method_not_allowed``)
-#: -- twelve unreachable values against the eleven reachable ones below.
+#: -- twelve unreachable values against the twelve reachable ones below.
+#: ``origin_refused`` joined the reachable set in M6E: the key-administration
+#: routes this SDK calls are ``/internal`` routes, and every one can now answer
+#: ``403`` with it.
 #:
 #: This mirrors ``internal/cli/exitcode.go``'s ``apiErrorExitCodes`` exactly,
 #: and ``tests/test_errors.py`` pins it so it cannot silently drift.
@@ -250,6 +261,7 @@ API_ERROR_EXCEPTIONS: dict[str, type[APIError]] = {
     "payload_too_large": RequestRejectedError,
     "validation_failed": RequestRejectedError,
     "invalid_cursor": RequestRejectedError,
+    "origin_refused": RequestRejectedError,
     "unauthorized": UnauthorizedError,
     "not_found": NotFoundError,
     "idempotency_conflict": ConflictError,

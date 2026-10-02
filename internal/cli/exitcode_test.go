@@ -71,13 +71,16 @@ func TestExitCodes_OnlySuccessIsZero(t *testing.T) {
 //
 // M6A's four read routes (GET /v1/jobs, GET /v1/jobs/{job_id}/attempts,
 // GET /v1/workers, GET /v1/queues) added no code to this set: every error
-// they document was already reachable from an existing route.
+// they document was already reachable from an existing route. M6E added
+// exactly one, origin_refused, because every /internal/v1 operation (among them
+// the key-administration routes this CLI calls) can now answer 403 with it.
 func TestApiErrorExitCodes_CoversExactlyTheReachableSet(t *testing.T) {
 	want := []string{
 		"malformed_json",
 		"payload_too_large",
 		"validation_failed",
 		"invalid_cursor",
+		"origin_refused",
 		"unauthorized",
 		"not_found",
 		"idempotency_conflict",
@@ -172,6 +175,17 @@ func TestRun_ExitRequestRejected_InvalidCursor(t *testing.T) {
 	code, _, _ := runAgainst(t, http.StatusUnprocessableEntity, errorBody("invalid_cursor"),
 		[]string{"dlq", "list", "--cursor", "garbage"})
 	require.Equal(t, ExitRequestRejected, code)
+}
+
+// TestRun_ExitRequestRejected_OriginRefused covers the /internal browser-origin
+// guard's 403. It is ExitRequestRejected, not ExitUnauthorized: the guard is not
+// authentication, no credential can fix it, and sending the identical request
+// again is refused identically.
+func TestRun_ExitRequestRejected_OriginRefused(t *testing.T) {
+	code, stdout, _ := runAgainst(t, http.StatusForbidden, errorBody("origin_refused"),
+		[]string{"api-keys", "create", "--scope", "s", "--name", "n"})
+	require.Equal(t, ExitRequestRejected, code)
+	require.Empty(t, stdout)
 }
 
 func TestRun_ExitUnauthorized(t *testing.T) {
