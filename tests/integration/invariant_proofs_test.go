@@ -51,9 +51,11 @@ func durableSnapshot(t *testing.T, jobID uuid.UUID) string {
 //
 // The other tests that touch this -- a cancel against a succeeded job, a
 // reconciliation after a success -- each try ONE operation against ONE terminal
-// status. Nothing tried the scheduler against any of them, which is the path a
-// careless predicate would turn into a resurrection. So this puts one job in
-// each terminal status, makes each look as eligible as it can be to every
+// status, and the scheduler had been pointed only at a job canceled out of
+// PENDING, never at a SUCCEEDED or DEAD_LETTERED one and never at its
+// re-notification scan: the path a careless predicate would turn into a
+// resurrection. So this puts one job in each terminal status, makes each look
+// as eligible as it can be to every
 // mutator the system has (a due available_at, a long-stale notification, a
 // deadline in the past, a lease window in the past), and then runs all of them:
 //
