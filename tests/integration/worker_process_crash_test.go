@@ -6,7 +6,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,9 +115,57 @@ func startService(t *testing.T, binDir, name, addr string, env map[string]string
 	for key, value := range env {
 		svc.cmd.Env = append(svc.cmd.Env, key+"="+value)
 	}
+	requirePinnedEndpoints(t, name, svc.cmd.Env)
 	require.NoError(t, svc.cmd.Start(), "starting %s", name)
 	t.Cleanup(func() { svc.stop() })
 	return svc
+}
+
+// serviceEndpoints names, for each real binary, the environment variables that
+// carry the address of infrastructure it dials. It is read off the binary's own
+// cmd/<name>/main.go: which of cfg.DatabaseURL, cfg.BrokerEndpoint,
+// cfg.ResultsEndpoint, and the worker's API base URL that binary actually uses.
+var serviceEndpoints = map[string][]string{
+	"taskforge-api":        {"TASKFORGE_DATABASE_URL", "TASKFORGE_RESULTS_ENDPOINT"},
+	"taskforge-outbox":     {"TASKFORGE_DATABASE_URL", "TASKFORGE_BROKER_ENDPOINT"},
+	"taskforge-reconciler": {"TASKFORGE_DATABASE_URL"},
+	"taskforge-scheduler":  {"TASKFORGE_DATABASE_URL"},
+	"taskforge-worker": {
+		"TASKFORGE_BROKER_ENDPOINT", "TASKFORGE_RESULTS_ENDPOINT", "TASKFORGE_WORKER_API_URL",
+	},
+}
+
+// suiteEndpoint is where the rest of the suite reaches each infrastructure
+// service. A spawned binary must be pointed at the same place.
+var suiteEndpoint = map[string]func() string{
+	"TASKFORGE_DATABASE_URL":    dsn,
+	"TASKFORGE_BROKER_ENDPOINT": brokerEndpoint,
+	// The object store has its own suite-wide setting, exactly as the broker does.
+	"TASKFORGE_RESULTS_ENDPOINT": resultsEndpoint,
+}
+
+// requirePinnedEndpoints asserts on the environment a child is about to be
+// started with -- the exact slice handed to the operating system -- that every
+// endpoint the binary dials is set, and set to where this suite reaches that
+// service. An endpoint left out would silently take its loopback default.
+func requirePinnedEndpoints(t *testing.T, binary string, childEnv []string) {
+	t.Helper()
+	endpoints, known := serviceEndpoints[binary]
+	require.Truef(t, known,
+		"%s is not in serviceEndpoints: read cmd/%s/main.go and list the endpoints it dials", binary, binary)
+
+	got := make(map[string]string, len(childEnv))
+	for _, entry := range childEnv {
+		name, value, _ := strings.Cut(entry, "=")
+		got[name] = value
+	}
+	for _, name := range endpoints {
+		value := got[name]
+		require.NotEmptyf(t, value, "%s would take %s from its loopback default", binary, name)
+		if suite, ok := suiteEndpoint[name]; ok {
+			require.Equalf(t, suite(), value, "%s is pointed somewhere other than where the suite reaches it", name)
+		}
+	}
 }
 
 // stop ends a service politely, then waits. Cleanup calls it for every service,
@@ -244,6 +297,64 @@ func createIsolatedBrokerQueue(t *testing.T, prefix string) string {
 
 var queueURLPattern = regexp.MustCompile(`<QueueUrl>([^<]+)</QueueUrl>`)
 
+// crashSharedEnvironment is every variable the crash test hands to every real
+// binary it spawns. The children do not inherit the developer's environment (see
+// startService), so anything not named here is whatever the binary's own
+// default is -- and for an endpoint, the default is the loopback of the machine
+// running the child.
+//
+// That is why each infrastructure endpoint is pinned explicitly, to the value
+// the rest of the suite is itself using. A run whose PostgreSQL, broker, or
+// object store is not on the test process's own loopback -- the suite inside a
+// bridged container against infrastructure on the host, say -- would otherwise
+// have a spawned binary quietly dial 127.0.0.1 for the one it forgot.
+// TestWorkerProcessCrash_EnvironmentPinsEveryLoopbackDefault finds the
+// variables with such a default from internal/config rather than from a list
+// kept here by hand.
+func crashSharedEnvironment(brokerQueue, apiAddr string, outboxPort, reconcilerPort int) map[string]string {
+	return map[string]string{
+		"TASKFORGE_DATABASE_URL":             dsn(),
+		"TASKFORGE_BROKER_ENDPOINT":          brokerEndpoint(),
+		"TASKFORGE_BROKER_QUEUE_NAME":        brokerQueue,
+		"TASKFORGE_BROKER_REGION":            "us-east-1",
+		"TASKFORGE_BROKER_ACCESS_KEY_ID":     "local",
+		"TASKFORGE_BROKER_SECRET_ACCESS_KEY": "local",
+		// The object store: taskforge-api serves results from it and
+		// taskforge-worker uploads to it and probes it for readiness, each through
+		// its own client built from this setting.
+		"TASKFORGE_RESULTS_ENDPOINT":         resultsEndpoint(),
+		"TASKFORGE_LEASE_DURATION":           crashLeaseDuration,
+		"TASKFORGE_HEARTBEAT_INTERVAL":       crashHeartbeatInterval,
+		"TASKFORGE_SESSION_STALE_AFTER":      crashStaleAfter,
+		"TASKFORGE_LEASE_RENEW_INTERVAL":     crashRenewInterval,
+		"TASKFORGE_API_ADDR":                 apiAddr,
+		"TASKFORGE_API_REQUEST_TIMEOUT":      "5s",
+		"TASKFORGE_OUTBOX_ADDR":              fmt.Sprintf("127.0.0.1:%d", outboxPort),
+		"TASKFORGE_OUTBOX_POLL_INTERVAL":     "200ms",
+		"TASKFORGE_OUTBOX_CLAIM_TIMEOUT":     "1s",
+		"TASKFORGE_RECONCILER_ADDR":          fmt.Sprintf("127.0.0.1:%d", reconcilerPort),
+		"TASKFORGE_RECONCILER_POLL_INTERVAL": "200ms",
+		"TASKFORGE_LOG_LEVEL":                "info",
+	}
+}
+
+// crashWorkerEnvironment is what a worker adds to the shared environment.
+func crashWorkerEnvironment(name, addr, apiURL string) map[string]string {
+	return map[string]string{
+		"TASKFORGE_WORKER_NAME":             name,
+		"TASKFORGE_WORKER_ADDR":             addr,
+		"TASKFORGE_WORKER_API_URL":          apiURL,
+		"TASKFORGE_WORKER_API_KEY":          currentWorkerKey(),
+		"TASKFORGE_WORKER_QUEUE":            "default",
+		"TASKFORGE_WORKER_GROUP":            "default",
+		"TASKFORGE_WORKER_CONCURRENCY":      "1",
+		"TASKFORGE_WORKER_CAPABILITIES":     "cpu",
+		"TASKFORGE_WORKER_POLL_WAIT":        "1s",
+		"TASKFORGE_WORKER_REQUEST_TIMEOUT":  crashRequestTimeout,
+		"TASKFORGE_WORKER_SHUTDOWN_TIMEOUT": "2s",
+	}
+}
+
 // TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries is the roadmap's
 // literal acceptance story, at the process boundary.
 //
@@ -263,26 +374,7 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 	workerAPort, workerBPort := freePort(t), freePort(t)
 	apiAddr := fmt.Sprintf("127.0.0.1:%d", apiPort)
 
-	shared := map[string]string{
-		"TASKFORGE_DATABASE_URL":             dsn(),
-		"TASKFORGE_BROKER_ENDPOINT":          brokerEndpoint(),
-		"TASKFORGE_BROKER_QUEUE_NAME":        brokerQueue,
-		"TASKFORGE_BROKER_REGION":            "us-east-1",
-		"TASKFORGE_BROKER_ACCESS_KEY_ID":     "local",
-		"TASKFORGE_BROKER_SECRET_ACCESS_KEY": "local",
-		"TASKFORGE_LEASE_DURATION":           crashLeaseDuration,
-		"TASKFORGE_HEARTBEAT_INTERVAL":       crashHeartbeatInterval,
-		"TASKFORGE_SESSION_STALE_AFTER":      crashStaleAfter,
-		"TASKFORGE_LEASE_RENEW_INTERVAL":     crashRenewInterval,
-		"TASKFORGE_API_ADDR":                 apiAddr,
-		"TASKFORGE_API_REQUEST_TIMEOUT":      "5s",
-		"TASKFORGE_OUTBOX_ADDR":              fmt.Sprintf("127.0.0.1:%d", outboxPort),
-		"TASKFORGE_OUTBOX_POLL_INTERVAL":     "200ms",
-		"TASKFORGE_OUTBOX_CLAIM_TIMEOUT":     "1s",
-		"TASKFORGE_RECONCILER_ADDR":          fmt.Sprintf("127.0.0.1:%d", reconcilerPort),
-		"TASKFORGE_RECONCILER_POLL_INTERVAL": "200ms",
-		"TASKFORGE_LOG_LEVEL":                "info",
-	}
+	shared := crashSharedEnvironment(brokerQueue, apiAddr, outboxPort, reconcilerPort)
 	env := func(extra map[string]string) map[string]string {
 		merged := make(map[string]string, len(shared)+len(extra))
 		for key, value := range shared {
@@ -311,19 +403,7 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 	require.Equal(t, 2, submitted.MaxAttempts)
 
 	workerEnv := func(name, addr, apiURL string) map[string]string {
-		return env(map[string]string{
-			"TASKFORGE_WORKER_NAME":             name,
-			"TASKFORGE_WORKER_ADDR":             addr,
-			"TASKFORGE_WORKER_API_URL":          apiURL,
-			"TASKFORGE_WORKER_API_KEY":          currentWorkerKey(),
-			"TASKFORGE_WORKER_QUEUE":            "default",
-			"TASKFORGE_WORKER_GROUP":            "default",
-			"TASKFORGE_WORKER_CONCURRENCY":      "1",
-			"TASKFORGE_WORKER_CAPABILITIES":     "cpu",
-			"TASKFORGE_WORKER_POLL_WAIT":        "1s",
-			"TASKFORGE_WORKER_REQUEST_TIMEOUT":  crashRequestTimeout,
-			"TASKFORGE_WORKER_SHUTDOWN_TIMEOUT": "2s",
-		})
+		return env(crashWorkerEnvironment(name, addr, apiURL))
 	}
 	workerAAddr := fmt.Sprintf("127.0.0.1:%d", workerAPort)
 	workerA := startService(t, binDir, "taskforge-worker", workerAAddr,
@@ -441,4 +521,96 @@ func TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries(t *testing.T) 
 		require.NotContains(t, svc.out.String(), `"level":"ERROR"`,
 			"%s logged an error:\n%s", svc.name, svc.out.String())
 	}
+}
+
+// loopbackDefaults returns every environment variable internal/config gives a
+// loopback default, found by parsing config.go rather than by a list kept here.
+// A variable added to the configuration later is therefore noticed.
+func loopbackDefaults(t *testing.T) map[string]string {
+	t.Helper()
+	path := filepath.Join("..", "..", "internal", "config", "config.go")
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	require.NoError(t, err)
+
+	literal := func(expr ast.Expr) (string, bool) {
+		basic, ok := expr.(*ast.BasicLit)
+		if !ok || basic.Kind != token.STRING {
+			return "", false
+		}
+		value, err := strconv.Unquote(basic.Value)
+		return value, err == nil
+	}
+	found := map[string]string{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) != 2 {
+			return true
+		}
+		if fn, ok := call.Fun.(*ast.Ident); !ok || fn.Name != "env" {
+			return true
+		}
+		name, nameOK := literal(call.Args[0])
+		value, valueOK := literal(call.Args[1])
+		if nameOK && valueOK && (strings.Contains(value, "127.0.0.1") ||
+			strings.Contains(value, "localhost") || strings.Contains(value, "[::1]")) {
+			found[name] = value
+		}
+		return true
+	})
+	return found
+}
+
+// TestWorkerProcessCrash_EnvironmentPinsEveryLoopbackDefault is the hermeticity
+// proof for TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries.
+//
+// The crash test spawns real binaries with a hand-built environment. Any
+// endpoint it leaves out silently becomes the binary's loopback default, which
+// is correct on a developer's machine and wrong the moment the suite runs
+// somewhere its infrastructure is not on its own loopback. That is how
+// TASKFORGE_RESULTS_ENDPOINT was missed, and a hand-kept list of endpoints
+// would miss the next one the same way.
+//
+// So this derives the list from internal/config and requires every variable
+// with a loopback default to be either pinned by the environment the crash test
+// builds, or named below with the reason it is not.
+func TestWorkerProcessCrash_EnvironmentPinsEveryLoopbackDefault(t *testing.T) {
+	defaults := loopbackDefaults(t)
+	for _, endpoint := range []string{
+		"TASKFORGE_DATABASE_URL", "TASKFORGE_BROKER_ENDPOINT", "TASKFORGE_RESULTS_ENDPOINT",
+		"TASKFORGE_WORKER_API_URL",
+	} {
+		require.Contains(t, defaults, endpoint, "the scan must find the variables it exists to find")
+	}
+
+	spawned := crashSharedEnvironment("queue", "127.0.0.1:1", 2, 3)
+	maps.Copy(spawned, crashWorkerEnvironment("worker", "127.0.0.1:4", "http://127.0.0.1:5"))
+
+	// Variables with a loopback default that no binary this test starts reads.
+	notSpawned := map[string]string{
+		"TASKFORGE_SCHEDULER_ADDR": "only taskforge-scheduler binds it, and this test starts none",
+	}
+	for name := range defaults {
+		if _, pinned := spawned[name]; pinned {
+			continue
+		}
+		reason, exempt := notSpawned[name]
+		require.Truef(t, exempt,
+			"%s defaults to a loopback address and the crash test does not pin it: a spawned binary "+
+				"would use the default wherever the suite's infrastructure actually is", name)
+		require.NotEmpty(t, reason)
+	}
+	for name := range notSpawned {
+		require.NotContainsf(t, spawned, name, "%s is pinned now; drop it from notSpawned", name)
+	}
+
+	// What is pinned comes from the suite's own configuration. Overriding that
+	// configuration must move every endpoint with it, which a default that merely
+	// happens to equal today's value could not do.
+	t.Setenv("TASKFORGE_TEST_DATABASE_URL", "postgres://database.invalid:5442/taskforge")
+	t.Setenv("TASKFORGE_BROKER_ENDPOINT", "http://broker.invalid:9324")
+	t.Setenv("TASKFORGE_RESULTS_ENDPOINT", "http://results.invalid:4566")
+	moved := crashSharedEnvironment("queue", "127.0.0.1:1", 2, 3)
+	require.Equal(t, "postgres://database.invalid:5442/taskforge", moved["TASKFORGE_DATABASE_URL"])
+	require.Equal(t, "http://broker.invalid:9324", moved["TASKFORGE_BROKER_ENDPOINT"])
+	require.Equal(t, "http://results.invalid:4566", moved["TASKFORGE_RESULTS_ENDPOINT"])
 }
