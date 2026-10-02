@@ -47,7 +47,11 @@ transaction, the outbox, the broker notification, and into a worker's claim and
 handler execution, under one trace id; and a read-only operator dashboard,
 embedded in `taskforge-api` and served same-origin under `/dashboard/`, that
 reads exactly those public routes with the operator's own key (see
-[ADR-0017](adr/0017-dashboard-toolchain-and-serving.md)).
+[ADR-0017](adr/0017-dashboard-toolchain-and-serving.md)); and a browser-origin
+guard on every `/internal/v1` route, which keeps a web page — the dashboard's own
+origin included — from driving the unauthenticated key-administration and
+worker-control routes (see
+[ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)).
 
 ---
 
@@ -104,7 +108,7 @@ single outbox publisher · a single reconciler instance.
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations; serve the embedded operator dashboard's static files under `/dashboard/`. | **Built** |
+| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations, every `/internal/v1` route behind a stateless browser-origin guard that refuses a request carrying `Sec-Fetch-Site` or `Origin`, or addressed to a non-loopback `Host`, with `403` `origin_refused` (not authentication; see [ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)); serve the embedded operator dashboard's static files under `/dashboard/`. | **Built** |
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |

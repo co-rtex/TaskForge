@@ -267,6 +267,14 @@ without a job.
   owner's decision and a prerequisite for any non-loopback deployment.
 - The pre-existing CSRF and DNS-rebinding exposure of those routes is unchanged
   by M6D, and recorded here and in CURRENT_STATE rather than fixed.
+- **Closed by [ADR-0018](0018-browser-origin-guard-on-the-internal-surface.md)
+  (M6E).** The guard this record deferred as the owner's decision was built as
+  its own bounded follow-up: every registered `/internal/v1` route now refuses a
+  request carrying `Sec-Fetch-Site` or `Origin`, or addressed to a non-loopback
+  `Host`, with `403` `origin_refused`. That closes both the dashboard-origin
+  exposure and the CSRF and DNS-rebinding exposure recorded above. This record's
+  decisions are unchanged and its status stays Accepted; the text above describes
+  the state M6D shipped in, and ADR-0018 states what remains open.
 - An `index.html` and its hashed assets come from one binary. Behind several
   `taskforge-api` replicas during a rolling deploy, one replica's entry
   document could name assets another replica does not have; and a newer

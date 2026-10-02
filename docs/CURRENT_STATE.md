@@ -1,9 +1,10 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. Milestones M1 through M6C are merged into `main`; this document
-records the implemented state through M6D, which is on its own branch and
-draft pull request. M6D is the last slice of M6, so M6 as a whole is complete.
+planned. Milestones M1 through M6D are merged into `main`; this document
+records the implemented state through M6E, which is on its own branch and
+draft pull request. M6 as a whole was already complete with M6D, its last slice;
+M6E is a follow-up to it, not a fifth slice.
 
 ## Milestone status
 
@@ -20,6 +21,10 @@ draft pull request. M6D is the last slice of M6, so M6 as a whole is complete.
 - **M6B — OpenTelemetry tracing:** complete.
 - **M6C — Prometheus metrics and the health residual:** complete.
 - **M6D — operator dashboard:** complete. With it, **M6 is complete.**
+- **M6E — browser-origin guard on the internal surface:** implemented on its
+  own branch and draft pull request. A follow-up to M6 that closes the two
+  exposures [ADR-0017](adr/0017-dashboard-toolchain-and-serving.md) recorded;
+  M6's own objective was discharged by M6A–M6D and is not reopened.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices and M6 into
 four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -64,7 +69,10 @@ Seven binaries build and run, plus one installable library:
   been revoked. The loopback-only worker-key management routes mint and revoke
   those credentials. `taskforge-api` never depends on the result object store
   being reachable at boot; only a request that needs an object-located result
-  does. It also serves the read-only operator dashboard, compiled into the
+  does. Every `/internal/v1` route also refuses a request that carries
+  `Sec-Fetch-Site` or `Origin`, or is addressed to a non-loopback `Host`, with
+  `403` `origin_refused` — see "M6E" below; that is not authentication. It also
+  serves the read-only operator dashboard, compiled into the
   binary, same-origin under `/dashboard/` — see "M6D — operator dashboard"
   below. A binary built before `make dash-build` serves a page saying the
   dashboard has not been built, and logs `dashboard_built=false`.
@@ -920,7 +928,7 @@ caller's script should actually do differently — not by HTTP status or by
 | --- | --- | --- |
 | 0 | `ExitSuccess` | The operation completed. |
 | 1 | `ExitUsageError` | taskforge-cli itself rejected the invocation; no HTTP request was made. |
-| 2 | `ExitRequestRejected` | The API rejected this specific request as malformed or invalid: `malformed_json`, `payload_too_large`, `validation_failed`, `invalid_cursor`. A different request is needed. |
+| 2 | `ExitRequestRejected` | The API rejected this specific request as malformed, invalid, or refused before it was looked at: `malformed_json`, `payload_too_large`, `validation_failed`, `invalid_cursor`, and (since M6E) `origin_refused`. A different request is needed. |
 | 3 | `ExitUnauthorized` | `unauthorized` — the presented credential (or its absence) was refused. |
 | 4 | `ExitNotFound` | `not_found`. |
 | 5 | `ExitConflict` | `idempotency_conflict`, `job_not_cancelable`, `job_not_dead_lettered` — the operation cannot be applied given current state; retrying the identical request will not help. |
@@ -952,6 +960,14 @@ ten members and that no two share a numeric value; `TestExitCodes_OnlySuccessIsZ
 asserts `ExitSuccess == 0` and that no other named code, and no
 `apiErrorExitCodes` value, is ever `0`. `TestApiErrorExitCodes_CoversExactlyTheReachableSet`
 pins the eleven-entry map above so it cannot silently grow or shrink.
+
+*Since M6E that map has twelve entries.* `origin_refused`, the `403` every
+`/internal/v1` operation can now answer, is reachable from the key-administration
+routes this CLI calls, so it joined `ExitRequestRejected`, and the Python SDK
+maps it to `RequestRejectedError`. The counts in the paragraphs above and in
+"M5E coverage" describe the state those milestones shipped in; the API's
+`Error.code` enum now has 24 values, twelve of them unreachable from the CLI's
+routes.
 
 **Every code has its own test asserting that specific numeric value** — not
 a shared "non-zero" assertion — driven through `Run()` against a real
@@ -1776,8 +1792,9 @@ directly. What the dashboard adds is a path to them through script injection
 in its page. A guard — refusing browser-originated `/internal/*` requests by
 `Origin` or `Sec-Fetch-Site`, or serving the dashboard from its own listener —
 moves a trust boundary, so it is the owner's decision and is deferred as a
-bounded follow-up; it must be settled before `taskforge-api` listens on
-anything but loopback.
+bounded follow-up; it had to be settled before `taskforge-api` listens on
+anything but loopback. **M6E built that guard**; see "M6E" below for what it
+closed and what remains open.
 
 The mitigation against such a script running at all: a Content-Security-Policy
 on every dashboard response allowing only same-origin script, style, and fetch
@@ -1874,6 +1891,153 @@ builtin frontend (363 kB of build context against a 193 MB `bin/` beside it).
 
 None. No schema change, no migration, no API change. `WithDashboard` is
 additive and optional.
+
+## M6E — browser-origin guard on the internal surface
+
+A follow-up to M6, not a fifth slice of it: M6's objective was discharged in full
+by M6A–M6D. [ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)
+records the decision, the alternatives it rejected, and its consequences. This
+section keeps three things apart: what is implemented, what evidence exists for
+it, and what is still open.
+
+### Implemented behavior
+
+Every registered `/internal/v1` route — all 14 documented operations and the 12
+method-less `405` fallbacks — refuses a request with **`403` and
+`Error.code` `origin_refused`** when any of these holds, checked in this order:
+
+1. it carries a `Sec-Fetch-Site` header, with any value, including `none` and an
+   empty value (`sec_fetch_site`);
+2. it carries an `Origin` header, with any value, including `null` and the API's
+   own origin (`origin`);
+3. its `Host` is empty, cannot be parsed, or is not loopback (`host`). Parsing
+   fails closed: an unbracketed IPv6 literal, an unclosed bracket, text after a
+   `]`, extra colons, and an empty or non-numeric port are all refused.
+
+The refusal runs before authentication, before the `405` answer, and before any
+handler reads the body. The response message is fixed and never echoes a header
+value; the log line carries the request id and the rule name and never a header
+value. The guard is stateless: no migration, no mixed-version state, and no
+change to any `/v1` route, the dashboard, `/metrics`, or the health probes.
+
+It is registered per route through one helper, `handleInternal`, as the
+outermost layer, so a refused request keeps its route pattern as its span name
+and metric label. The loopback predicate moved from `internal/config` to
+`internal/loopback` with identical behavior; the bind rule, the worker's API URL
+check, and the Host rule all call it.
+
+Contract: `origin_refused` is in the `Error.code` enum; all 14 `/internal`
+operations document the `403`; the `info` Authentication section describes the
+guard and says it is not authentication. The CLI maps `origin_refused` to
+`ExitRequestRejected` and the Python SDK to `RequestRejectedError`.
+
+### Evidence
+
+All of this ran on code commit `c90b269`; later commits on the branch change
+documentation only. Gate outputs are under "M6E gates", mutation results under
+"M6E coverage".
+
+- **Refusal table, driven by `api/openapi.yaml`** — for every `/internal`
+  operation the document declares, each of 18 browser markings (five
+  `Sec-Fetch-Site` values, three `Origin` values, ten malformed or foreign
+  `Host`s) returns `403`, `origin_refused`, the fixed message, the JSON error
+  shape, and the echoed request id, **and** a recording fake behind the API-key
+  store, the worker-key store, and the worker-control service shows nothing was
+  called, including the worker-key credential check. Each operation also has a
+  positive control proving the same request, unmarked, does reach those fakes —
+  without it, a request built wrongly would be "refused" by validation and the
+  empty-fake assertion would prove nothing.
+- **Pass-through** — with no browser headers, each of eight loopback `Host`
+  spellings (`127.0.0.1:8080`, `127.0.0.2:8080`, `localhost:8080`,
+  `LOCALHOST.:8080`, `[::1]:8080`, `[::1]`, `127.0.0.1`, `localhost`) reaches the
+  handler on every operation with the same status as the canonical request.
+- **Ordering** — a browser-marked registration carrying a *valid* worker key is
+  refused `403`, neither served (`200`) nor `401`, calls neither the credential
+  check nor registration, and its unmarked twin does register; a browser-marked
+  `DELETE /internal/v1/api-keys` is `403`, not `405`, and advertises no `Allow`.
+- **Scope** — with a valid key, `Sec-Fetch-Site`, `Origin`, and a non-loopback
+  `Host` all set, `/v1/jobs`, `/dashboard/`, `/metrics` and `/healthz` answer
+  exactly as without them, and an unregistered `/internal/v1/nonexistent` stays
+  the JSON `404`.
+- **Observability** — a refused request's span name and metric `route` label are
+  the route pattern (`POST /internal/v1/api-keys`; the fallback's own
+  `/internal/v1/api-keys` for a `DELETE`), never `unmatched`; the log lines carry
+  `rule` and `request_id`; and the captured log contains neither `evil.example`
+  nor `cross-site`.
+- **A real listener and database** — a raw HTTP `POST /internal/v1/api-keys` with
+  an `Origin` header (also with `Sec-Fetch-Site`, and with a foreign `Host`)
+  returns `403`; a following `GET` with no browser headers shows no key was
+  created, and the identical unmarked request then creates one.
+- **Registration cannot drift** — a test reads `server.go` and fails on any
+  `/internal` pattern registered around the helper, and pins the count of 26
+  guarded registrations.
+- **Contract** — every `/internal` operation declares the `403` with the fixed
+  message the server sends; no `/v1` operation does; and
+  `TestOpenAPI_TheInternalSurfaceIsDocumentedAsUnauthenticated` passes
+  unmodified.
+- **Existing tests** — the only existing tests changed are the Host edits in the
+  mechanical commit (19 direct `httptest.NewRequest` sites plus the shared
+  `doJSON` helper, through one helper, no assertion touched) and the CLI and SDK
+  exit-code tables that must now name `origin_refused`.
+
+### Upgrade note
+
+A client that reaches the API through a hostname alias for loopback — an
+`/etc/hosts` entry mapping `tf.local` to `127.0.0.1`, say — sent a non-loopback
+`Host` that was accepted before and gets `403` on `/internal` now. Address the
+API as `127.0.0.1`, `[::1]` or `localhost`. This is the one visible behavior
+change. Every default base URL (the CLI's, the SDK's, the worker's) is already
+`http://127.0.0.1:8080`, and none sends `Origin` or `Sec-Fetch-Site`.
+
+### What a worker does on a `403` at registration
+
+It exits; it does not loop. Observed with the real worker client and runner
+against the guarded API, with the request's `Host` rewritten to an alias:
+`RemoteError.Retryable` is false for a `403` (`internal/worker/client.go:612`),
+`Runner.retry` returns on the first attempt (`internal/worker/runner.go:839`),
+`Run` returns `register worker session: control plane returned HTTP 403
+(origin_refused)` (`runner.go:174`), and `taskforge-worker` logs it and exits `1`
+(`cmd/taskforge-worker/main.go:181`). With `RetryAttempts=5` exactly one request
+was sent. A worker also cannot be configured into this by accident:
+`TASKFORGE_WORKER_API_URL` must already use a loopback host, by the same
+predicate. That check is a throwaway observation and is not a committed test.
+Worker logic is unchanged.
+
+### Limitations — what this does not do
+
+- **It is not authentication.** Any non-browser process that can reach loopback
+  can still mint a credential. Authentication on `/internal` remains absent by
+  design.
+- **DNS rebinding can still read `/metrics`, `/healthz` and `/readyz`,** and load
+  the dashboard's static HTML, because the guard covers `/internal` only. They
+  carry no tenant data; the dashboard HTML is inert because the key lives in the
+  real origin's `sessionStorage`; `/v1` still needs a key the attacker lacks.
+  Guarding the whole listener would close the `/metrics` read and is left for
+  M8.
+- **A browser that sends no Fetch Metadata is covered by the `Origin` and `Host`
+  rules alone.** Such a browser also omits `Origin` on a same-origin `GET`, so a
+  same-origin script there can still list keys. Writes carry `Origin` and are
+  refused in every engine. Current Chromium, Firefox and Safari send Fetch
+  Metadata.
+- **The Host rule is coupled to the loopback bind.** M8's ECS workers will reach
+  the API under a non-loopback name; the bind and the Host rule have to be
+  revisited together there.
+- **Fail-closed coverage for a *new* route depends on two tests, not on
+  structure.** An `/internal` route registered around `handleInternal` is caught
+  by the source-scan test, which also pins the count of registrations. One
+  registered through it but absent from the OpenAPI document is not covered by
+  the refusal table, which is driven by the document; that is the pre-existing
+  gap, recorded above, that nothing checks the route table and the document
+  against each other.
+- The API version string in `api/openapi.yaml` (`0.8.0-m6a`) was not bumped for
+  the new error code; it has not been bumped since M6A.
+
+### Breaking change
+
+One new error code and one new `403` on every `/internal` operation. A client
+that branches on `Error.code` and treats an unknown code as a protocol error sees
+`origin_refused` only if it sends a browser-marked or non-loopback request, which
+no shipped client does.
 
 ## Verification
 
@@ -2456,6 +2620,47 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M6E gates
+
+Run locally on the branch, 2026-10-01, against code commit `c90b269`.
+PostgreSQL 16, ElasticMQ and the object store from `make up`; Python in
+`sdk/python/.venv`; Node only inside `dashboard/Dockerfile`.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS — `gofmt -w .` left no diff (`git status` showed only the documentation files edited afterwards) |
+| `make lint` | PASS — `gofmt -l` empty, `go vet ./...` silent |
+| `make build` | PASS — `go build -o bin/ ./cmd/...` |
+| `make test-unit` | PASS — 20 packages `ok`, none `FAIL` |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  91.594s` |
+| `make test-race` | PASS — 21 packages `ok` under `-race`; `ok  .../tests/integration  98.621s`; no `DATA RACE` |
+| `make sdk-lint` | PASS — `ruff format --check` clean, `ruff check` "All checks passed!", `mypy --strict` "no issues found in 21 source files" |
+| `make sdk-test` | PASS — `179 passed` |
+| `make dash-lint` | PASS — `biome ci`: "Checked 44 files ... No fixes applied", `tsc --noEmit` silent |
+| `make dash-test` | PASS — `Test Files 10 passed (10)`, `Tests 79 passed (79)` |
+
+The dashboard did not change; `dash-lint` and `dash-test` only confirm it did not
+regress. No Make target and no CI job was added. Hosted CI on the final head is
+not recorded here, because a commit cannot contain its own CI result: the pull
+request's checks are the record.
+
+### M6E coverage
+
+Six mutations, each applied by a script that asserts the edit landed exactly
+once, shown by `git diff`, run, and reverted. Each is caught by named tests in
+`internal/api`:
+
+| Mutation | Failing subtests in total | Caught by |
+| --- | --- | --- |
+| (a) delete the `sec_fetch_site` rule | 76 | `TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation`, `..._EveryBrowserMarkingNamesItsRule`, `..._FirstRuleToFireNamesTheRefusal`, `..._RefusalIsObservable`, `..._RunsBeforeAuthenticationAndBefore405` |
+| (b) delete the `origin` rule | 47 | the same five tests |
+| (c) delete the `host` rule | 150 | the refusal table, `..._EveryBrowserMarkingNamesItsRule`, `..._FirstRuleToFireNamesTheRefusal`, `..._RefusalIsObservable` |
+| (d) a `Host` split error falls back to accepting | 60 | the refusal table (the unparseable Hosts) and `..._EveryBrowserMarkingNamesItsRule` |
+| (e) register `POST /internal/v1/claims` without the helper | 18 | the refusal table, for exactly that route, and `TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which names `server.go:256` |
+| (f) swap the guard and `requireWorkerKey` | 19 | the refusal table, `..._RunsBeforeAuthenticationAndBefore405`, and the source-scan test |
+
+The mutated source diffs and failing output are in the pull request's handoff.
 
 ### M6D gates
 
@@ -3194,18 +3399,22 @@ exercised by a real hosted failure.
 - Worker registration authenticates, but every other worker-control route and
   both key-management surfaces (`/internal/v1/api-keys` and
   `/internal/v1/worker-keys`) remain unauthenticated by design, and every
-  service still binds to loopback. Anyone who can reach loopback can still
-  mint a credential of either kind for any scope.
-- Since M6D those routes share an origin with the dashboard, so script running
-  in the dashboard's page could administer credentials for every scope.
-  Accepted for loopback only; a browser-origin guard or a separate dashboard
-  listener is the owner's decision (see "M6D — operator dashboard" and
-  ADR-0017).
-- Those routes also check neither `Host` nor the request's origin, and the key
-  routes accept any `Content-Type`, so a website the operator visits can send a
-  cross-site request that mints or revokes a key (CSRF, with an unreadable
-  response), and DNS rebinding could read the response. This predates M6D
-  (it dates from M5A); the same guard would close it.
+  service still binds to loopback. Anyone who can reach loopback with a
+  non-browser client can still mint a credential of either kind for any scope;
+  since M6E a web page can no longer do so on their behalf.
+- **Closed by M6E, with what remains open.** M6D put a browser origin beside
+  the unauthenticated routes, so script in the dashboard's page could have
+  administered credentials for every scope, and those routes had always checked
+  neither `Host` nor the request's origin, so a website the operator visits could
+  send a cross-site request that minted or revoked a key (CSRF), and DNS
+  rebinding could read the response. M6E's guard (ADR-0018) now refuses, on every
+  registered `/internal/v1` route, a request carrying `Sec-Fetch-Site` or `Origin`
+  or addressed to a non-loopback `Host`. Still open, and recorded in M6E below:
+  DNS rebinding can still read `/metrics`, `/healthz` and `/readyz`, because the
+  guard covers `/internal` only; a browser that sends no Fetch Metadata is covered
+  by the `Origin` and `Host` rules alone, so a same-origin `GET` from one still
+  reaches the routes; and the guard is not authentication, so any non-browser
+  process that can reach loopback can still mint a credential.
 - An `index.html` and its hashed assets come from one binary, so several
   `taskforge-api` replicas behind a load balancer during a rolling deploy could
   serve an entry document naming assets another replica lacks. Impossible on
@@ -3300,12 +3509,6 @@ twelve required scenarios, plus `make demo` and `make demo-failure`. See
 also be watched from the dashboard.
 
 Smaller items available to whoever wants them, none blocking M7:
-
-- **An owner decision, before any non-loopback deployment:** guard
-  `/internal/*` against browser-originated requests (`Origin` /
-  `Sec-Fetch-Site`) or serve the dashboard from its own listener. It closes
-  both the dashboard-origin exposure and the pre-existing CSRF / DNS-rebinding
-  exposure recorded above.
 
 - `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
   deliberately did not build. See its section above for exactly what each would
