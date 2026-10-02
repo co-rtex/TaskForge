@@ -37,6 +37,29 @@ func execute(ctx context.Context, handler Handler, payload string) (json.RawMess
 	})
 }
 
+// executeWithin is execute with a watchdog. A demo.sleep that ignored its
+// context would wait out the duration in its payload, which in these tests is an
+// hour or a day, so a regression has to fail here rather than hang the run.
+func executeWithin(t *testing.T, limit time.Duration, ctx context.Context, handler Handler, payload string) (json.RawMessage, error) {
+	t.Helper()
+	type outcome struct {
+		result json.RawMessage
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := execute(ctx, handler, payload)
+		done <- outcome{result, err}
+	}()
+	select {
+	case got := <-done:
+		return got.result, got.err
+	case <-time.After(limit):
+		t.Fatalf("the handler did not return within %s of being asked to: it is ignoring its context", limit)
+		return nil, nil
+	}
+}
+
 // requireFailure asserts err is a handler-declared failure of the given class
 // and code, and returns it.
 func requireFailure(t *testing.T, err error, class lifecycle.FailureClass, code string) *FailureError {
@@ -110,7 +133,7 @@ func TestDemoSleep_ReturnsPromptlyWhenTheDeadlineEndsTheContext(t *testing.T) {
 	defer cancel()
 
 	started := time.Now()
-	result, err := execute(ctx, DemoSleep{}, `{"duration_ms":3600000}`)
+	result, err := executeWithin(t, 10*time.Second, ctx, DemoSleep{}, `{"duration_ms":3600000}`)
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Nil(t, result)
@@ -121,7 +144,7 @@ func TestDemoSleep_AContextThatIsAlreadyOverReturnsWithoutWaiting(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	result, err := execute(ctx, DemoSleep{}, `{"duration_ms":3600000}`)
+	result, err := executeWithin(t, 10*time.Second, ctx, DemoSleep{}, `{"duration_ms":3600000}`)
 
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, result)
@@ -140,7 +163,7 @@ func TestDemoSleep_AcceptsBothInclusiveBounds(t *testing.T) {
 		"largest":  fmt.Sprintf(`{"duration_ms":%d}`, maxSleepMillis),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := execute(ctx, DemoSleep{}, payload)
+			_, err := executeWithin(t, 10*time.Second, ctx, DemoSleep{}, payload)
 			require.ErrorIs(t, err, context.Canceled)
 			var failure *FailureError
 			require.False(t, errors.As(err, &failure), "the bound is inclusive: %s must be accepted", payload)
