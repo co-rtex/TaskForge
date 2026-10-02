@@ -51,6 +51,9 @@ cmd/<binary>/          Process entry points. Wiring only — no domain logic.
 internal/<domain>/     Library code. Not importable outside this module.
 migrations/            Versioned, forward-only SQL. Never edit an applied file.
 api/                   OpenAPI description of implemented endpoints only.
+scripts/               Developer scripts. scripts/demo is the Go program behind
+                       `make demo` and `make demo-failure`: deliberately not under
+                       cmd/, so `make build` neither builds nor ships it.
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
 tests/verification/    Infrastructure-free checks over the repository's own
                        documentation: the verification-matrix drift check.
@@ -84,7 +87,16 @@ make test-unit         # no external dependencies
 make test-integration  # requires `make up`
 make test-race         # race detector
 make build             # compile all binaries into ./bin
+make demo              # success demonstration: succeed, retry, dead-letter
+make demo-failure      # failure demonstration: a killed and a frozen worker
 ```
+
+`make demo` and `make demo-failure` build the binaries, start the infrastructure,
+migrate, and then run `go run ./scripts/demo success|failure`. The program starts
+its own services on free loopback ports, with a broker queue and a key scope of
+its own, asserts only on the jobs it submitted, never deletes or truncates
+anything, stops everything it started on every way out, and exits non-zero if any
+expectation fails. They leave the infrastructure up; `make down` is separate.
 
 The Python SDK has its own targets. They are deliberately **not** folded into
 `fmt`, `lint` and `test`, which stay Go-only so a Go contributor — and the fast
@@ -194,6 +206,9 @@ result, in the README or anywhere else.
 - Logs never contain secrets or unbounded request payloads.
 - TaskForge executes only trusted handlers registered in its own binary. It does not
   and will not run uploaded scripts, arbitrary shell commands, or untrusted plugins.
+  The registered set is pinned by a test, and
+  [ADR-0019](docs/adr/0019-demo-handlers-are-trusted-built-ins.md) records why the
+  demonstration handlers are part of it.
 - Local services bind to loopback. Nothing is exposed publicly without authentication.
 
 ## 11. Git rules

@@ -528,8 +528,9 @@ audit of what the tests already prove and the closing of what they do not; the
 second is new runnable behavior whose handlers raise a trust-boundary question
 the first never touches. It is split the same way M5 and M6 were, so each slice
 ships on its own evidence. The original objective, deliverables, and acceptance
-sentence are preserved across M7A and M7B, not reduced. M7 as a whole is
-complete when both slices are.
+sentence are preserved across M7A and M7B, not reduced.
+
+**Status:** complete — both slices are; see M7A and M7B below.
 
 #### M7A — Invariant and scenario proof audit
 **Objective.** Prove the invariants: establish, row by row, which test proves
@@ -559,19 +560,46 @@ deferred to M8 (see below).
 #### M7B — `make demo` and `make demo-failure`
 **Objective.** Two runnable demonstrations of the system's behavior, one of
 success and one of failure and recovery.
-**Deliverables.** `make demo` and `make demo-failure`, and whatever handlers they
-need.
-**Acceptance.** Set in M7B's own handoff, once the decision below is made.
-**Depends on.** M7A.
-**Status:** not started.
+**Deliverables.** `make demo` and `make demo-failure`, a Go program at
+`scripts/demo` that runs the real binaries; `demo.sleep` and `demo.fail`
+registered in the production worker, with strict and bounded payloads;
+[ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md); three integration
+tests over real PostgreSQL; and both demonstrations run in CI's integration job.
+**Acceptance.** Each target exits zero only if every one of its expectations
+holds, against the real binaries, and non-zero if any expectation fails or any
+wait times out.
 
-The demo-handler trust decision is still open, and it is why M7B gets its own
-handoff rather than riding along with M7A. [AGENTS.md](../AGENTS.md) §10 says
-TaskForge executes only trusted handlers registered in its own binary, and today
-`demo.echo` is the only one: a failure demonstration needs handlers that fail,
-stall, or outlive their budget, and whether those become production handlers
-in `taskforge-worker`, and what bounds them if so, is a decision about a trust
-boundary rather than about a Make target.
+- `make demo`: an echo job is `SUCCEEDED` after one attempt and its result read
+  back equals its payload; a retryable `demo.fail` job with `max_attempts=3`
+  fails three times, with a retry time recorded on the first two, and is
+  `DEAD_LETTERED` with the exhausted-budget reason; a permanent `demo.fail` job
+  fails once and is `DEAD_LETTERED` at once with the permanent-failure reason.
+- `make demo-failure`: a worker is `SIGKILL`ed while its attempt is `RUNNING`;
+  that attempt is `ABANDONED` and bound to that worker's session, a second attempt
+  on a second worker, under a different session, is `SUCCEEDED`, and so is the
+  job. A second worker is `SIGSTOP`ped mid-attempt, its attempt is abandoned and
+  finished by another worker, and after the frozen worker resumes and has had time
+  to act, the job is still `SUCCEEDED`, the first attempt still `ABANDONED`,
+  exactly one result exists and it is the second attempt's, and no third attempt
+  exists. The pass condition is the stored outcome, not anything a worker logs.
+- Both assert only on the jobs they submitted, in a scope of their own, never
+  delete or truncate anything, and leave no process behind on any way out.
+
+**Depends on.** M7A.
+**Status:** complete; see PR #20 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited.
+
+The demo-handler trust decision this entry carried is made and recorded in
+[ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md): the handlers are
+compiled into the production worker, unconditionally, with the bounds and the
+abuse analysis stated there. [AGENTS.md](../AGENTS.md) §10 is unchanged.
+
+Deliberately **not** in scope: a handler that fails and then succeeds, which
+would need the attempt number in `Execution` (the retry is shown by a retryable
+failure spending its whole budget instead); any change to the runner, a
+migration, the API, OpenAPI, the SDK, or the dashboard; the two M8 deferrals
+below; and the root `README.md`, which pull request #10 rewrites wholesale and
+which is where `make demo` belongs.
 
 ### M8 — Load generator, measured benchmarks, CI hardening, ECS Terraform
 **Objective.** Measure reality and make deployment credible.
@@ -590,6 +618,11 @@ one-directional route maps in `internal/api/deadline_contract_test.go`, and a
 route added without being added to them is uncovered rather than failing. A real
 gate needs a route registry inside `Handler()`; see
 [CURRENT_STATE.md](CURRENT_STATE.md).
+
+**Also deferred here from M7A.** The verification-matrix drift check proves that
+a cited assertion line lies inside the named test, not that the line is the
+assertion. Closing that means finding the assertion in the syntax tree instead of
+trusting a line number. See [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md).
 
 ---
 

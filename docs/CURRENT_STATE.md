@@ -1,12 +1,12 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M7A. Each milestone's line
+planned. It records the implemented state through M7B. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
 follow-up to it, not a fifth slice. M7 is split into M7A, the proof audit, and
-M7B, the demonstration targets, and is complete when both are.
+M7B, the demonstration targets, and is complete with both.
 
 ## Milestone status
 
@@ -31,8 +31,11 @@ M7B, the demonstration targets, and is complete when both are.
   reliability invariant and required scenario is mapped to a test that asserts
   durable state in [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md); no
   production code changed.
-- **M7B — `make demo` and `make demo-failure`:** not started. Its demo-handler
-  trust decision is still open, so it gets its own handoff.
+- **M7B — `make demo` and `make demo-failure`:** complete; see PR #20. Two
+  runnable demonstrations against the real binaries, and the two handlers they
+  need, registered in the production worker
+  ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md)). With it, **M7 is
+  complete.**
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 and M7 into two, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -42,7 +45,12 @@ that split the original undivided M5 into M5A–M5D.
 
 ## Runnable system
 
-Seven binaries build and run, plus one installable library:
+Seven binaries build and run, plus one installable library, and one program
+that is run from source and is not among the seven:
+
+- `scripts/demo` is the program behind `make demo` and `make demo-failure`. It
+  starts the real binaries from `./bin`, so it is not built by `make build`
+  and ships with nothing. See "M7B — `make demo` and `make demo-failure`" below.
 
 - `taskforge-sdk` (`sdk/python`, import `taskforge`) is a typed Python
   client over the same surface `taskforge-cli` covers. It is installed with
@@ -88,7 +96,8 @@ Seven binaries build and run, plus one installable library:
 - `taskforge-scheduler` promotes due delayed and retry-waiting jobs and
   re-notifies stranded queued work. It holds no broker connection.
 - `taskforge-worker` polls ElasticMQ only while it has capacity, heartbeats its
-  process session, executes trusted handlers through the control plane,
+  process session, executes its trusted handlers (`demo.echo`, `demo.fail` and
+  `demo.sleep`, pinned by a test; ADR-0019) through the control plane,
   classifies each handler's result and uploads a large one to the object
   store before reporting success, renews each running attempt's lease,
   reports classified failures, and acknowledges cancellation cooperatively.
@@ -1603,8 +1612,8 @@ has no registry, so it cannot bound the value, and its metrics therefore carry
 no `job_type` at all rather than a poorly bounded one. A test pins which metrics
 may carry it, so a future one cannot acquire it by accident.
 
-Today `Registry.Types()` holds one entry (`demo.echo`), so the ceiling is 2.
-A test drives 10,000 distinct caller-supplied values through the bound and
+Since M7B, `Registry.Types()` holds three entries (`demo.echo`, `demo.fail` and
+`demo.sleep`), so the ceiling is 4. A test drives 10,000 distinct caller-supplied values through the bound and
 asserts the series count stays there.
 
 ### Counters read from the database, not incremented in code
@@ -2139,7 +2148,9 @@ was not re-observed and its fix was not observed passing there.
 
 - **The drift check proves existence, not that a test is load-bearing.** A test
   that still exists and no longer proves its row passes it. The mutation results
-  above are a point-in-time record; nothing in CI re-runs them.
+  above are a point-in-time record; nothing in CI re-runs them. It also proves a
+  cited line lies inside the named test, not that the line is the assertion, and
+  the AST fix for that is deferred to M8.
 - **A "restart" of the scheduler and the reconciler is a connection pool, an
   engine, and a loop, stopped and replaced in one test process.** Only the worker
   has a real-binary kill test. The reconciler's replacement runs one `RunOnce`
@@ -2158,8 +2169,7 @@ was not re-observed and its fix was not observed passing there.
   implemented yet". M7A did not touch the hand-maintained maps.
 - **Hosted CI on the final head is not recorded here,** because a commit cannot
   contain its own CI result: the pull request's checks are the record.
-- **M7B is not started** and has an open decision about demo-handler trust; see
-  "Next objective".
+- **M7B was out of scope for M7A.** It is the next section.
 
 ### Breaking change
 
@@ -2167,6 +2177,239 @@ None. No production code, schema, API, CLI, SDK, dashboard, or configuration
 changed.
 
 Post-merge review corrections (B1: I17 citation; B2: durableSnapshot scope wording; ARCHITECTURE §12 wording): see PR #19.
+
+## M7B — `make demo` and `make demo-failure`
+
+M7 is split into M7A and M7B, this milestone; [ROADMAP.md](ROADMAP.md) records why.
+M7B puts two handlers in the production worker, adds a Go program that runs the
+real binaries, and adds two Make targets and their CI steps. This section keeps
+three things apart: what it does, what evidence exists, and what is still
+limited.
+
+**What changed in production code:** `internal/worker/handler.go` gains
+`DemoSleep`, `DemoFail` and a strict payload decoder, and
+`cmd/taskforge-worker` registers its handlers in one function,
+`registerTrustedHandlers`, instead of inline. **Nothing else.** The runner, the
+migrations, `api/openapi.yaml`, the SDK and the dashboard are unchanged.
+OpenAPI constrains `job_type` with a pattern (`^[a-z0-9][a-z0-9._-]{0,127}$`),
+never an enumeration, and both new types match it, so no schema moved; `demo.sleep`
+was already the example in the submission schema.
+
+### Behavior
+
+**The handlers.** `demo.sleep` takes exactly `{"duration_ms": n}` with
+`1 <= n <= jobs.MaxTimeoutSeconds * 1000`, waits on a timer inside a `select` with
+the context, and returns `{"slept_ms": n}`. `demo.fail` takes exactly
+`{"class": "retryable"}` or `{"class": "permanent"}` and fails in that class with
+the fixed code `demo_failure` and a fixed message per class. Any other payload is a
+`Permanent` `invalid_payload`, and no part of a payload is ever echoed into a
+failure. They are registered unconditionally, with no environment gate and no
+separate build; the reasoning, the bounds and the abuse analysis are
+[ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md).
+
+**How the runner treats a `demo.sleep` that returns `ctx.Err()`.** It does not
+look at the returned error first. It reads the cause it recorded on the handler's
+context, and a recorded cause outranks the return value
+(`internal/worker/runner.go:569-604`): operator cancellation reports a fenced
+acknowledgment (`:570`); the attempt deadline reports nothing and leaves
+`TIMED_OUT` to reconciliation (`:576`); loss of lease authority reports nothing
+and leaves recovery to the reconciler (`:586`); worker shutdown reports nothing
+(`:594`). A handler error with none of those causes is a failure (`:601`).
+
+**`make demo`** is `build up migrate` and then `go run ./scripts/demo success`. One
+worker runs three jobs. An echo job succeeds after one attempt and its result,
+read back, equals its payload. A retryable `demo.fail` job with `max_attempts=3`
+fails three times, with a retry time recorded on the first two attempts and none
+on the third, and is dead-lettered with `ATTEMPTS_EXHAUSTED`. A permanent
+`demo.fail` job, with the same budget, fails once and is dead-lettered at once
+with `PERMANENT_FAILURE`. The retry is shown by a retryable failure spending its
+whole budget; no handler fails and then succeeds, because that would need the
+attempt number in `Execution`.
+
+**`make demo-failure`** is `build up migrate` and then
+`go run ./scripts/demo failure`, in two phases.
+
+1. *Crash.* Only worker A runs, and a `demo.sleep` job is submitted. When the API
+   shows the job `RUNNING` on A, worker B starts and A is sent `SIGKILL`. A's
+   attempt is `ABANDONED` and bound to A's session; a second attempt on B, under a
+   different session, is `SUCCEEDED`, and so is the job.
+2. *Frozen worker.* B is stopped, so only worker C runs, and another `demo.sleep`
+   job is submitted. When it is `RUNNING` on C, C is sent `SIGSTOP`. It stays
+   stopped until the API shows attempt 1 `ABANDONED`. Worker D then starts and
+   finishes attempt 2. Only then is C sent `SIGCONT` and given at least four
+   seconds to act. The pass condition is the stored outcome after that: the job
+   still `SUCCEEDED`, attempt 1 still `ABANDONED`, exactly two attempts, exactly one
+   result and it is attempt 2's, and all of it identical to what was stored just
+   before C resumed.
+
+**Timings.** Both profiles are values `internal/config` accepts, and a unit test
+loads each through `config.Load`, `config.LoadWorker` and
+`config.ValidateWorkerTimings` and asserts the loaded value is the chosen one,
+because a duration the loader cannot parse is silently replaced by its default.
+
+| Setting | `demo` | `demo-failure` | Rule it satisfies |
+| --- | --- | --- | --- |
+| lease duration | 30s | 5s | between 1s and 24h |
+| heartbeat interval | 5s | 1s | positive |
+| session stale after | 15s | 3s | at least 3x heartbeat |
+| lease renew interval | 10s | 1.5s | 3x renew (4.5s) at most the lease |
+| worker request timeout | 5s | 1s | at most stale, and at most renew |
+| reconciler and scheduler poll | 250ms | 250ms | positive |
+| outbox poll, claim timeout | 200ms, 1s | 200ms, 1s | claim timeout at least the poll |
+| scheduler re-notify after | 5s | 5s | at least 3x poll (750ms) and at least the outbox claim timeout (1s) |
+| worker poll wait | 1s | 1s | between 1s and 20s |
+| job retry base, max | 500ms, 5s | 500ms, 5s | max at least base, whole milliseconds |
+
+The success profile keeps the shipped lease and liveness values, because nothing
+in it depends on a worker dying; only the retry settings and the poll intervals
+are shortened, so the whole run takes seconds rather than minutes.
+
+**What the program does and does not do.**
+
+- Every service and worker is started from `./bin` with an explicit environment
+  that pins every endpoint that binary dials, found from `cmd/<binary>/main.go`,
+  and an empty working directory so no `.env` reaches it. A test derives the
+  variables with a loopback default from `internal/config` by parsing it, and
+  requires each to be pinned.
+- Infrastructure comes from the same `TASKFORGE_*` variables the services read
+  (and the same `.env`), falling back to the compose defaults. CI points it at its
+  own services the same way.
+- Ports are free loopback ports chosen at run time. The run has its own broker
+  queue, so a worker already running elsewhere cannot receive its notifications
+  and a message a killed worker was holding cannot surface in a later run. Keys
+  are created in a scope unique to the run, and everything is asserted by this
+  run's job ids.
+- It never deletes or truncates anything in the database. It deletes the broker
+  queue it created, and it **revokes**, not deletes, its two keys, after its
+  workers have stopped.
+- Every child is in its own process group, and every exit stops all of them.
+  Every wait has a timeout.
+- It uses `taskforge-cli` for key creation, submission, and every read the CLI
+  gives as JSON. **Two facts come from PostgreSQL instead**, read-only and only for
+  this run's job ids and scope: which process session each attempt is bound to,
+  and which attempt a result belongs to. `api/openapi.yaml` withholds both from the
+  public API on purpose.
+
+**Output.** Trimmed from `make demo-failure` at code commit `68b693e`; the whole of
+both transcripts is in the pull request.
+
+```
+[   1.2s] The API shows the job RUNNING on worker A (session 09dfbe7f).
+[   1.3s] Started worker B ... Now SIGKILL worker A: no signal handler, no cleanup ...
+[  14.6s] Final timeline: #1 ABANDONED on worker-a, #2 SUCCEEDED on worker-b.
+[  14.6s] Read from PostgreSQL (the API withholds session ids): attempt 1 is bound to session 09dfbe7f, attempt 2 to session b9ea4417.
+[  16.6s] SIGSTOP worker C: frozen, not dead. ...
+[  21.7s] The API shows attempt 1 ABANDONED. Worker C is still frozen.
+[  30.2s] Attempt 2 SUCCEEDED on worker D. Stored state: SUCCEEDED, attempts [1:ABANDONED:...-c 2:SUCCEEDED:...-d].
+[  30.2s] SIGCONT worker C. Every timer it had is now overdue ...
+[  34.4s] Stored state after C resumed: SUCCEEDED, attempts [1:ABANDONED:...-c 2:SUCCEEDED:...-d].
+           WARN  lease authority deadline reached without a confirmed renewal
+           WARN  lease authority lost before an outcome could be reported
+           ERROR worker stopped with error worker session liveness could not be confirmed before the stale threshold after 3s
+  PASS  crash: attempt 1 is bound to worker-a's session       session 09dfbe7f
+  PASS  crash: the two attempts ran under different sessions  09dfbe7f vs b9ea4417
+  PASS  fence: results stored for the job                     1
+  PASS  fence: the result belongs to attempt 2                result attempt e4be2483, attempt 2 is e4be2483
+  PASS  fence: nothing C did changed the stored state         job, attempts and result are identical before and after C resumed
+=== RESULT: PASS (25 of 25 expectations met) ===
+```
+
+and from `make demo`, in the same run: `retry job attempts: #1 FAILED, #2 FAILED, #3 FAILED`,
+`attempt 1 failed; the control plane scheduled attempt 2 after 465ms`,
+`PASS  retry: dead-letter reason   ATTEMPTS_EXHAUSTED`,
+`PASS  permanent: dead-letter reason   PERMANENT_FAILURE`, and
+`=== RESULT: PASS (21 of 21 expectations met) ===`.
+
+### Evidence
+
+All of this ran on code commit `68b693e`, except the mutation record below, which
+ran on `fa0b420`; the two commits between them change two comments and the
+narration of one phase, and no expectation. Later commits on the branch change
+documentation only. Gate outputs are under "M7B gates".
+
+**Five mutations were applied and each was caught**, one per row below, each by a
+script that asserted the edit landed exactly once, shown by `git diff`, run,
+reverted, and confirmed with a clean `git status`. They are a spot check, not one
+per test or per expectation. The diffs and failing output are in the pull request's
+handoff.
+
+| Check | Mutation | Observed |
+| --- | --- | --- |
+| `demo.sleep` honors its context | the `select` on the timer and `ctx.Done()` becomes a bare `<-timer.C` | Four unit tests fail, each in the 10s watchdog ("it is ignoring its context"), instead of waiting out an hour. The integration test fails on the lease: expected `RELEASED`, found `EXPIRED`. The job still reached `CANCELED`, but through the reconciler rather than the worker's own acknowledgment |
+| `demo.fail` classes | the two `case` arms return each other's class | `TestDemoFail_MapsEachClass…` fails both ways (`RETRYABLE` against `PERMANENT`). The retryable integration test sees `[FAILED]` instead of `[FAILED FAILED]`, and the permanent one `[FAILED FAILED FAILED]` instead of `[FAILED]` |
+| the registered set | `demo.fail` is dropped from `registerTrustedHandlers` | The pinned-set test fails (`[demo.echo demo.sleep]` for `[demo.echo demo.fail demo.sleep]`), and so does the binding test (`demo.fail must be registered`). With the real binary rebuilt, `go run ./scripts/demo success` leaves the retry and permanent jobs `QUEUED` until its 60s wait ends, and exits 1 |
+| a `make demo` expectation | the permanent job is expected `SUCCEEDED` | `FAIL permanent: job status  expected SUCCEEDED, got DEAD_LETTERED`; `RESULT: FAIL (1 of 21 expectations failed)`; the program exits 1 and `make` reports `Error 1`, exiting 2 |
+| a `make demo-failure` expectation | phase 2 expects three attempts | `FAIL fence: attempts  expected 3, got 2`; `RESULT: FAIL (1 of 25 expectations failed)`; exit 1, `make` exit 2 |
+
+**Flake evidence.** `make demo` five times back to back: **5 of 5** exit 0, each
+`PASS (21 of 21)`, 4 to 9 seconds each including build and migrate.
+`make demo-failure` five times back to back: **5 of 5** exit 0, each
+`PASS (25 of 25)`, 34 to 36 seconds. `go test -tags integration -race -count=10`
+over the three new integration tests: each **10 of 10**, no `DATA RACE`,
+`ok … 16.008s`. `go test -race -count=10` over `scripts/demo`,
+`cmd/taskforge-worker` and the new handler tests in `internal/worker` passed.
+
+**Interruption.** Verified by experiment, not by reading: `SIGINT` during phase 1,
+and `SIGTERM` while worker C was frozen, each exit 130 with no process left and
+none left stopped; and a `SIGINT` sent to the whole `make demo-failure` process
+group, which is what a terminal's Ctrl-C does, mid-phase-1, ended with
+`exit status 130` and no process left.
+
+### Limitations
+
+- **The frozen worker is not refused by the control plane in `make demo-failure`;
+  it stops itself.** In all eleven failure-mode runs whose output was kept, C's log shows its own
+  lease deadline passing during the freeze, then "lease authority lost before an
+  outcome could be reported", then exit. `SIGSTOP` stops a process but not the
+  monotonic clock, and the real worker checks its conservative local deadline
+  before it reports, so it never sends the stale call. No run printed a control-plane
+  refusal code. The stored state is unchanged either way, which is what the
+  demonstration asserts, but a server-side refusal is what
+  `TestLateCompletion_AfterReassignmentIsRejectedAndOnlyTheReplacementCommits`
+  proves, by sending the stale calls itself. Whether
+  [PROJECT_SPEC.md](PROJECT_SPEC.md) §5's "stale-attempt fencing" is satisfied by
+  that, or wants the refusal shown in the demonstration, is the owner's call.
+- **Two facts are read from PostgreSQL, not the API.** The demonstration therefore
+  needs the database URL and depends on `job_attempts.worker_session_id`,
+  `worker_sessions`, `workers` and `results.attempt_id`. They are the only
+  schema-coupled reads in it.
+- **Queue capacity is shared across scopes.** `max_concurrency` counts active
+  leases across every scope, so a scope's own workers running long `demo.sleep` jobs
+  can occupy slots of that shared limit for up to `timeout_seconds` each. ADR-0019
+  records this. V1 has no multi-tenancy, so it is recorded, not mitigated.
+- **Phase 2 waits a fixed time, not an observed condition, before it submits.**
+  Stopping worker B can leave its last long poll open at the broker, which can hand
+  the next notification to a connection nobody reads. The program waits one poll
+  wait plus half a second. Without it, one run was observed to recover only after
+  the scheduler re-notified about five seconds later (`renotified_jobs: 1`); the
+  re-notification is still the fallback if the wait is ever not enough.
+- **Timing assumptions.** Each `demo.sleep` runs eight seconds so that it is still
+  running while a second worker starts and the first is killed. A runner slow
+  enough to take longer than that to start a worker would fail the first
+  expectation visibly rather than pass. None was observed, and **hosted CI on the
+  final head is not recorded here**, because a commit cannot contain its own CI
+  result: the pull request's checks are the record. The workflow was parsed as
+  YAML locally, and GitHub has not run it from this document.
+- **It creates its broker queue with an unsigned SQS query request,** which
+  ElasticMQ, the local broker, accepts (ADR-0005). Against real SQS it would need
+  signing; V1 has no such target.
+- **`SIGKILL` of the program itself leaves its children.** Each is in its own
+  process group, so it does not receive a signal sent to the program's group.
+  `SIGINT` and `SIGTERM` are handled and were tested; `SIGHUP` and a closed
+  terminal were not.
+- **The database keeps what a run created.** The jobs, attempts, workers, sessions,
+  results and dead-letter entries stay, under a scope no later run shares; only
+  `make down` removes them. The two keys are revoked.
+- **`make demo` and `make demo-failure` are not in the root `README.md`.** Pull
+  request #10 rewrites that file wholesale and owns it, so that is where they belong.
+- **No performance claim is made.** The run times above are what happened on one
+  machine, not a benchmark.
+
+### Breaking change
+
+The production worker now declares three job types, which `GET /v1/workers` reports
+as `supported_job_types` and which bound the worker's `job_type` metric label to
+four values. No schema, API, CLI, SDK, dashboard or configuration changed.
 
 ## Verification
 
@@ -2749,6 +2992,30 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M7B gates
+
+Run locally on the branch, 2026-10-02, against code commit `68b693e`.
+PostgreSQL 16, ElasticMQ and the object store from `make up`, on Go 1.27.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS — `gofmt -w .` changed no Go file (`git status -- '*.go'` empty) |
+| `make lint` | PASS — `go vet ./...` silent |
+| `make build` | PASS — `go build -o bin/ ./cmd/...`; `scripts/demo` is not among the outputs |
+| `make test-unit` | PASS — 22 packages `ok`, up from 21: `scripts/demo`. With `GOFLAGS='-count=1 -v'` the output carries `--- PASS: TestRegisterTrustedHandlers_PinsTheExactSetTheWorkerDeclares` and `--- PASS: TestVerificationMatrix_EveryRowResolves` with "verification matrix: 30 rows (I1-I18, S1-S12), 41 distinct tests resolved to real test functions" |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  92.107s` |
+| `make test-race` | PASS — 22 unit packages `ok` under `-race`; `ok  .../tests/integration  95.727s`; no `DATA RACE` |
+| `make demo` | PASS — 21 of 21 expectations; five consecutive runs, 5 of 5 |
+| `make demo-failure` | PASS — 25 of 25 expectations; five consecutive runs, 5 of 5 |
+| `go test -tags integration -race -count=10 -run 'TestDemoFail_\|TestDemoSleep_' ./tests/integration/` | PASS — each of the three tests 10 of 10, `ok … 16.008s`, no `DATA RACE` |
+| `go test -race -count=10 ./scripts/demo/ ./cmd/taskforge-worker/`, and the same over `-run 'TestDemoSleep_\|TestDemoFail_\|TestDemoHandlers_' ./internal/worker/` | PASS |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test` | NOT RUN — M7B changes nothing in `sdk/` or `dashboard/` |
+| `docker compose config --quiet` | NOT RUN — M7B changes no Compose file |
+
+The mutation results are under "Evidence" in the M7B section. Hosted CI on the
+final head is not recorded here, because a commit cannot contain its own CI
+result: the pull request's checks are the record.
 
 ### M7A gates
 
@@ -3621,9 +3888,11 @@ exercised by a real hosted failure.
   has no tracing, and server-initiated notifications — replay, scheduler
   promotion, abandonment requeue — carry no trace context, because none of them
   continues a client request.
-- Only `demo.echo` is registered as a production worker handler. Test-only
-  handlers are injected through the existing registry seam and add no production
-  surface.
+- Three handlers are registered as production worker handlers: `demo.echo`,
+  `demo.fail` and `demo.sleep` (M7B, ADR-0019). The set is pinned by
+  `TestRegisterTrustedHandlers_PinsTheExactSetTheWorkerDeclares`, and there is
+  still no real workload handler. Test-only handlers are still injected through
+  the existing registry seam and add no production surface.
 - Recurring schedules, timezone handling, and misfire policy are post-V1. M4
   implements one-shot delayed submission, not cron.
 
@@ -3663,22 +3932,29 @@ reconciler as shown in the repository README. The dashboard is at
 `http://127.0.0.1:8080/dashboard/`; it asks for an API key created with
 `taskforge-cli api-keys create`.
 
+`make demo` and `make demo-failure` build, start the infrastructure, migrate, and
+run the two demonstrations; they start and stop their own services, so none of
+the processes above needs to be running. They are not yet described in the root
+`README.md`: pull request #10 rewrites that file wholesale and owns it, so the
+two targets belong in its version.
+
 ## Next objective
 
-M7B: `make demo` and `make demo-failure`. See [ROADMAP.md](ROADMAP.md)'s M7B
-entry. It is not started, and it has an open decision that is why it gets its own
-handoff: whether the failure demonstration's handlers become production handlers
-in `taskforge-worker`, and what bounds them if they do, which is a question
-about the trust boundary [AGENTS.md](../AGENTS.md) §10 draws rather than about a
-Make target. M7A closed the proof audit; every M7 scenario can also be watched
+M8: load generator, measured benchmarks, CI hardening, and validated ECS
+Terraform. See [ROADMAP.md](ROADMAP.md)'s M8 entry. It is not started. It carries
+three items from earlier milestones: the route-table-versus-OpenAPI completeness
+check and the verification-matrix drift check's AST fix, both deferred from M7A;
+and the decision ADR-0019 leaves for M8's deployment, whether to gate the
+demonstration handlers there. M6E's note stands too: M8 has to revisit the
+loopback bind and the Host rule together. Every M7 scenario can also be watched
 from the dashboard.
 
-Smaller items available to whoever wants them, none blocking M7B:
+Smaller items available to whoever wants them, none blocking M8:
 
 - `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
   deliberately did not build. See its section above for exactly what each would
   take; both are larger than they look because the clean recording points are
   inside fenced-transition code.
 - `README.md` line 35 is still stale ("the Python SDK and the dashboard" do not
-  exist yet). Untouched through M7A because PR #10 rewrites that file
-  wholesale.
+  exist yet), and it does not mention `make demo` or `make demo-failure`.
+  Untouched through M7B because PR #10 rewrites that file wholesale.
