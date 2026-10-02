@@ -18,9 +18,9 @@ import (
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
-// durableSnapshot reads back every durable row that belongs to one job -- the
-// job itself, its attempts, its leases, its result, its dead-letter entry, and
-// its outbox events -- as one string.
+// durableSnapshot reads back one job's rows in exactly six tables -- jobs,
+// job_attempts, leases, results, dlq_entries and outbox_events -- as one string.
+// It does not read idempotency_records, dlq_replays or worker_sessions.
 //
 // It exists so a test can prove "this refused operation changed nothing" by
 // comparing before with after, rather than by re-asserting the handful of
@@ -70,8 +70,10 @@ func durableSnapshot(t *testing.T, jobID uuid.UUID) string {
 //   - an operator replay of the dead-lettered job, which creates a NEW job and
 //     leaves the original alone.
 //
-// Afterwards every durable row belonging to the three jobs must be byte-for-byte
-// what it was, not merely still carry a terminal status.
+// Afterwards each job's rows in the six tables durableSnapshot reads must be
+// byte-for-byte what they were, not merely still carry a terminal status. The
+// operator replay does write a dlq_replays row, which durableSnapshot does not
+// read, so it cannot disturb the comparison.
 func TestInvariant_TerminalJobsStayTerminalUnderEveryMutator(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
@@ -178,7 +180,7 @@ func TestInvariant_TerminalJobsStayTerminalUnderEveryMutator(t *testing.T) {
 	for status, fence := range terminal {
 		require.Equal(t, status, readJob(t, fence.JobID).status, "still terminal")
 		require.Equal(t, before[status], durableSnapshot(t, fence.JobID),
-			status+": every durable row of a terminal job survives every mutator unchanged")
+			status+": the job's rows in the six snapshot tables survive every mutator unchanged")
 	}
 }
 
