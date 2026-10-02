@@ -2166,6 +2166,8 @@ was not re-observed and its fix was not observed passing there.
 None. No production code, schema, API, CLI, SDK, dashboard, or configuration
 changed.
 
+Post-merge review corrections (B1: I17 citation; B2: durableSnapshot scope wording; ARCHITECTURE §12 wording): see PR #19.
+
 ## Verification
 
 ### M5A gates
