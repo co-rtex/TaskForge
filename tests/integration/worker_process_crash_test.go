@@ -200,13 +200,13 @@ func (s *service) waitReady(t *testing.T) {
 // succeedStaller forwards everything to the real API but holds POST .../succeed
 // requests until the caller gives up.
 //
-// It exists so the crash below happens while durable state says RUNNING. The
-// only trusted handler compiled into taskforge-worker is demo.echo, which
-// returns immediately, and adding a slow production handler purely to widen a
-// test window is exactly the kind of production surface this project refuses to
-// grow. Stalling one control-plane call instead leaves the worker holding an
-// active lease on a RUNNING attempt — the real state a crashed worker leaves —
-// without touching the worker, the handler registry, or the control plane.
+// It exists so the crash below happens while durable state says RUNNING. When
+// this was written the only handler in taskforge-worker was demo.echo, which
+// returns immediately, and a slow production handler purely to widen a test
+// window was surface this project refused to grow. demo.sleep has since been
+// added for M7B's demonstrations (ADR-0019), but this test still stalls one
+// control-plane call instead: the worker holds an active lease on a RUNNING
+// attempt, the real state a crashed worker leaves, and nothing else changes.
 type succeedStaller struct {
 	server  *httptest.Server
 	stalled atomic.Int32

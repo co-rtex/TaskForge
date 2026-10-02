@@ -33,6 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
+        demo demo-failure \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -83,6 +84,16 @@ test-integration: ## Run tests against real PostgreSQL and a real broker (needs 
 test-race: ## Run unit and integration tests under the race detector
 	$(GO) test -race ./...
 	$(GO) test -race -tags=integration -count=1 $(INTEGRATION_PKG)
+
+# The demonstrations are a Go program under scripts/, not under cmd/, so `make
+# build` neither compiles nor ships them. They start their own services on free
+# loopback ports and stop every one of them on every way out, and they leave the
+# infrastructure running: `make down` is separate and deletes its data.
+demo: build up migrate ## Run the success demo: a job that succeeds, one that retries and dead-letters, one that dead-letters at once
+	$(GO) run ./scripts/demo success
+
+demo-failure: build up migrate ## Run the failure demo: a worker killed mid-job, and a frozen worker that wakes after its job moved on
+	$(GO) run ./scripts/demo failure
 
 sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
 	$(PYTHON) -m venv $(SDK_VENV)

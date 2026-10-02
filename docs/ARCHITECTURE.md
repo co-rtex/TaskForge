@@ -30,8 +30,9 @@ cancellations, and expired leases; durable retry with bounded exponential
 backoff and injected jitter; public cancellation; the authoritative logical DLQ
 with listing, replay, and operator retry; scheduler promotion of due delayed and
 retry-waiting work; bounded recovery of stranded queued jobs; bounded
-`demo.echo` execution; scoped, revocable API-key authentication on the public
-surface; and scoped, revocable worker-key authentication of registration on
+execution of the trusted `demo.echo`, `demo.sleep` and `demo.fail` handlers;
+scoped, revocable API-key authentication on the public surface; and
+scoped, revocable worker-key authentication of registration on
 the internal worker-control surface, with every later worker-control call
 trusting that session's identity and a cheap revocation check rather than a
 re-presented credential; inline and object-backed result storage with
@@ -112,7 +113,7 @@ single outbox publisher · a single reconciler instance.
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |
-| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, classify and record their result (uploading a large one to the object store first), and report fenced outcomes including failures and cooperative cancellation. | **Built** for `demo.echo` |
+| `taskforge-worker` | Register a session, poll only from free bounded slots, claim, execute trusted handlers, classify and record their result (uploading a large one to the object store first), and report fenced outcomes including failures and cooperative cancellation. | **Built**; its handlers are `demo.echo`, `demo.sleep` and `demo.fail` ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md)). |
 | `taskforge-reconciler` | Mark stale sessions, record due attempt timeouts, finalize unacknowledged cancellations, expire leases, abandon their attempts, and release capacity. | **Built**; general drift repair beyond these is later. |
 | `taskforge-cli` | Operator and developer command-line interface over the public API and the loopback-only credential-management routes. | **Built** |
 | Operator dashboard | Read-only browser client of the public `/v1` read routes, compiled into `taskforge-api`. No endpoint, credential, or query of its own; it presents the operator's API key exactly as the CLI does. | **Built** |

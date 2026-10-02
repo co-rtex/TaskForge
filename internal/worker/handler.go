@@ -4,14 +4,18 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 )
 
@@ -116,7 +120,7 @@ func (r *Registry) Types() []string {
 	return types
 }
 
-// DemoEcho is M2's single trusted handler. It returns an exact copy of the
+// DemoEcho is M2's first trusted handler. It returns an exact copy of the
 // authoritative payload in process. Since M5C, runner.go classifies and
 // records that returned copy as the attempt's result; the payload/result
 // itself is still never logged.
@@ -126,4 +130,119 @@ func (DemoEcho) Execute(_ context.Context, execution Execution) (json.RawMessage
 	result := make(json.RawMessage, len(execution.Payload))
 	copy(result, execution.Payload)
 	return result, nil
+}
+
+// Stable codes the demonstration handlers report. Both match the pattern
+// api/openapi.yaml documents for a worker-reported error_code, which a test
+// reads from the document rather than from a copy.
+const (
+	// demoFailureCode is the one code demo.fail ever reports, whatever its
+	// payload says. The caller chooses the failure's class, never any part of its
+	// code or message, so no payload text can reach the dead-letter queue.
+	demoFailureCode = "demo_failure"
+	// invalidPayloadCode marks a payload a demonstration handler refused to act
+	// on. It is Permanent: the same payload will be refused identically on every
+	// retry, so spending the rest of the attempt budget on it would only delay the
+	// dead-letter entry that says so.
+	invalidPayloadCode = "invalid_payload"
+)
+
+// Failure messages are fixed strings. A handler's message is stored and listed,
+// so building one from the payload would turn a caller's data into text every
+// reader of the dead-letter queue sees (AGENTS.md section 10).
+const (
+	demoFailRetryableMessage = "demo.fail was asked to fail retryably"
+	demoFailPermanentMessage = "demo.fail was asked to fail permanently"
+	demoFailPayloadMessage   = `the payload must be exactly {"class": "retryable"} or {"class": "permanent"}`
+	demoSleepPayloadMessage  = `the payload must be exactly {"duration_ms": n}, a whole number of milliseconds within the supported range`
+)
+
+// maxDemoSleepMillis bounds demo.sleep to the longest a job may be allowed to run
+// at all. It is derived from the constant that bounds a job's own
+// timeout_seconds, not copied from it: a sleep longer than any attempt budget
+// could never finish, so a larger value would only be a payload the system
+// accepts and can never complete.
+const maxDemoSleepMillis = int64(jobs.MaxTimeoutSeconds) * 1000
+
+// decodeDemoPayload strictly decodes a demonstration handler's payload into
+// target. It rejects a field the target does not declare, a value of the wrong
+// type, and anything after the object, so the accepted payloads are exactly the
+// documented shape and nothing a caller could smuggle alongside it.
+//
+// Strictness matters more here than for a typical handler because these run
+// inside the production worker for every scope (ADR-0019): what they accept is
+// the whole of what a key holder can ask of them.
+func decodeDemoPayload(payload json.RawMessage, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	// Decode stops after the first value. Anything further is either a second
+	// object or garbage, and neither is the documented payload.
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after the payload object")
+	}
+	return nil
+}
+
+// DemoSleep waits for the requested number of milliseconds and reports how long
+// it slept. It exists so a failure demonstration has a job that is still
+// RUNNING when a worker is killed or frozen; see ADR-0019 for why it is a
+// production handler.
+//
+// It waits on a timer inside a select with the context, so cancellation, an
+// attempt deadline, and loss of lease authority all end it at once rather than
+// when the timer happens to fire. The runner decides what each of those means
+// from the cause it recorded on the context, not from the error returned here.
+type DemoSleep struct{}
+
+func (DemoSleep) Execute(ctx context.Context, execution Execution) (json.RawMessage, error) {
+	var request struct {
+		// A pointer so an absent or null field is distinguishable from zero, which
+		// is itself out of range.
+		DurationMS *int64 `json:"duration_ms"`
+	}
+	if err := decodeDemoPayload(execution.Payload, &request); err != nil ||
+		request.DurationMS == nil ||
+		*request.DurationMS < 1 || *request.DurationMS > maxDemoSleepMillis {
+		return nil, Permanent(invalidPayloadCode, demoSleepPayloadMessage)
+	}
+
+	timer := time.NewTimer(time.Duration(*request.DurationMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return json.Marshal(struct {
+		SleptMS int64 `json:"slept_ms"`
+	}{SleptMS: *request.DurationMS})
+}
+
+// DemoFail fails every time, in the class its payload names. It exists so the
+// retry and dead-letter paths can be shown with a real worker rather than only
+// asserted with a test-injected one; see ADR-0019.
+//
+// The payload picks one of two classes and nothing else: the code is fixed and
+// the message is a fixed string per class, so no part of what the caller sent is
+// stored, listed, or logged as a failure.
+type DemoFail struct{}
+
+func (DemoFail) Execute(_ context.Context, execution Execution) (json.RawMessage, error) {
+	var request struct {
+		Class *string `json:"class"`
+	}
+	if err := decodeDemoPayload(execution.Payload, &request); err != nil || request.Class == nil {
+		return nil, Permanent(invalidPayloadCode, demoFailPayloadMessage)
+	}
+	switch *request.Class {
+	case "retryable":
+		return nil, Retryable(demoFailureCode, demoFailRetryableMessage)
+	case "permanent":
+		return nil, Permanent(demoFailureCode, demoFailPermanentMessage)
+	default:
+		return nil, Permanent(invalidPayloadCode, demoFailPayloadMessage)
+	}
 }
