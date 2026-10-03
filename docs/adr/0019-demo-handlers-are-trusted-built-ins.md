@@ -72,14 +72,20 @@ What a key holder can do with these handlers, and what it cannot.
   a worker registered under a worker key for that same scope (`Claim` selects on
   `j.scope`, `internal/workers/store.go`). What a handler writes is its own
   attempt's outcome: a result or a bounded failure.
-- **Capacity is held for at most the job's `timeout_seconds`.** A sleeping
-  attempt occupies one lease, and so one of its worker's `concurrency_limit`
-  slots and one of its queue's `max_concurrency`, until it returns, is canceled,
-  or reaches its deadline. At the deadline the worker cancels the handler
-  (`internal/worker/runner.go:495`) and reports nothing, and the reconciler
-  records `TIMED_OUT` and closes the lease, `RELEASED` or `EXPIRED`
-  (`internal/workers/timeout.go:121`). A long-running handler holds capacity
-  identically.
+- **Capacity is held for at most the job's `timeout_seconds` per attempt, and a
+  job can have several attempts.** A sleeping attempt occupies one lease, and so
+  one of its worker's `concurrency_limit` slots and one of its queue's
+  `max_concurrency`, until it returns, is canceled, or reaches its deadline. At
+  the deadline the worker cancels the handler (`internal/worker/runner.go:495`)
+  and reports nothing, and the reconciler records `TIMED_OUT` and closes the
+  lease, `RELEASED` or `EXPIRED` (`internal/workers/timeout.go:121`). A
+  long-running handler holds capacity identically. The bound is per attempt:
+  across retries one job can hold a slot for up to `max_attempts ×
+  timeout_seconds` in total, in separate attempts, and a submission may ask for
+  both at their maximum (`jobs.MaxMaxAttempts` = 100 and `jobs.MaxTimeoutSeconds`
+  = 86,400, `internal/jobs/submit.go`). *(Corrected in M8A. This bullet
+  originally said capacity was held "for at most the job's `timeout_seconds`",
+  which was true of one attempt and not of the job.)*
 - **One resource is shared across scopes, and it should be said plainly.** A
   queue's `max_concurrency` counts `ACTIVE` leases across every scope
   (`internal/workers/store.go`, the `activeForQueue` count has no scope filter).
