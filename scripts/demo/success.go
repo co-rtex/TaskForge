@@ -38,13 +38,13 @@ func isTerminal(status string) bool {
 
 // runSuccess is `make demo`: one worker, and three jobs that end three ways.
 func (d *demo) runSuccess(ctx context.Context) {
-	d.say("--- One worker, three jobs ---")
-	_, workerName, err := d.startWorker(ctx, "w", 4)
+	d.Say("--- One worker, three jobs ---")
+	_, workerName, err := d.StartWorker(ctx, "w", 4)
 	if err != nil {
 		d.expect("a worker started", false, "%v", err)
 		return
 	}
-	d.say("Started %s, which declares demo.echo, demo.fail and demo.sleep.", workerName)
+	d.Say("Started %s, which declares demo.echo, demo.fail and demo.sleep.", workerName)
 
 	submissions := []struct {
 		label, jobType, payload string
@@ -61,7 +61,7 @@ func (d *demo) runSuccess(ctx context.Context) {
 			d.expect(s.label+": the job was submitted", false, "%v", err)
 			return
 		}
-		d.say("Submitted the %s job %s: %s %s, max_attempts=%d.", s.label, id, s.jobType, s.payload, s.maxAttempts)
+		d.Say("Submitted the %s job %s: %s %s, max_attempts=%d.", s.label, id, s.jobType, s.payload, s.maxAttempts)
 		all = append(all, &watched{label: s.label, id: id})
 	}
 	echo, retry, permanent := all[0], all[1], all[2]
@@ -79,7 +79,7 @@ func (d *demo) runSuccess(ctx context.Context) {
 					return false, "", err
 				}
 				if job.Status != w.last {
-					d.say("  %s job: %s", w.label, job.Status)
+					d.Say("  %s job: %s", w.label, job.Status)
 					w.last = job.Status
 				}
 				w.final = job
@@ -104,7 +104,7 @@ func (d *demo) verifyEcho(ctx context.Context, w *watched) {
 		d.expect("echo: the attempt history was read", false, "%v", err)
 		return
 	}
-	d.say("echo job attempts: %s", describeAttempts(attempts))
+	d.Say("echo job attempts: %s", describeAttempts(attempts))
 
 	expectEqual(d, "echo: job status", string(jobs.StatusSucceeded), w.final.Status)
 	expectEqual(d, "echo: attempts", 1, len(attempts))
@@ -126,10 +126,10 @@ func (d *demo) verifyRetry(ctx context.Context, w *watched) {
 		d.expect("retry: the attempt history was read", false, "%v", err)
 		return
 	}
-	d.say("retry job attempts: %s", describeAttempts(attempts))
+	d.Say("retry job attempts: %s", describeAttempts(attempts))
 	for _, a := range attempts {
 		if a.RetryAt != nil && a.RetryDelayMS != nil {
-			d.say("  attempt %d failed; the control plane scheduled attempt %d after %dms, at %s",
+			d.Say("  attempt %d failed; the control plane scheduled attempt %d after %dms, at %s",
 				a.AttemptNumber, a.AttemptNumber+1, *a.RetryDelayMS, a.RetryAt.Local().Format("15:04:05.000"))
 		}
 	}
@@ -177,7 +177,7 @@ func (d *demo) verifyPermanent(ctx context.Context, w *watched) {
 		d.expect("permanent: the attempt history was read", false, "%v", err)
 		return
 	}
-	d.say("permanent job attempts: %s (max_attempts was 3)", describeAttempts(attempts))
+	d.Say("permanent job attempts: %s (max_attempts was 3)", describeAttempts(attempts))
 
 	expectEqual(d, "permanent: job status", string(jobs.StatusDeadLettered), w.final.Status)
 	expectEqual(d, "permanent: attempts", 1, len(attempts))

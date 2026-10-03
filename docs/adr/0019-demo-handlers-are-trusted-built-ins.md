@@ -63,23 +63,31 @@ What a key holder can do with these handlers, and what it cannot.
 - **No new code can run.** The handlers are compiled in. This ADR changes which
   trusted code is compiled into the binary, not the rule that only such code
   runs.
-- **A payload is data.** Each handler decodes it into a struct of one field and
-  acts on nothing else. Neither reaches a shell, the filesystem, or the network,
-  and neither calls anything beyond the standard library's JSON decoder and a
-  timer.
+- **A payload is data.** Each handler accepts a single JSON object with exactly
+  one documented member, spelled exactly (`encoding/json` would match a key
+  case-insensitively) and never repeated (it would keep the last of two), and
+  decodes that member's value and nothing else. Neither reaches a shell, the
+  filesystem, or the network, and neither calls anything beyond the standard
+  library's JSON decoder and a timer.
 - **A key holder can make its own scope's jobs sleep or fail, and that is all.**
   A job belongs to the scope of the key that submitted it, and is claimed only by
   a worker registered under a worker key for that same scope (`Claim` selects on
   `j.scope`, `internal/workers/store.go`). What a handler writes is its own
   attempt's outcome: a result or a bounded failure.
-- **Capacity is held for at most the job's `timeout_seconds`.** A sleeping
-  attempt occupies one lease, and so one of its worker's `concurrency_limit`
-  slots and one of its queue's `max_concurrency`, until it returns, is canceled,
-  or reaches its deadline. At the deadline the worker cancels the handler
-  (`internal/worker/runner.go:495`) and reports nothing, and the reconciler
-  records `TIMED_OUT` and closes the lease, `RELEASED` or `EXPIRED`
-  (`internal/workers/timeout.go:121`). A long-running handler holds capacity
-  identically.
+- **Capacity is held for at most the job's `timeout_seconds` per attempt, and a
+  job can have several attempts.** A sleeping attempt occupies one lease, and so
+  one of its worker's `concurrency_limit` slots and one of its queue's
+  `max_concurrency`, until it returns, is canceled, or reaches its deadline. At
+  the deadline the worker cancels the handler (`internal/worker/runner.go:495`)
+  and reports nothing, and the reconciler records `TIMED_OUT` and closes the
+  lease, `RELEASED` or `EXPIRED` (`internal/workers/timeout.go:121`). A
+  long-running handler holds capacity identically. The bound is per attempt:
+  across retries one job can hold a slot for up to `max_attempts ×
+  timeout_seconds` in total, in separate attempts, and a submission may ask for
+  both at their maximum (`jobs.MaxMaxAttempts` = 100 and `jobs.MaxTimeoutSeconds`
+  = 86,400, `internal/jobs/submit.go`). *(Corrected in M8A. This bullet
+  originally said capacity was held "for at most the job's `timeout_seconds`",
+  which was true of one attempt and not of the job.)*
 - **One resource is shared across scopes, and it should be said plainly.** A
   queue's `max_concurrency` counts `ACTIVE` leases across every scope
   (`internal/workers/store.go`, the `activeForQueue` count has no scope filter).

@@ -161,6 +161,11 @@ func TestDemoSleep_AcceptsBothInclusiveBounds(t *testing.T) {
 	for name, payload := range map[string]string{
 		"smallest": `{"duration_ms":1}`,
 		"largest":  fmt.Sprintf(`{"duration_ms":%d}`, maxSleepMillis),
+		// Exact means the key as JSON decodes it, not the bytes on the wire:
+		// whitespace is not part of the key, and an escaped underscore is the
+		// same string once decoded.
+		"whitespace around the members": ` { "duration_ms" : 1 } `,
+		"escaped underscore in the key": `{"duration_ms":1}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := executeWithin(t, 10*time.Second, ctx, DemoSleep{}, payload)
@@ -192,6 +197,20 @@ func TestDemoSleep_RejectsEveryInvalidPayloadAsPermanentInvalidPayload(t *testin
 		"empty":                     ``,
 		"trailing second object":    `{"duration_ms":5}{"duration_ms":5}`,
 		"trailing garbage":          `{"duration_ms":5} x`,
+
+		// encoding/json matches a key to a struct field case-insensitively, so a
+		// strict-looking decode still accepted these. The documented payload
+		// spells its key exactly.
+		"upper-case key":                  `{"DURATION_MS":5}`,
+		"mixed-case key":                  `{"Duration_Ms":5}`,
+		"title-case key":                  `{"Duration_ms":5}`,
+		"right key and a wrong-case twin": `{"duration_ms":5,"DURATION_MS":6}`,
+
+		// encoding/json also accepts a repeated key and keeps the last value, so
+		// the payload that ran was not the one that was read.
+		"duplicated key, different values":  `{"duration_ms":5,"duration_ms":6}`,
+		"duplicated key, same value":        `{"duration_ms":5,"duration_ms":5}`,
+		"duplicated key, first one invalid": `{"duration_ms":"x","duration_ms":5}`,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -260,6 +279,14 @@ func TestDemoFail_RejectsEveryInvalidPayloadAsPermanentInvalidPayload(t *testing
 		"empty":                  ``,
 		"trailing second object": `{"class":"retryable"}{"class":"permanent"}`,
 		"trailing garbage":       `{"class":"retryable"} x`,
+
+		// The key is matched exactly, and a repeated key is refused rather than
+		// resolved to its last value; see the demo.sleep cases for why.
+		"title-case key":                   `{"Class":"retryable"}`,
+		"upper-case key":                   `{"CLASS":"permanent"}`,
+		"right key and a wrong-case twin":  `{"class":"retryable","Class":"permanent"}`,
+		"duplicated key, same value":       `{"class":"retryable","class":"retryable"}`,
+		"duplicated key, different values": `{"class":"retryable","class":"permanent"}`,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure \
+        demo demo-failure bench bench-smoke \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -94,6 +94,29 @@ demo: build up migrate ## Run the success demo: a job that succeeds, one that re
 
 demo-failure: build up migrate ## Run the failure demo: a worker killed mid-job, and a frozen worker that wakes after its job moved on
 	$(GO) run ./scripts/demo failure
+
+# The benchmark harness (scripts/bench), a Go program under scripts/ like the
+# demonstrations. `make bench` is the one recorded run: it refuses to start on a
+# dirty tree, runs the throughput measurement and then the fault-injection one
+# with the shipped default timings, and writes docs/benchmarks/<date>-<sha>.md and
+# .json. It takes about twenty-five minutes. `make bench-smoke` runs both in
+# miniature, asserts the harness measured validly, records nothing, and is what CI
+# runs; CI never records numbers. See docs/adr/0020-benchmark-methodology.md.
+#
+# BENCH_ARGS passes extra flags through, e.g. `make bench BENCH_ARGS="--profile
+# tuned"` for the one labelled tuned run.
+#
+# On macOS the run is wrapped in caffeinate: a laptop that sleeps mid-run makes
+# the Docker VM's clock step, and the harness aborts a run it sees that happen to.
+# caffeinate cannot stop a closed lid. Keep the lid open and the machine on power.
+BENCH_ARGS ?=
+KEEP_AWAKE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate -dimsu")
+
+bench: build up migrate ## Run the full benchmark and record it in docs/benchmarks (clean tree; about 25 minutes; lid open, on power)
+	$(KEEP_AWAKE) $(GO) run ./scripts/bench throughput faults --record $(BENCH_ARGS)
+
+bench-smoke: build up migrate ## Smoke-test the benchmark harness: about a minute, records nothing, fails if it measured wrongly
+	$(KEEP_AWAKE) $(GO) run ./scripts/bench smoke
 
 sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
 	$(PYTHON) -m venv $(SDK_VENV)
