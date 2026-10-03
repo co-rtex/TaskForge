@@ -164,8 +164,7 @@ func (s *Stack) Say(format string, args ...any) {
 // the developer's environment: whatever is not named here is the binary's own
 // default, and for an address that default is this machine's loopback.
 func (s *Stack) BaseEnv() map[string]string {
-	t := s.Timing
-	return map[string]string{
+	env := map[string]string{
 		"TASKFORGE_DATABASE_URL": s.Infra.DatabaseURL,
 
 		"TASKFORGE_BROKER_ENDPOINT":          s.Infra.BrokerEndpoint,
@@ -187,25 +186,12 @@ func (s *Stack) BaseEnv() map[string]string {
 		"TASKFORGE_SCHEDULER_ADDR":  s.SchedulerAddr,
 		"TASKFORGE_RECONCILER_ADDR": s.ReconcilerAddr,
 
-		"TASKFORGE_API_REQUEST_TIMEOUT":  t.APIRequest.String(),
-		"TASKFORGE_LEASE_DURATION":       t.Lease.String(),
-		"TASKFORGE_HEARTBEAT_INTERVAL":   t.Heartbeat.String(),
-		"TASKFORGE_SESSION_STALE_AFTER":  t.Stale.String(),
-		"TASKFORGE_LEASE_RENEW_INTERVAL": t.Renew.String(),
-
-		"TASKFORGE_OUTBOX_POLL_INTERVAL":     t.OutboxPoll.String(),
-		"TASKFORGE_OUTBOX_CLAIM_TIMEOUT":     t.OutboxClaim.String(),
-		"TASKFORGE_RECONCILER_POLL_INTERVAL": t.PollInterval.String(),
-		"TASKFORGE_SCHEDULER_POLL_INTERVAL":  t.PollInterval.String(),
-		"TASKFORGE_SCHEDULER_RENOTIFY_AFTER": t.RenotifyAfter.String(),
-
-		"TASKFORGE_JOB_RETRY_BASE":       t.RetryBase.String(),
-		"TASKFORGE_JOB_RETRY_MAX":        t.RetryMax.String(),
-		"TASKFORGE_JOB_RETRY_MULTIPLIER": strconv.FormatFloat(t.RetryMultiplier, 'f', -1, 64),
-		"TASKFORGE_JOB_RETRY_JITTER":     strconv.FormatFloat(t.RetryJitter, 'f', -1, 64),
-
 		"TASKFORGE_LOG_LEVEL": "info",
 	}
+	for name, value := range s.Timing.serviceEnv() {
+		env[name] = value
+	}
+	return env
 }
 
 // Env builds one binary's complete environment and refuses to return one that
@@ -230,20 +216,20 @@ func (s *Stack) Env(binary string, extra map[string]string) (map[string]string, 
 
 // WorkerEnv is what a worker adds to the shared environment.
 func (s *Stack) WorkerEnv(name, addr string, concurrency int) map[string]string {
-	t := s.Timing
-	return map[string]string{
-		"TASKFORGE_WORKER_NAME":             name,
-		"TASKFORGE_WORKER_ADDR":             addr,
-		"TASKFORGE_WORKER_API_URL":          s.APIURL,
-		"TASKFORGE_WORKER_API_KEY":          s.WorkerKey,
-		"TASKFORGE_WORKER_QUEUE":            "default",
-		"TASKFORGE_WORKER_GROUP":            "default",
-		"TASKFORGE_WORKER_CONCURRENCY":      strconv.Itoa(concurrency),
-		"TASKFORGE_WORKER_CAPABILITIES":     "cpu",
-		"TASKFORGE_WORKER_POLL_WAIT":        t.WorkerPollWait.String(),
-		"TASKFORGE_WORKER_REQUEST_TIMEOUT":  t.WorkerRequest.String(),
-		"TASKFORGE_WORKER_SHUTDOWN_TIMEOUT": t.WorkerShutdown.String(),
+	env := map[string]string{
+		"TASKFORGE_WORKER_NAME":         name,
+		"TASKFORGE_WORKER_ADDR":         addr,
+		"TASKFORGE_WORKER_API_URL":      s.APIURL,
+		"TASKFORGE_WORKER_API_KEY":      s.WorkerKey,
+		"TASKFORGE_WORKER_QUEUE":        "default",
+		"TASKFORGE_WORKER_GROUP":        "default",
+		"TASKFORGE_WORKER_CONCURRENCY":  strconv.Itoa(concurrency),
+		"TASKFORGE_WORKER_CAPABILITIES": "cpu",
 	}
+	for key, value := range s.Timing.workerEnv() {
+		env[key] = value
+	}
+	return env
 }
 
 // sortedEnv renders an environment as the KEY=VALUE slice exec wants, in a

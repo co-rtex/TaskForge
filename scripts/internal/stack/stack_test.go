@@ -198,6 +198,8 @@ func TestTimings_AreValuesTheServicesAcceptAndActuallyLoad(t *testing.T) {
 	for name, profile := range map[string]Timings{
 		"success": SuccessTimings(),
 		"failure": FailureTimings(),
+		"shipped": ShippedTimings(),
+		"tuned":   TunedTimings(),
 	} {
 		t.Run(name, func(t *testing.T) {
 			clearTaskforgeEnv(t)
@@ -402,4 +404,96 @@ func TestStack_StopProcsOnlyTouchesTheSelectedKind(t *testing.T) {
 
 	require.False(t, worker.Running())
 	require.True(t, service.Running(), "services outlive the workers so the run's keys can be revoked first")
+}
+
+// TestTimings_ShippedIsExactlyWhatTheServicesDefaultTo is what makes the
+// benchmark's headline run mean "shipped defaults". The profile spells every
+// value out, so that the record can list each one; this test fails the moment
+// internal/config's default for any of them changes without the profile, which
+// would otherwise leave a record claiming defaults that are no longer the
+// defaults.
+func TestTimings_ShippedIsExactlyWhatTheServicesDefaultTo(t *testing.T) {
+	clearTaskforgeEnv(t)
+	// The one setting with no default, and not a timing: the worker refuses to
+	// load without a credential, whatever else is left at its default.
+	t.Setenv("TASKFORGE_WORKER_API_KEY", "test-worker-key")
+	shared, err := config.Load()
+	require.NoError(t, err)
+	worker, err := config.LoadWorker()
+	require.NoError(t, err)
+
+	shipped := ShippedTimings()
+	require.Equal(t, shared.LeaseDuration, shipped.Lease)
+	require.Equal(t, shared.HeartbeatInterval, shipped.Heartbeat)
+	require.Equal(t, shared.SessionStaleAfter, shipped.Stale)
+	require.Equal(t, shared.LeaseRenewInterval, shipped.Renew)
+	require.Equal(t, worker.RequestTimeout, shipped.WorkerRequest)
+	require.Equal(t, worker.PollWait, shipped.WorkerPollWait)
+	require.Equal(t, worker.ShutdownTimeout, shipped.WorkerShutdown)
+	require.Equal(t, shared.APIRequestTimeout, shipped.APIRequest)
+	require.Equal(t, shared.OutboxPollInterval, shipped.OutboxPoll)
+	require.Equal(t, shared.OutboxClaimTimeout, shipped.OutboxClaim)
+	require.Equal(t, shared.SchedulerRenotifyAfter, shipped.RenotifyAfter)
+	require.Equal(t, shared.JobRetryBase, shipped.RetryBase)
+	require.Equal(t, shared.JobRetryMax, shipped.RetryMax)
+	require.Equal(t, shared.JobRetryMultiplier, shipped.RetryMultiplier)
+	require.Equal(t, shared.JobRetryJitter, shipped.RetryJitter)
+
+	// One interval serves two services, so both defaults must be that one value.
+	require.Equal(t, shared.ReconcilerPollInterval, shipped.PollInterval)
+	require.Equal(t, shared.SchedulerPollInterval, shipped.PollInterval)
+}
+
+// TestTimings_TunedOnlyChangesLeaseLivenessAndScanIntervals pins what "tuned"
+// means, so a labelled second run cannot quietly become something else: nothing
+// outside the lease and liveness windows and the scan intervals differs from the
+// shipped profile.
+func TestTimings_TunedOnlyChangesLeaseLivenessAndScanIntervals(t *testing.T) {
+	shipped, tuned := ShippedTimings(), TunedTimings()
+
+	require.Less(t, tuned.Lease, shipped.Lease)
+	require.Less(t, tuned.Stale, shipped.Stale)
+	require.Less(t, tuned.PollInterval, shipped.PollInterval)
+
+	// Everything else is the shipped value.
+	same := tuned
+	same.Lease, same.Heartbeat, same.Stale, same.Renew, same.WorkerRequest =
+		shipped.Lease, shipped.Heartbeat, shipped.Stale, shipped.Renew, shipped.WorkerRequest
+	same.PollInterval, same.OutboxPoll, same.OutboxClaim, same.RenotifyAfter =
+		shipped.PollInterval, shipped.OutboxPoll, shipped.OutboxClaim, shipped.RenotifyAfter
+	require.Equal(t, shipped, same)
+}
+
+// TestTimings_EnvIsEveryTimingVariableAServiceOrWorkerIsHanded is what the
+// benchmark record lists as "every TASKFORGE_* timing value in effect". It must
+// be the very values the processes are started with, not a second rendering.
+func TestTimings_EnvIsEveryTimingVariableAServiceOrWorkerIsHanded(t *testing.T) {
+	d := testStack(TunedTimings())
+	handed := d.BaseEnv()
+	for name, value := range d.WorkerEnv("demo-123-a", "127.0.0.1:1005", 1) {
+		handed[name] = value
+	}
+
+	listed := d.Timing.Env()
+	require.NotEmpty(t, listed)
+	for name, value := range listed {
+		require.Equalf(t, handed[name], value, "%s as listed must equal what a process is handed", name)
+	}
+	for _, name := range []string{
+		"TASKFORGE_LEASE_DURATION", "TASKFORGE_HEARTBEAT_INTERVAL", "TASKFORGE_SESSION_STALE_AFTER",
+		"TASKFORGE_LEASE_RENEW_INTERVAL", "TASKFORGE_RECONCILER_POLL_INTERVAL",
+		"TASKFORGE_SCHEDULER_POLL_INTERVAL", "TASKFORGE_WORKER_REQUEST_TIMEOUT",
+	} {
+		require.Contains(t, listed, name)
+	}
+	// Addresses, credentials and the queue name are not timings.
+	require.NotContains(t, listed, "TASKFORGE_DATABASE_URL")
+	require.NotContains(t, listed, "TASKFORGE_WORKER_API_KEY")
+}
+
+func TestStack_WorkerNameIsRunUniqueAndStableAcrossARestart(t *testing.T) {
+	d := testStack(ShippedTimings())
+	require.Equal(t, "demo-123-w07", d.WorkerName("w07"))
+	require.Equal(t, d.WorkerName("w07"), d.WorkerName("w07"), "a restart must be able to ask for the same name again")
+	require.NotEqual(t, d.WorkerName("w07"), d.WorkerName("w08"))
 }

@@ -180,24 +180,44 @@ func (p *Proc) WaitReady(ctx context.Context, timeout time.Duration) error {
 	}
 }
 
-// StartWorker runs one worker under a name unique to this run and waits for it
-// to report ready, which includes having registered its session.
+// WorkerName is the name label gives a worker in this run: unique to the run, and
+// the same every time it is asked for, so a worker that is killed and started
+// again is the same logical worker and not a new one.
+func (s *Stack) WorkerName(label string) string {
+	return fmt.Sprintf("%s-%s-%s", s.Prefix, s.RunID, label)
+}
+
+// StartWorker runs one worker under WorkerName(label) and waits for it to report
+// ready, which includes having registered its session.
 func (s *Stack) StartWorker(ctx context.Context, label string, concurrency int) (*Proc, string, error) {
-	addr, err := FreeLoopbackAddr()
+	name := s.WorkerName(label)
+	p, err := s.StartWorkerNamed(ctx, label, name, concurrency)
 	if err != nil {
-		return nil, "", err
-	}
-	name := fmt.Sprintf("%s-%s-%s", s.Prefix, s.RunID, label)
-	env, err := s.Env("taskforge-worker", s.WorkerEnv(name, addr, concurrency))
-	if err != nil {
-		return nil, "", err
-	}
-	p, err := s.Start("worker-"+label, "taskforge-worker", addr, KindWorker, env)
-	if err != nil {
-		return nil, "", err
-	}
-	if err := p.WaitReady(ctx, 60*time.Second); err != nil {
 		return nil, "", err
 	}
 	return p, name, nil
+}
+
+// StartWorkerNamed runs one worker under exactly the name given and waits for it
+// to report ready. Starting it again under the same name after the first process
+// has died is a process boot of the same logical worker: registration replaces
+// the prior boot's session and leaves its leases to expire (internal/workers,
+// Register). The process's output is appended to the same log file.
+func (s *Stack) StartWorkerNamed(ctx context.Context, label, name string, concurrency int) (*Proc, error) {
+	addr, err := FreeLoopbackAddr()
+	if err != nil {
+		return nil, err
+	}
+	env, err := s.Env("taskforge-worker", s.WorkerEnv(name, addr, concurrency))
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.Start("worker-"+label, "taskforge-worker", addr, KindWorker, env)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.WaitReady(ctx, 60*time.Second); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
