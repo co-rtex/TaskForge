@@ -52,8 +52,14 @@ internal/<domain>/     Library code. Not importable outside this module.
 migrations/            Versioned, forward-only SQL. Never edit an applied file.
 api/                   OpenAPI description of implemented endpoints only.
 scripts/               Developer scripts. scripts/demo is the Go program behind
-                       `make demo` and `make demo-failure`: deliberately not under
-                       cmd/, so `make build` neither builds nor ships it.
+                       `make demo` and `make demo-failure`, and scripts/bench the
+                       one behind `make bench` and `make bench-smoke`: deliberately
+                       not under cmd/, so `make build` neither builds nor ships
+                       them. scripts/internal/stack is the hermetic stack of real
+                       processes both run; scripts/readdb is the read-only database
+                       access and the measurement queries they and
+                       tests/integration share (it is not under internal/ because
+                       Go would then keep tests/integration out).
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
 tests/verification/    Infrastructure-free checks over the repository's own
                        documentation: the verification-matrix drift check.
@@ -89,6 +95,8 @@ make test-race         # race detector
 make build             # compile all binaries into ./bin
 make demo              # success demonstration: succeed, retry, dead-letter
 make demo-failure      # failure demonstration: a killed and a frozen worker
+make bench             # the recorded benchmark: throughput, then faults (clean tree, ~25 min)
+make bench-smoke       # the benchmark harness in miniature: ~1 min, records nothing
 ```
 
 `make demo` and `make demo-failure` build the binaries, start the infrastructure,
@@ -97,6 +105,17 @@ its own services on free loopback ports, with a broker queue and a key scope of
 its own, asserts only on the jobs it submitted, never deletes or truncates
 anything, stops everything it started on every way out, and exits non-zero if any
 expectation fails. They leave the infrastructure up; `make down` is separate.
+
+`make bench` builds the binaries, starts the infrastructure, migrates, and runs
+`go run ./scripts/bench throughput faults --record`. It refuses to start unless
+`git status --porcelain` is empty and every binary in `bin/` was built from
+`HEAD`; measures every instant on PostgreSQL's clock; uses the shipped default
+timings unless a labelled `--profile tuned` run is asked for; and writes
+`docs/benchmarks/<date>-<sha>.md` and `.json`, never overwriting one. A missed
+target is recorded as missed, not re-run. `make bench-smoke` asserts that the
+harness measured validly and records nothing; it is the only part CI runs, and CI
+never records numbers. The definitions are in
+[ADR-0020](docs/adr/0020-benchmark-methodology.md).
 
 The Python SDK has its own targets. They are deliberately **not** folded into
 `fmt`, `lint` and `test`, which stay Go-only so a Go contributor — and the fast
