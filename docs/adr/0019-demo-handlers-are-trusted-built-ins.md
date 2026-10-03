@@ -63,10 +63,12 @@ What a key holder can do with these handlers, and what it cannot.
 - **No new code can run.** The handlers are compiled in. This ADR changes which
   trusted code is compiled into the binary, not the rule that only such code
   runs.
-- **A payload is data.** Each handler decodes it into a struct of one field and
-  acts on nothing else. Neither reaches a shell, the filesystem, or the network,
-  and neither calls anything beyond the standard library's JSON decoder and a
-  timer.
+- **A payload is data.** Each handler accepts a single JSON object with exactly
+  one documented member, spelled exactly (`encoding/json` would match a key
+  case-insensitively) and never repeated (it would keep the last of two), and
+  decodes that member's value and nothing else. Neither reaches a shell, the
+  filesystem, or the network, and neither calls anything beyond the standard
+  library's JSON decoder and a timer.
 - **A key holder can make its own scope's jobs sleep or fail, and that is all.**
   A job belongs to the scope of the key that submitted it, and is claimed only by
   a worker registered under a worker key for that same scope (`Claim` selects on

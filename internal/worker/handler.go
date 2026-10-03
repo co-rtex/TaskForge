@@ -164,26 +164,78 @@ const (
 // accepts and can never complete.
 const maxDemoSleepMillis = int64(jobs.MaxTimeoutSeconds) * 1000
 
-// decodeDemoPayload strictly decodes a demonstration handler's payload into
-// target. It rejects a field the target does not declare, a value of the wrong
-// type, and anything after the object, so the accepted payloads are exactly the
-// documented shape and nothing a caller could smuggle alongside it.
+// decodeDemoPayload strictly decodes a demonstration handler's payload into its
+// members, keyed by their exact names, and returns them undecoded. It rejects a
+// payload that is not a single JSON object, one whose key set is not exactly
+// wantKeys, a repeated key, and anything after the object, so the accepted
+// payloads are exactly the documented shape and nothing a caller could smuggle
+// alongside it. The caller then decodes each value.
 //
 // Strictness matters more here than for a typical handler because these run
 // inside the production worker for every scope (ADR-0019): what they accept is
 // the whole of what a key holder can ask of them.
-func decodeDemoPayload(payload json.RawMessage, target any) error {
+//
+// Why not decode into a struct, or into a map with json.Unmarshal. encoding/json
+// matches a struct field to a key case-insensitively, so {"DURATION_MS": 5}
+// would be read as duration_ms; and both it and a map assignment resolve a
+// repeated key to its last value, so {"duration_ms": 5, "duration_ms": 6} would
+// run as 6 when the first member said 5. Neither is wrong by JSON's rules, but a
+// payload that means two things is not one these handlers should act on. The
+// object is therefore walked token by token: each key is compared as the exact
+// string JSON decodes it to (whitespace and escapes such as \u005f are not part of
+// the key), and a key seen twice is an error as it arrives.
+func decodeDemoPayload(payload json.RawMessage, wantKeys ...string) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
+
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := opening.(json.Delim); !ok || delim != '{' {
+		return nil, errors.New("the payload is not a JSON object")
+	}
+
+	members := map[string]json.RawMessage{}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, errors.New("an object member has no name")
+		}
+		// Deliberately not echoed: the key is caller data (AGENTS.md section 10).
+		if _, repeated := members[key]; repeated {
+			return nil, errors.New("a member name is repeated")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		members[key] = value
+	}
+	if _, err := decoder.Token(); err != nil { // the closing brace
+		return nil, err
 	}
 	// Decode stops after the first value. Anything further is either a second
 	// object or garbage, and neither is the documented payload.
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("unexpected data after the payload object")
+		return nil, errors.New("unexpected data after the payload object")
 	}
-	return nil
+
+	// Exactly the documented key set: none missing, none extra. Keys are exact
+	// strings in the map, so a wrong-case spelling is an extra key here and its
+	// correctly spelled twin, if absent, is a missing one.
+	if len(members) != len(wantKeys) {
+		return nil, errors.New("the payload does not have exactly the documented members")
+	}
+	for _, key := range wantKeys {
+		if _, present := members[key]; !present {
+			return nil, errors.New("the payload does not have exactly the documented members")
+		}
+	}
+	return members, nil
 }
 
 // DemoSleep waits for the requested number of milliseconds and reports how long
@@ -198,18 +250,19 @@ func decodeDemoPayload(payload json.RawMessage, target any) error {
 type DemoSleep struct{}
 
 func (DemoSleep) Execute(ctx context.Context, execution Execution) (json.RawMessage, error) {
-	var request struct {
-		// A pointer so an absent or null field is distinguishable from zero, which
-		// is itself out of range.
-		DurationMS *int64 `json:"duration_ms"`
+	members, err := decodeDemoPayload(execution.Payload, "duration_ms")
+	if err != nil {
+		return nil, Permanent(invalidPayloadCode, demoSleepPayloadMessage)
 	}
-	if err := decodeDemoPayload(execution.Payload, &request); err != nil ||
-		request.DurationMS == nil ||
-		*request.DurationMS < 1 || *request.DurationMS > maxDemoSleepMillis {
+	// A pointer so a null is distinguishable from zero, which is itself out of
+	// range. A value of the wrong type, or one past int64, fails to decode.
+	var durationMS *int64
+	if err := json.Unmarshal(members["duration_ms"], &durationMS); err != nil ||
+		durationMS == nil || *durationMS < 1 || *durationMS > maxDemoSleepMillis {
 		return nil, Permanent(invalidPayloadCode, demoSleepPayloadMessage)
 	}
 
-	timer := time.NewTimer(time.Duration(*request.DurationMS) * time.Millisecond)
+	timer := time.NewTimer(time.Duration(*durationMS) * time.Millisecond)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -218,7 +271,7 @@ func (DemoSleep) Execute(ctx context.Context, execution Execution) (json.RawMess
 	}
 	return json.Marshal(struct {
 		SleptMS int64 `json:"slept_ms"`
-	}{SleptMS: *request.DurationMS})
+	}{SleptMS: *durationMS})
 }
 
 // DemoFail fails every time, in the class its payload names. It exists so the
@@ -231,13 +284,15 @@ func (DemoSleep) Execute(ctx context.Context, execution Execution) (json.RawMess
 type DemoFail struct{}
 
 func (DemoFail) Execute(_ context.Context, execution Execution) (json.RawMessage, error) {
-	var request struct {
-		Class *string `json:"class"`
-	}
-	if err := decodeDemoPayload(execution.Payload, &request); err != nil || request.Class == nil {
+	members, err := decodeDemoPayload(execution.Payload, "class")
+	if err != nil {
 		return nil, Permanent(invalidPayloadCode, demoFailPayloadMessage)
 	}
-	switch *request.Class {
+	var class *string
+	if err := json.Unmarshal(members["class"], &class); err != nil || class == nil {
+		return nil, Permanent(invalidPayloadCode, demoFailPayloadMessage)
+	}
+	switch *class {
 	case "retryable":
 		return nil, Retryable(demoFailureCode, demoFailRetryableMessage)
 	case "permanent":
