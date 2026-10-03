@@ -92,6 +92,11 @@ var requiredBinaries = []string{
 	"taskforge-reconciler", "taskforge-worker", "taskforge-cli",
 }
 
+// RequiredBinaries is the names of the binaries a stack runs, for a caller that
+// wants to check them (the benchmark verifies each was built from the commit it
+// records). The slice is a copy.
+func RequiredBinaries() []string { return append([]string(nil), requiredBinaries...) }
+
 // New resolves the infrastructure, checks the binaries exist, and chooses the
 // run's names and ports. It starts nothing.
 func New(opts Options) (*Stack, error) {
