@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure bench bench-smoke \
+        demo demo-failure bench bench-smoke images \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -117,6 +117,23 @@ bench: build up migrate ## Run the full benchmark and record it in docs/benchmar
 
 bench-smoke: build up migrate ## Smoke-test the benchmark harness: about a minute, records nothing, fails if it measured wrongly
 	$(KEEP_AWAKE) $(GO) run ./scripts/bench smoke
+
+# The six service images (the root Dockerfile): api, outbox, scheduler,
+# reconciler, worker and migrate, tagged taskforge-<service>:dev with the commit
+# in the org.opencontainers.image.revision label. It depends on dash-build because
+# the api embeds internal/dashboard/dist: a clean clone has only .gitkeep there,
+# and an api image built without the dashboard would serve a placeholder page.
+# See docs/adr/0021-container-images-and-supply-chain-scanning.md.
+IMAGE_SERVICES := api outbox scheduler reconciler worker migrate
+IMAGE_REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+
+images: dash-build ## Build the six service images as taskforge-<service>:dev (builds the dashboard first)
+	@set -e; for svc in $(IMAGE_SERVICES); do \
+		echo "==> taskforge-$$svc:dev"; \
+		$(DOCKER) build --target $$svc --build-arg REVISION=$(IMAGE_REVISION) --tag taskforge-$$svc:dev .; \
+	done
+	@$(DOCKER) image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' | \
+		awk 'NR==1 || /^taskforge-(api|outbox|scheduler|reconciler|worker|migrate):dev/'
 
 sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
 	$(PYTHON) -m venv $(SDK_VENV)
