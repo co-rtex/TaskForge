@@ -72,12 +72,19 @@ func parseNpmAudit(data []byte) (scanResult, error) {
 			if json.Unmarshal(raw, &advisory) != nil || advisory.Source == 0 && advisory.URL == "" {
 				continue // a string: a dependency this package is vulnerable through
 			}
-			if severityRank[advisory.Severity] < severityRank[npmThreshold] {
-				continue
-			}
 			id := path.Base(advisory.URL)
 			if !strings.HasPrefix(id, "GHSA-") {
 				id = fmt.Sprintf("npm:%d", advisory.Source)
+			}
+			// A severity this driver does not know cannot be judged against the
+			// threshold. Treating it as below the threshold would let an unrecognised
+			// severity through, so it fails closed.
+			rank, known := severityRank[advisory.Severity]
+			if !known {
+				return scanResult{}, fmt.Errorf("npm audit advisory %s has an unknown severity %q (known: info, low, moderate, high, critical)", id, advisory.Severity)
+			}
+			if rank < severityRank[npmThreshold] {
+				continue
 			}
 			if seen[id] {
 				continue

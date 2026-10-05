@@ -186,6 +186,33 @@ func TestParseNpmAudit_HighAndCriticalAdvisoriesCountAndModerateOnesDoNot(t *tes
 	require.Contains(t, got.Findings[0].Location+got.Findings[1].Location, "vite")
 }
 
+// An advisory whose severity this driver does not know cannot be judged against the
+// threshold, and a parser that treated it as below the threshold would let an
+// unrecognised severity through. It fails closed, naming the severity.
+func npmAdvisoryWithSeverity(severity string) string {
+	return `{"auditReportVersion":2,"vulnerabilities":{"vite":{"name":"vite","severity":"high","range":"<5.4.20",
+	  "via":[{"source":1100001,"name":"vite","title":"Path traversal","url":"https://github.com/advisories/GHSA-aaaa-1111-bbbb","severity":"` + severity + `","range":"<5.4.20"}]}},
+	  "metadata":{"dependencies":{"prod":4}}}`
+}
+
+func TestParseNpmAudit_AnAdvisoryWithAnUnknownSeverityFailsClosed(t *testing.T) {
+	for name, severity := range map[string]string{"empty": "", "unknown": "unknown", "capitalised": "High", "a typo": "hihg"} {
+		_, err := parseNpmAudit([]byte(npmAdvisoryWithSeverity(severity)))
+		require.Errorf(t, err, "severity %q (%s) must be an error, not a skipped advisory", severity, name)
+		require.ErrorContains(t, err, "severity")
+		require.ErrorContains(t, err, "GHSA-aaaa-1111-bbbb", "the message names the advisory")
+		require.ErrorContains(t, err, `"`+severity+`"`, "and the severity it could not read")
+	}
+}
+
+func TestParseNpmAudit_EveryKnownSeverityIsStillJudgedAgainstTheThreshold(t *testing.T) {
+	for severity, counts := range map[string]bool{"info": false, "low": false, "moderate": false, "high": true, "critical": true} {
+		got, err := parseNpmAudit([]byte(npmAdvisoryWithSeverity(severity)))
+		require.NoErrorf(t, err, severity)
+		require.Equalf(t, counts, len(got.Findings) == 1, "severity %s", severity)
+	}
+}
+
 func TestParseNpmAudit_TheRecordedCleanRunHasNoFindings(t *testing.T) {
 	got, err := parseNpmAudit(fixture(t, "npm-audit-clean.json"))
 	require.NoError(t, err)

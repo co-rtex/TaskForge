@@ -50,8 +50,19 @@ const (
 // the command is run from.
 const defaultExceptions = "security/scan-exceptions.yaml"
 
+// sourceOptions are the settings a live source reads from the command line.
+type sourceOptions struct {
+	// pipAuditLock is the hash-locked requirements file pip-audit is installed from.
+	pipAuditLock string
+}
+
+// defaultPipAuditLock is where pip-audit's hash-locked tree is committed, relative to
+// the repository root the command is run from. The version of pip-audit is the
+// `pip-audit==` line in that file and nowhere else.
+const defaultPipAuditLock = "security/pip-audit.requirements.txt"
+
 // source produces one tool's raw machine-readable output, or says why it could not.
-type source func(ctx context.Context) ([]byte, error)
+type source func(ctx context.Context, opts sourceOptions) ([]byte, error)
 
 // parser turns a tool's raw output into findings, or says why it is not that
 // tool's report.
@@ -72,6 +83,8 @@ tools: govulncheck gitleaks pip-audit npm-audit (default: all four)
 
 flags:
   -exceptions path          the exceptions file (default security/scan-exceptions.yaml)
+  -pip-audit-lock path      the hash-locked requirements pip-audit is installed from
+                            (default security/pip-audit.requirements.txt)
   -govulncheck-report path  read recorded govulncheck -json output instead of running it
   -gitleaks-report path     read a recorded gitleaks JSON report instead of running it
   -pip-audit-report path    read a recorded pip-audit JSON report instead of running it
@@ -84,6 +97,7 @@ func run(args []string, stdout, stderr io.Writer, now time.Time, sources map[str
 	flags := flag.NewFlagSet("scan", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	exceptionsPath := flags.String("exceptions", defaultExceptions, "")
+	pipAuditLock := flags.String("pip-audit-lock", defaultPipAuditLock, "")
 	reports := map[string]*string{}
 	for _, tool := range knownTools {
 		reports[tool] = flags.String(tool+"-report", "", "")
@@ -137,7 +151,7 @@ func run(args []string, stdout, stderr io.Writer, now time.Time, sources map[str
 		if !slices.Contains(selected, tool) {
 			continue
 		}
-		data, err := obtain(ctx, tool, *reports[tool], sources)
+		data, err := obtain(ctx, tool, *reports[tool], sources, sourceOptions{pipAuditLock: *pipAuditLock})
 		if err != nil {
 			fail(tool, "-", "could not run: "+err.Error())
 			continue
@@ -182,7 +196,7 @@ func exceptionKey(e Exception) string { return e.Tool + "\x00" + e.ID }
 
 // obtain returns a tool's raw output: from a recorded report if one was named,
 // otherwise from the tool's source.
-func obtain(ctx context.Context, tool, reportPath string, sources map[string]source) ([]byte, error) {
+func obtain(ctx context.Context, tool, reportPath string, sources map[string]source, opts sourceOptions) ([]byte, error) {
 	if reportPath != "" {
 		return os.ReadFile(reportPath)
 	}
@@ -190,5 +204,5 @@ func obtain(ctx context.Context, tool, reportPath string, sources map[string]sou
 	if !ok {
 		return nil, fmt.Errorf("no way to run %s was provided", tool)
 	}
-	return src(ctx)
+	return src(ctx, opts)
 }

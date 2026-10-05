@@ -25,7 +25,7 @@ func cleanSources(t *testing.T) map[string]source {
 }
 
 func staticSource(data []byte) source {
-	return func(context.Context) ([]byte, error) { return data, nil }
+	return func(context.Context, sourceOptions) ([]byte, error) { return data, nil }
 }
 
 func writeExceptions(t *testing.T, doc string) string {
@@ -137,7 +137,9 @@ func TestRun_AMalformedExceptionsFileFailsAndSaysWhy(t *testing.T) {
 // A scan that could not run is not a scan that found nothing.
 func TestRun_AToolThatCannotRunFailsTheScan(t *testing.T) {
 	sources := cleanSources(t)
-	sources[toolGitleaks] = func(context.Context) ([]byte, error) { return nil, errors.New("docker: command not found") }
+	sources[toolGitleaks] = func(context.Context, sourceOptions) ([]byte, error) {
+		return nil, errors.New("docker: command not found")
+	}
 
 	code, out := runScan(t, writeExceptions(t, noExceptions), sources)
 
@@ -222,11 +224,27 @@ func TestRun_EveryLineOfOutputForAFindingNamesToolIdLocationAndStatus(t *testing
 	}
 }
 
+// The hash-locked file that pip-audit is installed from is a path the driver is told,
+// so that a check can hand it a damaged copy and watch the install refuse it (B3-m).
+func TestRun_PassesThePipAuditLockPathToItsSource(t *testing.T) {
+	var got sourceOptions
+	sources := map[string]source{toolPipAudit: func(_ context.Context, opts sourceOptions) ([]byte, error) {
+		got = opts
+		return fixture(t, "pip-audit-clean.json"), nil
+	}}
+
+	code, out := runScan(t, writeExceptions(t, noExceptions), sources, "pip-audit")
+	require.Equal(t, exitPassed, code, out)
+	require.Equal(t, defaultPipAuditLock, got.pipAuditLock, "the default is the committed lock")
+
+	_, out = runScan(t, writeExceptions(t, noExceptions), sources, "-pip-audit-lock", "/tmp/damaged.txt", "pip-audit")
+	require.Equal(t, "/tmp/damaged.txt", got.pipAuditLock, out)
+}
+
 // --- pins -----------------------------------------------------------------------
 
 func TestEveryToolIsPinnedExactly(t *testing.T) {
 	require.Regexp(t, `^v\d+\.\d+\.\d+$`, govulncheckVersion, "govulncheck is run at an exact tag, never @latest")
-	require.Regexp(t, `^\d+\.\d+\.\d+$`, pipAuditVersion, "pip-audit is installed with ==")
 	require.Regexp(t, `^ghcr\.io/gitleaks/gitleaks:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$`, gitleaksImage,
 		"gitleaks runs from its container image, by version and digest; not gitleaks-action, which needs a licence for organisations")
 }

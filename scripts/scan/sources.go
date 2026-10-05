@@ -23,8 +23,6 @@ const (
 	// Go in go.mod. Raise this when go.mod's Go does.
 	govulncheckVersion = "v1.7.0"
 
-	pipAuditVersion = "2.10.1"
-
 	// gitleaks runs from its published container image, pinned by version and by
 	// multi-platform index digest. It is deliberately not gitleaks-action, which
 	// needs a licence for organisations.
@@ -87,7 +85,7 @@ var goDirective = regexp.MustCompile(`(?m)^go\s+(\d+\.\d+(?:\.\d+)?)\s*$`)
 // with a newer Go the scan would pass for a toolchain the images are not built
 // with; GOTOOLCHAIN pins it to the one the Dockerfile and CI use. With -json it
 // exits 0 whether or not it found anything, so any other exit is the tool failing.
-func runGovulncheck(ctx context.Context) ([]byte, error) {
+func runGovulncheck(ctx context.Context, _ sourceOptions) ([]byte, error) {
 	mod, err := os.ReadFile(goModFile)
 	if err != nil {
 		return nil, err
@@ -112,7 +110,17 @@ func runGovulncheck(ctx context.Context) ([]byte, error) {
 // --redact keeps the secrets out of the report, and --exit-code 0 makes a finding a
 // report entry and not a process failure, so that a non-zero exit means gitleaks
 // itself failed.
-func runGitleaks(ctx context.Context) ([]byte, error) {
+func runGitleaks(ctx context.Context, _ sourceOptions) ([]byte, error) {
+	// A shallow clone holds part of the history, and a scan of part of it is not a
+	// scan of the history. This is checked first, before anything is mounted.
+	shallow := execute(ctx, "", nil, "git", "rev-parse", "--is-shallow-repository")
+	if shallow.err != nil {
+		return nil, shallow.err
+	}
+	if problem := shallowProblem(string(shallow.stdout)); problem != "" {
+		return nil, errors.New(problem)
+	}
+
 	config, err := filepath.Abs(gitleaksConfig)
 	if err != nil {
 		return nil, err
@@ -149,20 +157,60 @@ func runGitleaks(ctx context.Context) ([]byte, error) {
 	return os.ReadFile(filepath.Join(out, "report.json"))
 }
 
+// pipAuditInstallArgs is the argument list that installs the scanner into its own
+// virtual environment: from the committed hash-locked file, with --require-hashes so
+// that pip refuses any file whose hash is not in the lock, --no-deps so that it
+// resolves nothing beside the lock, and --only-binary=:all: so that a wheel failing its
+// hash is a failure. Without that last one, pip silently skips a wheel whose hash does
+// not match and falls back to the source distribution (whose hash is also in the lock),
+// then builds it with build dependencies the lock does not cover: a tampered wheel
+// would become a quiet downgrade instead of an error. No requirement is named on the
+// command line. It is a function so that a test can read the arguments the driver uses.
+func pipAuditInstallArgs(toolPython, lockFile string) []string {
+	return []string{toolPython, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+		"--require-hashes", "--only-binary=:all:", "--no-deps", "-r", lockFile}
+}
+
+// shallowProblem judges the answer of `git rev-parse --is-shallow-repository`. Anything
+// but exactly "false" refuses: "true" because the history is partial, and anything else
+// (git older than 2.15 echoes the option back) because failing to find out cannot be
+// allowed to read as "not shallow".
+func shallowProblem(output string) string {
+	switch strings.TrimSpace(output) {
+	case "false":
+		return ""
+	case "true":
+		return "shallow clone: gitleaks would scan partial history; fetch full history"
+	}
+	return fmt.Sprintf("could not tell whether this is a shallow clone (git said %q); gitleaks needs the full history", strings.TrimSpace(output))
+}
+
 // runPipAudit audits the Python SDK's runtime dependency tree.
 //
 // It installs the SDK into a clean virtual environment, so the tree audited is the
 // one a user gets, resolved at the moment of the scan, and not the development
 // tools beside it. The SDK has no lockfile; this resolution is the closest thing to
-// what `pip install` would deliver. The project itself is left out of the list (it
-// is not on an index), and pip-audit is told not to resolve again.
+// what `pip install` would deliver. That tree is deliberately unlocked: it is what is
+// being examined. The SCANNER is the opposite: pip-audit and its whole dependency tree
+// are installed from a committed file in which every package is pinned and every
+// distribution file is hash-locked, so the check that looks for a compromised
+// dependency does not itself run whatever PyPI serves that day. The project itself is
+// left out of the audited list (it is not on an index), and pip-audit is told not to
+// resolve again.
 //
 // pip-audit exits 1 when it finds something, with the report on standard output, so
 // exit 1 with output is handed to the parser, which decides.
-func runPipAudit(ctx context.Context) ([]byte, error) {
+func runPipAudit(ctx context.Context, opts sourceOptions) ([]byte, error) {
 	sdk, err := filepath.Abs(sdkDir)
 	if err != nil {
 		return nil, err
+	}
+	lock, err := filepath.Abs(firstNonEmpty(opts.pipAuditLock, defaultPipAuditLock))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(lock); err != nil {
+		return nil, fmt.Errorf("the hash-locked pip-audit requirements are missing: %w", err)
 	}
 	work, err := os.MkdirTemp("", "scan-pip-audit-")
 	if err != nil {
@@ -172,11 +220,12 @@ func runPipAudit(ctx context.Context) ([]byte, error) {
 
 	sdkPython := filepath.Join(work, "sdk", "bin", "python")
 	toolDir := filepath.Join(work, "tool")
+	toolPython := filepath.Join(toolDir, "bin", "python")
 	for _, step := range [][]string{
 		{"python3", "-m", "venv", filepath.Join(work, "sdk")},
 		{sdkPython, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", sdk},
 		{"python3", "-m", "venv", toolDir},
-		{filepath.Join(toolDir, "bin", "python"), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "pip-audit==" + pipAuditVersion},
+		pipAuditInstallArgs(toolPython, lock),
 	} {
 		if res := execute(ctx, "", nil, step[0], step[1:]...); res.err != nil {
 			return nil, res.err
@@ -210,7 +259,7 @@ func runPipAudit(ctx context.Context) ([]byte, error) {
 // container: it builds the audit-report stage of dashboard/Dockerfile and reads the
 // report out of it. --no-cache-filter makes the audit run every time; a cached
 // layer would report the advisory database as it was when the layer was built.
-func runNpmAudit(ctx context.Context) ([]byte, error) {
+func runNpmAudit(ctx context.Context, _ sourceOptions) ([]byte, error) {
 	out, err := os.MkdirTemp("", "scan-npm-audit-")
 	if err != nil {
 		return nil, err

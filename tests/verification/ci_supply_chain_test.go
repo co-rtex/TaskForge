@@ -69,7 +69,7 @@ func TestCI_NoToolIsFetchedByAFloatingVersionOrThroughGitleaksAction(t *testing.
 
 	require.NotContains(t, text, "gitleaks/gitleaks-action", "gitleaks-action needs a licence for organisations; the scan runs the pinned container")
 	require.NotRegexp(t, `@latest\b`, text, "a Go tool installed @latest is a different tool tomorrow")
-	require.NotContains(t, text, "pip install pip-audit", "pip-audit is installed, at an exact version, by the scan driver; CI does not install a second copy")
+	require.NotContains(t, text, "pip install pip-audit", "pip-audit is installed by the scan driver, from the hash-locked file; CI does not install a second, unlocked copy")
 }
 
 func TestCI_TheImagesJobBuildsTheSixImagesAndRunsTheSmokeAgainstItsOwnInfrastructure(t *testing.T) {

@@ -574,7 +574,8 @@ jobs:
   # identically in both places (security/scan-exceptions.yaml for govulncheck, pip-audit
   # and npm audit; .gitleaks.toml for gitleaks). Every tool is pinned inside the driver:
   # govulncheck at an exact tag, gitleaks by container digest (not gitleaks-action,
-  # which needs a licence for organisations), pip-audit with ==, and npm audit in
+  # which needs a licence for organisations), pip-audit and its whole dependency tree
+  # from a hash-locked file (security/pip-audit.requirements.txt), and npm audit in
   # the Node image dashboard/Dockerfile pins. See docs/adr/0021.
   # ---------------------------------------------------------------------------
   scan:
