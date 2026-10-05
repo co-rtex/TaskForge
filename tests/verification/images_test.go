@@ -276,4 +276,12 @@ func TestMakefile_ImagesBuildsAfterTheDashboardIsBuilt(t *testing.T) {
 	require.Contains(t, strings.Fields(rule[1]), "dash-build", "make images must depend on dash-build")
 
 	require.Regexp(t, `(?m)^images:.*##`, text, "images needs a ## help line")
+
+	// The smoke inspects and runs the built images, so it builds them first and
+	// needs the infrastructure for the migrate and api checks.
+	smoke := regexp.MustCompile(`(?m)^images-smoke:\s*(.*?)\s*(?:##.*)?$`).FindStringSubmatch(text)
+	require.NotNil(t, smoke, "the Makefile needs an images-smoke target")
+	require.Contains(t, strings.Fields(smoke[1]), "images")
+	require.Contains(t, strings.Fields(smoke[1]), "up")
+	require.Regexp(t, `(?m)^images-smoke:.*##`, text, "images-smoke needs a ## help line")
 }

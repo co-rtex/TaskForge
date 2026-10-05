@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure bench bench-smoke images \
+        demo demo-failure bench bench-smoke images images-smoke \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -134,6 +134,13 @@ images: dash-build ## Build the six service images as taskforge-<service>:dev (b
 	done
 	@$(DOCKER) image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' | \
 		awk 'NR==1 || /^taskforge-(api|outbox|scheduler|reconciler|worker|migrate):dev/'
+
+# Inspects and runs the six images: non-root user, labels, only the service's own
+# binary, rejection of an invalid configuration, the migrate image against
+# PostgreSQL, and the api serving the real dashboard. It builds the images first and
+# needs the infrastructure up. See scripts/imagesmoke and ADR-0021.
+images-smoke: images up ## Check the six images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard
+	$(GO) run ./scripts/imagesmoke
 
 sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
 	$(PYTHON) -m venv $(SDK_VENV)
