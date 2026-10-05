@@ -24,7 +24,7 @@ evidence matter more than feature count.
 
 | Concern | Choice |
 | --- | --- |
-| Services | Go (see `go.mod` for the pinned language version) |
+| Services | Go (see `go.mod`, which names an exact patch release; the `Dockerfile`'s builder image must match it, and a test enforces that) |
 | Database | PostgreSQL 16, accessed with `pgx/v5` and explicit SQL |
 | Broker | SQS-compatible; ElasticMQ locally, AWS SQS Standard as the cloud direction |
 | Local orchestration | Docker Compose |
@@ -34,6 +34,8 @@ evidence matter more than feature count.
 | Python tooling | `ruff format` (authoritative), `ruff check`, `mypy --strict` |
 | Operator dashboard | React + TypeScript built by Vite, embedded into `taskforge-api` with `go:embed`; Node runs **only** inside the digest-pinned image in `dashboard/Dockerfile` |
 | Dashboard tooling | Biome (`biome ci`, authoritative formatter and linter), `tsc --noEmit`, Vitest |
+| Container images | One root `Dockerfile`: a digest-pinned `golang` builder and a digest-pinned `distroless/static-debian12:nonroot` base, six targets, no CLI image |
+| Supply-chain scanning | `scripts/scan` driving govulncheck, gitleaks (pinned container), pip-audit and npm audit (in the dashboard's pinned Node), with one exceptions file |
 
 Required to build and run: Git, Go, Docker, Docker Compose, GNU Make.
 Additionally required to build or test the Python SDK in `sdk/python`: a
@@ -97,6 +99,9 @@ make demo              # success demonstration: succeed, retry, dead-letter
 make demo-failure      # failure demonstration: a killed and a frozen worker
 make bench             # the recorded benchmark: throughput, then faults (clean tree, ~25 min)
 make bench-smoke       # the benchmark harness in miniature: ~1 min, records nothing
+make images            # build the dashboard, then the six service images as taskforge-<service>:dev
+make images-smoke      # build the images, then inspect and run them (needs `make up`)
+make scan              # govulncheck, gitleaks, pip-audit and npm audit; blocks on any unexcepted finding
 ```
 
 `make demo` and `make demo-failure` build the binaries, start the infrastructure,
@@ -118,6 +123,23 @@ target is recorded as missed, not re-run. `make bench-smoke` asserts that the
 harness measured validly and records nothing; it is the only part CI runs, and CI
 never records numbers. The definitions are in
 [ADR-0020](docs/adr/0020-benchmark-methodology.md).
+
+`make images` builds `internal/dashboard/dist` first (the api embeds it; a clean
+clone has only a placeholder) and then one image per service from the root
+`Dockerfile`, each labelled with the commit. `make images-smoke` runs
+`go run ./scripts/imagesmoke`: every image must run as a non-root user, hold only its
+own binary, and reject an invalid configuration with the specific message; the
+migrate image must leave PostgreSQL at the embedded schema version; and the api image
+must serve the dashboard build it was built with. Nothing is pushed anywhere.
+
+`make scan` runs `go run ./scripts/scan`: govulncheck (reachable findings only, under
+the Go that `go.mod` declares), gitleaks over the full git history, pip-audit over
+the SDK's runtime tree, and npm audit over the dashboard's production dependencies.
+Any finding without an entry in `security/scan-exceptions.yaml`, and any entry that is
+malformed or has expired, fails it. It needs Docker, Python 3 and the network. **A real
+secret is never added to `.gitleaks.toml` or the exceptions file:** revoke it. The
+decisions are in
+[ADR-0021](docs/adr/0021-container-images-and-supply-chain-scanning.md).
 
 The Python SDK has its own targets. They are deliberately **not** folded into
 `fmt`, `lint` and `test`, which stay Go-only so a Go contributor — and the fast

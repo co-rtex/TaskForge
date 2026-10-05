@@ -606,12 +606,16 @@ which is where `make demo` belongs.
 M8 as originally written bundles three different things: measuring (a harness
 and a methodology, and a machine to run them on), hardening CI (images, scanners,
 and two gates M7A deferred), and deployment (a trust-boundary decision and
-infrastructure that costs money). It is split into three slices so each ships on
-its own evidence, the way M5, M6 and M7 were. The original objective,
-deliverables, and acceptance sentence are preserved across M8A, M8B and M8C, not
-reduced.
+infrastructure that costs money). It is split into slices so each ships on its own
+evidence, the way M5, M6 and M7 were: M8A measures, M8B is the supply chain
+(images and scanning), M8D carries the two gates M7A deferred together with four
+items the M8A review raised, and M8C is deployment. The original objective,
+deliverables, and acceptance sentence are preserved across them, not reduced.
 
-**Status:** M8A is complete; see PR #21. M8B and M8C are planned.
+**Order: M8B, then M8D, then M8C.** M8C keeps its name.
+
+**Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D and M8C
+are planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -640,21 +644,52 @@ production behavior, the schema, the API, OpenAPI, the SDK, the dashboard or the
 runner other than the demo handlers' payload decoding. A saturation search is not
 in scope either: the owner fixed the workload and the offered load.
 
-#### M8B — CI hardening
-**Objective.** Make CI cover what the original M8 listed and close the two gates
-M7A deferred.
-**Deliverables.** Dockerfiles for the services; image builds in CI; secret and
-dependency scanning; and, carried from M7A, a route registry inside `Handler()`
-checked against `api/openapi.yaml` so that a route added to one and not the other
-fails, and a verification-matrix drift check that finds the cited assertion in the
-syntax tree instead of trusting a line number (see
-[VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)).
-**Acceptance.** CI covers fmt, vet, unit, race, migrations, integration, e2e,
-SDK, frontend, Docker builds, and secret and dependency scanning, and no workflow
-is permanently failing; the route table and `api/openapi.yaml` are checked
-against each other in both directions; the drift check fails on a cited line that
-is inside the named test but is not an assertion.
+#### M8B — Supply chain (container images and scanning)
+**Objective.** Make the repository build container images and scan its supply
+chain, with scanners that block CI.
+**Deliverables.** One root `Dockerfile` with a builder stage and one final target
+per service (api, outbox, scheduler, reconciler, worker, migrate; no CLI image) on
+a digest-pinned distroless nonroot base, built after `make dash-build`; `make
+images` and `make images-smoke` (`scripts/imagesmoke`); a drift check between the
+Dockerfile's Go version and `go.mod`; `scripts/scan` and `make scan`, which run
+govulncheck, gitleaks, pip-audit and npm audit at pinned versions and apply one
+committed exceptions file, `security/scan-exceptions.yaml`; `.gitleaks.toml`; the
+`images` and `scan` jobs in CI; and
+[ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md).
+**Acceptance.** CI builds the six images and checks that each runs as a non-root
+user, rejects an invalid configuration with the specific message, and that the
+migrate image leaves PostgreSQL at the embedded schema version and the api image
+serves the real dashboard build; the four scanners block CI on any finding without
+a valid, unexpired exception; and no workflow is permanently failing.
 **Depends on.** M8A.
+**Status:** complete; see PR #22 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited.
+
+Deliberately **not** in scope: any change to production code, the schema, the API,
+OpenAPI, the SDK or the dashboard; a registry push or registry credentials;
+multi-architecture builds in CI; an image vulnerability scanner; Dependabot; and the
+items that moved to M8D.
+
+#### M8D — The two gates M7A deferred, and the M8A review items
+**Objective.** Close the two gates M7A deferred and four items the M8A review
+raised.
+**Deliverables.** A route registry inside `Handler()` checked against
+`api/openapi.yaml` so that a route added to one and not the other fails, in both
+directions; a verification-matrix drift check that finds the cited assertion in the
+syntax tree instead of trusting a line number (see
+[VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)); and the four items carried from
+the M8A review:
+- ADR-0020's justification of the throughput tolerance, and the wording of
+  [PROJECT_SPEC.md](PROJECT_SPEC.md) §7 for that target: "kept pace with offered
+  load; headroom not measured";
+- an investigation of the 50.04 s worker-failure recovery outlier;
+- the benchmark record renderer's extra newline;
+- the run-time estimate in [AGENTS.md](../AGENTS.md).
+**Acceptance.** The route table and `api/openapi.yaml` are checked against each
+other in both directions; the drift check fails on a cited line that is inside the
+named test but is not an assertion; and each of the four review items is closed or
+recorded as deliberately left.
+**Depends on.** M8B.
 **Status:** planned.
 
 #### M8C — Deployment
@@ -669,10 +704,18 @@ whether the demonstration handlers are gated in a deployed worker
 ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
 a gate open).
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8B. **Needs its own owner decision before any work starts:** the
-bind, `/internal` and the handler gate are trust-boundary decisions, and the
-infrastructure costs money.
+**Depends on.** M8B; follows M8D in the owner's order (M8B, M8D, M8C). **Needs its
+own owner decision before any work starts:** the bind, `/internal` and the handler
+gate are trust-boundary decisions, and the infrastructure costs money.
 **Status:** planned.
+
+**Open product decision, not part of M8C's deliverables: the shipped default
+timings.** The M8A benchmark missed the dispatch-latency and worker-failure-recovery
+targets on the shipped defaults (`TASKFORGE_OUTBOX_POLL_INTERVAL=1s`,
+`TASKFORGE_LEASE_DURATION=30s`) and met all five on a tuned, labelled profile
+([PROJECT_SPEC.md](PROJECT_SPEC.md) §7). Which timings a deployment ships is the
+owner's decision. Changing the defaults would require re-measuring, because the
+recorded results describe the defaults as they are.
 
 ---
 
