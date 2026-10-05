@@ -1,0 +1,31 @@
+# gitleaks configuration for `make scan` and CI. The default rule set stays on;
+# the only changes are allowlist entries for known fake fixtures, each one scoped to
+# the rule, the file and the value it covers, with a comment naming the fixture.
+#
+# A real secret is never added here. If gitleaks finds one, it is revoked and taken
+# out of use, and this file is not touched. An allowlist entry that is wider than
+# its fixture hides the next real secret that lands in the same file.
+title = "TaskForge gitleaks configuration"
+
+[extend]
+useDefault = true
+
+# Fixture: the dashboard's test API key. dashboard/src/test/fixtures.ts defines
+# "tf_fixture_key_0123456789", a made-up key the dashboard's tests send to a mocked
+# API. It is not a TaskForge key format and opens nothing.
+[[allowlists]]
+description = "dashboard test fixture API key"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^dashboard/src/test/fixtures\.ts$''']
+regexes = ['''tf_fixture_key_0123456789''']
+
+# Fixture: the result-handler test's identifiers. internal/api/result_handlers_test.go
+# builds "results/scope/job/attempt", a made-up object path used to exercise the
+# result endpoints. It is a path in a fake bucket, not a credential.
+[[allowlists]]
+description = "result handler test fixture object path"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^internal/api/result_handlers_test\.go$''']
+regexes = ['''results/scope/job/attempt''']

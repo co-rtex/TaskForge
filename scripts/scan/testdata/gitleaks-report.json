@@ -1,0 +1,53 @@
+[
+  {
+    "RuleID": "generic-api-key",
+    "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+    "StartLine": 20,
+    "EndLine": 20,
+    "StartColumn": 15,
+    "EndColumn": 56,
+    "Match": "TEST_API_KEY = \"REDACTED\"",
+    "Secret": "REDACTED",
+    "File": "dashboard/src/test/fixtures.ts",
+    "SymlinkFile": "",
+    "Commit": "c8da430d35ae111183ffac6f2614c8d689f8717a",
+    "Link": "https://github.com/co-rtex/TaskForge/blob/c8da430d35ae111183ffac6f2614c8d689f8717a/dashboard/src/test/fixtures.ts#L20",
+    "Entropy": 4.2136607,
+    "Tags": [],
+    "Fingerprint": "c8da430d35ae111183ffac6f2614c8d689f8717a:dashboard/src/test/fixtures.ts:generic-api-key:20"
+  },
+  {
+    "RuleID": "generic-api-key",
+    "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+    "StartLine": 85,
+    "EndLine": 85,
+    "StartColumn": 40,
+    "EndColumn": 77,
+    "Match": "ObjectKey: \"REDACTED\"",
+    "Secret": "REDACTED",
+    "File": "internal/api/result_handlers_test.go",
+    "SymlinkFile": "",
+    "Commit": "a16bf564cece1d46043cf605aa5e5f5a45bf5194",
+    "Link": "https://github.com/co-rtex/TaskForge/blob/a16bf564cece1d46043cf605aa5e5f5a45bf5194/internal/api/result_handlers_test.go#L85",
+    "Entropy": 3.5932696,
+    "Tags": [],
+    "Fingerprint": "a16bf564cece1d46043cf605aa5e5f5a45bf5194:internal/api/result_handlers_test.go:generic-api-key:85"
+  },
+  {
+    "RuleID": "generic-api-key",
+    "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+    "StartLine": 107,
+    "EndLine": 107,
+    "StartColumn": 40,
+    "EndColumn": 77,
+    "Match": "ObjectKey: \"REDACTED\"",
+    "Secret": "REDACTED",
+    "File": "internal/api/result_handlers_test.go",
+    "SymlinkFile": "",
+    "Commit": "a16bf564cece1d46043cf605aa5e5f5a45bf5194",
+    "Link": "https://github.com/co-rtex/TaskForge/blob/a16bf564cece1d46043cf605aa5e5f5a45bf5194/internal/api/result_handlers_test.go#L107",
+    "Entropy": 3.5932696,
+    "Tags": [],
+    "Fingerprint": "a16bf564cece1d46043cf605aa5e5f5a45bf5194:internal/api/result_handlers_test.go:generic-api-key:107"
+  }
+]

@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure bench bench-smoke images images-smoke \
+        demo demo-failure bench bench-smoke images images-smoke scan \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -141,6 +141,16 @@ images: dash-build ## Build the six service images as taskforge-<service>:dev (b
 # needs the infrastructure up. See scripts/imagesmoke and ADR-0021.
 images-smoke: images up ## Check the six images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard
 	$(GO) run ./scripts/imagesmoke
+
+# The four supply-chain scanners, through one driver that applies
+# security/scan-exceptions.yaml: govulncheck (reachable vulnerabilities in the Go
+# code), gitleaks (secrets in the full git history), pip-audit (the SDK's runtime
+# dependency tree) and npm audit (the dashboard's production dependencies). Any
+# finding without a valid, unexpired exception fails it. It needs Docker (gitleaks
+# and npm audit run in pinned containers), Python 3 and the network.
+# See docs/adr/0021-container-images-and-supply-chain-scanning.md.
+scan: ## Scan for reachable Go vulnerabilities, secrets in git history, and vulnerable SDK and dashboard dependencies
+	$(GO) run ./scripts/scan
 
 sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
 	$(PYTHON) -m venv $(SDK_VENV)

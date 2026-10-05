@@ -1,0 +1,24 @@
+# Accepted scanner findings, and the only place they may be accepted.
+#
+# `make scan` (scripts/scan) fails on any govulncheck, gitleaks, pip-audit or npm
+# audit finding that has no entry here, and fails on any entry here that is
+# malformed or has expired. The list is empty because nothing is currently
+# excepted: the findings the first full run turned up were fixed or are fixtures
+# allowlisted in .gitleaks.toml, as docs/CURRENT_STATE.md records.
+#
+# Every entry has all five fields. A missing field, an unknown key, an unknown tool
+# or a date that is not an ISO date fails the scan.
+#
+#   - id: GO-2099-0001                  # what the tool reports: an OSV id, or a CVE or
+#                                       # GHSA alias of it; a gitleaks fingerprint; a
+#                                       # PYSEC or GHSA id
+#     tool: govulncheck                 # govulncheck | gitleaks | pip-audit | npm-audit
+#     reason: >-                        # why it is acceptable, not only that it is
+#       The vulnerable function is reachable only from a developer script.
+#     accepted_by: Christian Cortez
+#     expires: 2026-12-31               # holds through the end of this day (UTC);
+#                                       # renew with a fresh reason, or remove
+#
+# A real secret is never excepted. Revoke it and remove it from use; see
+# docs/adr/0021-container-images-and-supply-chain-scanning.md.
+exceptions: []
