@@ -623,7 +623,7 @@ func TestOpenAPI_EveryInternalOperationDocumentsTheOriginGuardRefusal(t *testing
 		}
 	}
 
-	raw, err := os.ReadFile("../../api/openapi.yaml")
+	raw, err := os.ReadFile(openAPIPath())
 	require.NoError(t, err)
 	var spec struct {
 		Components struct {

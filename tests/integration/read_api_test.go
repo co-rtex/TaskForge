@@ -858,7 +858,8 @@ func TestReadAPI_QueueDepthStatusesMatchTheIndexPredicate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestReadAPI_EveryReadRefusesAnUnauthenticatedCaller is the HTTP-level
-// counterpart to the unit test's publicRoutes walk.
+// counterpart to the unit tests in internal/api that walk the route table's
+// public entries.
 func TestReadAPI_EveryReadRefusesAnUnauthenticatedCaller(t *testing.T) {
 	reset(t)
 	srv := newAPI(t)

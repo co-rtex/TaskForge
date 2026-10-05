@@ -78,37 +78,21 @@ func acceptingKeys(scope string) *fakeKeys {
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
 
-// publicRoutes is every route the public surface exposes. Each case must
-// answer 401 without a credential, so a route added later without the wrapper
-// shows up as a failure here rather than as an open endpoint.
-var publicRoutes = []struct{ method, path string }{
-	{http.MethodPost, "/v1/jobs"},
-	{http.MethodGet, "/v1/jobs"},
-	{http.MethodGet, "/v1/jobs/" + "11111111-1111-1111-1111-111111111111"},
-	{http.MethodGet, "/v1/jobs/11111111-1111-1111-1111-111111111111/attempts"},
-	{http.MethodGet, "/v1/jobs/11111111-1111-1111-1111-111111111111/result"},
-	{http.MethodPost, "/v1/jobs/11111111-1111-1111-1111-111111111111/cancel"},
-	{http.MethodPost, "/v1/jobs/11111111-1111-1111-1111-111111111111/retry"},
-	{http.MethodGet, "/v1/dlq"},
-	{http.MethodPost, "/v1/dlq/11111111-1111-1111-1111-111111111111/replay"},
-	{http.MethodGet, "/v1/workers"},
-	{http.MethodGet, "/v1/queues"},
-}
-
 // TestAuth_EveryPublicRouteRefusesAnUnauthenticatedRequest is the load-bearing
 // assertion of this milestone.
 //
 // The job store is nil, so a route that let an unauthenticated request through
-// to its handler would panic rather than quietly pass. Combined with the route
-// list above, this is what makes "the public surface is authenticated" a tested
-// property instead of a claim about the registration code.
+// to its handler would panic rather than quietly pass. Walking the route table,
+// not a list kept beside it, is what makes "the public surface is authenticated"
+// a tested property of every public route the server registers instead of a
+// claim about the registration code.
 func TestAuth_EveryPublicRouteRefusesAnUnauthenticatedRequest(t *testing.T) {
 	handler := newTestServer(t)
 
-	for _, route := range publicRoutes {
-		t.Run(route.method+" "+route.path, func(t *testing.T) {
+	for _, route := range tableRoutes(t, surfacePublic) {
+		t.Run(route.pattern(), func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			request := httptest.NewRequest(route.method, route.path, strings.NewReader(validBody))
+			request := httptest.NewRequest(route.method, requestPath(route.path), strings.NewReader(validBody))
 			request.Header.Set("Idempotency-Key", "k1")
 			handler.ServeHTTP(recorder, request)
 
@@ -134,8 +118,8 @@ func TestAuth_EveryPublicRouteRefusesAnUnauthenticatedRequest(t *testing.T) {
 // unauthenticated caller reaches body decoding and validation; and the next
 // public handler written without that internal guard would simply be open.
 func TestAuth_EveryPublicRouteConsultsTheCredentialStore(t *testing.T) {
-	for _, route := range publicRoutes {
-		t.Run(route.method+" "+route.path, func(t *testing.T) {
+	for _, route := range tableRoutes(t, surfacePublic) {
+		t.Run(route.pattern(), func(t *testing.T) {
 			var consulted int
 			handler := NewServer(nil, Config{MaxRequestBytes: 1024}, discardLogger()).
 				WithAuth(&fakeKeys{
@@ -150,7 +134,7 @@ func TestAuth_EveryPublicRouteConsultsTheCredentialStore(t *testing.T) {
 				Handler()
 
 			recorder := httptest.NewRecorder()
-			request := authorize(httptest.NewRequest(route.method, route.path, strings.NewReader(validBody)))
+			request := authorize(httptest.NewRequest(route.method, requestPath(route.path), strings.NewReader(validBody)))
 			request.Header.Set("Idempotency-Key", "k1")
 			// The job store is nil, so an authenticated request panics on its way
 			// into PostgreSQL. That is the proof it got past authentication, and
@@ -204,10 +188,10 @@ func TestAuth_HappensBeforeTheRequestBodyIsLookedAt(t *testing.T) {
 func TestAuth_AServerWithNoCredentialStoreRefusesEverything(t *testing.T) {
 	handler := NewServer(nil, Config{MaxRequestBytes: 1024}, discardLogger()).Handler()
 
-	for _, route := range publicRoutes {
-		t.Run(route.method+" "+route.path, func(t *testing.T) {
+	for _, route := range tableRoutes(t, surfacePublic) {
+		t.Run(route.pattern(), func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			request := authorize(httptest.NewRequest(route.method, route.path, strings.NewReader(validBody)))
+			request := authorize(httptest.NewRequest(route.method, requestPath(route.path), strings.NewReader(validBody)))
 			request.Header.Set("Idempotency-Key", "k1")
 			handler.ServeHTTP(recorder, request)
 

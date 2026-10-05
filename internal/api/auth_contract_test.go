@@ -2,37 +2,12 @@ package api
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	yaml "go.yaml.in/yaml/v3"
 )
-
-// publicOperations is the spec-side view of the same eleven routes
-// publicRoutes names on the handler side. The two lists existing separately
-// is the point: each is derived from a different source, and this file is
-// where they have to agree.
-//
-// Both lists are maintained BY HAND. Nothing walks the mux and compares it
-// with the document, so adding a route without adding it here leaves it
-// uncovered rather than failing a test. A real completeness gate needs a route
-// registry inside Handler(); it is recorded as follow-up work in
-// docs/CURRENT_STATE.md rather than claimed here.
-var publicOperations = []struct{ method, path string }{
-	{"post", "/v1/jobs"},
-	{"get", "/v1/jobs"},
-	{"get", "/v1/jobs/{job_id}"},
-	{"get", "/v1/jobs/{job_id}/attempts"},
-	{"get", "/v1/jobs/{job_id}/result"},
-	{"post", "/v1/jobs/{job_id}/cancel"},
-	{"post", "/v1/jobs/{job_id}/retry"},
-	{"get", "/v1/dlq"},
-	{"post", "/v1/dlq/{job_id}/replay"},
-	{"get", "/v1/workers"},
-	{"get", "/v1/queues"},
-}
 
 // TestOpenAPI_EveryPublicOperationRequiresAnAPIKey keeps the document from
 // telling a client that a route is open when the handler refuses it.
@@ -42,19 +17,22 @@ var publicOperations = []struct{ method, path string }{
 func TestOpenAPI_EveryPublicOperationRequiresAnAPIKey(t *testing.T) {
 	doc := loadOpenAPI(t)
 
-	for _, target := range publicOperations {
-		t.Run(target.method+" "+target.path, func(t *testing.T) {
-			operation, ok := doc.Paths[target.path][target.method]
-			require.Truef(t, ok, "%s %s is missing from the spec", target.method, target.path)
+	// Every public route the server registers, from the route table, not from a
+	// list kept beside it: a public route added without its spec text fails here.
+	for _, target := range tableRoutes(t, surfacePublic) {
+		method := strings.ToLower(target.method)
+		t.Run(method+" "+target.path, func(t *testing.T) {
+			operation, ok := doc.Paths[target.path][method]
+			require.Truef(t, ok, "%s %s is missing from the spec", method, target.path)
 
 			require.Lenf(t, operation.Security, 1,
-				"%s %s must declare exactly one security requirement", target.method, target.path)
+				"%s %s must declare exactly one security requirement", method, target.path)
 			scopes, named := operation.Security[0]["ApiKeyAuth"]
-			require.Truef(t, named, "%s %s must require ApiKeyAuth", target.method, target.path)
+			require.Truef(t, named, "%s %s must require ApiKeyAuth", method, target.path)
 			require.Empty(t, scopes, "a key carries one scope; there are no OAuth-style scopes to request")
 
 			response, documented := operation.Responses["401"]
-			require.Truef(t, documented, "%s %s requires a key but documents no 401", target.method, target.path)
+			require.Truef(t, documented, "%s %s requires a key but documents no 401", method, target.path)
 			require.Equal(t, CodeUnauthorized, response.Content["application/json"].Example.Error.Code)
 
 			// The document must state the indistinguishability, not merely
@@ -310,7 +288,7 @@ func TestOpenAPI_AuthenticationSectionStatesTheFormatAndTheBoundaries(t *testing
 
 func readOpenAPI(t *testing.T) string {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	raw, err := os.ReadFile(openAPIPath())
 	require.NoError(t, err)
 	return string(raw)
 }
