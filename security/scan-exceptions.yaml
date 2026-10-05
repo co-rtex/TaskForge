@@ -1,0 +1,28 @@
+# Dated risk acceptances for govulncheck, pip-audit and npm audit findings.
+#
+# `make scan` (scripts/scan) fails on any finding from those three tools that has no
+# entry here, and fails on any entry here that is malformed or has expired. The list
+# is empty because nothing is currently excepted: the findings the first full run
+# turned up were fixed (the Go standard-library vulnerabilities) or are fake fixtures
+# allowlisted in .gitleaks.toml, as docs/CURRENT_STATE.md records.
+#
+# This file does NOT take gitleaks entries, and an entry with `tool: gitleaks` fails
+# the scan. A gitleaks finding is accepted in .gitleaks.toml, as a fixture (a fake
+# value) or as a revoked secret pinned to its commit, and nowhere else. History is
+# permanent, so an expiry date would only create renewal churn here, and naming a
+# revoked credential's value in this file would put it back in the tree. See
+# docs/adr/0021-container-images-and-supply-chain-scanning.md.
+#
+# Every entry has all five fields. A missing field, an unknown key, a tool other than
+# govulncheck, pip-audit or npm-audit, or a date that is not an ISO date fails the scan.
+#
+#   - id: GO-2099-0001                  # what the tool reports: an OSV id, or a CVE or
+#                                       # GHSA alias of it; a PYSEC or GHSA id
+#     tool: govulncheck                 # govulncheck | pip-audit | npm-audit
+#     reason: >-                        # why it is acceptable, not only that it is
+#       The vulnerable function is reachable only from a developer script.
+#     accepted_by: Christian Cortez
+#     expires: 2026-12-31               # holds through the end of this day (UTC);
+#                                       # renew with a fresh reason, or remove
+#
+exceptions: []

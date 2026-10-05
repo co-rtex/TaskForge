@@ -1,0 +1,21 @@
+# An allowlist: deny everything, then admit only what the six service binaries
+# import, which `go list -deps` over ./cmd/taskforge-{api,outbox,scheduler,
+# reconciler,worker,migrate} shows is go.mod, go.sum, cmd/, internal/ and
+# migrations/. Nothing else enters the build context: not .git, not .env, not the
+# SDK, the dashboard source, the docs or node_modules.
+#
+# internal/ includes internal/dashboard/dist, which the api embeds. It is
+# gitignored apart from .gitkeep, and Docker's ignore file does not read
+# .gitignore, so this allowlist is what lets the built dashboard in. `make images`
+# runs `make dash-build` first so that there is one to admit.
+#
+# dashboard/Dockerfile has its own allowlist beside it (Dockerfile.dockerignore),
+# which BuildKit prefers for that file, so the two do not interact.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+!migrations
+# Tests are not part of an image's build.
+**/*_test.go

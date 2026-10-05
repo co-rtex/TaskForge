@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure bench bench-smoke \
+        demo demo-failure bench bench-smoke images images-smoke scan \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -117,6 +117,42 @@ bench: build up migrate ## Run the full benchmark and record it in docs/benchmar
 
 bench-smoke: build up migrate ## Smoke-test the benchmark harness: about a minute, records nothing, fails if it measured wrongly
 	$(KEEP_AWAKE) $(GO) run ./scripts/bench smoke
+
+# The six service images (the root Dockerfile): api, outbox, scheduler,
+# reconciler, worker and migrate, tagged taskforge-<service>:dev with the commit
+# in the org.opencontainers.image.revision label. It depends on dash-build because
+# the api embeds internal/dashboard/dist: a clean clone has only .gitkeep there,
+# and an api image built without the dashboard would serve a placeholder page.
+# See docs/adr/0021-container-images-and-supply-chain-scanning.md.
+IMAGE_SERVICES := api outbox scheduler reconciler worker migrate
+IMAGE_REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+
+images: dash-build ## Build the six service images as taskforge-<service>:dev (builds the dashboard first)
+	@set -e; for svc in $(IMAGE_SERVICES); do \
+		echo "==> taskforge-$$svc:dev"; \
+		$(DOCKER) build --target $$svc --build-arg REVISION=$(IMAGE_REVISION) --tag taskforge-$$svc:dev .; \
+	done
+	@$(DOCKER) image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' | \
+		awk 'NR==1 || /^taskforge-(api|outbox|scheduler|reconciler|worker|migrate):dev/'
+
+# Inspects and runs the six images: non-root user, labels, only the service's own
+# binary, rejection of an invalid configuration, the migrate image against
+# PostgreSQL, and the api serving the real dashboard. It builds the images first and
+# needs the infrastructure up. See scripts/imagesmoke and ADR-0021.
+images-smoke: images up ## Check the six images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard
+	$(GO) run ./scripts/imagesmoke
+
+# The four supply-chain scanners, through one driver: govulncheck (reachable
+# vulnerabilities in the Go code), gitleaks (secrets in the full git history),
+# pip-audit (the SDK's runtime dependency tree) and npm audit (the dashboard's
+# production dependencies). A govulncheck, pip-audit or npm audit finding is accepted
+# only by a valid, unexpired entry in security/scan-exceptions.yaml; a gitleaks
+# finding only in .gitleaks.toml (a fake fixture, or a revoked secret pinned to its
+# commit). Anything else fails it. It needs Docker (gitleaks and npm audit run in
+# pinned containers), Python 3 and the network.
+# See docs/adr/0021-container-images-and-supply-chain-scanning.md.
+scan: ## Scan for reachable Go vulnerabilities, secrets in git history, and vulnerable SDK and dashboard dependencies
+	$(GO) run ./scripts/scan
 
 sdk-venv: ## Create the Python SDK virtualenv and install it with dev extras
 	$(PYTHON) -m venv $(SDK_VENV)

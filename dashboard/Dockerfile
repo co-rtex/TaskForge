@@ -45,3 +45,18 @@ RUN npm run build
 # Only the built files, exported with `docker build --output`.
 FROM scratch AS dist
 COPY --from=build /repo/internal/dashboard/dist/ /
+
+# `make scan` audits the dashboard's production dependencies here, in the one
+# pinned Node, so that Node is still pinned in exactly one place. npm audit reads
+# the lockfile and asks the registry; --omit=dev leaves out everything that never
+# ships. It always exits 0 here and writes the report to a file: scripts/scan
+# decides what blocks, at high and above, and an error npm reports (a registry that
+# could not be reached) is in the report as an error, which the driver fails on.
+FROM deps AS audit
+RUN npm audit --omit=dev --audit-level=high --json > /audit.json || true
+
+# Only the report, exported with `docker build --output`. The scan builds this
+# target with --no-cache-filter audit, so a cached layer cannot stand in for a
+# fresh look at the advisory database.
+FROM scratch AS audit-report
+COPY --from=audit /audit.json /
