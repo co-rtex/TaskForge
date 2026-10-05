@@ -189,124 +189,10 @@ func (s *Server) WithTracer(tracer trace.Tracer) *Server {
 // with both identities.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	// Every public route is wrapped in requireAPIKey at registration, so the set
-	// of authenticated routes is readable here rather than in an inclusion list
-	// inside a middleware that would drift from the mux. Adding a public route
-	// without the wrapper is a visible omission on this screen.
-	mux.HandleFunc("POST /v1/jobs", s.requireAPIKey(s.handleSubmitJob))
-	mux.HandleFunc("GET /v1/jobs", s.requireAPIKey(s.handleListJobs))
-	mux.HandleFunc("GET /v1/jobs/{job_id}", s.requireAPIKey(s.handleGetJob))
-	mux.HandleFunc("GET /v1/jobs/{job_id}/attempts", s.requireAPIKey(s.handleListJobAttempts))
-	mux.HandleFunc("GET /v1/jobs/{job_id}/result", s.requireAPIKey(s.handleGetJobResult))
-	mux.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.requireAPIKey(s.handleCancelJob))
-	// Operator retry IS DLQ replay: same service, same idempotency namespace. Two
-	// routes exist because operators reach for both names, not because there are
-	// two operations.
-	mux.HandleFunc("POST /v1/jobs/{job_id}/retry", s.requireAPIKey(s.handleReplayJob))
-	mux.HandleFunc("GET /v1/dlq", s.requireAPIKey(s.handleListDLQ))
-	mux.HandleFunc("POST /v1/dlq/{job_id}/replay", s.requireAPIKey(s.handleReplayJob))
-	// The operator read surface (M6A). PROJECT_SPEC.md section 4 items 4 and 7
-	// name these; the dashboard, the CLI, and the SDK are all consumers of
-	// exactly these four routes and nothing else.
-	mux.HandleFunc("GET /v1/workers", s.requireAPIKey(s.handleListWorkers))
-	mux.HandleFunc("GET /v1/queues", s.requireAPIKey(s.handleListQueues))
-	// Health probes stay unauthenticated. They reveal nothing tenant-specific,
-	// and a liveness probe that needed a credential would report a healthy
-	// process as dead the moment that credential was revoked.
-	if s.metrics != nil {
-		// Unauthenticated, like the health probes beside it, and on this same
-		// already-loopback-bound listener. See WithMetrics.
-		mux.Handle("GET /metrics", s.metrics.Handler())
-	}
-	mux.HandleFunc("GET /healthz", s.handleLiveness)
-	mux.HandleFunc("GET /readyz", s.handleReadiness)
-	if s.dashboard != nil {
-		// Static files and nothing else: the dashboard reads only the /v1
-		// routes above, with the operator's own key, like any other client.
-		// One subtree pattern, so every dashboard path shares one bounded span
-		// name and metric route label however many client routes it has.
-		mux.HandleFunc("GET "+DashboardPath, s.handleDashboard)
-		// {$} matches the bare root only. Every other unrouted path still
-		// falls through to the catch-all below.
-		mux.HandleFunc("GET /{$}", s.handleDashboardRoot)
-	}
-	// Every /internal pattern -- the real routes below and their method-less 405
-	// fallbacks further down -- is registered through handleInternal, which puts
-	// the browser-origin guard outside whatever else the route carries. The set
-	// of guarded routes is therefore this registration list and nothing else, and
-	// registering an /internal pattern any other way is a visible omission here.
-	if s.keys != nil {
-		s.handleInternal(mux, "POST /internal/v1/api-keys", s.handleCreateAPIKey)
-		s.handleInternal(mux, "GET /internal/v1/api-keys", s.handleListAPIKeys)
-		s.handleInternal(mux, "POST /internal/v1/api-keys/{key_id}/revoke", s.handleRevokeAPIKey)
-	}
-	if s.workerKeys != nil {
-		s.handleInternal(mux, "POST /internal/v1/worker-keys", s.handleCreateWorkerKey)
-		s.handleInternal(mux, "GET /internal/v1/worker-keys", s.handleListWorkerKeys)
-		s.handleInternal(mux, "POST /internal/v1/worker-keys/{key_id}/revoke", s.handleRevokeWorkerKey)
-	}
-	if s.control != nil {
-		// Registration alone is wrapped in requireWorkerKey: every other
-		// worker-control route below resolves its scope from the session
-		// identity the request already carries rather than a fresh credential.
-		// See requireWorkerKey's doc comment for why that asymmetry is
-		// deliberate.
-		s.handleInternal(mux, "PUT /internal/v1/worker-sessions/{worker_session_id}", s.requireWorkerKey(s.handleRegisterWorkerSession))
-		s.handleInternal(mux, "POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.handleHeartbeat)
-		s.handleInternal(mux, "POST /internal/v1/claims", s.handleClaim)
-		s.handleInternal(mux, "POST /internal/v1/leases/{lease_id}/renew", s.handleRenewLease)
-		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/start", s.handleStartAttempt)
-		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/succeed", s.handleSucceedAttempt)
-		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/fail", s.handleFailAttempt)
-		s.handleInternal(mux, "POST /internal/v1/attempts/{attempt_id}/cancel", s.handleCancelAttempt)
-	}
-
-	// ServeMux answers an unmatched method with a plain-text 405 and an unmatched
-	// path with a plain-text 404, neither of which matches the structured error
-	// shape every other response uses. Registering method-less patterns alongside
-	// the real ones reclaims those cases: a pattern that names a method is more
-	// specific, so it still wins for that method, and everything else falls
-	// through to here.
-	mux.HandleFunc("/v1/jobs", s.methodNotAllowed(http.MethodGet, http.MethodPost))
-	mux.HandleFunc("/v1/jobs/{job_id}", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/v1/jobs/{job_id}/attempts", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/v1/jobs/{job_id}/result", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/v1/jobs/{job_id}/cancel", s.methodNotAllowed(http.MethodPost))
-	mux.HandleFunc("/v1/jobs/{job_id}/retry", s.methodNotAllowed(http.MethodPost))
-	mux.HandleFunc("/v1/dlq", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/v1/dlq/{job_id}/replay", s.methodNotAllowed(http.MethodPost))
-	mux.HandleFunc("/v1/workers", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/v1/queues", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/healthz", s.methodNotAllowed(http.MethodGet))
-	mux.HandleFunc("/readyz", s.methodNotAllowed(http.MethodGet))
-	if s.dashboard != nil {
-		mux.HandleFunc(DashboardPath, s.methodNotAllowed(http.MethodGet))
-	}
-	if s.keys != nil {
-		// 405 is answered before authentication, deliberately -- but after the
-		// browser-origin guard, which handleInternal puts outside it: a
-		// browser-marked DELETE is refused 403, not told which methods exist. "This path does
-		// not accept DELETE" is a fact about the route table, not about the
-		// caller, so it discloses nothing a reader of the OpenAPI document does
-		// not already have.
-		s.handleInternal(mux, "/internal/v1/api-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/api-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
-	}
-	if s.workerKeys != nil {
-		s.handleInternal(mux, "/internal/v1/worker-keys", s.methodNotAllowed(http.MethodGet, http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/worker-keys/{key_id}/revoke", s.methodNotAllowed(http.MethodPost))
-	}
-	if s.control != nil {
-		s.handleInternal(mux, "/internal/v1/worker-sessions/{worker_session_id}", s.methodNotAllowed(http.MethodPut))
-		s.handleInternal(mux, "/internal/v1/worker-sessions/{worker_session_id}/heartbeat", s.methodNotAllowed(http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/claims", s.methodNotAllowed(http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/leases/{lease_id}/renew", s.methodNotAllowed(http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/start", s.methodNotAllowed(http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/succeed", s.methodNotAllowed(http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/fail", s.methodNotAllowed(http.MethodPost))
-		s.handleInternal(mux, "/internal/v1/attempts/{attempt_id}/cancel", s.methodNotAllowed(http.MethodPost))
-	}
-	mux.HandleFunc("/", s.handleNotFound)
+	// Every route is declared in routeTable (routes.go) and registered from it:
+	// the table is the one place a route, its wrappers, its feature group and its
+	// reason for being absent from the spec are read.
+	s.registerRoutes(mux)
 
 	// Innermost first. withSpanRoute must sit directly on the mux so it reads
 	// the pattern off the same *Request the mux wrote it to -- see its comment.
@@ -340,9 +226,14 @@ func (s *Server) Handler() http.Handler {
 // existed and every refusal would be labelled "unmatched".
 //
 // Every /internal pattern goes through here, including the method-less
-// fallbacks. TestServer_EveryInternalPatternIsRegisteredThroughTheGuard pins
-// that, and TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation
-// proves the result for every operation api/openapi.yaml documents.
+// fallbacks: register (routes.go) sends a route there when its chain is a guard
+// chain, and a fallback derived for an internal path gets one. That nothing
+// registers around the table is held by TestRoutes_NothingRegistersAroundTheTable,
+// which also holds that this function is called only from register. The result
+// is proved by behavior, for every entry and every internal fallback, by
+// TestRoutes_InternalRoutesAreGuardedOutermost, and for every operation
+// api/openapi.yaml documents by
+// TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation.
 func (s *Server) handleInternal(mux *http.ServeMux, pattern string, handler http.HandlerFunc) {
 	mux.HandleFunc(pattern, s.refuseBrowserOrigin(handler))
 }
