@@ -478,3 +478,134 @@ jobs:
       - name: Tear down local infrastructure
         if: always()
         run: docker compose down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # Container images. Its own job: it needs Docker and the dashboard build, and
+  # its failures (an image that runs as root, a migrate image that applies the
+  # wrong schema) read differently from a Go test failure. It owns its own
+  # Compose lifecycle, like `race`: the smoke applies the migrations from the
+  # migrate image to a database that has none, which would be a lie if
+  # `make migrate` had already run against it.
+  #
+  # Nothing is pushed anywhere. The images are built for linux/amd64, the runner's
+  # own architecture, and discarded with the runner; there is no registry login in
+  # this workflow. See docs/adr/0021.
+  # ---------------------------------------------------------------------------
+  images:
+    name: Container images (build, non-root, config rejection, migrate, dashboard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        # For `go run ./scripts/imagesmoke` below. The images build their own Go
+        # in the Dockerfile's pinned golang image.
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Start local infrastructure
+        run: make up
+
+      - name: Build the dashboard and the six images
+        # `make images` builds the dashboard first (the api embeds
+        # internal/dashboard/dist; without it the api image would serve a
+        # placeholder), then one image per service, labelled with this commit.
+        run: make images
+
+      - name: Image smoke (make images-smoke)
+        # `make images-smoke` is not used for the reason the demonstrations in the
+        # integration job do not use `make demo`: it depends on `up` and `images`,
+        # which this job has already done.
+        #
+        # On Linux the migrate and api containers run on the host network and reach
+        # the compose services on loopback, spelled out here as the integration
+        # job spells them.
+        env:
+          TASKFORGE_DATABASE_URL: postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable
+          TASKFORGE_BROKER_ENDPOINT: http://127.0.0.1:9324
+          TASKFORGE_RESULTS_ENDPOINT: http://127.0.0.1:4566
+        run: go run ./scripts/imagesmoke
+
+      - name: Collect failure diagnostics
+        if: failure()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/taskforge-images-diagnostics"
+          mkdir -p "${out}"
+          docker image ls > "${out}/images.txt" 2>&1 || true
+          docker ps --all > "${out}/containers.txt" 2>&1 || true
+          docker compose ps --all > "${out}/compose-ps.txt" 2>&1 || true
+          docker compose logs --no-color --tail 400 postgres > "${out}/postgres.log" 2>&1 || true
+          cat "${out}/images.txt" "${out}/containers.txt" || true
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: images-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/taskforge-images-diagnostics
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Tear down local infrastructure
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # Supply-chain scan. Its own job, for three reasons. It needs the full git
+  # history (gitleaks scans every commit), which the other jobs do not fetch. It
+  # needs Docker, Python and the network to the advisory databases. And its
+  # failures are of a different kind: a vulnerability published tomorrow fails the
+  # scan with no change to the code, and that must read as its own status line,
+  # not turn `checks` red.
+  #
+  # It runs the command a developer runs, `make scan`, so security/scan-exceptions.yaml
+  # applies identically in both places. Every tool is pinned inside the driver:
+  # govulncheck at an exact tag, gitleaks by container digest (not gitleaks-action,
+  # which needs a licence for organisations), pip-audit with ==, and npm audit in
+  # the Node image dashboard/Dockerfile pins. See docs/adr/0021.
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Supply-chain scan (govulncheck, gitleaks, pip-audit, npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: a secret committed and later deleted is still leaked.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Set up Python
+        # pip-audit and the SDK's clean virtualenv need a Python the workflow
+        # chose, at the SDK's current CI version.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Report the resolved toolchain
+        run: |
+          set -euo pipefail
+          go version
+          python3 --version
+          docker version --format 'docker {{.Server.Version}}'
+          git rev-list --all --count
+
+      - name: Scan
+        run: make scan
