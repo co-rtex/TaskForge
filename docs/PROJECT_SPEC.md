@@ -152,20 +152,46 @@ delivery. Endpoint-by-endpoint semantics live in
   publicly.
 - Secrets are never committed. `.env.example` contains names and safe placeholders.
 
-## 7. Benchmark targets — **UNMEASURED**
+## 7. Benchmark targets and measured results
 
-These are goals used to shape design. **None has been measured.** They must never
-appear as achieved results in the README, in a commit message, or in a handoff
-until a reproducible run records them under
-[docs/](.) with SHA, environment, command, and limitations.
+These targets shaped the design. Each has now been **measured once, on one
+machine**, by a reproducible run whose record names the commit, the environment,
+the command, the settings in effect and the limitations:
+[docs/benchmarks/2026-10-05-d796722.md](benchmarks/2026-10-05-d796722.md), the
+headline run, on the shipped default timings. Every figure is read from
+PostgreSQL's clock, and the definition of each figure and the rule for when a
+target is met were fixed before the run in
+[ADR-0020](adr/0020-benchmark-methodology.md). A figure below is never rounded in
+the system's favor, and a target that was missed says so.
 
-| Target | Value | Status |
-| --- | --- | --- |
-| Sustained throughput | 1,000 jobs/minute across 12 workers | Not measured |
-| Dispatch latency | p95 < 500 ms | Not measured |
-| Fault-injection volume | 10,000 jobs | Not measured |
-| Completion under fault injection | ≥ 99.7% | Not measured |
-| Worker-failure recovery | < 30 s | Not measured |
+| Target | Value | Measured ([record](benchmarks/2026-10-05-d796722.md)) | Met? |
+| --- | --- | --- | --- |
+| Sustained throughput | 1,000 jobs/minute across 12 workers | 999.83 jobs/min completed over a 5 minute window, with 1000.23 offered | **Met**, within the 1% tolerance ADR-0020 fixed before the run. It is 0.17 jobs/min below 1,000. |
+| Dispatch latency | p95 < 500 ms | p95 963.7 ms (p50 552.2 ms, p99 1009.4 ms, max 1046.6 ms; n = 5,001) | **MISSED**, beside `TASKFORGE_OUTBOX_POLL_INTERVAL=1s` |
+| Fault-injection volume | 10,000 jobs | 10,000 jobs, with 24 workers killed | **Met** |
+| Completion under fault injection | ≥ 99.7% | 10,000 of 10,000 `SUCCEEDED` (100.000%), 5 minutes after the last submission | **Met** |
+| Worker-failure recovery | < 30 s | worst 50.04 s, median 32.02 s, over 16 abandoned attempts, none left unreplaced | **MISSED**, beside `TASKFORGE_LEASE_DURATION=30s` |
+
+Read the table with these in mind.
+
+- **Two targets are missed on the shipped defaults, and the record says which
+  settings sit beside each miss.** A killed worker's attempt is only abandoned when
+  its lease expires, so with a 30 s lease recovery cannot be much under 30 s; the
+  outbox publishes once a second, so a job waits for the next pass.
+- **A second run, labelled TUNED, met all five**
+  ([record](benchmarks/2026-10-05-c1764d7-tuned.md)): a 10 s lease, tighter
+  liveness windows, and scans every 250 ms with the outbox every 200 ms gave a
+  dispatch p95 of 208.5 ms and a worst recovery of 10.98 s. It shows what those
+  settings buy. It does not replace the headline run, and the shipped defaults have
+  not changed.
+- **These are one machine and one run.** A laptop running the load generator, the
+  services, twelve workers and Docker, with PostgreSQL on tmpfs in a Docker VM and
+  ElasticMQ for SQS. There is no variance estimate. A measured value here says
+  nothing about another machine or a deployment, and the targets remain the targets
+  for those. The record's Limitations section lists the rest.
+- **A result may be quoted only with a link to a record.** The rule this section
+  was written under stands for any future number: it appears in the README, a
+  commit message or a handoff only with the record that produced it.
 
 ## 8. Non-goals
 
