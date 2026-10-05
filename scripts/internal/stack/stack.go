@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/co-rtex/TaskForge/scripts/readdb"
 )
@@ -77,13 +77,16 @@ type Stack struct {
 	APIKey, WorkerKey     string
 	APIKeyID, WorkerKeyID string
 
-	// DB is a read-only connection (readdb.Open), for the few facts the public
-	// API deliberately does not expose and for reading measurements back.
-	DB *pgx.Conn
+	// DB is a read-only pool (readdb.Open), for the few facts the public API
+	// deliberately does not expose and for reading measurements back. It is safe
+	// for use from several goroutines.
+	DB *pgxpool.Pool
 
 	mu      sync.Mutex
 	procs   []*Proc
 	cleaned sync.Once
+
+	sayMu sync.Mutex // narration comes from several goroutines in a benchmark run
 }
 
 // binaries a stack runs. They must already be built into ./bin by `make build`.
@@ -162,6 +165,8 @@ func FreeLoopbackAddr() (string, error) {
 
 // Say narrates one step with the time since the run began.
 func (s *Stack) Say(format string, args ...any) {
+	s.sayMu.Lock()
+	defer s.sayMu.Unlock()
 	fmt.Fprintf(s.Out, "[%6.1fs] %s\n", time.Since(s.Started).Seconds(), fmt.Sprintf(format, args...))
 }
 
@@ -337,7 +342,7 @@ func (s *Stack) Cleanup() {
 			s.Say("Stopped the %d processes this run started; %d still running.", started, stillRunning)
 		}
 		if s.DB != nil {
-			_ = s.DB.Close(context.Background())
+			s.DB.Close()
 		}
 		if s.QueueURL != "" {
 			if err := deleteQueue(context.Background(), s.Infra.BrokerEndpoint, s.QueueURL); err != nil {

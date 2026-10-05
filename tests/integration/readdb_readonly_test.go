@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func TestReaddb_OpenRefusesWrites(t *testing.T) {
 
 	guarded, err := readdb.Open(ctx, dsn())
 	require.NoError(t, err)
-	defer guarded.Close(ctx)
+	defer guarded.Close()
 
 	// The setting is in force from the startup packet.
 	var setting string
@@ -82,4 +83,43 @@ func TestReaddb_OpenRefusesWrites(t *testing.T) {
 	var n int
 	require.NoError(t, guarded.QueryRow(ctx, `SELECT count(*) FROM queues WHERE name = 'readdb-write-probe'`).Scan(&n))
 	require.Zero(t, n)
+}
+
+// TestReaddb_OpenIsSafeForConcurrentUse proves the handle can be shared by the
+// goroutines of a run. The benchmark's watchdog, its fault injector and its main
+// flow all read through the one handle the stack opens; a single pgx.Conn is not
+// safe for that, and the failure is not a clean error: it is "conn busy" on one
+// goroutine and, in pgx's statement cache, "fatal error: concurrent map writes"
+// that kills the whole process. Run under -race, as `make test-race` does.
+func TestReaddb_OpenIsSafeForConcurrentUse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	handle, err := readdb.Open(ctx, dsn())
+	require.NoError(t, err)
+	defer handle.Close()
+
+	const goroutines, perGoroutine = 16, 40
+	errs := make(chan error, goroutines*perGoroutine)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				if _, err := readdb.ClockNow(ctx, handle); err != nil {
+					errs <- err
+				}
+				if _, err := readdb.StatusCounts(ctx, handle, "readdb-concurrency-scope"); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err, "a read through the shared handle failed")
+	}
 }

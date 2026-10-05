@@ -257,12 +257,12 @@ func serverVersion() string {
 	if err != nil {
 		return "unknown: " + err.Error()
 	}
-	conn, err := readdb.Open(ctx, in.DatabaseURL)
+	pool, err := readdb.Open(ctx, in.DatabaseURL)
 	if err != nil {
 		return "unknown: " + err.Error()
 	}
-	defer conn.Close(ctx)
-	version, err := readdb.ServerVersion(ctx, conn)
+	defer pool.Close()
+	version, err := readdb.ServerVersion(ctx, pool)
 	if err != nil {
 		return "unknown: " + err.Error()
 	}
