@@ -602,27 +602,77 @@ below; and the root `README.md`, which pull request #10 rewrites wholesale and
 which is where `make demo` belongs.
 
 ### M8 — Load generator, measured benchmarks, CI hardening, ECS Terraform
-**Objective.** Measure reality and make deployment credible.
-**Deliverables.** Load generator; reproducible benchmark harness recording SHA,
-environment, command, and limitations; CI covering fmt, vet, unit, race, migrations,
-integration, e2e, SDK, frontend, Docker builds, secret and dependency scanning;
-validated (not applied) Terraform for ALB, ECS services, RDS, SQS, S3, secrets, logs.
-**Acceptance.** Benchmark numbers replace the "unmeasured target" table in
-[PROJECT_SPEC.md](PROJECT_SPEC.md) §7 with recorded results; CI is green and no
-workflow is permanently failing; `terraform validate` passes without applying.
+
+M8 as originally written bundles three different things: measuring (a harness
+and a methodology, and a machine to run them on), hardening CI (images, scanners,
+and two gates M7A deferred), and deployment (a trust-boundary decision and
+infrastructure that costs money). It is split into three slices so each ships on
+its own evidence, the way M5, M6 and M7 were. The original objective,
+deliverables, and acceptance sentence are preserved across M8A, M8B and M8C, not
+reduced.
+
+**Status:** M8A is complete; see PR #21. M8B and M8C are planned.
+
+#### M8A — Load generator and measured benchmarks
+**Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
+recorded results.
+**Deliverables.** A load generator and benchmark harness at `scripts/bench`
+(`make bench`, `make bench-smoke`) that runs the real binaries with the stack
+`scripts/demo` shares (`scripts/internal/stack`); the measurement queries the
+harness and `tests/integration` share (`scripts/readdb`);
+[ADR-0020](adr/0020-benchmark-methodology.md); a smoke step in CI's integration
+job that records nothing; and a record under [docs/benchmarks](benchmarks/) naming
+the commit, the environment, the command, the settings and the limitations. Three
+carried items: the stack's PostgreSQL connection is read-only, ADR-0019's capacity
+bound is stated per attempt, and the demonstration handlers match payload keys
+exactly.
+**Acceptance.** [PROJECT_SPEC.md](PROJECT_SPEC.md) §7 carries a measured value and
+a Met or MISSED verdict for each target, linked to a record that a reproducible
+run produced on a clean tree; a target that was missed is recorded as missed next
+to the settings that decided it; and CI never records a number.
 **Depends on.** M7.
+**Status:** complete; see PR #21 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited.
 
-**Deferred here from M7A.** A check that the route table and `api/openapi.yaml`
-describe the same set of routes. Today that agreement rests on hand-maintained,
-one-directional route maps in `internal/api/deadline_contract_test.go`, and a
-route added without being added to them is uncovered rather than failing. A real
-gate needs a route registry inside `Handler()`; see
-[CURRENT_STATE.md](CURRENT_STATE.md).
+Deliberately **not** in scope: Dockerfiles, scanners, the route-table registry,
+the drift-check fix, Terraform, the non-loopback bind, and any change to
+production behavior, the schema, the API, OpenAPI, the SDK, the dashboard or the
+runner other than the demo handlers' payload decoding. A saturation search is not
+in scope either: the owner fixed the workload and the offered load.
 
-**Also deferred here from M7A.** The verification-matrix drift check proves that
-a cited assertion line lies inside the named test, not that the line is the
-assertion. Closing that means finding the assertion in the syntax tree instead of
-trusting a line number. See [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md).
+#### M8B — CI hardening
+**Objective.** Make CI cover what the original M8 listed and close the two gates
+M7A deferred.
+**Deliverables.** Dockerfiles for the services; image builds in CI; secret and
+dependency scanning; and, carried from M7A, a route registry inside `Handler()`
+checked against `api/openapi.yaml` so that a route added to one and not the other
+fails, and a verification-matrix drift check that finds the cited assertion in the
+syntax tree instead of trusting a line number (see
+[VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)).
+**Acceptance.** CI covers fmt, vet, unit, race, migrations, integration, e2e,
+SDK, frontend, Docker builds, and secret and dependency scanning, and no workflow
+is permanently failing; the route table and `api/openapi.yaml` are checked
+against each other in both directions; the drift check fails on a cited line that
+is inside the named test but is not an assertion.
+**Depends on.** M8A.
+**Status:** planned.
+
+#### M8C — Deployment
+**Objective.** Make deployment credible without applying it.
+**Deliverables.** Validated (not applied) Terraform for ALB, ECS services, RDS,
+SQS, S3, secrets and logs, together with the three decisions that deployment
+forces: the non-loopback bind, which
+[ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)'s shared
+loopback predicate ties to the `Host` rule and which must be revisited with it;
+protection of `/internal`, which ADR-0018 deliberately did not provide; and
+whether the demonstration handlers are gated in a deployed worker
+([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
+a gate open).
+**Acceptance.** `terraform validate` passes without applying.
+**Depends on.** M8B. **Needs its own owner decision before any work starts:** the
+bind, `/internal` and the handler gate are trust-boundary decisions, and the
+infrastructure costs money.
+**Status:** planned.
 
 ---
 

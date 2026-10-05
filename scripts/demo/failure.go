@@ -15,6 +15,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/workers"
+	"github.com/co-rtex/TaskForge/scripts/internal/stack"
 )
 
 const (
@@ -76,9 +77,9 @@ func (d *demo) waitRunningOn(ctx context.Context, jobID, workerName string) (str
 // crashPhase kills a worker with SIGKILL while it holds a RUNNING attempt, and
 // shows another worker finish the job.
 func (d *demo) crashPhase(ctx context.Context) {
-	d.say("--- Phase 1: a worker is killed mid-job ---")
+	d.Say("--- Phase 1: a worker is killed mid-job ---")
 
-	workerA, nameA, err := d.startWorker(ctx, "a", 1)
+	workerA, nameA, err := d.StartWorker(ctx, "a", 1)
 	if err != nil {
 		d.expect("crash: worker A started", false, "%v", err)
 		return
@@ -88,7 +89,7 @@ func (d *demo) crashPhase(ctx context.Context) {
 		d.expect("crash: the job was submitted", false, "%v", err)
 		return
 	}
-	d.say("Submitted job %s: demo.sleep for %dms. Only worker A is running.", jobID, sleepMillis)
+	d.Say("Submitted job %s: demo.sleep for %dms. Only worker A is running.", jobID, sleepMillis)
 
 	observed, ok := d.waitRunningOn(ctx, jobID, nameA)
 	if !ok {
@@ -100,9 +101,9 @@ func (d *demo) crashPhase(ctx context.Context) {
 		d.expect("crash: worker A has one process session", false, "sessions=%v err=%v", sessionsA, err)
 		return
 	}
-	d.say("The API shows the job RUNNING on worker A (session %s).", short(sessionsA[0]))
+	d.Say("The API shows the job RUNNING on worker A (session %s).", short(sessionsA[0]))
 
-	workerB, nameB, err := d.startWorker(ctx, "b", 1)
+	workerB, nameB, err := d.StartWorker(ctx, "b", 1)
 	if err != nil {
 		d.expect("crash: worker B started", false, "%v", err)
 		return
@@ -110,8 +111,8 @@ func (d *demo) crashPhase(ctx context.Context) {
 	// Phase 2 begins "with only worker C running". A worker left over from here
 	// would be eligible for that job too, and would take it before C could.
 	defer func() {
-		d.say("Stopping worker B, so the next phase starts with no worker running.")
-		workerB.stop()
+		d.Say("Stopping worker B, so the next phase starts with no worker running.")
+		workerB.Stop()
 		// B's last long poll may still be open at the broker, and a notification
 		// published while it is open can be handed to a connection nobody is
 		// reading. The system repairs that (the scheduler re-notifies), but five
@@ -119,19 +120,19 @@ func (d *demo) crashPhase(ctx context.Context) {
 		// given one poll wait to drop it first.
 		select {
 		case <-ctx.Done():
-		case <-time.After(d.timing.workerPollWait + 500*time.Millisecond):
+		case <-time.After(d.Timing.WorkerPollWait + 500*time.Millisecond):
 		}
 	}()
-	d.say("Started worker B, so there is somewhere for the job to go. Now SIGKILL worker A: no signal handler, no cleanup, no chance to say goodbye.")
-	if err := workerA.signal(syscall.SIGKILL); err != nil {
+	d.Say("Started worker B, so there is somewhere for the job to go. Now SIGKILL worker A: no signal handler, no cleanup, no chance to say goodbye.")
+	if err := workerA.Signal(syscall.SIGKILL); err != nil {
 		d.expect("crash: worker A was killed", false, "%v", err)
 		return
 	}
-	workerA.waitExit(10 * time.Second)
-	d.expect("crash: worker A died from SIGKILL", !workerA.running() && workerA.diedFromSignal(syscall.SIGKILL),
-		"still running: %t", workerA.running())
+	workerA.WaitExit(10 * time.Second)
+	d.expect("crash: worker A died from SIGKILL", !workerA.Running() && workerA.DiedFromSignal(syscall.SIGKILL),
+		"still running: %t", workerA.Running())
 
-	d.say("Nothing tells the control plane A is dead. Its heartbeats stop and its lease runs out; the reconciler notices both.")
+	d.Say("Nothing tells the control plane A is dead. Its heartbeats stop and its lease runs out; the reconciler notices both.")
 	observed, ok = d.waitFor(ctx, "the job to reach SUCCEEDED", 90*time.Second,
 		func(ctx context.Context) (bool, string, error) {
 			job, err := d.job(ctx, jobID)
@@ -159,7 +160,7 @@ func (d *demo) crashPhase(ctx context.Context) {
 		d.expect("crash: the attempt history was read", false, "%v", err)
 		return
 	}
-	d.say("Final timeline: %s.", describeAttempts(attempts))
+	d.Say("Final timeline: %s.", describeAttempts(attempts))
 	expectEqual(d, "crash: job status", string(jobs.StatusSucceeded), job.Status)
 	expectEqual(d, "crash: attempts", 2, len(attempts))
 	if len(attempts) != 2 {
@@ -193,7 +194,7 @@ func (d *demo) verifySessions(ctx context.Context, prefix, jobID, firstWorker, s
 		d.expect(prefix+": the second worker's sessions were read", false, "%v", err)
 		return
 	}
-	d.say("Read from PostgreSQL (the API withholds session ids): attempt 1 is bound to session %s, attempt 2 to session %s.",
+	d.Say("Read from PostgreSQL (the API withholds session ids): attempt 1 is bound to session %s, attempt 2 to session %s.",
 		short(bindings[0].SessionID), short(bindings[1].SessionID))
 
 	d.expect(prefix+": attempt 1 is bound to "+shortWorker(firstWorker)+"'s session",
@@ -247,9 +248,9 @@ func (d *demo) durableView(ctx context.Context, jobID string) (durableView, []at
 // The pass condition is the durable outcome either way: read after the worker
 // has had time to act, and not anything in its log.
 func (d *demo) fencingPhase(ctx context.Context) {
-	d.say("--- Phase 2: a worker is frozen mid-job, and wakes after the job has moved on ---")
+	d.Say("--- Phase 2: a worker is frozen mid-job, and wakes after the job has moved on ---")
 
-	workerC, nameC, err := d.startWorker(ctx, "c", 1)
+	workerC, nameC, err := d.StartWorker(ctx, "c", 1)
 	if err != nil {
 		d.expect("fence: worker C started", false, "%v", err)
 		return
@@ -259,17 +260,17 @@ func (d *demo) fencingPhase(ctx context.Context) {
 		d.expect("fence: the job was submitted", false, "%v", err)
 		return
 	}
-	d.say("Submitted job %s: demo.sleep for %dms. Only worker C is running.", jobID, sleepMillis)
+	d.Say("Submitted job %s: demo.sleep for %dms. Only worker C is running.", jobID, sleepMillis)
 
 	observed, ok := d.waitRunningOn(ctx, jobID, nameC)
 	if !ok {
 		d.expect("fence: the job ran on worker C", false, "%s", observed)
 		return
 	}
-	d.say("The API shows the job RUNNING on worker C.")
+	d.Say("The API shows the job RUNNING on worker C.")
 
-	d.say("SIGSTOP worker C: frozen, not dead. It cannot heartbeat or renew its lease, and it stays this way until attempt 1 is ABANDONED.")
-	if err := workerC.signal(syscall.SIGSTOP); err != nil {
+	d.Say("SIGSTOP worker C: frozen, not dead. It cannot heartbeat or renew its lease, and it stays this way until attempt 1 is ABANDONED.")
+	if err := workerC.Signal(syscall.SIGSTOP); err != nil {
 		d.expect("fence: worker C was frozen", false, "%v", err)
 		return
 	}
@@ -285,14 +286,14 @@ func (d *demo) fencingPhase(ctx context.Context) {
 	if !ok {
 		return
 	}
-	d.say("The API shows attempt 1 ABANDONED. Worker C is still frozen.")
+	d.Say("The API shows attempt 1 ABANDONED. Worker C is still frozen.")
 
-	_, nameD, err := d.startWorker(ctx, "d", 1)
+	_, nameD, err := d.StartWorker(ctx, "d", 1)
 	if err != nil {
 		d.expect("fence: worker D started", false, "%v", err)
 		return
 	}
-	d.say("Started worker D.")
+	d.Say("Started worker D.")
 	observed, ok = d.waitFor(ctx, "attempt 2 to SUCCEED on worker D", 90*time.Second,
 		func(ctx context.Context) (bool, string, error) {
 			attempts, err := d.attempts(ctx, jobID)
@@ -312,32 +313,32 @@ func (d *demo) fencingPhase(ctx context.Context) {
 		d.expect("fence: the stored state was read before C resumed", false, "%v", err)
 		return
 	}
-	d.say("Attempt 2 SUCCEEDED on worker D. Stored state: %s, attempts %v.", before.JobStatus, before.Attempts)
+	d.Say("Attempt 2 SUCCEEDED on worker D. Stored state: %s, attempts %v.", before.JobStatus, before.Attempts)
 
-	d.say("SIGCONT worker C. Every timer it had is now overdue, and it still holds attempt 1's lease and fence in memory.")
+	d.Say("SIGCONT worker C. Every timer it had is now overdue, and it still holds attempt 1's lease and fence in memory.")
 	resumedAt := time.Now()
-	if err := workerC.signal(syscall.SIGCONT); err != nil {
+	if err := workerC.Signal(syscall.SIGCONT); err != nil {
 		d.expect("fence: worker C was resumed", false, "%v", err)
 		return
 	}
 	// Give it time to act. A worker whose session has been fenced is expected to
 	// stop, so waiting for it to exit usually ends the wait early; the minimum
 	// below is what makes the wait mean something when it does not.
-	workerC.waitExit(10 * time.Second)
+	workerC.WaitExit(10 * time.Second)
 	if wait := resumeGrace - time.Since(resumedAt); wait > 0 {
 		select {
 		case <-ctx.Done():
 		case <-time.After(wait):
 		}
 	}
-	d.say("Worker C has had %s to act (it is %s).", time.Since(resumedAt).Round(100*time.Millisecond), processState(workerC))
+	d.Say("Worker C has had %s to act (it is %s).", time.Since(resumedAt).Round(100*time.Millisecond), processState(workerC))
 
 	after, attempts, err := d.durableView(ctx, jobID)
 	if err != nil {
 		d.expect("fence: the stored state was read after C resumed", false, "%v", err)
 		return
 	}
-	d.say("Stored state after C resumed: %s, attempts %v.", after.JobStatus, after.Attempts)
+	d.Say("Stored state after C resumed: %s, attempts %v.", after.JobStatus, after.Attempts)
 
 	// The pass conditions: all of them are the stored outcome.
 	expectEqual(d, "fence: job status", string(jobs.StatusSucceeded), after.JobStatus)
@@ -376,10 +377,10 @@ func (d *demo) fencingPhase(ctx context.Context) {
 // the real worker checks that before it reports anything: it stops itself and
 // never sends the stale call. Both leave the stored state untouched; in every run
 // observed, this demonstration with unmodified binaries produced the second.
-func (d *demo) illustrateRefusal(p *proc) {
-	data, err := os.ReadFile(p.log)
+func (d *demo) illustrateRefusal(p *stack.Proc) {
+	data, err := os.ReadFile(p.Log)
 	if err != nil {
-		d.say("Could not read %s's log: %v", p.label, err)
+		d.Say("Could not read %s's log: %v", p.Label, err)
 		return
 	}
 	var refusals, own []string
@@ -395,28 +396,28 @@ func (d *demo) illustrateRefusal(p *proc) {
 		text := strings.TrimSpace(fmt.Sprintf("%-5s %s %s", line.Level, line.Msg, line.Error))
 		switch {
 		case refusalCodes.MatchString(raw):
-			refusals = append(refusals, truncate(text, 300))
+			refusals = append(refusals, stack.Truncate(text, 300))
 		case line.Level == "WARN" || line.Level == "ERROR":
-			own = append(own, truncate(text, 300))
+			own = append(own, stack.Truncate(text, 300))
 		}
 	}
 
 	print := func(lines []string) {
 		for _, line := range lines[:min(len(lines), 5)] {
-			fmt.Fprintf(d.out, "           %s\n", line)
+			fmt.Fprintf(d.Out, "           %s\n", line)
 		}
 	}
 	if len(refusals) > 0 {
-		d.say("The control plane refused the frozen worker; matched on the error code in %s's own log (illustration only, not a pass condition):", p.label)
+		d.Say("The control plane refused the frozen worker; matched on the error code in %s's own log (illustration only, not a pass condition):", p.Label)
 		print(refusals)
 		return
 	}
-	d.say("No control-plane refusal code appears in %s's log: it sent no stale report to refuse. Every lease deadline it held had passed during the freeze, so it stopped itself first. Its own account (illustration only, not a pass condition):", p.label)
+	d.Say("No control-plane refusal code appears in %s's log: it sent no stale report to refuse. Every lease deadline it held had passed during the freeze, so it stopped itself first. Its own account (illustration only, not a pass condition):", p.Label)
 	print(own)
 }
 
-func processState(p *proc) string {
-	if p.running() {
+func processState(p *stack.Proc) string {
+	if p.Running() {
 		return "still running"
 	}
 	return "no longer running"

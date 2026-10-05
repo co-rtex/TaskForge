@@ -1,12 +1,14 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M7B. Each milestone's line
+planned. It records the implemented state through M8A. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
 follow-up to it, not a fifth slice. M7 is split into M7A, the proof audit, and
-M7B, the demonstration targets, and is complete with both.
+M7B, the demonstration targets, and is complete with both. M8 is split into M8A,
+the measured benchmarks, M8B and M8C; M8A is complete and the other two are
+planned.
 
 ## Milestone status
 
@@ -36,17 +38,27 @@ M7B, the demonstration targets, and is complete with both.
   need, registered in the production worker
   ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md)). With it, **M7 is
   complete.**
+- **M8A — load generator and measured benchmarks:** complete; see PR #21. A
+  harness that runs the real binaries, two recorded runs, and the first measured
+  values for [PROJECT_SPEC.md](PROJECT_SPEC.md) §7: **two of its five targets are
+  missed on the shipped defaults.** See "M8A" below. M8B (CI hardening) and M8C
+  (deployment) are planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
-and M7 into two, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
+M7 into two, and M8 into three, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
 
 ## Runnable system
 
-Seven binaries build and run, plus one installable library, and one program
-that is run from source and is not among the seven:
+Seven binaries build and run, plus one installable library, and two programs
+that are run from source and are not among the seven:
+
+- `scripts/bench` is the program behind `make bench` and `make bench-smoke`. It
+  starts the same stack `scripts/demo` does, offers load over HTTP, kills workers
+  on a seeded schedule, and measures by reading PostgreSQL. Like `scripts/demo` it
+  is not built by `make build` and ships with nothing. See "M8A" below.
 
 - `scripts/demo` is the program behind `make demo` and `make demo-failure`. It
   starts the real binaries from `./bin`, so it is not built by `make build`
@@ -2411,6 +2423,153 @@ The production worker now declares three job types, which `GET /v1/workers` repo
 as `supported_job_types` and which bound the worker's `job_type` metric label to
 four values. No schema, API, CLI, SDK, dashboard or configuration changed.
 
+## M8A — load generator and measured benchmarks
+
+M8 is split into M8A, this milestone, M8B and M8C; [ROADMAP.md](ROADMAP.md)
+records why. M8A adds a harness that runs the real binaries, records one measured
+run of [PROJECT_SPEC.md](PROJECT_SPEC.md) §7's targets, and carries three small
+items from M7. This section keeps three things apart: what it does, what evidence
+exists, and what is still limited.
+
+**What changed in production code:** `internal/worker/handler.go` only. The two
+demonstration handlers, `demo.sleep` and `demo.fail`, now match their payload key
+exactly and refuse a repeated key. **Nothing else.** The runner, the migrations,
+`api/openapi.yaml`, the SDK and the dashboard are unchanged. Everything else is
+under `scripts/`, `tests/`, `docs/`, the Makefile, `AGENTS.md` and CI.
+
+### Behavior
+
+**The harness** is `scripts/bench`, with three modes: `throughput`, `faults` and
+`smoke`. A full run, `make bench`, is `throughput faults --record`. It starts the
+stack in `scripts/internal/stack`, the hermetic stack `scripts/demo` now shares
+(extracted without changing `make demo` or `make demo-failure`), creates keys in a
+scope of its own, submits `demo.sleep` for 50 ms over `net/http` at 1,000 jobs a
+minute to 12 workers of 4 slots, and reads everything back from PostgreSQL through
+`scripts/readdb`, a read-only handle (`default_transaction_read_only=on`) whose
+queries `tests/integration` also imports. It never deletes or truncates anything.
+How each figure is defined, how a target is judged Met or MISSED, and why the
+headline run uses the shipped defaults are in
+[ADR-0020](adr/0020-benchmark-methodology.md) and are not restated here.
+
+**What it refuses.** A recorded run refuses to start unless `git status
+--porcelain` is empty and every binary in `bin/` was stamped by `go build` with
+`HEAD` and an unmodified tree. Every mode refuses while another TaskForge service
+binary is running on the machine, and a run aborts, naming the cause, if
+PostgreSQL's clock and the harness's monotonic clock drift apart by more than two
+seconds, or if a worker the fault injector did not kill exits. A record is never
+overwritten and an invalid run is never recorded.
+
+**`make bench-smoke`** runs a small throughput run and a small fault run on the
+short-lease profile with a kill that has to hit an attempt, asserts thirteen
+things about the harness's own output, and records nothing. CI runs it in the
+integration job, after the demonstrations; **CI never records a number.**
+
+**The results** are in [PROJECT_SPEC.md](PROJECT_SPEC.md) §7, which is their
+canonical home, and in the two records under [benchmarks/](benchmarks/). On the
+shipped defaults, throughput and the fault-injection volume and completion targets
+are met and the dispatch-latency and worker-failure-recovery targets are
+**missed**. A second, labelled run on a tuned profile met all five.
+
+**Three carried items.** The stack opens PostgreSQL read-only. ADR-0019 now says
+its capacity bound is per attempt and that one job can hold a slot for up to
+`max_attempts × timeout_seconds` across separate attempts. The demonstration
+handlers decode their payload token by token into a map of exact key to value, so
+`{"DURATION_MS": 5}`, `{"Class": "retryable"}` and a repeated key, all accepted
+before, are now permanent `invalid_payload` failures.
+
+### Evidence
+
+The measured commit is **`d796722`**: both the headline run and its record say so,
+and `git diff --stat d796722 HEAD -- ':!docs'` is empty, so no file outside
+`docs/` has changed since. The gate outputs under "M8A gates" ran on `18601e0`,
+which differs from `d796722` only in a paragraph of `AGENTS.md`. The tuned run was
+measured on `c1764d7`, the commit that added the headline record, which differs from
+`d796722` only under `docs/`.
+
+**Four mutations were applied and each was caught**, each shown by `git diff`, run,
+reverted, and confirmed with a clean `git status` (they ran on `6a908aa`):
+
+| Mutation | Caught by | What it said |
+| --- | --- | --- |
+| (a) the dispatch query reads `started_at` instead of the claim's `created_at` | `TestBenchQueries_DispatchLatencyIsTheClaimMinusTheSubmission` | expected 40ms, actual 90ms |
+| (b) the fault schedule ignores the seed | `TestSchedule_ADifferentSeedGivesADifferentSchedule` | the two schedules are equal |
+| (c1) the recorded path no longer calls the dirty-tree guard | `TestRun_ARecordedRunOnADirtyTreeIsRefusedBeforeAnythingStarts` | the refusal was about `bin/`, not the tree |
+| (c2) the guard function accepts any tree | `TestRequireCleanTree_RefusesAModifiedFile`, `…RefusesAnUntrackedFileAndStagedWorkToo`, and the one above | three tests failed |
+| (d) recovery is measured from the replacement's `started_at` | `TestBenchQueries_RecoveryIsTheReplacementsClaimMinusTheKill` | expected 31s, actual 33s |
+
+The percentile method was checked the same way: a floating-point `ceil(0.95 × n)`
+fails the exact-rank test (it gives 951 for n = 1000), which is why the rank is
+computed in integers.
+
+**What this milestone's own checks caught, and what was wrong about my reading of
+them.** This is recorded because the fixes and one retraction are part of why the
+numbers can be trusted.
+
+- **A real harness bug.** The first five `make bench-smoke` runs passed two. One
+  failed with `conn busy` and one crashed the process with `fatal error:
+  concurrent map writes`: the benchmark shared a single `pgx.Conn` between its
+  watchdog, its fault injector and its main flow. `readdb.Open` now returns a
+  read-only pool, and `TestReaddb_OpenIsSafeForConcurrentUse` fails with a data
+  race on the old single connection and passes ten times under `-race` on the
+  pool. The recorded run would have crashed the same way.
+- **A wrong diagnosis, retracted.** One of those runs left 38 jobs `QUEUED` after
+  its drain, and I attributed it to a slow broker and raised the smoke's wait
+  bounds (commit `2b9931c`). That was wrong. The crash above had left a whole
+  stack running as an orphan, and its outbox and scheduler were taking other runs'
+  events and publishing them to its own dead queue. The same orphan then broke
+  eight outbox and scheduler integration tests. `2b9931c` is reverted
+  (`bfdd35a`), and the harness now refuses to start while any TaskForge service is
+  running on the machine (`18601e0`), with a test and a check against a real
+  process.
+- **The environment can invalidate a run, and the harness now says so.** With the
+  laptop's lid closed on battery, macOS entered Maintenance Sleep during runs
+  even under `caffeinate`, and the Docker VM's clock was stepped on each wake: a
+  "12 second" window measured 61 seconds, and a "4 second" one measured 14
+  minutes. One `make demo-failure` run failed on this (1 of 13 expectations; a
+  worker was fenced the second the machine slept) and was rerun under `caffeinate`
+  with the lid open. The harness's clock watchdog exists because of it.
+
+### Limitations
+
+- **One machine, one run, and a busy one.** A laptop (Apple M3, 8 logical cores,
+  8 GiB) running the load generator, five services, twelve workers, Docker (a 3.8
+  GiB VM) and the Claude desktop app, whose renderer was using roughly a third of a
+  core when checked just before the runs. Both
+  recorded runs were on AC power with Low Power Mode off, after the owner plugged
+  in and switched it off. There is no variance estimate.
+- **The throughput target is met inside a tolerance.** 999.83 jobs/min is 0.17
+  below 1,000. ADR-0020 fixed a one-sided 1% tolerance before any run, and the
+  verdict follows from it; read strictly, 999.83 is below 1,000.
+- **The 50.04 s recovery has not been explained.** Fourteen of the sixteen
+  recovered attempts took 31.96 to 33.98 s, which is the 30 s lease plus the 2 s
+  reconciler scan plus the outbox poll. The last kill's two attempts took 50.04 s
+  each, and the tuned run had no such outlier. A guess is a notification handed to
+  the killed worker's open long poll and redelivered later; it was not
+  investigated, and it is not asserted.
+- **Eleven of the headline run's 24 kills hit nothing.** Each chose a worker that
+  held an attempt, but a 50 ms attempt can finish between the choice and the
+  signal, so recovery is measured on 16 attempts, not 24.
+- **Dispatch latency leans slightly in the system's favor by definition.** It reads
+  `job_attempts.created_at`, the start of the claim transaction. The supplementary
+  lease-issuance figure is 583.3 ms median and 973.1 ms p95 on the headline run,
+  against 552.2 ms and 963.7 ms, and does not change the verdict.
+- **The quiet-host check sees this machine only.** A stack on another host pointed
+  at the same database is invisible to it.
+- **The time estimates in `AGENTS.md` and the Makefile help are wrong.** They say
+  about 25 minutes; each recorded run took about 16. They are outside `docs/` and
+  were left alone so that nothing outside `docs/` changed after the measured commit.
+- **The benchmark uses the demonstration handlers.** If M8C gates them in a
+  deployed worker, the benchmark has to run against one that registers them.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot
+  contain its own CI result: the pull request's checks are the record.
+
+### Breaking change
+
+`demo.sleep` and `demo.fail` match payload keys exactly. A payload with a wrong-case
+or a repeated key, which both handlers accepted before, is now a permanent
+`invalid_payload` failure. No schema, API, CLI, SDK, dashboard or configuration
+changed.
+
 ## Verification
 
 ### M5A gates
@@ -2992,6 +3151,35 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8A gates
+
+Run locally on the branch, 2026-10-04, on commit `18601e0` (see "Evidence" for how
+it relates to the measured commit `d796722`), from a machine with no other
+TaskForge process running, on AC power with the lid open. PostgreSQL 16, ElasticMQ
+and the object store from `make up`, on Go 1.27. A first round of these gates
+failed because of an orphaned stack and a harness bug, both described under
+"Evidence"; the table is the round after they were fixed.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS — `gofmt -w .` changed nothing (0 diff lines) |
+| `make lint` | PASS — `go vet ./...` silent |
+| `make build` | PASS — `go build -o bin/ ./cmd/...`; `scripts/bench` is not among the outputs |
+| `make test-unit` | PASS — 24 packages `ok`, up from 22: `scripts/bench` and `scripts/internal/stack` (`scripts/demo` is a test package already). `TestVerificationMatrix_EveryRowResolves` prints "30 rows (I1-I18, S1-S12), 41 distinct tests resolved to real test functions". 77 `--- PASS` lines across the three script packages, no `--- FAIL`. |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  78.297s` |
+| `make test-race` | PASS — 24 unit packages `ok` under `-race`; `ok  …/tests/integration  96.580s`; no `DATA RACE` |
+| `go test -tags integration -race -count=10 -run 'TestReaddb_\|TestBenchQueries_' ./tests/integration/` | PASS — each of the six tests 10 of 10, `ok … 3.981s`, no `DATA RACE` |
+| `make demo` | PASS — 21 of 21 expectations, the same as the baseline taken before the stack was extracted |
+| `make demo-failure` | PASS — 25 of 25 expectations, the same as the pre-extraction baseline |
+| `make bench-smoke`, five consecutive runs | PASS — 5 of 5, each "13 of 13 checks met". The round before the fixes passed 2 of 5. |
+| `go run -race ./scripts/bench smoke` | PASS — 13 of 13, no `DATA RACE` |
+| `make bench` (the recorded run) | PASS — exit 0, about 16 minutes, wrote `docs/benchmarks/2026-10-05-d796722.{md,json}`; run once |
+| `make bench BENCH_ARGS="--profile tuned"` | PASS — exit 0, about 16 minutes, wrote `…-c1764d7-tuned.{md,json}`; run once |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test` | NOT RUN — M8A changes nothing in `sdk/` or `dashboard/` |
+| `docker compose config --quiet` | NOT RUN — M8A changes no Compose file |
+
+The mutation results are under "Evidence" in the M8A section.
 
 ### M7B gates
 
@@ -3779,7 +3967,7 @@ saturates to 0 on arm64.
 **No performance or recovery-time claim is made.** Every threshold in these tests
 is deliberately short so a behavior is observable inside a test; they prove
 correctness, not speed. The benchmark table in
-[PROJECT_SPEC.md](PROJECT_SPEC.md) §7 remains unmeasured.
+[PROJECT_SPEC.md](PROJECT_SPEC.md) §7 was unmeasured then; M8A measured it (see "M8A").
 
 ## Continuous integration
 
@@ -3807,6 +3995,12 @@ into a failure.
 
 The M7A drift check (`tests/verification`) runs inside `make test-unit`, so it
 runs in the first job; no job was added.
+
+M8A adds one step to the integration job, after the two demonstrations:
+`go run ./scripts/bench smoke`, pointed at the compose services the job already
+started with the same `TASKFORGE_*` endpoints. It does not call `make up`, and it
+never records a number. The failure-diagnostics step also collects the harness's
+`taskforge-bench-*` process logs. No job was added.
 
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure.
@@ -3940,14 +4134,20 @@ two targets belong in its version.
 
 ## Next objective
 
-M8: load generator, measured benchmarks, CI hardening, and validated ECS
-Terraform. See [ROADMAP.md](ROADMAP.md)'s M8 entry. It is not started. It carries
-three items from earlier milestones: the route-table-versus-OpenAPI completeness
-check and the verification-matrix drift check's AST fix, both deferred from M7A;
-and the decision ADR-0019 leaves for M8's deployment, whether to gate the
-demonstration handlers there. M6E's note stands too: M8 has to revisit the
-loopback bind and the Host rule together. Every M7 scenario can also be watched
-from the dashboard.
+M8B: CI hardening. See [ROADMAP.md](ROADMAP.md)'s M8B entry. It is not started. It
+is Dockerfiles, image builds in CI, and secret and dependency scanning, plus the two
+gates M7A deferred: a route registry inside `Handler()` checked against
+`api/openapi.yaml`, and the verification-matrix drift check's AST fix. M8C
+(deployment) follows it and **needs its own owner decision before any work
+starts**: the non-loopback bind, which M6E's note says has to be revisited together
+with the Host rule; protection of `/internal`; and the decision ADR-0019 leaves,
+whether to gate the demonstration handlers in a deployed worker. Every M7 scenario
+can also be watched from the dashboard.
+
+Two follow-ups M8A leaves, neither blocking M8B: the 50.04 s recovery outlier on the
+headline run is unexplained, and whether the shipped lease and outbox interval
+should change is a question the two records answer only as numbers, not as a
+decision.
 
 Smaller items available to whoever wants them, none blocking M8:
 

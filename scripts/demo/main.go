@@ -77,12 +77,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 // run executes the chosen demonstration and returns the process exit code.
 func (d *demo) run(ctx context.Context) int {
 	// Deferred as well as called below: a panic must not leave a worker behind.
-	defer d.cleanup()
+	defer d.Cleanup()
 
-	d.say("TaskForge demo, %s mode. This run's scope is %q.", d.mode, d.scope)
-	d.say("Process logs go to %s", d.logDir)
+	d.Say("TaskForge demo, %s mode. This run's scope is %q.", d.mode, d.Scope)
+	d.Say("Process logs go to %s", d.LogDir)
 
-	if err := d.setup(ctx); err != nil {
+	if err := d.Setup(ctx); err != nil {
 		d.rep.add("the demo stack started", false, err.Error())
 	} else if d.mode == modeSuccess {
 		d.runSuccess(ctx)
@@ -92,17 +92,17 @@ func (d *demo) run(ctx context.Context) int {
 
 	// Stopped before the table is printed, so no process is still writing and
 	// nothing the summary says depends on one that is still running.
-	d.cleanup()
+	d.Cleanup()
 	return d.finish(ctx)
 }
 
 // finish prints the expectation table and chooses the exit code.
 func (d *demo) finish(ctx context.Context) int {
-	failed := d.rep.print(d.out, d.mode)
-	d.say("Process logs were left in %s", d.logDir)
+	failed := d.rep.print(d.Out, d.mode)
+	d.Say("Process logs were left in %s", d.LogDir)
 	switch {
 	case ctx.Err() != nil:
-		d.say("Interrupted: the run did not complete.")
+		d.Say("Interrupted: the run did not complete.")
 		return exitInterrupted
 	case failed > 0 || d.rep.empty():
 		return exitFailed

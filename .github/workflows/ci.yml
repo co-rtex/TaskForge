@@ -242,6 +242,22 @@ jobs:
           TASKFORGE_RESULTS_ENDPOINT: http://127.0.0.1:4566
         run: go run ./scripts/demo failure
 
+      - name: Benchmark harness smoke (make bench-smoke)
+        # A short run of the load generator and the fault injector against the
+        # real binaries, with a worker killed mid-job. It asserts that the harness
+        # produced valid measurements, and it records nothing: CI never records
+        # benchmark numbers, because a shared runner's numbers are not the
+        # project's (docs/adr/0020-benchmark-methodology.md).
+        #
+        # `make bench-smoke` is not used for the same reason the demonstrations
+        # above are not: it depends on `up`, and this job has already started the
+        # infrastructure. The program is the same.
+        env:
+          TASKFORGE_DATABASE_URL: postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable
+          TASKFORGE_BROKER_ENDPOINT: http://127.0.0.1:9324
+          TASKFORGE_RESULTS_ENDPOINT: http://127.0.0.1:4566
+        run: go run ./scripts/bench smoke
+
       - name: Collect failure diagnostics
         if: failure()
         continue-on-error: true
@@ -254,11 +270,11 @@ jobs:
           docker compose logs --no-color --tail 400 postgres > "${out}/postgres.log" 2>&1 || true
           docker compose logs --no-color --tail 400 elasticmq > "${out}/elasticmq.log" 2>&1 || true
           docker compose logs --no-color --tail 400 objectstore > "${out}/objectstore.log" 2>&1 || true
-          # The demonstrations leave each process's own log in a temporary
-          # directory and print its path. Service logs only: they never carry a
+          # The demonstrations and the benchmark smoke leave each process's own
+          # log in a temporary directory and print its path. Service logs only: they never carry a
           # credential, and the empty working directory the program gives each
           # child is left behind.
-          for dir in "${TMPDIR:-/tmp}"/taskforge-demo-*; do
+          for dir in "${TMPDIR:-/tmp}"/taskforge-demo-* "${TMPDIR:-/tmp}"/taskforge-bench-*; do
             [ -d "${dir}" ] || continue
             mkdir -p "${out}/$(basename "${dir}")"
             cp "${dir}"/*.log "${out}/$(basename "${dir}")/" 2>/dev/null || true
