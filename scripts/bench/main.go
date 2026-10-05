@@ -68,6 +68,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	if o.modes[0] == modeSmoke {
+		if err := RequireQuietHost(listProcesses); err != nil {
+			fmt.Fprintf(stderr, "bench: %v\n", err)
+			return exitFailed
+		}
 		err := runSmoke(ctx, stdout)
 		return finish(ctx, err, stderr)
 	}
@@ -84,6 +88,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "bench: %v\n", prov.binariesErr)
 			return exitFailed
 		}
+	}
+
+	// After the cheap, deterministic provenance checks, and before anything starts.
+	if err := RequireQuietHost(listProcesses); err != nil {
+		fmt.Fprintf(stderr, "bench: %v\n", err)
+		return exitFailed
 	}
 
 	var th *ThroughputResult

@@ -104,3 +104,73 @@ func TestRequireBuiltFrom_RefusesAMissingBinary(t *testing.T) {
 	err := RequireBuiltFrom("/bin", []string{"a"}, wantSHA, readerOf(nil))
 	require.Error(t, err)
 }
+
+// A stack that is already running on this machine competes for the work of the
+// stack being measured. The outbox publisher and the scheduler claim events from
+// one shared table whatever their scope, so a stray one publishes another run's
+// notifications to a queue nobody reads. A smoke that was crashed once left
+// exactly that behind, and the next runs failed in ways that looked like a slow
+// system and were not.
+func lister(lines ...string) ProcessLister {
+	return func() ([]string, error) { return lines, nil }
+}
+
+func TestRequireQuietHost_AcceptsAMachineWithNoServiceProcesses(t *testing.T) {
+	require.NoError(t, RequireQuietHost(lister(
+		"  101 /sbin/launchd",
+		"  202 /usr/local/bin/postgres -D /var/lib/postgresql/data",
+		"  303 /usr/local/bin/docker compose up -d",
+	)))
+	require.NoError(t, RequireQuietHost(lister()), "an empty list is a quiet machine")
+}
+
+func TestRequireQuietHost_ARunningServiceBinaryIsRefusedAndNamed(t *testing.T) {
+	err := RequireQuietHost(lister(
+		"  101 /sbin/launchd",
+		"36827 /Users/me/TaskForge/bin/taskforge-outbox",
+	))
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "36827")
+	require.Contains(t, err.Error(), "taskforge-outbox")
+	require.Contains(t, err.Error(), "stop", "it says what to do about it")
+}
+
+func TestRequireQuietHost_EveryServiceBinaryCounts(t *testing.T) {
+	for _, name := range []string{"taskforge-api", "taskforge-outbox", "taskforge-scheduler", "taskforge-reconciler", "taskforge-worker"} {
+		err := RequireQuietHost(lister("  900 /opt/x/bin/" + name + " --flag"))
+		require.Errorf(t, err, "%s must be refused", name)
+	}
+}
+
+func TestRequireQuietHost_ListsEveryStrayNotJustTheFirst(t *testing.T) {
+	err := RequireQuietHost(lister(
+		"  11 /a/bin/taskforge-api",
+		"  12 /a/bin/taskforge-outbox",
+		"  13 /a/bin/taskforge-worker",
+	))
+	for _, pid := range []string{"11", "12", "13"} {
+		require.Contains(t, err.Error(), pid)
+	}
+}
+
+// Text that merely mentions a service is not a service: an editor open on its
+// source, the go tool building it, a grep for it, the CLI.
+func TestRequireQuietHost_OnlyTheExecutableCounts(t *testing.T) {
+	require.NoError(t, RequireQuietHost(lister(
+		"  21 vim cmd/taskforge-worker/main.go",
+		"  22 go build -o bin/ ./cmd/taskforge-worker",
+		"  23 grep taskforge-outbox /tmp/log",
+		"  24 /Users/me/TaskForge/bin/taskforge-cli jobs list",
+	)))
+}
+
+func TestRequireQuietHost_ARunFromGoRunIsStillAServiceByItsBinaryName(t *testing.T) {
+	require.Error(t, RequireQuietHost(lister("  31 /var/folders/xx/T/go-build123/b001/exe/taskforge-scheduler")))
+}
+
+func TestRequireQuietHost_AFailureToListIsARefusalNotAPass(t *testing.T) {
+	err := RequireQuietHost(func() ([]string, error) { return nil, errors.New("ps: operation not permitted") })
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "operation not permitted")
+}

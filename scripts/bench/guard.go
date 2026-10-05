@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -69,4 +70,62 @@ func RequireBuiltFrom(binDir string, binaries []string, want string, read BuildI
 		}
 	}
 	return nil
+}
+
+// ProcessLister returns one line per running process, "<pid> <command line>", as
+// `ps -axo pid=,command=` prints them. It is a parameter so a test can answer.
+type ProcessLister func() ([]string, error)
+
+func listProcesses() ([]string, error) {
+	out, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(strings.TrimRight(string(out), "\n"), "\n"), nil
+}
+
+// serviceBinaries are the long-running TaskForge processes. Any of them already
+// running on this machine takes part in the work of the stack being measured: the
+// outbox publisher, the scheduler and the reconciler claim rows from tables that
+// every scope shares, so a stray one publishes, promotes and re-notifies for a run
+// that is not its own. taskforge-cli is a client and is not here.
+var serviceBinaries = []string{
+	"taskforge-api", "taskforge-outbox", "taskforge-scheduler", "taskforge-reconciler", "taskforge-worker",
+}
+
+// RequireQuietHost refuses to start while another TaskForge service is running on
+// this machine, and names each by pid so it can be stopped. It looks at the
+// executable (the first word of the command) and not at the text, so an editor
+// open on a source file, `go build`, or a grep for the name is not mistaken for a
+// service. If the list cannot be read, that is a refusal and not a pass.
+//
+// It sees this machine only. A stack on another host pointed at the same database
+// is not visible to it, and the record says so.
+//
+// This exists because it happened: a smoke run crashed without running its
+// cleanup, its outbox and scheduler stayed up, and five later runs and eight
+// integration tests failed in ways that looked like a slow system.
+func RequireQuietHost(list ProcessLister) error {
+	lines, err := list()
+	if err != nil {
+		return fmt.Errorf("could not check that no other TaskForge stack is running: %w", err)
+	}
+	var strays []string
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		executable := filepath.Base(fields[1])
+		for _, name := range serviceBinaries {
+			if executable == name {
+				strays = append(strays, fmt.Sprintf("%s %s", fields[0], strings.Join(fields[1:], " ")))
+			}
+		}
+	}
+	if len(strays) == 0 {
+		return nil
+	}
+	return fmt.Errorf("another TaskForge stack is running on this machine and would compete for the same work, so no measurement here could be trusted:\n  %s\nstop it first (for a crashed run's leftovers: pkill -f 'bin/taskforge-')",
+		strings.Join(strays, "\n  "))
 }
