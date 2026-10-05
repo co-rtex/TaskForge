@@ -109,7 +109,9 @@ expectation fails. They leave the infrastructure up; `make down` is separate.
 `make bench` builds the binaries, starts the infrastructure, migrates, and runs
 `go run ./scripts/bench throughput faults --record`. It refuses to start unless
 `git status --porcelain` is empty and every binary in `bin/` was built from
-`HEAD`; measures every instant on PostgreSQL's clock; uses the shipped default
+`HEAD`; refuses, in every mode, while another TaskForge service is running on the
+machine (a stray outbox or scheduler takes other runs' work); measures every
+instant on PostgreSQL's clock; uses the shipped default
 timings unless a labelled `--profile tuned` run is asked for; and writes
 `docs/benchmarks/<date>-<sha>.md` and `.json`, never overwriting one. A missed
 target is recorded as missed, not re-run. `make bench-smoke` asserts that the
