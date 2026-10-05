@@ -127,6 +127,51 @@ func migrationOutcome(output string) (migrationResult, error) {
 	return result, nil
 }
 
+// firstRunProblem judges the migrate image's FIRST run against a database the smoke
+// created a moment before, which holds nothing. That run must apply every embedded
+// migration. "Schema already up to date" is a failure here, not a pass: it is what
+// a database someone else already migrated says, and it would let the check pass
+// for an image that applies nothing. The count must be exact, so an image built
+// without its newest migration is caught by name.
+func firstRunProblem(result migrationResult, wantCount int) string {
+	switch {
+	case result.kind == outcomeCurrent:
+		return "the first run found the schema already up to date, so this database was not fresh and the run shows nothing about applying migrations"
+	case result.kind != outcomeApplied:
+		return "the first run neither applied migrations nor found the schema current"
+	case result.applied != wantCount:
+		return fmt.Sprintf("the first run applied %d migrations into an empty database; the image should embed %d", result.applied, wantCount)
+	}
+	return ""
+}
+
+// smokeDatabase is the only shape of database name the smoke will create or drop.
+// CREATE and DROP DATABASE take an identifier, not a parameter, so the name is held
+// to this pattern: a bug can never make the smoke drop any other database.
+var smokeDatabase = regexp.MustCompile(`^taskforge_imagesmoke_[0-9]+$`)
+
+// throwawayDatabaseName names the smoke's own database after its process, so that
+// two smokes on one server do not share one.
+func throwawayDatabaseName(pid int) string {
+	return fmt.Sprintf("taskforge_imagesmoke_%d", pid)
+}
+
+// withDatabaseName returns rawURL with only its database changed: the user, the
+// password, the host, the port and the whole query string are exactly as they were.
+// It parses and sets the path, and never rebuilds the URL by hand.
+func withDatabaseName(rawURL, name string) (string, error) {
+	if !smokeDatabase.MatchString(name) {
+		return "", fmt.Errorf("%q is not a database name the smoke is willing to create or drop", name)
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", errors.New("the database URL is not a URL with a host")
+	}
+	u.Path = "/" + name
+	u.RawPath = ""
+	return u.String(), nil
+}
+
 var migrationFile = regexp.MustCompile(`^(\d{4})_.+\.sql$`)
 
 // expectedSchema counts the migration files in dir and finds the highest version.

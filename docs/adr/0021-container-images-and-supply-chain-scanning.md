@@ -82,9 +82,21 @@ variable is chosen per service from its real validation rules, because running a
 image with no environment does not reject: five of the six pass validation and fail
 later, connecting to the database.
 
-`migrate` runs against the job's PostgreSQL and the smoke asserts, directly in
-PostgreSQL, that `schema_migrations` holds the embedded migrations (count and
-highest version), then runs it again and requires "already up to date".
+`migrate` runs against a database **the smoke creates for it**: `CREATE DATABASE
+taskforge_imagesmoke_<pid>` on the server `TASKFORGE_DATABASE_URL` names, over a
+separate read-write connection (`scripts/readdb` is read-only on purpose and cannot
+create a database), dropped with `DROP DATABASE … WITH (FORCE)` on success, on
+failure and on interrupt. The migrate image is pointed at it by rewriting only the
+database name in the URL. The first run must **apply** every embedded migration, with
+the count exact: "schema already up to date" on the first run is a failure, because
+it is what a database something else already migrated says, and it would let an image
+that applies nothing pass. The second run must report "already up to date". The smoke
+then reads `schema_migrations` in that database, directly, and requires the embedded
+count and highest version. The freshness of the database is therefore guaranteed by
+the smoke itself and not by the lifecycle of the job that runs it. (The first version
+of this check ran against the shared database and accepted "already up to date";
+a host `make migrate` made it pass without the image applying anything. That was
+found in review of PR #22 and fixed.)
 
 `api` runs detached, and the smoke fetches `/dashboard/` and requires a marker only
 the built dashboard contains, fetches the hashed script the page references, and
@@ -156,9 +168,9 @@ Two new jobs rather than steps in existing ones.
 
 - **`images`** needs Docker, the dashboard build and PostgreSQL, and its failures
   (a root image, a wrong schema) read differently from a Go test failure. It owns
-  its Compose lifecycle, like `race`, because the smoke applies migrations from the
-  migrate image to a database that has none; reusing the integration job's migrated
-  database would make "applies the migrations" untestable.
+  its Compose lifecycle, like `race`, so that it never depends on another job's
+  database. Whether the migrate image applies migrations does not rest on that: the
+  smoke creates its own empty database.
 - **`scan`** needs the full history, which no other job fetches, and its failures are
   of a different kind: an advisory published tomorrow fails it with no code change,
   and that must read as its own status line and not turn `checks` red. It runs

@@ -83,7 +83,6 @@ func TestCI_TheImagesJobBuildsTheSixImagesAndRunsTheSmokeAgainstItsOwnInfrastruc
 	require.Contains(t, runs, "make images", "the images are built by the target a developer runs, which builds the dashboard first")
 	require.Contains(t, runs, "go run ./scripts/imagesmoke")
 	require.Less(t, strings.Index(runs, "make images"), strings.Index(runs, "go run ./scripts/imagesmoke"), "build before smoke")
-	require.NotContains(t, runs, "make migrate", "the smoke applies the migrations from the migrate image, to a database that has none")
 	require.NotContains(t, runs, "docker push", "no registry push, no registry credentials")
 	require.NotContains(t, runs, "docker login")
 

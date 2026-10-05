@@ -6,13 +6,20 @@
 //     binary and no shell;
 //   - every image, given an environment that configuration validation rejects,
 //     exits non-zero and says why, in the one variable that image reads;
-//   - the migrate image applies the migrations to PostgreSQL, and the schema
-//     version recorded there is the one the image embeds;
+//   - the migrate image, run against a database the smoke created a moment before
+//     and which is empty, applies every embedded migration, finds nothing to do the
+//     second time, and leaves the schema version the image embeds;
 //   - the api image serves the real dashboard build and not the placeholder page.
 //
 // It runs under `make images-smoke` and in CI, from the repository root, after the
 // images exist. It lives under scripts/, so `make build` neither builds nor ships
-// it. It creates nothing in PostgreSQL but the migrations the migrate image applies.
+// it.
+//
+// It creates one database of its own, taskforge_imagesmoke_<pid>, on the server
+// TASKFORGE_DATABASE_URL names, over a separate read-write connection (scripts/readdb
+// is read-only on purpose), and drops it on every way out. That is what makes the
+// migrate check mean something: a database someone has already migrated would let an
+// image that applies nothing pass.
 package main
 
 import (
@@ -32,6 +39,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/co-rtex/TaskForge/scripts/internal/stack"
 	"github.com/co-rtex/TaskForge/scripts/readdb"
@@ -240,61 +249,137 @@ func envArgs(env map[string]string) []string {
 	return args
 }
 
+// containerDatabaseURL is a database URL as a container must dial it: unchanged on
+// Linux, where containers share the host's network, and with the loopback host
+// rewritten on Docker Desktop.
+func (s *smoke) containerDatabaseURL(hostURL string) string {
+	if s.hostNetwork {
+		return hostURL
+	}
+	return rewriteForDesktop(map[string]string{"TASKFORGE_DATABASE_URL": hostURL})["TASKFORGE_DATABASE_URL"]
+}
+
+// createDatabase creates the smoke's own database over a separate read-write
+// connection to the server. CREATE DATABASE cannot run in a transaction or on
+// scripts/readdb's read-only handle.
+func createDatabase(ctx context.Context, serverURL, name string) error {
+	conn, err := pgx.Connect(ctx, serverURL)
+	if err != nil {
+		return fmt.Errorf("connect to create %s: %w", name, err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
+	return nil
+}
+
+// dropDatabase removes the smoke's database, forcing off any connection still on it.
+// It uses a fresh context of its own, so that it still runs when the smoke was
+// interrupted and its context is cancelled.
+func dropDatabase(serverURL, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, serverURL)
+	if err != nil {
+		return fmt.Errorf("connect to drop %s: %w", name, err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+		return fmt.Errorf("drop %s: %w", name, err)
+	}
+	return nil
+}
+
+// checkMigrate runs the migrate image twice against a database it was just handed,
+// empty, and then reads that database itself.
+//
+// The first run must APPLY every embedded migration; "already up to date" fails it
+// (firstRunProblem). That is only a meaningful test because the database is the
+// smoke's own: a shared one may already have been migrated from the host.
 func (s *smoke) checkMigrate(ctx context.Context) {
+	const (
+		applies  = "migrate: applies every embedded migration to an empty database"
+		again    = "migrate: a second run finds the schema current"
+		version  = "migrate: PostgreSQL's schema version is the embedded one"
+		cleanup  = "migrate: drops its throwaway database"
+		migrates = "migrations"
+	)
+
+	wantCount, wantHighest, err := expectedSchema(migrates)
+	if err != nil {
+		s.record(applies, err.Error(), "")
+		return
+	}
+	name := throwawayDatabaseName(os.Getpid())
+	hostURL, err := withDatabaseName(s.infra.DatabaseURL, name)
+	if err != nil {
+		s.record(applies, err.Error(), "")
+		return
+	}
+	if err := createDatabase(ctx, s.infra.DatabaseURL, name); err != nil {
+		s.record(applies, err.Error(), "")
+		return
+	}
+	defer func() {
+		s.record(cleanup, errString(dropDatabase(s.infra.DatabaseURL, name)), name+" dropped")
+	}()
+
 	run := func() (dockerOutput, error) {
 		runCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 		defer cancel()
 		args := append([]string{"run", "--rm"}, s.networkArgs()...)
-		args = append(args, "--env", "TASKFORGE_DATABASE_URL="+s.containerEnv()["TASKFORGE_DATABASE_URL"], imageName("migrate"))
+		args = append(args, "--env", "TASKFORGE_DATABASE_URL="+s.containerDatabaseURL(hostURL), imageName("migrate"))
 		return docker(runCtx, args...)
 	}
 
 	first, err := run()
 	if err != nil {
-		s.record("migrate: applies the migrations to PostgreSQL", err.Error(), "")
+		s.record(applies, err.Error(), "")
 		return
 	}
 	outcome, outErr := migrationOutcome(first.combined())
 	switch {
 	case first.exit != 0:
-		s.record("migrate: applies the migrations to PostgreSQL", fmt.Sprintf("exit %d:\n%s", first.exit, truncate(first.combined(), 600)), "")
+		s.record(applies, fmt.Sprintf("exit %d:\n%s", first.exit, truncate(first.combined(), 600)), "")
 	case outErr != nil:
-		s.record("migrate: applies the migrations to PostgreSQL", outErr.Error(), "")
-	case outcome.kind == outcomeApplied:
-		s.record("migrate: applies the migrations to PostgreSQL", "", fmt.Sprintf("exit 0, applied %d", outcome.applied))
+		s.record(applies, outErr.Error(), "")
 	default:
-		s.record("migrate: applies the migrations to PostgreSQL", "", "exit 0, schema was already current")
+		s.record(applies, firstRunProblem(outcome, wantCount), fmt.Sprintf("exit 0, applied %d into an empty database", outcome.applied))
 	}
 
 	// A second run must find nothing left to do: the first one really finished.
 	second, err := run()
 	if err != nil {
-		s.record("migrate: a second run finds the schema current", err.Error(), "")
-	} else if again, outErr := migrationOutcome(second.combined()); second.exit != 0 || outErr != nil || again.kind != outcomeCurrent {
-		s.record("migrate: a second run finds the schema current", fmt.Sprintf("exit %d, %v:\n%s", second.exit, outErr, truncate(second.combined(), 400)), "")
+		s.record(again, err.Error(), "")
+	} else if rerun, outErr := migrationOutcome(second.combined()); second.exit != 0 || outErr != nil || rerun.kind != outcomeCurrent {
+		s.record(again, fmt.Sprintf("exit %d, %v:\n%s", second.exit, outErr, truncate(second.combined(), 400)), "")
 	} else {
-		s.record("migrate: a second run finds the schema current", "", "exit 0, schema already up to date")
+		s.record(again, "", "exit 0, schema already up to date")
 	}
 
-	// Then read PostgreSQL itself, not the command's account of what it did.
-	wantCount, wantHighest, err := expectedSchema("migrations")
+	// Then read PostgreSQL itself, the throwaway database and not the shared one,
+	// and not the command's account of what it did.
+	pool, err := readdb.Open(ctx, hostURL)
 	if err != nil {
-		s.record("migrate: PostgreSQL's schema version is the embedded one", err.Error(), "")
-		return
-	}
-	pool, err := readdb.Open(ctx, s.infra.DatabaseURL)
-	if err != nil {
-		s.record("migrate: PostgreSQL's schema version is the embedded one", err.Error(), "")
+		s.record(version, err.Error(), "")
 		return
 	}
 	defer pool.Close()
 	var gotCount, gotHighest int
 	if err := pool.QueryRow(ctx, `SELECT count(*), coalesce(max(version), 0) FROM schema_migrations`).Scan(&gotCount, &gotHighest); err != nil {
-		s.record("migrate: PostgreSQL's schema version is the embedded one", fmt.Sprintf("read schema_migrations: %v", err), "")
+		s.record(version, fmt.Sprintf("read schema_migrations: %v", err), "")
 		return
 	}
-	s.record("migrate: PostgreSQL's schema version is the embedded one", schemaProblem(gotCount, gotHighest, wantCount, wantHighest),
+	s.record(version, schemaProblem(gotCount, gotHighest, wantCount, wantHighest),
 		fmt.Sprintf("schema_migrations: %d migrations, highest version %d", gotCount, gotHighest))
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // --- api and the dashboard ------------------------------------------------------

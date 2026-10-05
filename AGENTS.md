@@ -129,8 +129,11 @@ clone has only a placeholder) and then one image per service from the root
 `Dockerfile`, each labelled with the commit. `make images-smoke` runs
 `go run ./scripts/imagesmoke`: every image must run as a non-root user, hold only its
 own binary, and reject an invalid configuration with the specific message; the
-migrate image must leave PostgreSQL at the embedded schema version; and the api image
-must serve the dashboard build it was built with. Nothing is pushed anywhere.
+migrate image must **apply** every embedded migration into an empty database the
+smoke creates for it (`taskforge_imagesmoke_<pid>` on the same server, dropped on
+every way out, so the database role needs `CREATEDB`) and leave it at the embedded
+schema version; and the api image must serve the dashboard build it was built with.
+Nothing is pushed anywhere.
 
 `make scan` runs `go run ./scripts/scan`: govulncheck (reachable findings only, under
 the Go that `go.mod` declares), gitleaks over the full git history, pip-audit over

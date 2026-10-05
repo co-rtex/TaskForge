@@ -483,9 +483,12 @@ jobs:
   # Container images. Its own job: it needs Docker and the dashboard build, and
   # its failures (an image that runs as root, a migrate image that applies the
   # wrong schema) read differently from a Go test failure. It owns its own
-  # Compose lifecycle, like `race`: the smoke applies the migrations from the
-  # migrate image to a database that has none, which would be a lie if
-  # `make migrate` had already run against it.
+  # Compose lifecycle, like `race`, so it never depends on another job's database.
+  # That the migrate image really applies migrations does not depend on this job's
+  # lifecycle: the smoke creates its own empty database on this job's PostgreSQL,
+  # requires the image's first run to apply every embedded migration into it, and
+  # drops it afterwards, so a database that something else had already migrated
+  # cannot make that check pass.
   #
   # Nothing is pushed anywhere. The images are built for linux/amd64, the runner's
   # own architecture, and discarded with the runner; there is no registry login in

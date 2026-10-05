@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -195,3 +196,93 @@ func TestBuilderImage(t *testing.T) {
 }
 
 const hex64 = "5502b0e56fca23feba76dbc5387ba59c593c02ccc2f0f7355871ea9a0852cebe"
+
+// --- the migrate check owns its database ------------------------------------------
+
+// The first run of the migrate image must APPLY the embedded migrations. The old
+// check accepted "schema already up to date" there, which is what a host
+// `make migrate` leaves behind, so it could pass for an image that applied nothing.
+func TestFirstRunProblem_AlreadyCurrentIsRejected(t *testing.T) {
+	problem := firstRunProblem(migrationResult{kind: outcomeCurrent}, 18)
+
+	require.NotEmpty(t, problem, "an image that finds nothing to do has not shown it can apply migrations")
+	require.Contains(t, problem, "already", "the message says why: the database was not fresh")
+}
+
+func TestFirstRunProblem_AppliedFewerThanEmbeddedIsRejected(t *testing.T) {
+	problem := firstRunProblem(migrationResult{kind: outcomeApplied, applied: 17}, 18)
+
+	require.NotEmpty(t, problem)
+	require.Contains(t, problem, "17")
+	require.Contains(t, problem, "18")
+}
+
+func TestFirstRunProblem_AppliedMoreThanEmbeddedIsRejected(t *testing.T) {
+	require.NotEmpty(t, firstRunProblem(migrationResult{kind: outcomeApplied, applied: 19}, 18))
+}
+
+func TestFirstRunProblem_AppliedExactlyTheEmbeddedMigrationsIsAccepted(t *testing.T) {
+	require.Empty(t, firstRunProblem(migrationResult{kind: outcomeApplied, applied: 18}, 18))
+}
+
+func TestWithDatabaseName_ChangesOnlyTheDatabase(t *testing.T) {
+	const in = "postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable"
+
+	got, err := withDatabaseName(in, "taskforge_imagesmoke_4242")
+
+	require.NoError(t, err)
+	require.Equal(t, "postgres://taskforge:taskforge@127.0.0.1:5442/taskforge_imagesmoke_4242?sslmode=disable", got)
+}
+
+func TestWithDatabaseName_PreservesUserPasswordHostPortAndEveryQueryParameter(t *testing.T) {
+	// A password that needs percent-encoding, a non-default port, and a query with
+	// more than one parameter: anything that rebuilt the URL by hand would lose one.
+	const in = "postgres://svc_user:p%40ss%3Aword%2F1@db.internal.example:6543/maindb?sslmode=require&connect_timeout=7&application_name=smoke"
+
+	got, err := withDatabaseName(in, "taskforge_imagesmoke_1")
+
+	require.NoError(t, err)
+	want, err := url.Parse(in)
+	require.NoError(t, err)
+	parsed, err := url.Parse(got)
+	require.NoError(t, err)
+
+	require.Equal(t, want.Scheme, parsed.Scheme)
+	require.Equal(t, want.User.Username(), parsed.User.Username())
+	wantPassword, _ := want.User.Password()
+	gotPassword, _ := parsed.User.Password()
+	require.Equal(t, wantPassword, gotPassword, "the password is not lost or re-encoded into something else")
+	require.Equal(t, want.Hostname(), parsed.Hostname())
+	require.Equal(t, want.Port(), parsed.Port())
+	require.Equal(t, want.Query(), parsed.Query(), "sslmode and every other parameter survive")
+	require.Equal(t, "/taskforge_imagesmoke_1", parsed.Path)
+}
+
+func TestWithDatabaseName_ComposesWithTheDesktopRewrite(t *testing.T) {
+	// On Docker Desktop the container gets the swapped name AND host.docker.internal.
+	swapped, err := withDatabaseName("postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable", "taskforge_imagesmoke_9")
+	require.NoError(t, err)
+
+	got := rewriteForDesktop(map[string]string{"TASKFORGE_DATABASE_URL": swapped})["TASKFORGE_DATABASE_URL"]
+
+	require.Equal(t, "postgres://taskforge:taskforge@host.docker.internal:5442/taskforge_imagesmoke_9?sslmode=disable", got)
+}
+
+func TestWithDatabaseName_RefusesANameThatIsNotOurs(t *testing.T) {
+	// The name is interpolated into CREATE and DROP DATABASE. Only the smoke's own
+	// shape is ever allowed through, so a bug can never drop another database.
+	for _, name := range []string{"", "taskforge", "postgres", "taskforge_imagesmoke_", "taskforge_imagesmoke_1; DROP DATABASE taskforge", `taskforge_imagesmoke_1"`, "TASKFORGE_IMAGESMOKE_1"} {
+		_, err := withDatabaseName("postgres://u:p@127.0.0.1:5442/taskforge", name)
+		require.Errorf(t, err, "%q must be refused", name)
+	}
+	_, err := withDatabaseName("not a url", "taskforge_imagesmoke_1")
+	require.Error(t, err)
+}
+
+func TestThrowawayDatabaseName_IsDerivedFromThePidAndPassesItsOwnValidation(t *testing.T) {
+	name := throwawayDatabaseName(31337)
+
+	require.Equal(t, "taskforge_imagesmoke_31337", name)
+	_, err := withDatabaseName("postgres://u:p@127.0.0.1:5442/taskforge", name)
+	require.NoError(t, err)
+}
