@@ -1,5 +1,5 @@
-// Command scan runs TaskForge's supply-chain scanners and applies the one file of
-// accepted exceptions.
+// Command scan runs TaskForge's supply-chain scanners and applies the acceptances
+// the repository records.
 //
 //	go run ./scripts/scan                   # make scan: all four tools
 //	go run ./scripts/scan gitleaks          # one tool
@@ -7,10 +7,16 @@
 // The tools are govulncheck (reachable vulnerabilities in the Go code),
 // gitleaks (secrets in the full git history), pip-audit (the Python SDK's runtime
 // dependency tree) and npm audit (the dashboard's production dependencies). Each
-// is run at a pinned version, its machine-readable output is parsed, and any
-// finding without a valid, unexpired entry in security/scan-exceptions.yaml fails
-// the run. An exception that is malformed or has expired fails the run too.
+// is run at a pinned version and its machine-readable output is parsed.
 //
+// There are two acceptance mechanisms, with different meanings. A govulncheck,
+// pip-audit or npm audit finding is accepted by a dated risk acceptance in
+// security/scan-exceptions.yaml, and fails the run without a valid, unexpired one;
+// a malformed or expired entry fails the run too. A gitleaks finding is accepted in
+// .gitleaks.toml, which gitleaks itself reads, as a fake fixture or as a revoked
+// secret pinned to its commit; it is never accepted in the exceptions file, and an
+// entry for gitleaks there is an error.
+
 // It exists because govulncheck has no way to say "this finding is accepted until
 // that date", and because four tools with four exit-code conventions need one
 // policy applied once. See docs/adr/0021-container-images-and-supply-chain-scanning.md.

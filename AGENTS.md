@@ -35,7 +35,7 @@ evidence matter more than feature count.
 | Operator dashboard | React + TypeScript built by Vite, embedded into `taskforge-api` with `go:embed`; Node runs **only** inside the digest-pinned image in `dashboard/Dockerfile` |
 | Dashboard tooling | Biome (`biome ci`, authoritative formatter and linter), `tsc --noEmit`, Vitest |
 | Container images | One root `Dockerfile`: a digest-pinned `golang` builder and a digest-pinned `distroless/static-debian12:nonroot` base, six targets, no CLI image |
-| Supply-chain scanning | `scripts/scan` driving govulncheck, gitleaks (pinned container), pip-audit and npm audit (in the dashboard's pinned Node), with one exceptions file |
+| Supply-chain scanning | `scripts/scan` driving govulncheck, gitleaks (pinned container), pip-audit and npm audit (in the dashboard's pinned Node). Dated risk acceptance for the three dependency scanners lives in `security/scan-exceptions.yaml`; a gitleaks finding is accepted only in `.gitleaks.toml` |
 
 Required to build and run: Git, Go, Docker, Docker Compose, GNU Make.
 Additionally required to build or test the Python SDK in `sdk/python`: a
@@ -138,10 +138,12 @@ Nothing is pushed anywhere.
 `make scan` runs `go run ./scripts/scan`: govulncheck (reachable findings only, under
 the Go that `go.mod` declares), gitleaks over the full git history, pip-audit over
 the SDK's runtime tree, and npm audit over the dashboard's production dependencies.
-Any finding without an entry in `security/scan-exceptions.yaml`, and any entry that is
-malformed or has expired, fails it. It needs Docker, Python 3 and the network. **A real
-secret is never added to `.gitleaks.toml` or the exceptions file:** revoke it. The
-decisions are in
+A govulncheck, pip-audit or npm audit finding without a valid, unexpired entry in
+`security/scan-exceptions.yaml` fails it, as does a malformed or expired entry; an entry
+for gitleaks there is an error. A gitleaks finding is accepted only in `.gitleaks.toml`,
+as a fixture (a fake value) or a revoked secret pinned to its commit. It needs Docker,
+Python 3 and the network. **A live secret is never allowlisted anywhere: revoke it
+first, then pin it as revoked.** The decisions are in
 [ADR-0021](docs/adr/0021-container-images-and-supply-chain-scanning.md).
 
 The Python SDK has its own targets. They are deliberately **not** folded into

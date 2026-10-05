@@ -20,15 +20,28 @@ const (
 	toolNpmAudit    = "npm-audit"
 )
 
+// knownTools are the tools the driver can run, and so the names a run can select.
 var knownTools = []string{toolGovulncheck, toolGitleaks, toolPipAudit, toolNpmAudit}
 
-// Exception is one accepted finding in security/scan-exceptions.yaml. Every field
+// exceptableTools are the tools whose findings this file can accept: a dated risk
+// acceptance, for a vulnerability in a dependency that has no fix yet or cannot be
+// taken yet. gitleaks is deliberately not among them. A gitleaks finding is accepted
+// in .gitleaks.toml, as a fixture (a fake value) or as a revoked secret pinned to its
+// commit, and nowhere else. History is permanent, so an expiry would only create
+// renewal churn, and naming a revoked credential's value here would put it back in
+// the tree. See docs/adr/0021-container-images-and-supply-chain-scanning.md.
+var exceptableTools = []string{toolGovulncheck, toolPipAudit, toolNpmAudit}
+
+// gitleaksPointer is what an entry for gitleaks is told.
+const gitleaksPointer = "gitleaks findings are not accepted in this file: add a fixture entry (a fake value) or, for a secret that has already been revoked, a revoked entry pinned to its commit, in .gitleaks.toml; see ADR-0021"
+
+// Exception is one accepted finding in security/scan-exceptions.yaml: a dated risk
+// acceptance for govulncheck, pip-audit or npm-audit. Every field
 // is required: an exception is a decision someone made, with a reason, until a
 // date, and it lapses on that date instead of becoming permanent by neglect.
 type Exception struct {
 	// ID is an identifier the tool reports for the finding: an OSV id or a CVE
-	// for govulncheck, a fingerprint for gitleaks, a PYSEC or GHSA id for
-	// pip-audit and npm-audit.
+	// for govulncheck, a PYSEC or GHSA id for pip-audit and npm-audit.
 	ID   string `yaml:"id"`
 	Tool string `yaml:"tool"`
 	// Reason says why the finding is acceptable, not merely that it is accepted.
@@ -83,8 +96,11 @@ func parseExceptions(data []byte, today time.Time) ([]Exception, []string) {
 				bad("is missing the required field %q", field)
 			}
 		}
-		if e.Tool != "" && !slices.Contains(knownTools, e.Tool) {
-			bad("names an unknown tool %q (known: %s)", e.Tool, strings.Join(knownTools, ", "))
+		switch {
+		case e.Tool == toolGitleaks:
+			bad("%s", gitleaksPointer)
+		case e.Tool != "" && !slices.Contains(exceptableTools, e.Tool):
+			bad("names an unknown tool %q (an exception may name: %s)", e.Tool, strings.Join(exceptableTools, ", "))
 		}
 		if strings.TrimSpace(e.Expires) != "" {
 			expires, err := time.Parse(dateLayout, strings.TrimSpace(e.Expires))
@@ -110,8 +126,13 @@ func parseExceptions(data []byte, today time.Time) ([]Exception, []string) {
 
 // matchException finds a valid exception for a finding: the same tool, naming the
 // finding's own identifier or one of its aliases. An exception for one tool never
-// excuses another tool's finding.
+// excuses another tool's finding, and a gitleaks finding is never excused here at
+// all, even by an entry that parsing would have refused: its mechanism is
+// .gitleaks.toml.
 func matchException(f Finding, list []Exception) (Exception, bool) {
+	if f.Tool == toolGitleaks {
+		return Exception{}, false
+	}
 	for _, e := range list {
 		if e.Tool != f.Tool {
 			continue

@@ -142,12 +142,14 @@ images: dash-build ## Build the six service images as taskforge-<service>:dev (b
 images-smoke: images up ## Check the six images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard
 	$(GO) run ./scripts/imagesmoke
 
-# The four supply-chain scanners, through one driver that applies
-# security/scan-exceptions.yaml: govulncheck (reachable vulnerabilities in the Go
-# code), gitleaks (secrets in the full git history), pip-audit (the SDK's runtime
-# dependency tree) and npm audit (the dashboard's production dependencies). Any
-# finding without a valid, unexpired exception fails it. It needs Docker (gitleaks
-# and npm audit run in pinned containers), Python 3 and the network.
+# The four supply-chain scanners, through one driver: govulncheck (reachable
+# vulnerabilities in the Go code), gitleaks (secrets in the full git history),
+# pip-audit (the SDK's runtime dependency tree) and npm audit (the dashboard's
+# production dependencies). A govulncheck, pip-audit or npm audit finding is accepted
+# only by a valid, unexpired entry in security/scan-exceptions.yaml; a gitleaks
+# finding only in .gitleaks.toml (a fake fixture, or a revoked secret pinned to its
+# commit). Anything else fails it. It needs Docker (gitleaks and npm audit run in
+# pinned containers), Python 3 and the network.
 # See docs/adr/0021-container-images-and-supply-chain-scanning.md.
 scan: ## Scan for reachable Go vulnerabilities, secrets in git history, and vulnerable SDK and dashboard dependencies
 	$(GO) run ./scripts/scan

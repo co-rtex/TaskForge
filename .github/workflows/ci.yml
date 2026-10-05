@@ -570,8 +570,9 @@ jobs:
   # scan with no change to the code, and that must read as its own status line,
   # not turn `checks` red.
   #
-  # It runs the command a developer runs, `make scan`, so security/scan-exceptions.yaml
-  # applies identically in both places. Every tool is pinned inside the driver:
+  # It runs the command a developer runs, `make scan`, so the acceptances apply
+  # identically in both places (security/scan-exceptions.yaml for govulncheck, pip-audit
+  # and npm audit; .gitleaks.toml for gitleaks). Every tool is pinned inside the driver:
   # govulncheck at an exact tag, gitleaks by container digest (not gitleaks-action,
   # which needs a licence for organisations), pip-audit with ==, and npm audit in
   # the Node image dashboard/Dockerfile pins. See docs/adr/0021.

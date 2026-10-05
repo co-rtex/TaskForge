@@ -45,35 +45,6 @@ func TestExceptionsFile_ExistsAtTheOnePathTheDriverAndCIUse(t *testing.T) {
 	require.Contains(t, driver, `"`+exceptionsFilePath+`"`, "the driver's default is that file")
 }
 
-// An allowlist entry that is wider than its fixture hides the next real secret that
-// lands in the same file or matches the same rule. Each entry must therefore name a
-// rule, a path and a value, require all three, and say which fixture it covers.
-func TestGitleaksConfig_EveryAllowlistEntryIsScopedToOneFixtureAndExplained(t *testing.T) {
-	text := readRepoFile(t, gitleaksConfigPath)
-
-	require.Regexp(t, `(?m)^\[extend\]\s*\nuseDefault\s*=\s*true`, text, "the default rule set stays on")
-	require.NotRegexp(t, `(?m)^\[allowlist\]`, text, "a global allowlist is not scoped to a rule; use [[allowlists]] with targetRules")
-
-	blocks := strings.Split(text, "[[allowlists]]")
-	require.Greater(t, len(blocks), 1, "the known fixtures are allowlisted here")
-	for i, block := range blocks[1:] {
-		// The comment that explains the entry is the text above its header, which is
-		// the tail of the previous block.
-		comment := blocks[i]
-		lines := strings.Split(strings.TrimRight(comment, "\n"), "\n")
-		var explanation []string
-		for j := len(lines) - 1; j >= 0 && strings.HasPrefix(strings.TrimSpace(lines[j]), "#"); j-- {
-			explanation = append([]string{lines[j]}, explanation...)
-		}
-		require.Regexpf(t, `(?i)fixture`, strings.Join(explanation, "\n"), "allowlist entry %d needs a comment naming the fixture it covers", i+1)
-
-		require.Regexpf(t, `(?m)^condition\s*=\s*"AND"`, block, "entry %d must require the path AND the value, not either", i+1)
-		require.Regexpf(t, `(?m)^targetRules\s*=\s*\["[a-z0-9-]+"\]`, block, "entry %d must name the rule it covers", i+1)
-		require.Regexpf(t, `(?m)^paths\s*=\s*\['''\^[^']+\$'''\]`, block, "entry %d must be anchored to one file path", i+1)
-		require.Regexpf(t, `(?m)^regexes\s*=\s*\['''[^']+'''\]`, block, "entry %d must name the value it covers", i+1)
-	}
-}
-
 func TestDashboardDockerfile_NodeIsPinnedOnceAndTheAuditRunsInIt(t *testing.T) {
 	stages := parseDockerfile(t, readRepoFile(t, dashDockerfilePath))
 

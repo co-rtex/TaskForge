@@ -156,6 +156,22 @@ func TestRun_OutputThatIsNotAReportFailsTheScan(t *testing.T) {
 	require.Regexp(t, `(?m)^\s*FAIL\s+pip-audit\s`, out)
 }
 
+// The gitleaks mechanism is .gitleaks.toml. A gitleaks finding with a gitleaks entry in
+// the exceptions file is still a failed scan, and the entry itself is reported.
+func TestRun_AGitleaksFindingIsNotExcusedByAnEntryInTheExceptionsFile(t *testing.T) {
+	sources := cleanSources(t)
+	sources[toolGitleaks] = staticSource(fixture(t, "gitleaks-report.json"))
+	fingerprint := "c8da430d35ae111183ffac6f2614c8d689f8717a:dashboard/src/test/fixtures.ts:generic-api-key:20"
+	doc := "exceptions:\n  - {id: " + fingerprint + ", tool: gitleaks, reason: r, accepted_by: a, expires: 2026-12-31}\n"
+
+	code, out := runScan(t, writeExceptions(t, doc), sources)
+
+	require.Equal(t, exitFailed, code, out)
+	require.Contains(t, out, "RESULT: FAIL")
+	require.Regexp(t, `(?m)^\s*FAIL\s+gitleaks\s+`+regexp.QuoteMeta(fingerprint)+`\s.*not excepted`, out, "the finding is still reported as not excepted")
+	require.Regexp(t, `(?m)^\s*FAIL\s+exceptions\s+`+regexp.QuoteMeta(fingerprint)+`\s.*\.gitleaks\.toml`, out, "and the entry is reported, with where to go")
+}
+
 func TestRun_NamedToolsRunAloneAndAnUnknownNameIsAUsageError(t *testing.T) {
 	sources := map[string]source{toolGitleaks: staticSource(fixture(t, "gitleaks-clean.json"))}
 	code, out := runScan(t, writeExceptions(t, noExceptions), sources, "gitleaks")

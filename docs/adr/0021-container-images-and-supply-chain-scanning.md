@@ -1,4 +1,4 @@
-# ADR-0021: Container images and supply-chain scanning: one Dockerfile, pinned bases, blocking scanners, one exceptions file
+# ADR-0021: Container images and supply-chain scanning: one Dockerfile, pinned bases, blocking scanners, two acceptance mechanisms
 
 - **Status:** Accepted
 - **Date:** 2026-10-05
@@ -24,14 +24,17 @@ Three things about the repository make the obvious versions of this work wrong:
   from another.
 - **The scanners do not share a policy.** govulncheck has no way to accept a finding
   until a date; gitleaks, pip-audit and npm audit each have an ignore mechanism of
-  their own, in four formats, with different expiry semantics (mostly none). A
+  their own, in different formats, with different expiry semantics (mostly none). A
   blocking scan with four bespoke ignore files is a scan people learn to bypass.
 
 The owner decided the shape (recorded in the M8B prompt and repeated here as
-decisions, not options): scanners **block** CI; exceptions live in **one committed
-file** and carry `id, tool, reason, accepted_by, expires`; a malformed or expired
-entry fails CI; and there is **one root Dockerfile** with a builder stage and one
-final target per service.
+decisions, not options): scanners **block** CI; exceptions are committed, and carry
+`id, tool, reason, accepted_by, expires`; a malformed or expired entry fails CI; and
+there is **one root Dockerfile** with a builder stage and one final target per
+service. The first version of the exceptions decision was *one file for all four
+tools*. In the review of PR #22 the owner refined it into **two acceptance mechanisms
+with different meanings** (below), because a gitleaks finding is not the kind of thing
+a date can accept.
 
 ## Decision
 
@@ -110,9 +113,11 @@ CI's `dashboard` job proves the build itself), or that the dashboard works.
 ### The scan driver
 
 `scripts/scan` (`make scan`, and CI) is a Go program that runs four tools, parses
-their machine-readable output, applies `security/scan-exceptions.yaml`, prints one
-line per finding (tool, id, location, excepted or not) and exits non-zero on any
-finding that is not excepted.
+their machine-readable output, applies `security/scan-exceptions.yaml` to the findings
+of govulncheck, pip-audit and npm audit, prints one line per finding (tool, id,
+location, excepted or not) and exits non-zero on any finding that is not excepted. A
+gitleaks finding is accepted by gitleaks's own configuration, `.gitleaks.toml`, which
+the driver hands to the container; a finding gitleaks still reports is never excepted.
 
 | Tool | Version pin | Scope |
 | --- | --- | --- |
@@ -126,7 +131,8 @@ exit-code conventions need one policy applied once. A tool that cannot run, or w
 output is not that tool's report (empty, truncated, a different format), **fails the
 scan**: a scan that could not run is not a scan that found nothing. Findings are
 matched to exceptions by the tool's own identifier or any of its aliases, within the
-same tool only.
+same tool only, and a gitleaks finding is never matched to an entry in the exceptions
+file at all.
 
 govulncheck runs under the toolchain `go.mod` declares because it reports
 standard-library vulnerabilities against whichever Go runs it; on a workstation with
@@ -134,51 +140,60 @@ a newer Go the scan would pass for a compiler the images are not built with.
 v1.7.0 is the newest govulncheck that builds with Go 1.25.x (v1.8.0 requires 1.26),
 so the pin rises with `go.mod`'s Go, not before it.
 
-### The exceptions file
+### Two acceptance mechanisms, with distinct meanings
 
-One file, `security/scan-exceptions.yaml`. Each entry has all five fields: `id`,
-`tool`, `reason`, `accepted_by`, `expires` (an ISO date). The driver fails the run
-on: a missing or empty field, an unknown key (so a misspelled `expires` cannot make
-an exception permanent), an unknown tool, a date that is not an ISO date, an expired
-entry, or a duplicate. An entry holds through the **end of its `expires` day** (UTC)
-and fails from the next. An entry that matches nothing in a run is **noted, not
-failed**: a finding that has been fixed should prompt removal, not break the build.
-An expired entry excuses nothing, even if it names a live finding.
+Accepting a finding means different things for different tools, so there are two
+mechanisms and each is the only place for what it accepts. This was the owner's
+decision in the PR #22 review.
 
-The file is checked on every run, whatever the scanners find, so a lapsed exception
-cannot sit unnoticed until the finding returns. `security/scan-exceptions.yaml` is
-empty at M8B because nothing is excepted.
+**`security/scan-exceptions.yaml` is a dated risk acceptance, for govulncheck,
+pip-audit and npm audit only.** Those findings are vulnerabilities in code the project
+depends on, and "we accept this until the fix lands or the date arrives" is a
+meaningful statement about them. Each entry has all five fields: `id`, `tool`,
+`reason`, `accepted_by`, `expires` (an ISO date). The driver fails the run on: a
+missing or empty field, an unknown key (so a misspelled `expires` cannot make an
+exception permanent), a tool other than those three, a date that is not an ISO date,
+an expired entry, or a duplicate. **An entry for `gitleaks` is an error** that names
+`.gitleaks.toml`, and a gitleaks finding never matches an exception, even one handed to
+the matcher directly. An entry holds through the **end of its `expires` day** (UTC) and
+fails from the next. An entry that matches nothing in a run is **noted, not failed**:
+a finding that has been fixed should prompt removal, not break the build. An expired
+entry excuses nothing, even if it names a live finding. The file is checked on every
+run, whatever the scanners find, so a lapsed exception cannot sit unnoticed until the
+finding returns. It is empty at M8B because nothing is excepted.
 
-### Secrets
+**`.gitleaks.toml` is the only place a gitleaks finding is accepted.** gitleaks keeps
+its default rules on. The file holds exactly two kinds of `[[allowlists]]` entry,
+**both permanent by design, because history is permanent**:
 
-gitleaks keeps its default rules on. `.gitleaks.toml` allowlists only known fake
-fixtures, each entry scoped to **a rule, a path anchored to one file, and the value**
-(`condition = "AND"`), with a comment naming the fixture. `tests/verification`
-fails an entry that lacks any of these. **A real secret is never allowlisted.** If
-the scan finds one, the response is to revoke it and remove it from use, and to leave
-the configuration alone; an allowlist entry wider than its fixture hides the next
-real secret that lands in the same file.
+1. **FIXTURE: a fake value.** `targetRules` (one rule), `paths` (one entry, anchored
+   `^...$` and a literal file path), `regexes` (one entry, a **literal** value: no
+   regex metacharacter other than an escaped one) and `condition = "AND"`, so rule,
+   file and value must all match. A comment above the entry names the fixture. The
+   value must appear verbatim in the named file at `HEAD`, so an entry cannot outlive
+   its fixture, and a typo cannot silently allowlist nothing.
+2. **REVOKED: a real secret that has already been revoked.** `targetRules` (one
+   rule), `paths` (one anchored literal file) and `commits` (exactly one full 40-hex
+   SHA), with `condition = "AND"` and **no `regexes`**: the entry never contains the
+   secret's value. A comment above it states `Revoked YYYY-MM-DD by <name>` and what
+   the credential was for. It excuses that rule, in that file, at that one commit, and
+   nothing else: the same value committed again, in another commit, is a new finding.
+
+`tests/verification` parses the file and fails an entry that is neither kind, or both
+(a `commits` and a `regexes` together, or neither), or that carries any other key,
+including a `description` on a REVOKED entry, which would be a place to put the value.
+It also refuses any table other than `[extend]` and `[[allowlists]]`, so a global
+`[allowlist]` or a custom rule cannot appear unreviewed. No REVOKED entry exists today.
+
+**A live secret is never allowlisted. The procedure is: revoke it, then pin it.**
+If the scan finds a real secret, stop. Revoke it at its source and confirm that it no
+longer works; remove it from the current tree; and only then add a REVOKED entry for
+the finding's rule, file and commit (the finding's id is `commit:file:rule:line`), with
+the comment above it. Editing `.gitleaks.toml` first, to make the scan pass, is the
+failure this procedure exists to prevent.
 
 gitleaks runs from its container image, pinned by version and by digest, and not as
 `gitleaks/gitleaks-action`, which requires a licence for organisations.
-
-### CI
-
-Two new jobs rather than steps in existing ones.
-
-- **`images`** needs Docker, the dashboard build and PostgreSQL, and its failures
-  (a root image, a wrong schema) read differently from a Go test failure. It owns
-  its Compose lifecycle, like `race`, so that it never depends on another job's
-  database. Whether the migrate image applies migrations does not rest on that: the
-  smoke creates its own empty database.
-- **`scan`** needs the full history, which no other job fetches, and its failures are
-  of a different kind: an advisory published tomorrow fails it with no code change,
-  and that must read as its own status line and not turn `checks` red. It runs
-  `make scan`, so the exceptions apply identically in both places.
-
-Every action is pinned by commit SHA, every image by digest, every Go tool at an
-exact tag, pip-audit with `==`. `tests/verification/ci_supply_chain_test.go` holds
-those rules and the shape of the two jobs.
 
 ## Alternatives considered
 
@@ -193,11 +208,23 @@ those rules and the shape of the two jobs.
   The first cannot express an exception with an expiry; the second needs a licence
   for organisations; both add an unpinned-by-us layer between the repository and the
   tool. A script run by `make scan` is the same command locally and in CI.
-- **Each tool's native ignore mechanism** (a `.gitleaksignore` file, pip-audit's
+- **Each tool's native ignore mechanism** for the dated findings (pip-audit's
   `--ignore-vuln`, an `npm audit` allow-list). Different formats, no common expiry,
-  and govulncheck has none. One file, one schema, one expiry rule was the owner's decision.
-- **Exceptions without expiry.** A permanent exception is a decision nobody owns
-  any more. The date forces it back in front of a person.
+  and govulncheck has none. One file with one schema and one expiry rule for those three
+  tools was the owner's decision.
+- **Dated exceptions without expiry.** A permanent acceptance of a vulnerability is a
+  decision nobody owns any more. The date forces it back in front of a person. (This
+  is the argument for expiry on the three dependency scanners, and the reason it does
+  not carry over to gitleaks, below.)
+- **Accepting gitleaks findings through the dated exceptions file.** Rejected, in the
+  PR #22 review. *History is permanent*: a fixture committed in 2026 is in the history
+  in 2036, and a revoked credential stays revoked, so an expiry date on either would
+  only create renewal churn: a date to bump that carries no information. Naming the
+  finding by value would be worse. A revoked credential's value written into an
+  exceptions entry, or into a `regexes` allowlist, puts that credential back into the
+  tree, and excuses the same value wherever it is committed next. So REVOKED entries
+  are pinned to a commit instead and never carry the value, and the dated file does not
+  take gitleaks at all.
 - **Failing on imported-but-uncalled vulnerabilities.** Noisy to the point of being
   ignored. The owner chose reachable-only for govulncheck.
 - **A second Dockerfile per service, or a base image per service.** Six Dockerfiles
@@ -239,6 +266,13 @@ those rules and the shape of the two jobs.
   against PostgreSQL. That the services work together in containers, on a network,
   with a real bind address, is M8C, which needs its own decision about the non-loopback
   bind (ADR-0018).
-- **The leak scan checks history, and history is permanent.** A fixture allowlisted
-  here stays allowlisted for the commit that introduced it; a real secret found in
-  history is a revocation, not a rewrite.
+- **The leak scan checks history, and history is permanent.** A fixture entry stays
+  until the fixture is removed from its file (a test then fails it); a REVOKED entry
+  stays as long as the commit does. A real secret found in history is a revocation
+  followed by a pin, not a rewrite of history and not a dated exception.
+- **A REVOKED entry is as narrow as one commit.** A revoked value that was copied
+  into several commits needs one entry per commit, and a fixture value reused in a
+  second file needs its own entry. That is the cost of not allowlisting by value.
+- **The shape check is a scoped text parser, not a TOML library,** because adding a
+  dependency is the owner's decision. It reads only the subset `.gitleaks.toml`
+  uses and refuses what it does not understand.

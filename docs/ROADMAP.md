@@ -652,15 +652,19 @@ per service (api, outbox, scheduler, reconciler, worker, migrate; no CLI image) 
 a digest-pinned distroless nonroot base, built after `make dash-build`; `make
 images` and `make images-smoke` (`scripts/imagesmoke`); a drift check between the
 Dockerfile's Go version and `go.mod`; `scripts/scan` and `make scan`, which run
-govulncheck, gitleaks, pip-audit and npm audit at pinned versions and apply one
-committed exceptions file, `security/scan-exceptions.yaml`; `.gitleaks.toml`; the
-`images` and `scan` jobs in CI; and
+govulncheck, gitleaks, pip-audit and npm audit at pinned versions and apply two
+acceptance mechanisms with distinct meanings: `security/scan-exceptions.yaml`, a dated
+risk acceptance for govulncheck, pip-audit and npm audit only, and `.gitleaks.toml`, the
+only place a gitleaks finding is accepted, as a fixture (a fake value) or a revoked
+secret pinned to its commit; the `images` and `scan` jobs in CI; and
 [ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md).
 **Acceptance.** CI builds the six images and checks that each runs as a non-root
 user, rejects an invalid configuration with the specific message, and that the
-migrate image leaves PostgreSQL at the embedded schema version and the api image
-serves the real dashboard build; the four scanners block CI on any finding without
-a valid, unexpired exception; and no workflow is permanently failing.
+migrate image applies every embedded migration into an empty database and leaves it
+at the embedded schema version, and the api image serves the real dashboard build; the
+four scanners block CI on any finding not accepted by its tool's mechanism (an
+unexpired dated entry for the three dependency scanners; a fixture or revoked entry
+for gitleaks); and no workflow is permanently failing.
 **Depends on.** M8A.
 **Status:** complete; see PR #22 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
 evidence and for what remains limited.

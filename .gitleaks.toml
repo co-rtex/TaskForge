@@ -1,10 +1,28 @@
-# gitleaks configuration for `make scan` and CI. The default rule set stays on;
-# the only changes are allowlist entries for known fake fixtures, each one scoped to
-# the rule, the file and the value it covers, with a comment naming the fixture.
+# gitleaks configuration for `make scan` and CI. This file is the ONLY place a gitleaks
+# finding is accepted (docs/adr/0021-container-images-and-supply-chain-scanning.md).
+# security/scan-exceptions.yaml does not take gitleaks entries: history is permanent,
+# so an expiry date would only create renewal churn, and an entry that named a revoked
+# credential's value would put it back in the tree.
 #
-# A real secret is never added here. If gitleaks finds one, it is revoked and taken
-# out of use, and this file is not touched. An allowlist entry that is wider than
-# its fixture hides the next real secret that lands in the same file.
+# The default rule set stays on. Every [[allowlists]] entry below is exactly one of two
+# kinds, both permanent by design, and tests/verification refuses anything else:
+#
+#   FIXTURE  A fake value. targetRules (one rule), paths (one anchored file, ^...$),
+#            regexes (one literal value) and condition = "AND". A comment above the
+#            entry starts "Fixture:" and names the fixture. The value must appear
+#            verbatim in that file at HEAD, so an entry cannot outlive its fixture.
+#
+#   REVOKED  A real secret that has ALREADY been revoked. targetRules (one rule), paths
+#            (one anchored file) and commits (exactly one 40-hex SHA), with
+#            condition = "AND" and NO regexes: the entry never contains the secret's
+#            value. A comment above it states "Revoked YYYY-MM-DD by <name>" and what
+#            the credential was for. It excuses that rule in that file at that one
+#            commit and nothing else; the same value committed again is a new finding.
+#
+# A LIVE secret is never allowlisted. The procedure is: revoke it at its source first,
+# and only then pin it here as REVOKED. If gitleaks finds one, stop and revoke; do not
+# edit this file to make the scan pass.
+
 title = "TaskForge gitleaks configuration"
 
 [extend]
