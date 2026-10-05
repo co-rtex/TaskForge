@@ -111,12 +111,7 @@ func smokeOptions() options {
 	o.workers, o.concurrency = 4, 4
 	o.warmup, o.window = 2*time.Second, 4*time.Second
 	o.jobs, o.kills = 60, 1
-	// The smoke asserts that the harness measured validly, not how fast the system
-	// is, so its waits are generous: they only bound a hang, and a run that is
-	// healthy ends as soon as every job is terminal. The first version used 90s and
-	// 60s and failed once on a broker that took ~400ms to accept each message, which
-	// is a slow environment and not an invalid measurement.
-	o.deadline, o.drain = 3*time.Minute, 3*time.Minute
+	o.deadline, o.drain = 90*time.Second, 60*time.Second
 	return o
 }
 
