@@ -185,6 +185,18 @@ definition) refuses to start unless:
 - the workers, slots, rate, warm-up, window, job count, kill count and deadline
   are the fixed values or longer.
 
+**Every mode, recorded or not, also refuses while another TaskForge service binary
+is running on the machine.** The outbox publisher, the scheduler and the reconciler
+claim rows from tables every scope shares, so a stray one takes part in the work of
+the stack being measured: it publishes another run's notifications to a queue
+nobody reads, and the scheduler then re-notifies the jobs it stranded. This was
+learned from a harness crash that left a whole stack behind: five later smoke runs
+and eight integration tests failed in ways that looked like a slow broker, and a
+wrong diagnosis cost a commit that was then reverted. The check matches the
+executable and not the text of a command line, and it names each pid. It sees this
+machine only; a stack on another host pointed at the same database is invisible to
+it.
+
 It refuses to write a record whose run is invalid, and it never overwrites a
 record (`O_EXCL`). A record contains the commit, the clean tree, the command, the
 environment (CPU, cores, memory, OS, **power source**, Go, Docker and the Docker
@@ -251,7 +263,9 @@ not run `make bench`.
   configuration the record prints next to the verdict, not of the harness.
 - The harness aborts runs it can show are untrustworthy. It cannot detect
   everything: CPU throttling on battery power, thermal limits and contention from
-  other processes are not detected, and the record states the power source so a
-  reader can judge.
+  other processes are not detected, and the record states the power source and
+  Low Power Mode so a reader can judge. A laptop with its lid closed sleeps whatever
+  `caffeinate` holds, and each wake steps the Docker VM's clock; the watchdog turns
+  that into an aborted run and not a wrong number.
 - `scripts/readdb` is outside `scripts/internal` so `tests/integration` can import
   the queries it tests. The harness and the test share one copy of each query.
