@@ -652,7 +652,8 @@ per service (api, outbox, scheduler, reconciler, worker, migrate; no CLI image) 
 a digest-pinned distroless nonroot base, built after `make dash-build`; `make
 images` and `make images-smoke` (`scripts/imagesmoke`); a drift check between the
 Dockerfile's Go version and `go.mod`; `scripts/scan` and `make scan`, which run
-govulncheck, gitleaks, pip-audit and npm audit at pinned versions and apply two
+govulncheck, gitleaks, pip-audit and npm audit at pinned versions (pip-audit with its
+whole dependency tree hash-locked) and apply two
 acceptance mechanisms with distinct meanings: `security/scan-exceptions.yaml`, a dated
 risk acceptance for govulncheck, pip-audit and npm audit only, and `.gitleaks.toml`, the
 only place a gitleaks finding is accepted, as a fixture (a fake value) or a revoked

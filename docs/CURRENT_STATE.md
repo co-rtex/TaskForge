@@ -46,7 +46,8 @@ in the order M8B, M8D, M8C; M8A and M8B are complete and the other two are plann
 - **M8B — supply chain (container images and scanning):** complete; see PR #22.
   One root `Dockerfile` builds six non-root distroless images; an image smoke
   inspects and runs them; and `make scan` runs govulncheck, gitleaks, pip-audit and
-  npm audit against one exceptions file, blocking CI. No application code changed;
+  npm audit, blocking CI, with two acceptance mechanisms: a dated file for the three
+  dependency scanners and `.gitleaks.toml` for gitleaks. No application code changed;
   `go.mod`'s Go moved from 1.25.0 to 1.25.14 because the first scan found 35
   reachable standard-library vulnerabilities. See "M8B" below. M8D (the two gates
   M7A deferred, and four items from the M8A review) and M8C (deployment) are
@@ -65,7 +66,8 @@ that are run from source and are not among the seven:
 
 - `scripts/scan` is the program behind `make scan`. It runs govulncheck, gitleaks,
   pip-audit and npm audit at pinned versions, parses their machine-readable output,
-  and applies `security/scan-exceptions.yaml`. See "M8B" below.
+  and applies `security/scan-exceptions.yaml` to the findings of the last three
+  (gitleaks has `.gitleaks.toml`). See "M8B" below.
 
 - `scripts/imagesmoke` is the program behind `make images-smoke`. It inspects and
   runs the six service images. See "M8B" below.
@@ -2601,6 +2603,13 @@ to `1.25.14`**, so every binary is now compiled by a different Go toolchain (see
 "Evidence"). Everything else is new files, `dashboard/Dockerfile` (two stages),
 the Makefile, `AGENTS.md`, CI and `docs/`.
 
+**The review of PR #22 changed this milestone three ways,** and this section describes
+the result: the image smoke's migrate check now runs against a database of its own and
+requires the image to apply the migrations (it could pass without that); acceptance of
+a scanner finding is split into two mechanisms with different meanings, one of which
+is `.gitleaks.toml` alone for gitleaks; and the scanner pip-audit is installed from a
+hash-locked file. Three smaller hardenings came with them (below).
+
 ### Behavior
 
 **Images.** `make images` builds the dashboard (`make dash-build`) and then six
@@ -2618,19 +2627,28 @@ is `golang:1.25.14`, and a test fails if that differs from `go.mod`.
 | Node (npm audit), pinned only in `dashboard/Dockerfile` | `node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1` (npm 11.19.0) |
 | gitleaks | `ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f` |
 | govulncheck | `golang.org/x/vuln/cmd/govulncheck@v1.7.0` (v1.8.0 requires Go 1.26) |
-| pip-audit | `pip-audit==2.10.1` |
+| pip-audit, and its whole tree | `security/pip-audit.requirements.txt`: `pip-audit==2.10.1` and 28 more packages, each pinned with `==`, 362 `--hash=sha256:` digests in all, installed with `--require-hashes --only-binary=:all: --no-deps`. Generated once by `uv 0.12.23` (not part of the scan); the command is in the file's header and reproduces its body byte for byte. |
 
-**The image smoke** (`make images-smoke`, `scripts/imagesmoke`) made 40 checks and
-met all 40 locally and on hosted CI: for each of the six images, that it exists, runs
-as a non-root user, has an exec-form entrypoint that is its own binary, carries the
-labels with this commit, holds only its own binary and no shell, and, run with no
-network and one invalid variable, **exits non-zero with the specific message**; for
-`migrate`, that it applies the migrations, that a second run finds the schema
-current, and that `schema_migrations` in PostgreSQL holds the 18 embedded migrations
-(highest version 18); for `api`, that it serves the real dashboard build. The invalid
-variable is chosen per service because running an image with no environment does not
-reject: five of the six pass validation and fail connecting to the database, and the
-worker fails on a missing key.
+**The image smoke** (`make images-smoke`, `scripts/imagesmoke`) makes 41 checks. For
+each of the six images: that it exists, runs as a non-root user, has an exec-form
+entrypoint that is its own binary, carries the labels with this commit, holds only its
+own binary and no shell, and, run with no network and one invalid variable, **exits
+non-zero with the specific message**. The invalid variable is chosen per service
+because running an image with no environment does not reject: five of the six pass
+validation and fail connecting to the database, and the worker fails on a missing key.
+
+For `migrate`, the smoke **creates a database of its own**, `taskforge_imagesmoke_<pid>`,
+on the server `TASKFORGE_DATABASE_URL` names, over a separate read-write connection
+(`scripts/readdb` is read-only on purpose), and points the image at it by changing only
+the database name in the URL. Then: the first run must **apply** every embedded
+migration, with the count exact (18); "schema already up to date" on the first run is a
+failure; a second run must say "already up to date"; `schema_migrations` in that
+database must hold the 18 embedded migrations, highest version 18; and the database is
+dropped, on success, on failure and on interrupt, with the drop itself a check. This
+check could pass before the review without the image applying anything, because it ran
+against the shared database, which a host `make migrate` leaves migrated.
+
+For `api`, that it serves the real dashboard build.
 
 **What the `api` check proves, and what it does not.** It fetches `/dashboard/` from
 the running container, requires the marker only the built dashboard contains
@@ -2642,24 +2660,37 @@ that was in the build context. It does not prove that `dist` was fresh relative 
 the dashboard source (that is `make images` depending on `make dash-build`, and CI's
 `dashboard` job), and it does not exercise the dashboard.
 
-**The scanners** (`make scan`, `scripts/scan`) run four tools and apply
-`security/scan-exceptions.yaml`, which is **empty** because nothing is excepted.
+**The scanners** (`make scan`, `scripts/scan`) run four tools. There are **two
+acceptance mechanisms, with different meanings** (the owner's decision in the review of
+PR #22; the reasons are in ADR-0021):
 
-| Tool | Scope | Result on `dab2418` |
+- **`security/scan-exceptions.yaml` is a dated risk acceptance, for govulncheck,
+  pip-audit and npm audit only.** It is **empty** because nothing is excepted. An entry
+  with `tool: gitleaks` is an error that points to `.gitleaks.toml`, and a gitleaks
+  finding never matches an exception.
+- **`.gitleaks.toml` is the only place a gitleaks finding is accepted,** and holds
+  exactly two kinds of entry, both permanent by design because history is permanent.
+  A **FIXTURE** is a fake value, scoped by one rule, one anchored file and one literal
+  value, with `condition = "AND"`, and the value must appear verbatim in the named file
+  at `HEAD`. A **REVOKED** entry is a real secret that has already been revoked, scoped
+  by one rule, one anchored file and exactly one 40-hex commit SHA, with `condition =
+  "AND"` and **no value in the entry**, under a comment `Revoked YYYY-MM-DD by <name>`.
+  **A live secret is never allowlisted: revoke it, then pin it.** `tests/verification`
+  judges every entry as exactly one kind. **No REVOKED entry exists today;** the file
+  holds two FIXTURE entries for three known fake values
+  (`tf_fixture_key_0123456789` in `dashboard/src/test/fixtures.ts`, and the object path
+  `results/scope/job/attempt` at two lines of `internal/api/result_handlers_test.go`).
+
+| Tool | Scope | Result on `fd57822` |
 | --- | --- | --- |
 | govulncheck v1.7.0, under Go 1.25.14 | reachable vulnerabilities only (a finding whose trace begins with a called function) | no findings; database modified 2026-10-01T20:24:15Z |
-| gitleaks v8.30.1 | the full git history of every ref (194 commits in a fresh clone) | no findings, with two allowlist entries for three known fake fixtures |
-| pip-audit 2.10.1 | the SDK's runtime dependency tree, resolved in a clean virtual environment | no findings, 7 packages |
-| npm audit, in the pinned Node | the dashboard's production dependencies, high and above | no findings, 4 production packages |
+| gitleaks v8.30.1 | the full git history of every ref (198 commits in a fresh clone); a shallow clone is refused | no findings |
+| pip-audit 2.10.1 | the SDK's runtime dependency tree, resolved in a clean virtual environment (this tree is deliberately not locked: it is what is examined) | no findings, 7 packages |
+| npm audit, in the pinned Node | the dashboard's production dependencies, high and above; an advisory with a severity the driver does not know fails the parse | no findings, 4 production packages |
 
-A finding without an unexpired exception, an exception that is malformed or expired,
-a tool that cannot run, and output that is not the tool's report each fail the run.
-Each finding prints one line: tool, id, location, and whether it is excepted.
-`.gitleaks.toml` keeps the default rules and allowlists three known fake fixtures
-(`tf_fixture_key_0123456789` in `dashboard/src/test/fixtures.ts`, and the object path
-`results/scope/job/attempt` at two lines of `internal/api/result_handlers_test.go`),
-each scoped to the rule, one file path and the value. **A real secret is never
-allowlisted.**
+A finding that is not accepted by its tool's mechanism, an exception that is malformed
+or expired, a tool that cannot run, and output that is not the tool's report each fail
+the run. Each finding prints one line: tool, id, location, and whether it is excepted.
 
 ### Evidence
 
@@ -2667,8 +2698,8 @@ allowlisted.**
 
 | Tool | Finding | Disposition |
 | --- | --- | --- |
-| govulncheck | **35 reachable standard-library vulnerabilities** against Go 1.25.0, fixed in releases from 1.25.2 to 1.25.13 (for example GO-2025-4010 in `net/url`, reached from `internal/config` `Validate`, and GO-2025-4012 in `net/http`, reached from `scripts/internal/stack`) | **Upgraded**: `go.mod` to Go 1.25.14, in its own commit (`cb9ca62`), with `make fmt`, `lint`, `build`, `test-unit`, `test-integration` and `test-race` green after it. A rerun reports none. |
-| gitleaks | 3 `generic-api-key` findings, all in test files, all fake: `TEST_API_KEY` in `dashboard/src/test/fixtures.ts:20` and two `ObjectKey` strings in `internal/api/result_handlers_test.go` (lines 85 and 107 at the commit that introduced them) | **Allowlisted** in `.gitleaks.toml`, each by rule, path and value, after reading each line. Without the allowlist the scan reports exactly these three; with it, none. |
+| govulncheck | **35 reachable standard-library vulnerabilities** against Go 1.25.0, fixed in releases from 1.25.2 to 1.25.13 (for example GO-2025-4010 in `net/url`, reached from `internal/config` `Validate`, and GO-2025-4012 in `net/http`, reached from `scripts/internal/stack`) | **Upgraded**: `go.mod` to Go 1.25.14, in its own commit (`cb9ca62`). **The local gates after that commit (`make fmt`, `lint`, `build`, `test-unit`, `test-integration`, `test-race`) ran on host Go 1.27.0, which is newer than `go.mod` requires, so they did not exercise 1.25.14.** The Go 1.25.14 evidence is hosted CI, whose `setup-go` reads `go.mod` (the scan job's log shows `go version go1.25.14 linux/amd64`) and which passed all eight checks on `dab2418` (run 37266315524) and on `fd57822` (run 37343678612), and the images, which are built by `golang:1.25.14`. A rerun of govulncheck under `GOTOOLCHAIN=go1.25.14` reports none. |
+| gitleaks | 3 `generic-api-key` findings, all in test files, all fake: `TEST_API_KEY` in `dashboard/src/test/fixtures.ts:20` and two `ObjectKey` strings in `internal/api/result_handlers_test.go` (lines 85 and 107 at the commit that introduced them) | **Allowlisted** in `.gitleaks.toml` as FIXTURE entries, each by rule, path and value, after reading each line. Without the allowlist the scan reports exactly these three; with it, none. |
 | pip-audit | none | not applicable |
 | npm audit | none | not applicable |
 
@@ -2678,23 +2709,58 @@ reported before deciding how to handle it. The upgrade commit therefore precedes
 driver's commit, so that every commit's own gates pass. Since the driver exists,
 every number above is reproduced by `make scan`.
 
-**Five mutations were applied and each was caught.** Four ran in the working tree,
-each shown by `git diff`, run, reverted, and confirmed with a clean `git status`.
-Mutation (a) ran in a throwaway fresh clone of the pushed branch, because gitleaks
-scans history and so needs a commit, and the working checkout had a leftover local
-branch that a history scan also sees.
+**Five mutations were applied in the first round and each was caught.** Four ran in the
+working tree, each shown by `git diff`, run, reverted, and confirmed with a clean
+`git status`. Mutation (a) ran in a throwaway fresh clone of the pushed branch, because
+gitleaks scans history and so needs a commit, and the working checkout had a leftover
+local branch that a history scan also sees. (b) and (e) were rerun after the review
+changes and behave as below.
 
 | Mutation | Caught by | What it said |
 | --- | --- | --- |
 | (a) a fake `ghp_…` token in a new test file, committed in the clone | gitleaks, through `go run ./scripts/scan gitleaks` | `FAIL gitleaks <commit>:scripts/scan/planted_test.go:github-pat:10 scripts/scan/planted_test.go:10`, `RESULT: FAIL`. The line does not print the token. |
-| (b) an exception whose `expires` is 2026-10-04, a day before the run | the driver's exceptions check | `FAIL exceptions GO-2099-0001 (govulncheck) expired on 2026-10-04: renew it with a fresh reason and date, or remove it`, `RESULT: FAIL`, exit 1 |
-| (c) `USER 0` on the worker target | `make images-smoke` | `FAIL worker: runs as a non-root user — the image runs as uid 0 ("0")`; `RESULT: FAIL (1 of 40 checks failed)` |
+| (b) an exception whose `expires` is 2026-10-04, a day before the run | the driver's exceptions check | `FAIL exceptions GO-2099-0001 (govulncheck) expired on 2026-10-04: renew it with a fresh reason and date, or remove it`, `RESULT: FAIL`, exit 1. The unit test of the same file **passes**: expiry is the scan's job. |
+| (c) `USER 0` on the worker target | `make images-smoke` | `FAIL worker: runs as a non-root user — the image runs as uid 0 ("0")`; `RESULT: FAIL (1 of 40 checks failed)` (40 checks then) |
 | (d) the Dockerfile's builder `golang:1.25.13` against `go.mod`'s `1.25.14` | `TestDockerfile_BuilderGoVersionIsExactlyGoMods` | expected `"1.25.14"`, actual `"1.25.13"` |
 | (e) the recorded govulncheck output of the Go 1.25.0 run, fed to the real driver with `-govulncheck-report` | the driver | `FAIL govulncheck GO-2025-4012 … -- not excepted` and `GO-2025-4010 … -- not excepted`, `RESULT: FAIL`, exit 1. No vulnerable dependency was added; this mutation is an input, not an edit. |
 
-**The checks also caught my own mistakes.** This is recorded because they bear on how
-far the checks can be trusted.
+**Mutations for the review fixes.** Each was applied, shown by `git diff`, run, and
+reverted with a clean `git status`.
 
+| Fix | Mutation | Caught by | What it said |
+| --- | --- | --- | --- |
+| B1 | the newest migration (`0018`) left out of the migrate image's build context by a temporary `.dockerignore` line | `make images-smoke` | `FAIL migrate: applies every embedded migration to an empty database — the first run applied 17 migrations into an empty database; the image should embed 18`, and the schema-version check `records 17 migrations up to version 17; the image embeds 18 up to version 18`; the throwaway database was still dropped. Reverted: `41 of 41`. |
+| B1 | the first run may find the schema "already current" | `TestFirstRunProblem_AlreadyCurrentIsRejected` | fails |
+| B1 | the rewritten URL drops its query string | `TestWithDatabaseName_*` (three tests) | fail |
+| B2 | an entry for gitleaks is allowed in the exceptions file | `TestParseExceptions_TheListOfToolsThatMayBeExceptedExcludesGitleaks…` | fails |
+| B2 | the refusal that names `.gitleaks.toml` removed | `TestParseExceptions_AGitleaksEntryIsRefusedAndPointsToTheGitleaksConfig`, `TestRun_AGitleaksFindingIsNotExcusedByAnEntryInTheExceptionsFile` | fail |
+| B2 | the matcher stops refusing gitleaks findings | `TestExceptionMatching_AGitleaksFindingNeverMatchesAnException` | fails |
+| B2 | on the real `.gitleaks.toml`: `condition` removed from an entry; a fixture value that is not in its file; an entry with both `commits` and `regexes` | `TestGitleaksConfig_TheCommittedConfigIsWellFormed`, `…EveryFixtureValueAppearsVerbatimInItsFileAtHEAD` | `condition must be "AND"…`; `the value does not appear in dashboard/src/test/fixtures.ts`; `it has both commits and regexes…` (a first attempt at the third did not apply, and its "ok" was discarded) |
+| B2-m | a REVOKED entry, against the pinned gitleaks, in a throwaway clone: see below | gitleaks | see below |
+| B3 | `--require-hashes`, `--only-binary=:all:` removed from the install, or a requirement named on the command line | `TestPipAuditInstallArgs_…` | each fails |
+| B3-m | the **wheel's** hash for `idna 3.20` altered in a copy of the lock (one line differs), passed with `-pip-audit-lock` | the real install | `ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE … idna==3.20 from …idna-3.20-py3-none-any.whl`; `FAIL pip-audit … could not run`, `RESULT: FAIL`. The copy was outside the repository; nothing to revert. |
+| B3 | a hash removed from a package in the committed lock | `TestPipAuditLock_TheCommittedLockIsWellFormed` | `requests==2.34.2 carries no --hash=sha256:<digest>` |
+| N1 | an unknown npm severity is skipped again | `TestParseNpmAudit_AnAdvisoryWithAnUnknownSeverityFailsClosed` | fails |
+| N2 | a shallow repository is no longer refused; or git saying something odd is read as "not shallow" | `TestShallowProblem` | fails (both) |
+| N2 | live: a `--depth 1` clone of the pushed branch | `go run ./scripts/scan gitleaks` | `FAIL gitleaks … could not run: shallow clone: gitleaks would scan partial history; fetch full history` |
+| N3 | an expired entry in the committed exceptions file | the unit test **passes**; the scan fails | `TestTheCommittedExceptionsFileIsWellFormed` ok; `FAIL exceptions GO-2099-0001 … expired on 2026-10-04` |
+
+**B2-m, the REVOKED entry against the pinned gitleaks.** In a throwaway fresh clone,
+never pushed, then deleted: (0) the clone scanned clean. (1) A fake 36-character
+`ghp_` token was committed (`C1`); the scan failed on it, naming `C1`, rule
+`github-pat`. (2) A REVOKED entry for `C1` (rule `github-pat`, the file, the commit
+SHA, no value) was added; the repository's own shape test accepted it, and the scan
+passed. (3) The same token was committed again in the same file on a new line (`C3`);
+the scan failed naming **only `C3`**, and `C1` was not named. The token's value
+appeared in none of the outputs. This is what "commit-narrow" means in practice.
+
+**The review's checks also caught my own mistakes,** and so did my own checks of my
+fixes. This is recorded because they bear on how far the checks can be trusted.
+
+- **A migrate check that could pass without migrating.** The first version ran
+  against the shared database and accepted "schema already up to date" as having
+  applied the migrations. The first local run in the previous round printed exactly
+  that and I called it a pass. It was found in review.
 - **A test constant that looked like a Stripe key.** `TestParseGitleaks_NeverCopiesASecretIntoWhatItPrints`
   used a made-up string with a `sk_live_` prefix. GitHub's push protection declined
   the push (GH013, a Stripe API key), and `make scan` on the same commit reported
@@ -2702,48 +2768,92 @@ far the checks can be trusted.
   both tools match. The three unpushed commits were rebuilt with a marker that
   matches no vendor pattern, and the push then went through. **The unblock URL was
   not used.**
-- **A mutation that passed.** The first version of mutation (a) planted a token one
-  rule-length short, and the scan passed. The rule is format-exact, so the mutation
-  proved nothing; it was corrected to the rule's length and then failed as it
-  should.
-- **A stale image refused.** The first local smoke failed six revision-label checks
-  because the images had been built at an earlier commit; the smoke refuses an image
-  that is not built from `HEAD`, and passed once they were rebuilt.
+- **Mutations that passed, and so proved nothing.** The first version of mutation (a)
+  planted a token one rule-length short. The first B3-m altered one of a package's two
+  hashes and the install passed both times, because pip skips a wheel whose hash does
+  not match and falls back to the source distribution whose hash still does. That
+  fallback is a quiet downgrade, built with unlocked build dependencies, so the install
+  now passes `--only-binary=:all:`; the wheel's hash was then altered and the install
+  failed as it should. A third attempt at a B2 mutation did not apply at all.
+- **A section I deleted by accident.** Rewriting ADR-0021's acceptance sections, my
+  edit sliced from one heading to a later one and removed the `### CI` section between
+  them. I found it by diffing the heading list against the previous commit, and
+  restored it in the next commit.
+- **A stale image refused.** The first local smoke in the previous round failed six
+  revision-label checks because the images had been built at an earlier commit; the
+  smoke refuses an image that is not built from `HEAD`.
 
 **Hosted CI.** On run 37266315524 (head `dab2418`, checked out as the pull request's
-merge commit `a75c188`), all eight checks passed. The two new jobs took:
+merge commit `a75c188`) all eight checks passed, and on run 37343678612 (head
+`fd57822`, the final code) all eight passed again. The two new jobs took:
 
-| Job | Time |
-| --- | --- |
-| Container images (build, non-root, config rejection, migrate, dashboard) | 120 s |
-| Supply-chain scan (govulncheck, gitleaks, pip-audit, npm audit) | 69 s |
+| Job | `dab2418` | `fd57822` |
+| --- | --- | --- |
+| Container images (build, non-root, config rejection, migrate, dashboard) | 120 s | 137 s |
+| Supply-chain scan (govulncheck, gitleaks, pip-audit, npm audit) | 69 s | 49 s |
 
-For comparison, the existing jobs took 73 s (checks), 70 s (dashboard), 222 s (race)
-and 246 s (integration). **This is the first time the Linux path of the image smoke
-has run:** host networking, `linux/amd64`, a database with no migrations, where the
-`migrate` check reported "applied 18". The sizes it printed are
-api 30.4 MB, outbox 25.3 MB, scheduler 21.5 MB, reconciler 21.6 MB, worker 27.0 MB and
-migrate 18.8 MB. Locally, on Apple silicon (`linux/arm64`), `docker image ls` shows
-api 40.9 MB, outbox 35.3 MB, scheduler 30.9 MB, reconciler 31.1 MB, worker 36.6 MB
-and migrate 27.5 MB, and the smoke prints 6.2 to 9.2 MB for the same images. The
-three sets of figures differ by a factor of three or four for the same binaries; I
-did not establish why (the architecture, the Docker daemon and its image store, and
-the field read all differ), and they should not be compared with one another.
+For comparison, on `fd57822` the existing jobs took 59 s (checks), 61 s (dashboard),
+241 s (race) and 237 s (integration). **The Linux path of the image smoke** (host
+networking, `linux/amd64`) has run on hosted CI twice. On `fd57822` it reported
+`migrate: applies every embedded migration to an empty database — exit 0, applied 18
+into an empty database`, a second run "already up to date", 18 migrations at version
+18 in the throwaway database, the database dropped, and `41 of 41 checks met`. On
+`dab2418` the sizes it printed were api 30.4 MB, outbox 25.3 MB, scheduler 21.5 MB,
+reconciler 21.6 MB, worker 27.0 MB and migrate 18.8 MB. Locally, on Apple silicon
+(`linux/arm64`), `docker image ls` shows api 40.9 MB, outbox 35.3 MB, scheduler 30.9
+MB, reconciler 31.1 MB, worker 36.6 MB and migrate 27.5 MB, and the smoke prints 6.2 to
+9.2 MB for the same images. The three sets of figures differ by a factor of three or
+four for the same binaries; I did not establish why (the architecture, the Docker
+daemon and its image store, and the field read all differ), and they should not be
+compared with one another.
 
 ### Limitations
 
 - **A new advisory can fail an unrelated pull request.** That is what "scanners
   block" means. The remedy is an upgrade or a dated exception. No scheduled run of
   `main` exists, so a newly published advisory is found by the next pull request.
-- **The exceptions mechanism has never been used on a real finding.** The file is
-  empty. The mechanism is tested by fixtures built from recorded output and by
+- **The dated exceptions mechanism has never been used on a real finding.** The file
+  is empty. The mechanism is tested by fixtures built from recorded output and by
   mutation (b); an exception for a live finding has not been exercised against a live
   scan.
+- **No REVOKED entry has ever been needed,** and its shape has been exercised against
+  the pinned gitleaks only with a planted token in a throwaway clone (B2-m). A REVOKED
+  entry is as narrow as one commit: a revoked value copied into several commits needs
+  one entry per commit, and a fixture value reused in a second file needs its own
+  entry. That is the cost of not allowlisting by value.
+- **The gitleaks shape check is a scoped text parser, not a TOML library,** because
+  adding a dependency is the owner's decision. It refuses what it does not understand
+  (a multi-line array, an unknown table), so a valid TOML construct outside the subset
+  fails with a message and has to be rewritten or the parser extended.
+- **The fixture-value check reads the file at `HEAD`** (`git show HEAD:<path>`). A
+  fixture and its allowlist entry added together in one uncommitted change fail the
+  unit test until the fixture is committed.
 - **govulncheck is pinned at v1.7.0,** the newest that builds with Go 1.25.x; v1.8.0
   requires Go 1.26.
 - **The SDK has no lockfile,** so pip-audit audits the resolution on the day of the
-  scan. A version `pip` would not choose today is not examined.
+  scan. A version `pip` would not choose today is not examined. The scanner's own tree
+  is locked; the tree it examines is not. They are different trees.
+- **The pip-audit lock is refreshed by hand.** Moving pip-audit or picking up a fixed
+  dependency of it is an edit to the command in the lock's header, a rerun and a
+  reviewed diff. The `pip` that creates the scanner's virtual environment is the one
+  bundled with the interpreter and is not itself locked. `--only-binary=:all:` means a
+  platform with no wheel for one of the 29 packages fails the install loudly instead
+  of building from source; both platforms I checked (Apple silicon on Python 3.14 and
+  `linux/amd64` on 3.13, in Docker) install, and so does hosted CI.
 - **npm audit and pip-audit need their registries.** An outage fails the scan.
+- **The shallow-clone check needs git 2.15 or newer.** An older git echoes the option
+  back, and anything but `true` or `false` is a refusal.
+- **A smoke that is killed outright cannot drop its database.** `kill -9` skips the
+  deferred drop and leaves `taskforge_imagesmoke_<pid>`. By design this is not
+  verified, and nothing sweeps old ones. The smoke needs a role that can `CREATE
+  DATABASE`; the compose role can, locally and on hosted CI.
+- **`make bench-smoke` can fail on a kill that lands on an idle worker.** In the
+  final-code gate run it failed once ("the kill hit an attempt, and it was recovered:
+  0 abandoned") and then passed three runs in a row. Nothing under `scripts/bench`,
+  `scripts/internal`, `cmd` or `internal` changed in this milestone. M8A's section
+  records that kills can hit nothing; the smoke's own check evidently does not make
+  that impossible. CI runs this smoke in the integration job, so it is a possible
+  source of a red job.
 - **Reachable-only is a scope, not a proof.** A vulnerability in code that is
   imported and never called is not reported by govulncheck here, by the owner's
   decision.
@@ -2754,7 +2864,8 @@ the field read all differ), and they should not be compared with one another.
   investigate why. The binaries are built with `-trimpath`, but I did not test
   that two builds produce byte-identical binaries.
 - **CI labels an image with the pull request's merge commit,** not the branch head,
-  because that is what the runner checks out (`a75c188`, not `dab2418`).
+  because that is what the runner checks out (`a75c188`, not `dab2418`, on the first
+  run).
 - **Nothing runs the images together.** The smoke starts each alone (and the `api`
   and `migrate` images against PostgreSQL). That the services work as containers on
   a network, with a real bind address, is M8C.
@@ -2768,14 +2879,17 @@ the field read all differ), and they should not be compared with one another.
   left alone as outside this milestone.
 - **Hosted CI on the final head is not recorded here,** because a commit cannot
   contain its own CI result: the pull request's checks are the record. The figures
-  above are from `dab2418`, whose code is the final head's.
+  above are from `dab2418` and from `fd57822`, the final code; the commits after
+  `fd57822` change `docs/` only.
 
 ### Breaking change
 
 `go.mod` requires Go 1.25.14. A contributor with an older 1.25 toolchain will have
 Go download 1.25.14 automatically (`GOTOOLCHAIN=auto`); one who sets
-`GOTOOLCHAIN=local` with an older Go will see a build error. No schema, API, CLI,
-SDK, dashboard or configuration changed.
+`GOTOOLCHAIN=local` with an older Go will see a build error. An entry with
+`tool: gitleaks` in `security/scan-exceptions.yaml`, which the first version of this
+milestone accepted, is now an error. No schema, API, CLI, SDK, dashboard or
+configuration changed.
 
 ## Verification
 
@@ -3361,38 +3475,35 @@ Recorded as risks, not worked around silently.
 
 ### M8B gates
 
-Run locally on the branch, 2026-10-05, on code commit `dab2418` (the commits after
-it change `docs/`, `AGENTS.md` and nothing else), from a machine with no other
-TaskForge process running, on AC power with the lid open. PostgreSQL 16, ElasticMQ
-and the object store from `make up`, on Go 1.27 (so the scan's `GOTOOLCHAIN` pin to
-1.25.14 is exercised).
+Run locally on the branch, 2026-10-05, on code commit `fd57822` (the commits after it
+change `docs/` only), from a machine with no other TaskForge process running, on AC
+power with the lid open. PostgreSQL 16, ElasticMQ and the object store from `make up`,
+on Go 1.27 (so the scan's `GOTOOLCHAIN` pin to 1.25.14 is exercised).
 
 | Command | Result |
 | --- | --- |
 | `make fmt` | PASS — `gofmt -w .` changed nothing |
 | `make lint` | PASS — `go vet ./...` silent |
 | `make build` | PASS — `go build -o bin/ ./cmd/...`; seven binaries; `scripts/scan` and `scripts/imagesmoke` are not among the outputs |
-| `make test-unit` | PASS — 26 packages `ok`, up from 24: `scripts/scan` (40 tests) and `scripts/imagesmoke` (12). `tests/verification` runs 28 tests, 18 of them new (`TestDockerfile_*`, `TestDockerignore_*`, `TestMakefile_Images*`, `TestMakefile_Scan*`, `TestExceptionsFile_*`, `TestGitleaksConfig_*`, `TestDashboardDockerfile_*`, `TestCI_*`). The matrix check prints "30 rows (I1-I18, S1-S12), 41 distinct tests resolved to real test functions". |
-| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  115.752s` |
-| `make test-race` | PASS — 27 packages `ok` under `-race`; `ok  …/tests/integration  99.445s`; no `DATA RACE` |
-| `make images` | PASS — six images built; see the table below |
-| `make images-smoke` | PASS — `RESULT: PASS (40 of 40 checks met)`, about 15 s |
-| `make scan` | PASS in a fresh clone of the pushed branch: `ok` for all four tools, `RESULT: PASS`, 27.7 s. **In the working checkout it fails,** on a leftover local branch (`backup-pre-fix`) that holds the commit with the Stripe-shaped test constant; see "Evidence". |
+| `make test-unit` | PASS — 26 packages `ok`. `scripts/scan`: 50 tests, `scripts/imagesmoke`: 21, `tests/verification`: 39, all passing. 32 tests were added or renamed since `1510a7a`, each shown passing by name in the review round's report. The matrix check prints "30 rows (I1-I18, S1-S12), 41 distinct tests resolved to real test functions". |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  104.161s` |
+| `make test-race` | PASS — 27 packages `ok` under `-race`; `ok  …/tests/integration  83.529s`; no `DATA RACE` |
+| `make migrate`, then `make images-smoke` | PASS — the main database was already at 18 migrations; `RESULT: PASS (41 of 41 checks met)`, including `migrate: applies every embedded migration to an empty database — exit 0, applied 18 into an empty database` and `migrate: drops its throwaway database`; about 20 s. Afterwards `pg_database` listed `postgres`, `taskforge`, `template0`, `template1` and no `taskforge_imagesmoke_%` database. |
+| `make scan` | PASS in a fresh clone of the pushed branch at `fd57822` (198 commits, not shallow), 27.0 s: `ok` for all four tools, `RESULT: PASS`. **In the working checkout it fails,** on a leftover local branch, `backup-pre-fix`, that holds an earlier commit with a Stripe-shaped test constant; the owner is to delete it. |
 | `make demo` | PASS — 21 of 21 expectations, the same as M8A |
-| `make bench-smoke` | PASS — 13 of 13 checks met, the same as M8A |
-| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test` | NOT RUN locally — M8B changes nothing in `sdk/` or `dashboard/src`; CI's `sdk` and `dashboard` jobs ran them on `dab2418` and passed |
-| `make demo-failure`, `docker compose config --quiet` | NOT RUN locally — M8B changes neither; CI's integration and checks jobs ran them on `dab2418` and passed |
+| `make bench-smoke` | **One failure, then three passes.** The first run: `RESULT: FAIL (1 of 13 checks failed)`, the failed check "faults: the kill hit an attempt, and it was recovered: 0 abandoned, 0 replaced, 0 never replaced". Three consecutive reruns: `PASS (13 of 13 checks met)` each. See Limitations. Lid open, AC power, Low Power Mode off, no stray TaskForge process before either. |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test`, `make demo-failure`, `docker compose config --quiet` | NOT RUN locally — nothing they cover changed; CI ran them on `fd57822` (run 37343678612) and passed |
 
-The six local images (Apple silicon, `linux/arm64`, Docker Desktop):
+The six local images at `fd57822` (Apple silicon, `linux/arm64`, Docker Desktop):
 
 | Image | ID | `docker image ls` size |
 | --- | --- | --- |
-| `taskforge-api:dev` | `f7516935dca5` | 40.9 MB |
-| `taskforge-outbox:dev` | `c2c6a05cdc77` | 35.3 MB |
-| `taskforge-scheduler:dev` | `b963808a8378` | 30.9 MB |
-| `taskforge-reconciler:dev` | `b94cfbcb0143` | 31.1 MB |
-| `taskforge-worker:dev` | `5cce9689f782` | 36.6 MB |
-| `taskforge-migrate:dev` | `875fb0e5155a` | 27.5 MB |
+| `taskforge-api:dev` | `f1d30ec86bb4` | 40.9 MB |
+| `taskforge-outbox:dev` | `d7e3a753953c` | 35.3 MB |
+| `taskforge-scheduler:dev` | `adc572cc7a94` | 30.9 MB |
+| `taskforge-reconciler:dev` | `cde4f421a8f4` | 31.1 MB |
+| `taskforge-worker:dev` | `0de49151ff55` | 36.6 MB |
+| `taskforge-migrate:dev` | `559abdd9330b` | 27.5 MB |
 
 The mutation results are under "Evidence" in the M8B section.
 

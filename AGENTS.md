@@ -141,9 +141,11 @@ the SDK's runtime tree, and npm audit over the dashboard's production dependenci
 A govulncheck, pip-audit or npm audit finding without a valid, unexpired entry in
 `security/scan-exceptions.yaml` fails it, as does a malformed or expired entry; an entry
 for gitleaks there is an error. A gitleaks finding is accepted only in `.gitleaks.toml`,
-as a fixture (a fake value) or a revoked secret pinned to its commit. It needs Docker,
-Python 3 and the network. **A live secret is never allowlisted anywhere: revoke it
-first, then pin it as revoked.** The decisions are in
+as a fixture (a fake value) or a revoked secret pinned to its commit. pip-audit and its
+whole dependency tree are installed from the hash-locked
+`security/pip-audit.requirements.txt`. It needs Docker, Python 3, the network and a full
+git history (a shallow clone is refused). **A live secret is never allowlisted anywhere:
+revoke it first, then pin it as revoked.** The decisions are in
 [ADR-0021](docs/adr/0021-container-images-and-supply-chain-scanning.md).
 
 The Python SDK has its own targets. They are deliberately **not** folded into
