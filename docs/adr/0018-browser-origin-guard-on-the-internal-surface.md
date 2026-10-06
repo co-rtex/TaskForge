@@ -8,7 +8,10 @@
   exists; every route is registered from one table, and an AST check over the
   package's non-test files holds that nothing registers around it. The guard, its
   rules, its order and its outermost position are unchanged, and every other
-  section stands.
+  section stands. The guard is now held by **path**: every route, and every `405`
+  fallback, under `/internal/` must carry it whatever its table entry declares,
+  checked by a table-consistency rule, by tests that select by path, and by a check
+  at startup that refuses to build a server whose table breaks it.
 - **Date:** 2026-10-01
 
 ## Context

@@ -95,6 +95,40 @@ valid, and one behind the `405` would tell it which methods a path allows. It
 sits inside the mux, not around it, so a refused request still carries its route
 pattern into its span name and its metric label.
 
+### The invariants are keyed by path, not by what an entry declares
+
+The guard and the API key are invariants of **where a client can reach a route**.
+Every route whose path starts with `/internal/` must go through the browser-origin
+guard, and so must its derived `405` fallback; every route whose path starts with
+`/v1/` must be wrapped in `requireAPIKey`, and its fallback must be unwrapped. That
+holds whatever `surface`, `chain` or `group` the entry declares, because a surface
+is a label an entry gives itself and a label can be wrong. It is enforced three
+ways, each of which holds without the others:
+
+1. **The table-consistency rule.** `TestRoutes_TableIsInternallyConsistent` ties
+   surface to path in both directions: a path under `/internal/` is
+   `surfaceInternal`, a path under `/v1/` is `surfacePublic`, and a probe or an
+   unlisted route is under neither. A violation names the entry and the direction.
+2. **Behavior tests that select by path.** `TestRoutes_InternalRoutesAreGuardedOutermost`
+   and `TestRoutes_PublicRoutesRequireAnAPIKey` take every enabled route under the
+   prefix, and every derived fallback under `/internal/`, through one helper that
+   never reads the declared surface or the chain a fallback was given.
+3. **A startup check.** Before it registers anything, `registerRoutes` runs
+   `checkRouteBoundaries`, a pure function, over every enabled route and every
+   derived fallback and panics on a breach, naming the pattern and the wrapper it
+   needs. A table that would register an unguarded `/internal` route, or an
+   unauthenticated `/v1` one, is a server that never starts. The check changes no
+   response, and the golden is unchanged by it.
+
+The first version of this decision keyed the tests, and the fallback derivation, on
+the declared surface. An entry declared unlisted at `/internal/v1/debug` then
+registered an unguarded route and an unguarded `405` fallback beside it with every
+test passing, and the same shape under `/v1/` skipped `requireAPIKey`. The test this
+decision removed had selected by the `/internal/` path text, so that was a
+regression of [ADR-0018](0018-browser-origin-guard-on-the-internal-surface.md)'s
+fail-closed property. Review of the pull request found it; the three checks above
+close it.
+
 ### Derived `405` fallbacks, and the two exceptions
 
 For every path the table holds, the method-less pattern that answers a method the
@@ -161,8 +195,11 @@ it.
 | The table and the spec are the same set of operations, in both directions | `TestRoutes_TableMatchesTheSpec` |
 | Unlisted entries are deliberate | `TestRoutes_UnlistedEntriesAreDeliberate` |
 | Nothing registers around the table | `TestRoutes_NothingRegistersAroundTheTable` |
-| Public routes need a key and consult the credential store | `TestRoutes_PublicRoutesRequireAnAPIKey`, and the `TestAuth_*` tests, which now walk the table |
-| The guard is outermost on every internal route and every internal fallback | `TestRoutes_InternalRoutesAreGuardedOutermost` |
+| Every route under `/v1/` needs a key and consults the credential store, selected by path | `TestRoutes_PublicRoutesRequireAnAPIKey`, and the `TestAuth_*` tests, which now walk the table |
+| The guard is outermost on every route and every derived fallback under `/internal/`, selected by path | `TestRoutes_InternalRoutesAreGuardedOutermost` |
+| An entry's surface agrees with its path, both ways | `TestRoutes_TableIsInternallyConsistent` |
+| A table that breaks the path rule is refused at startup | `TestRouteBoundaries_RefuseEachBreach`, `TestRouteBoundaries_TheRealTableIsAccepted`, `TestRoutes_HandlerRefusesATableThatBreaksABoundary` |
+| The golden's unlisted paths are the table's | `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` |
 | Registration alone requires a worker key | `TestRoutes_RegistrationAloneRequiresAWorkerKey` |
 | Probes and unlisted routes are unwrapped | `TestRoutes_ProbesAndUnlistedRoutesNeedNoCredentialAndNoGuard` |
 | Fallbacks say what the table and the spec say | `TestRoutes_FallbacksAreDerivedFromTheTable` |
@@ -204,10 +241,11 @@ filtered by feature before anything is registered.
 - **ADR-0018's second fail-closed test is replaced.** That record said coverage of
   the guard came from two tests, one of which read `server.go` for `/internal`
   patterns registered around the helper. The guard is still outermost on every
-  internal route and fallback, still through `handleInternal`; it is now a
-  property of an entry's `chain`, held by the table tests above and by the AST
-  check, which covers every package file rather than the lines of one. ADR-0018's
-  status records the clause it loses.
+  internal route and fallback, still through `handleInternal`. It is now a
+  property of the **path**, not of what an entry declares: anything under
+  `/internal/` must carry it, held by the three checks above, while the AST check
+  holds that nothing registers around the table and covers every package file
+  rather than the lines of one. ADR-0018's status records the clause it loses.
 - **The golden pins behavior, so a deliberate routing change regenerates it.**
   `go test ./internal/api -run TestRouteBehavior_MatchesTheGolden -update-route-golden`,
   and every changed row is reviewed as a behavior change.
@@ -224,13 +262,24 @@ filtered by feature before anything is registered.
   probes directly and are outside it. It identifies a `ServeMux` by the declared
   type of the receiver parameter, not by type-checking, so it fails closed on any
   call named `Handle` or `HandleFunc` outside the three registration functions,
-  and renaming those functions means updating the check, which says so.
+  and renaming those functions means updating the check, which says so. Two
+  things are outside it: a registration through a method value
+  (`h := mux.HandleFunc`, then `h(...)`), which is neither a call to `Handle` nor
+  one to `HandleFunc`, and a middleware that matches `r.URL.Path` and answers a
+  request before the mux sees it, which registers nothing.
+- **The path rule is a literal prefix.** A pattern whose first segment is a
+  wildcard, such as `GET /{a}/v1/{b}`, matches a request under `/internal/` without
+  carrying the prefix: `net/http`'s mux hands `GET /internal/v1/nonexistent` to it
+  ahead of the `/` catch-all. Neither the table-consistency rule nor
+  `checkRouteBoundaries` would see such an entry. No entry has one, and the check
+  does not reject one.
 - **The table is compared with the spec by method and path only.** Parameters,
   schemas and responses are not compared by this decision; the contract tests
   that read the spec's text still do that.
 - **Built per server.** Each handler is a method value bound to the server, and
   `/metrics`' handler is resolved once when the table is built. Tests read the
-  table through unexported accessors; nothing exposes it at runtime, and no
-  endpoint lists it.
+  table through unexported accessors, and one test changes it through
+  `Server.routeTableHook`, an unexported seam that nothing in production sets;
+  nothing exposes the table at runtime, and no endpoint lists it.
 - **Behavior is unchanged, including where it is arguably wrong.** A wrong method
   on `/metrics` or `/` is still a `404`, not a `405`.

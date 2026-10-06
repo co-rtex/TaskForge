@@ -2914,7 +2914,9 @@ Two doc comments changed (`handleInternal`'s and `requireAPIKey`'s), because bot
 described the old registration. Nothing under `cmd/`, `migrations/`, `api/`, `sdk/`,
 `dashboard/` or `scripts/` changed, and `api/openapi.yaml` is not edited. Every
 status, `Allow` header, error code, wrapper order, matched route pattern, span name
-and metric route label is the same; the evidence below is how that was checked.
+and metric route label is the same for every table the server accepts; the evidence below
+is how that was checked. `Handler()` now also refuses, at startup, a table that breaks
+the path rule described under "Behavior".
 
 ### Behavior
 
@@ -2933,6 +2935,20 @@ everything else; registration alone is `refuseBrowserOrigin(requireWorkerKey(han
 probes and unlisted routes are unwrapped. The worker-session asymmetry
 ([ADR-0014](adr/0014-worker-control-authentication.md)) is unchanged and is now the one
 `guard+worker-key` entry in the table.
+
+**The boundary rule is keyed by path, not by what an entry declares.** Every route
+under `/internal/` must carry the browser-origin guard, and so must its derived `405`
+fallback; every route under `/v1/` must be wrapped in `requireAPIKey`, and its fallback
+must be unwrapped, whatever surface, chain or group its entry declares
+([ADR-0022](adr/0022-the-route-table-is-the-single-source-of-routes.md)). Three checks
+hold it: the table-consistency test ties surface to path in both directions; the two
+wrapper tests (`TestRoutes_InternalRoutesAreGuardedOutermost`,
+`TestRoutes_PublicRoutesRequireAnAPIKey`) select by path through one helper; and
+`registerRoutes` runs `checkRouteBoundaries`, a pure function, over every enabled route
+and every derived fallback before it registers anything and **panics**, naming the
+pattern and the wrapper it needs, so such a table never serves. The check changes no
+response. `Server.routeTableHook` is an unexported seam that only a test sets, so a test
+can show `Handler()` refusing a breaching table.
 
 **Fallbacks are derived.** For each path the table holds, the method-less pattern that
 answers any other method with the structured `405` has an `Allow` header equal to the
@@ -2966,7 +2982,15 @@ check over the package's non-test files, and its own tests on synthetic sources)
 `TestRoutes_RegistrationAloneRequiresAWorkerKey`,
 `TestRoutes_ProbesAndUnlistedRoutesNeedNoCredentialAndNoGuard`,
 `TestRoutes_FallbacksAreDerivedFromTheTable` and
-`TestRoutes_FeatureGroupsGateTheirRoutesAndNothingElse`. Removed:
+`TestRoutes_FeatureGroupsGateTheirRoutesAndNothingElse`; and, added when the review of
+PR #23 found the hole under "Evidence", `TestRouteBoundaries_RefuseEachBreach`,
+`TestRouteBoundaries_TheRealTableIsAccepted`,
+`TestRoutes_HandlerRefusesATableThatBreaksABoundary` and
+`TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` (the golden's list of unlisted paths is
+the table's). `TestRoutes_TableIsInternallyConsistent`,
+`TestRoutes_PublicRoutesRequireAnAPIKey` and
+`TestRoutes_InternalRoutesAreGuardedOutermost` were changed in that round to key on the
+path. Removed:
 `TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which counted
 `s.handleInternal(mux,` lines in `server.go` and cannot hold for a table-driven
 `Handler()`, replaced by the AST check; and the hand lists `publicRoutes` and
@@ -3029,6 +3053,41 @@ group is never enabled, so it would simply not be registered. The consistency te
 not check it, and now requires an unlisted entry to be in the `metrics` or `dashboard`
 group; with `GET /metrics` stripped of its group, that test fails by name.
 
+**The review of PR #23 found a hole, and what closed it is shown.** The first version
+keyed the guard and API-key tests, and the fallback derivation, on an entry's declared
+surface, not its path. Reproduced on `60d1764` before anything was changed: adding
+`{GET /internal/v1/debug, surfaceUnlisted, chainNone, groupDashboard}` and
+`{GET /v1/debug, surfaceUnlisted, chainNone, groupDashboard}` left `go test ./internal/api`
+at `ok`, with an unguarded `/internal` route and an unauthenticated `/v1` route registered.
+The test the table change had removed selected by the `/internal/` path text, so this was a
+regression of [ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)'s
+fail-closed property. The fix is in the code commit `71d403b`, and the golden is
+byte-identical to `60d1764` (`git diff` of `internal/api/testdata/` is 0 bytes).
+
+With the startup check on, a breaching table makes `Handler()` panic, so every test that
+builds a server fails by panic before it can fail by assertion. To show each check failing
+on its own, every mutation was run twice: **(a)** as is, and **(b)** with only the call to
+`checkRouteBoundaries` in `registerRoutes` replaced by `error(nil)`, so that the
+consistency rule and the path-selected tests fail by assertion. Each was applied, shown
+applied, failing, and reverted with the tree clean.
+
+| # | Mutation | (a) all three checks on | (b) startup check stubbed out |
+| --- | --- | --- | --- |
+| M10 | Add `GET /internal/v1/debug`, unlisted, `chainNone`, reason "x" | panic at `Handler()`: `route "GET /internal/v1/debug" is under /internal/ but its chain is none; every /internal route must go through the browser-origin guard` | the consistency test (`… is under /internal/ but is declared unlisted …`); `TestRoutes_InternalRoutesAreGuardedOutermost` (**403 expected, 200 actual**: the unguarded route was served); `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute`. The golden still passes: the path is not in its matrix, which is the gap the last test closes. |
+| M11 | The same shape at `/v1/debug` | panic naming `GET /v1/debug` and `requireAPIKey` | the consistency test; `TestRoutes_PublicRoutesRequireAnAPIKey` (**401 expected, 200 actual**); the golden-matrix test. The guard test passes, as it should. |
+| M12 | In `fallbacksFor`, force every fallback to `chainNone` | panic naming `405 fallback "/internal/v1/api-keys"` | the 12 `fallback_/internal/…` subtests of the guard test (403 expected, 405 actual), and the golden (92 rows). The consistency test passes: fallbacks are derived, not table data. |
+| M13 | Add an unlisted `GET /debug/vars` (`metrics`, `chainNone`, with a reason) outside both prefixes | **only `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` fails** across the whole package; the consistency test, both wrapper tests, the boundary tests and the `Handler()` test pass | not run: nothing to stub, and nothing else fails, so the rule is not over-broad |
+| M5, rerun | `POST /internal/v1/claims` without the guard | panic naming `POST /internal/v1/claims` | the guard test (403 expected, 400 actual), the golden (2 rows), the consistency test |
+| M8, rerun | The fallback of `/internal/v1/claims` outside the guard | panic naming `405 fallback "/internal/v1/claims"` | the guard test's `fallback_/internal/v1/claims` subtest (403 expected, 405 actual), the golden (8 rows) |
+
+The nine mutations in the table above were run before the startup check existed, so for
+mutations 4, 5 and 8 they describe what the tests alone caught. M5 and M8 are the same
+mutations rerun here. A first attempt at these runs used a shell helper that reported
+`PASS` for a test name that matched nothing (zsh does not split an unquoted variable); it
+was caught because both runs of M10 read `PASS` for every test at once, replaced with one
+that reports `NO TEST RAN` and checked against a name that matches nothing, and the
+results above are from the corrected helper.
+
 **Table versus spec.** With every group on, the 27 non-unlisted entries and the 27
 operations parsed from `api/openapi.yaml` are the same set: 11 public, 14 internal and
 the 2 probes. Before the table nothing compared them in this direction.
@@ -3040,13 +3099,29 @@ the 2 probes. Before the table nothing compared them in this direction.
   outside it. A `ServeMux` is recognised by the declared type of the receiver
   parameter, not by type-checking; the check fails closed on any call named `Handle`
   or `HandleFunc` outside `registerRoutes`, `register` and `handleInternal`, and
-  renaming those functions means updating the check, which says so.
+  renaming those functions means updating the check, which says so. Two things are
+  outside it: a registration through a method value (`h := mux.HandleFunc`, then
+  `h(...)`), which is neither a call to `Handle` nor one to `HandleFunc`, and a
+  middleware that matches `r.URL.Path` and answers before the mux sees the request, which
+  registers nothing.
 - **The table is compared with the spec by method and path only.** Parameters,
   schemas and responses are not compared here; the contract tests that read the spec's
   text still are.
-- **The golden covers its matrix.** A new unlisted route enters it only when its path
-  is added to `goldenUnlisted`; a new spec path enters it automatically. A route in
-  neither is held by the other tests, not by the golden.
+- **The golden covers its matrix.** A new spec path enters it automatically. A new
+  unlisted route fails `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` until its path
+  is added to `goldenUnlisted` and the golden is regenerated deliberately, reviewing every
+  new row.
+- **The path rule is a literal prefix.** A pattern whose first segment is a wildcard,
+  such as `GET /{a}/v1/{b}`, matches a request under `/internal/` without carrying the
+  prefix: `net/http`'s mux hands `GET /internal/v1/nonexistent` to it ahead of the `/`
+  catch-all (checked with a scratch program). Neither the consistency rule nor
+  `checkRouteBoundaries` would see such an entry, and neither rejects one. No entry has
+  one. **This is open for the owner to decide**; it was not changed here.
+- **The path-selected behavior tests are the second line, not the first.** With the
+  startup check in place a breaching table panics every server before they run, so they
+  are shown failing by assertion only with the check stubbed out (run (b) above), by
+  mutation, not by a test in the tree. They are what holds the invariant if the check is
+  removed or weakened.
 - **The golden's `credentialed` rows run real handler code against a nil job store.** A
   public route with a valid key panics into the recovery middleware's `500`, as the
   existing tests rely on. A change in that behavior shows as changed rows.
@@ -3653,28 +3728,40 @@ Recorded as risks, not worked around silently.
 
 ### M8D1 gates
 
-Run locally on the branch, 2026-10-06, on code commit `5fbcbb4` (the commit after it
-changes `docs/` only), with no other TaskForge process running. PostgreSQL 16, ElasticMQ
-and the object store from `make up`, on host Go 1.27.0. **The machine was on battery
+Run locally on the branch, 2026-10-06, on the final code commit **`71d403b`** (the review
+fix; the commit after it changes `docs/` only) with no other TaskForge process running.
+PostgreSQL 16, ElasticMQ and the object store from `make up`, on host Go 1.27.0. The first
+round's results, on `5fbcbb4`, are in the second table. **The machine was on battery
 power (38% to 46%, discharging), not AC, with Low Power Mode off; I could not verify the
-lid.** `make bench-smoke` records nothing and asserts only that the harness measured
-validly, but the benchmark methodology asks for AC, so that condition was not met for
-its runs.
+lid.** That matters only for `make bench-smoke`, which records nothing, and which was not
+rerun in the review round.
 
-| Command | Result |
+| Command | Result on `71d403b` |
 | --- | --- |
 | `make fmt` | PASS — `gofmt -w .` changed nothing (0 diff lines) |
 | `make lint` | PASS — `go vet ./...` silent |
 | `make build` | PASS — seven binaries |
-| `make test-unit` | PASS — 26 packages `ok`. `internal/api` runs 143 top-level tests, all passing, including the 13 new ones (see "M8D1" above): `TestRouteBehavior_MatchesTheGolden`, `TestRouteBehavior_GoldenIsNotVacuous`, `TestRoutes_NothingRegistersAroundTheTable`, `TestRoutes_RegistrationCheckerAcceptsTheCompliantShapeAndReportsEveryBreach`, `TestRoutes_TableIsInternallyConsistent`, `TestRoutes_TableMatchesTheSpec`, `TestRoutes_UnlistedEntriesAreDeliberate`, `TestRoutes_PublicRoutesRequireAnAPIKey`, `TestRoutes_InternalRoutesAreGuardedOutermost`, `TestRoutes_RegistrationAloneRequiresAWorkerKey`, `TestRoutes_ProbesAndUnlistedRoutesNeedNoCredentialAndNoGuard`, `TestRoutes_FallbacksAreDerivedFromTheTable`, `TestRoutes_FeatureGroupsGateTheirRoutesAndNothingElse` |
-| `GOTOOLCHAIN=go1.25.14 go test ./internal/api ./tests/verification` | PASS — both `ok`; this is the toolchain CI uses, which the other local gates do not exercise |
-| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  87.711s` |
-| `make test-race` | PASS — 27 packages `ok` under `-race`; `ok  …/internal/api  4.292s`; `ok  …/tests/integration  96.394s`; no `DATA RACE` |
-| `make demo` | PASS — `RESULT: PASS (21 of 21 expectations met)`, the same as M8B |
-| `make bench-smoke`, three consecutive runs | PASS — `13 of 13 checks met` each; no idle-worker kill failure in these three runs (or in a fourth run earlier on `0710a72`). On battery power, as above. |
-| `make images-smoke` | PASS — `RESULT: PASS (41 of 41 checks met)`: every image labelled with revision `5fbcbb4`, `migrate: applies every embedded migration to an empty database — exit 0, applied 18 into an empty database`, `migrate: drops its throwaway database`, and `api: serves the real dashboard build` (245,826 bytes, sha256 `09c10b43f077`). Afterwards `pg_database` listed no `taskforge_imagesmoke_%` database. **Run with a credential-free `DOCKER_CONFIG` and `DOCKER_HOST` set to Docker Desktop's socket,** because on this machine `docker-credential-desktop get` hung and so did every Docker Hub lookup; the first two attempts of this gate hung on that lookup (the first for about five minutes) and I stopped them. Neither the Makefile nor the repository changed; the pinned base images are public. |
-| `make scan` | PASS in a fresh clone of the pushed branch at `5fbcbb4` (203 commits, not shallow): `ok` for govulncheck (Go 1.25.14, scanner v1.7.0), gitleaks (full history, all refs), pip-audit (7 packages) and npm audit (4 production packages), `RESULT: PASS`. **In the working checkout it fails,** as in M8B, on the leftover local branch `backup-pre-fix`; I did not touch that branch. Run with the same credential-free `DOCKER_CONFIG`. The scan of the final head, which includes the documentation commit, is recorded in the pull request, not here, because a commit cannot contain its own result. |
+| `make test-unit` | PASS — 26 packages `ok`. `internal/api` runs **147** top-level tests, all passing (143 before the review fix, plus 4). Run by name: `TestRoutes_TableIsInternallyConsistent`, `TestRoutes_PublicRoutesRequireAnAPIKey`, `TestRoutes_InternalRoutesAreGuardedOutermost` (changed to key on the path), and the new `TestRouteBoundaries_RefuseEachBreach`, `TestRouteBoundaries_TheRealTableIsAccepted`, `TestRoutes_HandlerRefusesATableThatBreaksABoundary`, `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute`. The two path-selected tests still run 11 and 27 subtests, as before. `TestRouteBehavior_MatchesTheGolden` and `TestRoutes_NothingRegistersAroundTheTable` pass with their files unchanged. |
+| `GOTOOLCHAIN=go1.25.14 go test ./internal/api ./tests/verification` | PASS — both `ok`; CI's toolchain |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  95.121s` |
+| `make test-race` | PASS — 27 packages `ok` under `-race`; `ok  …/internal/api  4.162s`; `ok  …/tests/integration  94.627s`; no `DATA RACE` |
+| `make demo` | PASS — `RESULT: PASS (21 of 21 expectations met)`. Not required this round; run because it starts the real `taskforge-api` binary, so it shows the startup check passing on the real configuration. |
+| `make scan` | recorded in the pull request, not here: it is run in a fresh clone of the pushed final head, which includes this documentation commit, and a commit cannot contain its own result. In the working checkout it fails, as in M8B, on the leftover local branch `backup-pre-fix`, which I did not touch. |
+| `make bench-smoke`, `make images-smoke` | NOT RUN in the review round — nothing outside `internal/api` and `docs/` changed. Their first-round results are below. |
 | `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test`, `make demo-failure`, `docker compose config --quiet` | NOT RUN locally — nothing they cover changed |
+
+First round, on `5fbcbb4` (before the review fix; `internal/api` has since changed, nothing
+else has):
+
+| Command | Result on `5fbcbb4` |
+| --- | --- |
+| `make fmt`, `lint`, `build`, `test-unit` | PASS — 26 packages `ok`; `internal/api` 143 top-level tests |
+| `make test-integration` | PASS — `87.711s` |
+| `make test-race` | PASS — 27 packages, no `DATA RACE` |
+| `make demo` | PASS — 21 of 21 |
+| `make bench-smoke`, three runs | PASS — `13 of 13 checks met` each, **on battery power**; no idle-worker kill failure |
+| `make images-smoke` | PASS — `41 of 41 checks met` (labels `5fbcbb4`; `migrate` applied 18 migrations into an empty throwaway database and dropped it; the `api` image served the real dashboard build). **Run with a credential-free `DOCKER_CONFIG` and `DOCKER_HOST` set to Docker Desktop's socket,** because on this machine `docker-credential-desktop get` hung and so did every Docker Hub lookup; the first two attempts hung on that lookup and I stopped them. Neither the Makefile nor the repository changed. |
+| `make scan` | PASS in a fresh clone at `5fbcbb4`; run with the same credential-free `DOCKER_CONFIG` |
 
 The mutation results, and the golden's row counts, are under "Evidence" in the M8D1
 section.
