@@ -12,8 +12,6 @@ package verification
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -184,8 +182,9 @@ func parseRow(table, docLine int, cells []string) (row, []string) {
 // read exactly like any other: the parser ignores build constraints, which is
 // what lets this check see tests that `go test ./...` does not compile.
 type goFile struct {
-	lines int
-	funcs map[string][]funcSpan // by name; a method and a function may share one
+	lines  int
+	funcs  map[string][]funcSpan // by name; a method and a function may share one
+	source *sourceFile           // the parsed file, for the assertion-line rule
 }
 
 type funcSpan struct {
@@ -199,23 +198,23 @@ func parseGoFile(path string) (*goFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, source, parser.SkipObjectResolution)
+	sf, err := parseSourceFile(path, source)
 	if err != nil {
 		return nil, err
 	}
 	parsed := &goFile{
-		lines: strings.Count(string(source), "\n") + 1,
-		funcs: map[string][]funcSpan{},
+		lines:  strings.Count(string(source), "\n") + 1,
+		funcs:  map[string][]funcSpan{},
+		source: sf,
 	}
-	for _, decl := range file.Decls {
+	for _, decl := range sf.file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok {
 			continue
 		}
 		parsed.funcs[fn.Name.Name] = append(parsed.funcs[fn.Name.Name], funcSpan{
-			start:     fset.Position(fn.Pos()).Line,
-			end:       fset.Position(fn.End()).Line,
+			start:     sf.line(fn.Pos()),
+			end:       sf.line(fn.End()),
 			isMethod:  fn.Recv != nil,
 			signature: fn.Type,
 		})
@@ -248,6 +247,22 @@ func isTestFunc(span funcSpan) bool {
 func validate(rows []row, root string) []string {
 	var problems []string
 	files := map[string]*goFile{}
+	packages := map[string]*packageIndex{}
+	// packageOf is every file of the package a file belongs to, which is what a
+	// helper in "the same package" means. It is loaded once per package.
+	packageOf := func(file *goFile, path string) (*packageIndex, error) {
+		dir := filepath.Dir(filepath.Join(root, filepath.FromSlash(path)))
+		key := dir + "|" + file.source.file.Name.Name
+		if cached, ok := packages[key]; ok {
+			return cached, nil
+		}
+		index, err := loadPackageIndex(dir, file.source.file.Name.Name)
+		if err != nil {
+			return nil, err
+		}
+		packages[key] = index
+		return index, nil
+	}
 	load := func(path string) (*goFile, string) {
 		if cached, ok := files[path]; ok {
 			return cached, ""
@@ -340,17 +355,40 @@ func validate(rows []row, root string) []string {
 				complain("%s:%d is past the end of the file (%d lines)", at.path, at.line, file.lines)
 				continue
 			}
-			inside := false
+			// The line must be inside one of this row's tests, and it must be an
+			// assertion line there: covered by an assertion call on the test's own
+			// goroutine (see assertion_line_test.go). The first condition is the
+			// older, weaker check and stays: a line outside every named test is
+			// reported as that, not as a failure of the rule.
+			inside, valid := false, false
+			var reasons []string
 			for _, ref := range r.tests {
 				if ref.path != at.path {
 					continue
 				}
 				for _, span := range file.funcs[ref.name] {
-					inside = inside || (at.line >= span.start && at.line <= span.end)
+					if at.line < span.start || at.line > span.end {
+						continue
+					}
+					inside = true
+					pkg, err := packageOf(file, at.path)
+					if err != nil {
+						complain("cannot read the package of %s: %v", at.path, err)
+						valid = true // already reported; do not add a second problem
+						continue
+					}
+					if why := citationProblem(pkg, file.source, ref.name, at.line); why == "" {
+						valid = true
+					} else {
+						reasons = append(reasons, ref.name+": the line "+why)
+					}
 				}
 			}
-			if !inside {
+			switch {
+			case !inside:
 				complain("%s:%d is not inside any test this row names in that file", at.path, at.line)
+			case !valid:
+				complain("%s:%d is not an assertion line: %s", at.path, at.line, strings.Join(reasons, "; "))
 			}
 		}
 
@@ -414,21 +452,49 @@ const fixtureTestFile = `//go:build integration
 
 package fixture
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestAlpha(t *testing.T) {
 	_ = 1
+	require.Equal(t, 1, 1) // alpha-assertion
 	_ = 2
 }
 
 func TestBeta(t *testing.T) {
-	_ = 3
+	require.Equal(t, 3, 3) // beta-assertion
 }
 
 func notATest(t *testing.T) {}
 
 func TestNotATestEither(x int) {}
 `
+
+// fixtureLine is the 1-based line of the first line of src that contains marker.
+func fixtureLine(t *testing.T, src, marker string) int {
+	t.Helper()
+	for i, line := range strings.Split(src, "\n") {
+		if strings.Contains(line, marker) {
+			return i + 1
+		}
+	}
+	require.Failf(t, "marker not found", "%q is not in the fixture", marker)
+	return 0
+}
+
+// The cited locations the fixtures use, found by marker so editing the fixture
+// cannot silently point them at something else. alpha is an assertion inside
+// TestAlpha, the test every fixture row names; beta is one inside TestBeta, which
+// no row names; alphaSetup is a setup line inside TestAlpha, which is inside the
+// named test and is not an assertion.
+func fixtureAlphaAssertion(t *testing.T) int {
+	return fixtureLine(t, fixtureTestFile, "alpha-assertion")
+}
+func fixtureBetaAssertion(t *testing.T) int { return fixtureLine(t, fixtureTestFile, "beta-assertion") }
+func fixtureAlphaSetup(t *testing.T) int    { return fixtureAlphaAssertion(t) - 1 }
 
 const fixtureCodeFile = `package fixture
 
@@ -450,7 +516,8 @@ func fixtureRows(t *testing.T) ([]string, string) {
 		"| --- | --- | --- | --- | --- | --- |",
 	}
 	row := func(id string) string {
-		return fmt.Sprintf("| %s | statement | `TestAlpha` (tests/integration/fixture_test.go) | tests/integration/fixture_test.go:7 | `produce.go:Produce` | COVERED |", id)
+		return fmt.Sprintf("| %s | statement | `TestAlpha` (tests/integration/fixture_test.go) | tests/integration/fixture_test.go:%d | `produce.go:Produce` | COVERED |",
+			id, fixtureAlphaAssertion(t))
 	}
 	for n := 1; n <= invariantCount; n++ {
 		lines = append(lines, row(fmt.Sprintf("I%d", n)))
@@ -527,15 +594,16 @@ func TestMatrixChecker_FailsWhenACitedLineIsOutsideTheNamedTests(t *testing.T) {
 	lines, root := fixtureRows(t)
 	for i, line := range lines {
 		if strings.HasPrefix(line, "| I9 |") {
-			// Line 12 is inside TestBeta, which this row does not name.
-			lines[i] = strings.Replace(line, "fixture_test.go:7", "fixture_test.go:12", 1)
+			// An assertion inside TestBeta, which this row does not name.
+			lines[i] = strings.Replace(line, fmt.Sprintf("fixture_test.go:%d", fixtureAlphaAssertion(t)),
+				fmt.Sprintf("fixture_test.go:%d", fixtureBetaAssertion(t)), 1)
 		}
 		if strings.HasPrefix(line, "| I10 |") {
-			lines[i] = strings.Replace(line, "fixture_test.go:7", "fixture_test.go:900", 1)
+			lines[i] = strings.Replace(line, fmt.Sprintf("fixture_test.go:%d", fixtureAlphaAssertion(t)), "fixture_test.go:900", 1)
 		}
 	}
 	problems := strings.Join(check(t, lines, root), "\n")
-	require.Contains(t, problems, "fixture_test.go:12 is not inside any test this row names")
+	require.Contains(t, problems, fmt.Sprintf("fixture_test.go:%d is not inside any test this row names", fixtureBetaAssertion(t)))
 	require.Contains(t, problems, "fixture_test.go:900 is past the end of the file")
 }
 
