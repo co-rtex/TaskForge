@@ -315,8 +315,10 @@ func renderMarkdown(r Record) string {
 	w("- **Load generator:** the load generator and the system under test share a host, so the generator's own work competes with the system's for CPU.")
 	w("- **Workload:** one handler, `demo.sleep` for 50 ms. It is not representative of a real job mix, and no saturation point was searched for.")
 	w("- **Definitions:** dispatch latency reads `job_attempts.created_at`, which is PostgreSQL's `now()` and so the start of the claim transaction. A lock wait inside that transaction is not in it; the supplementary lease-issuance figure above is. Recovery is measured for the attempts a kill happened to hit, and kills prefer a worker that is holding an attempt, so it is the recovery of an occupied worker, not of a random one.")
+	// The last line is the last Limitations bullet, and w ends it with one "\n".
+	// Nothing follows it: a trailing w("") would end the file in a blank line, which
+	// every committed record had to have trimmed by hand.
 	w("- **Power and sleep:** a laptop on battery, or with Low Power Mode on, is throttled, and it sleeps. The run's PostgreSQL clock is checked against this process's monotonic clock every five seconds to catch a sleep or a stepped Docker VM clock, and the run aborts if they disagree, but throttling is not detected. The power source and Low Power Mode above are what the machine reported.")
-	w("")
 	return b.String()
 }
 

@@ -47,7 +47,7 @@ func runFaults(parent context.Context, o options, out io.Writer) (res FaultsResu
 	db := st.DB
 	clk := realClock{}
 
-	submit := newSubmitter(st.APIURL, st.APIKey, st.RunID)
+	submit := newSubmitterWithDuration(st.APIURL, st.APIKey, st.RunID, o.faultJobDuration)
 	start := time.Now()
 	pacer, err := NewPacer(start, o.rate)
 	if err != nil {
@@ -151,6 +151,13 @@ func (f *fleet) injectFaults(ctx context.Context, schedule []Kill, start time.Ti
 
 // killOne SIGKILLs one worker and restarts it under the same name.
 //
+// With targeted kills on (only the smoke) the victim is drawn from the workers
+// holding an attempt that still has at least targetMargin of its duration left, read
+// on PostgreSQL's clock, waiting up to occupancyWait for one; if none appears the
+// kill is NOT made and the observation says why, so the smoke fails the check that
+// names that and a harness miss is not read as a recovery failure. Recorded runs
+// never take that branch, and the paragraph below is exactly what they do.
+//
 // Which worker. The victim is drawn from the workers that are holding an attempt
 // when the kill is due, waiting up to occupancyWait for one; if none ever does,
 // from every worker that is running. With 50 ms jobs at the target rate a worker
@@ -184,11 +191,26 @@ func (f *fleet) killOne(ctx context.Context, index int, k Kill) killObservation 
 		return fail("no worker was running to kill")
 	}
 
-	held, occupied := f.waitForOccupied(ctx, live)
-	candidates := occupied
-	ob.ChoseOccupied = len(occupied) > 0
-	if !ob.ChoseOccupied {
-		candidates = live
+	var (
+		held       map[string]int
+		candidates []string
+	)
+	if f.target != nil {
+		held, candidates = f.waitForTargetable(ctx, live)
+		if len(candidates) == 0 {
+			ob.NotMade = fmt.Sprintf("no worker held an attempt with at least %s of its %s left within %s",
+				f.target.margin, f.target.duration, occupancyWait)
+			return ob
+		}
+		ob.ChoseOccupied = true
+	} else {
+		var occupied []string
+		held, occupied = f.waitForOccupied(ctx, live)
+		candidates = occupied
+		ob.ChoseOccupied = len(occupied) > 0
+		if !ob.ChoseOccupied {
+			candidates = live
+		}
 	}
 	name, err := ChooseVictim(k.Pick, candidates)
 	if err != nil {
@@ -247,4 +269,52 @@ func (f *fleet) waitForOccupied(ctx context.Context, live []string) (held map[st
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// targeting is what aiming a kill needs: how long the jobs sleep, and how much of
+// that must be left for an attempt to be a target.
+type targeting struct{ duration, margin time.Duration }
+
+// targetingFor is nil for every run but the smoke's, which is what keeps a recorded
+// run on the original selection.
+func targetingFor(o options) *targeting {
+	if !o.targetableKills {
+		return nil
+	}
+	return &targeting{duration: o.faultJobDuration, margin: o.targetMargin()}
+}
+
+// waitForTargetable returns each live worker's count of attempts a kill could still
+// catch, and the live workers holding at least one, waiting up to occupancyWait for
+// there to be one. It is waitForOccupied with the targetable query: the candidates
+// are the same kind of thing, and ChooseVictim sorts them, so the seeded draw
+// picks the same worker for the same state.
+func (f *fleet) waitForTargetable(ctx context.Context, live []string) (held map[string]int, candidates []string) {
+	deadline := time.Now().Add(occupancyWait)
+	for {
+		var err error
+		if held, err = readdb.TargetableAttempts(ctx, f.st.DB, f.st.Scope, f.target.duration, f.target.margin); err == nil {
+			candidates = targetableCandidates(held, live)
+			if len(candidates) > 0 {
+				return held, candidates
+			}
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return held, nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// targetableCandidates is the live workers that hold at least one targetable
+// attempt. A worker that is not running is not a candidate whatever the database
+// says about its attempts: it cannot be killed twice.
+func targetableCandidates(held map[string]int, live []string) []string {
+	var out []string
+	for _, name := range live {
+		if held[name] > 0 {
+			out = append(out, name)
+		}
+	}
+	return out
 }

@@ -59,6 +59,15 @@ const (
 	// hit an idle worker would measure nothing.
 	occupancyWait = 2 * time.Second
 
+	// smokeFaultJobDuration is how long each job of the SMOKE's fault run sleeps.
+	// The recorded runs keep jobDurationMS; the smoke does not, because a kill that
+	// lands on a 50 ms attempt can find it finished by the time the SIGKILL is
+	// sent (two database round trips later), and the smoke would then fail "the
+	// kill hit an attempt" for a reason that has nothing to do with recovery. With
+	// 3 s a worker holds an attempt for long enough that a kill aimed at one with
+	// time left (see targetMargin) cannot miss. The arithmetic is in CURRENT_STATE.
+	smokeFaultJobDuration = 3 * time.Second
+
 	// completionDeadline is the fixed deadline for "SUCCEEDED by a fixed
 	// deadline": five minutes after the last submission. Three lease windows of
 	// the shipped profile, which is the slowest recovery any job can need.
@@ -88,6 +97,15 @@ type options struct {
 	// drain bounds how long the throughput run waits for its jobs to finish after
 	// the window closes.
 	drain time.Duration
+	// faultJobDuration is how long each job of the fault run sleeps. A recorded run
+	// uses the owner's fixed workload, demo.sleep for jobDurationMS, and
+	// validateRecordable refuses anything else. Only the smoke lengthens it.
+	faultJobDuration time.Duration
+	// targetableKills makes each kill choose its victim only among workers
+	// holding an attempt that still has time left, and not make the kill at all if
+	// there is none; see killOne. It is off for a recorded run, whose victim
+	// selection is fixed, and on only for the smoke.
+	targetableKills bool
 }
 
 func defaultOptions() options {
@@ -96,6 +114,7 @@ func defaultOptions() options {
 		workers: fixedWorkers, concurrency: fixedConcurrency,
 		warmup: minWarmup, window: minWindow, jobs: fixedFaultJobs, kills: defaultKills,
 		deadline: completionDeadline, drain: drainTimeout,
+		faultJobDuration: jobDurationMS * time.Millisecond,
 	}
 }
 
@@ -112,8 +131,17 @@ func smokeOptions() options {
 	o.warmup, o.window = 2*time.Second, 4*time.Second
 	o.jobs, o.kills = 60, 1
 	o.deadline, o.drain = 90*time.Second, 60*time.Second
+	// The fault phase's jobs are long and its kills are aimed (see smokeFaultJobDuration
+	// and killOne). The throughput phase keeps the fixed 50 ms workload.
+	o.faultJobDuration, o.targetableKills = smokeFaultJobDuration, true
 	return o
 }
+
+// targetMargin is how much of a job's duration must be left for an attempt to be
+// a target for a kill: half of it. The victim is read from PostgreSQL, then its
+// session, then the clock, and then signalled, and an attempt with half its
+// duration left cannot finish in that time.
+func (o options) targetMargin() time.Duration { return o.faultJobDuration / 2 }
 
 // smokeJobs is how many jobs the smoke's fault phase submits.
 func (o options) smokeJobs() int { return o.jobs }
@@ -249,6 +277,12 @@ func (o options) validateRecordable() error {
 	}
 	if o.deadline != completionDeadline {
 		add("the completion deadline is %s; a recorded run uses %s", o.deadline, completionDeadline)
+	}
+	if want := jobDurationMS * time.Millisecond; o.faultJobDuration != want {
+		add("the fault run's jobs sleep for %s; a recorded run's workload is demo.sleep for %s", o.faultJobDuration, want)
+	}
+	if o.targetableKills {
+		add("kills are aimed at attempts with time left; a recorded run draws its victim as ADR-0020 defines it")
 	}
 	if o.profile != profileShipped && o.profile != profileTuned {
 		add("profile %q is not %q or %q", o.profile, profileShipped, profileTuned)

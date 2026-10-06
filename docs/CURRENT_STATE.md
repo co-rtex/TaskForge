@@ -1,16 +1,17 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8D1. Each milestone's line
+planned. It records the implemented state through M8D2. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
 follow-up to it, not a fifth slice. M7 is split into M7A, the proof audit, and
 M7B, the demonstration targets, and is complete with both. M8 is split into M8A,
 the measured benchmarks, M8B, the supply chain (container images and scanning), M8D1,
-the route registry, M8D2, the verification-matrix drift check with four items from
-the M8A review and the bench-smoke flake, and M8C, deployment, in the order M8B, M8D1,
-M8D2, M8C; M8A, M8B and M8D1 are complete and the other two are planned.
+the route registry, M8D2, the verification-matrix drift check with the bench-smoke
+flake and three items from the M8A review, M8D3, the investigation of the 50.04 s
+recovery outlier, and M8C, deployment, in the order M8B, M8D1, M8D2, M8D3, M8C; M8A,
+M8B, M8D1 and M8D2 are complete and the other two are planned.
 
 ## Milestone status
 
@@ -56,8 +57,16 @@ M8D2, M8C; M8A, M8B and M8D1 are complete and the other two are planned.
   from it and from nothing else, an AST check holds that, and the table is held to
   `api/openapi.yaml` in both directions. Nothing observable changed, which a golden
   generated from the hand-registered server and left byte-identical by the refactor
-  shows. See "M8D1" below. M8D2 (the matrix drift check, four items from the M8A
-  review, and the bench-smoke flake) and M8C (deployment) are planned.
+  shows. See "M8D1" below.
+- **M8D2 — the matrix drift check, the bench-smoke flake and the M8A documentation
+  items:** complete; see PR #24. A cited line in the verification matrix must now be an
+  assertion on the test's own goroutine, not merely a line inside the test; `make
+  bench-smoke` aims its kill at an attempt that PostgreSQL shows has time left, so a
+  kill can no longer land on an attempt about to finish; the benchmark renderer ends a
+  record in one newline; the run-time estimate is the measured one; ADR-0023 derives the
+  throughput tolerance; and a route whose first path segment is a wildcard is refused.
+  Recorded benchmark runs are untouched. See "M8D2" below. M8D3 (the 50.04 s recovery
+  outlier) and M8C (deployment) are planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into five, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -2183,9 +2192,10 @@ was not re-observed and its fix was not observed passing there.
 
 - **The drift check proves existence, not that a test is load-bearing.** A test
   that still exists and no longer proves its row passes it. The mutation results
-  above are a point-in-time record; nothing in CI re-runs them. It also proves a
-  cited line lies inside the named test, not that the line is the assertion, and
-  the AST fix for that is deferred to M8 (now M8D2).
+  above are a point-in-time record; nothing in CI re-runs them. At M7A it also
+  proved only that a cited line lay inside the named test, not that the line was an
+  assertion; M8D2 closed that (see "M8D2" below), and what it still does not prove
+  is that the assertion reads durable state.
 - **A "restart" of the scheduler and the reconciler is a connection pool, an
   engine, and a loop, stopped and replaced in one test process.** Only the worker
   has a real-binary kill test. The reconciler's replacement runs one `RunOnce`
@@ -2562,7 +2572,12 @@ numbers can be trusted.
   in and switched it off. There is no variance estimate.
 - **The throughput target is met inside a tolerance.** 999.83 jobs/min is 0.17
   below 1,000. ADR-0020 fixed a one-sided 1% tolerance before any run, and the
-  verdict follows from it; read strictly, 999.83 is below 1,000.
+  verdict follows from it; read strictly, 999.83 is below 1,000. M8D2 derived the
+  window-boundary bound from this record's own figures, 17.66 jobs or 3.53 jobs a
+  minute against a measured shortfall of 2 jobs, and reworded §7 to say the run "kept
+  pace with the offered load; headroom not measured"
+  ([ADR-0023](adr/0023-the-throughput-tolerance-derived-from-the-headline-record.md));
+  the coded 1% is looser than that bound and was not changed.
 - **The 50.04 s recovery has not been explained.** Fourteen of the sixteen
   recovered attempts took 31.96 to 33.98 s, which is the 30 s lease plus the 2 s
   reconciler scan plus the outbox poll. The last kill's two attempts took 50.04 s
@@ -2578,9 +2593,10 @@ numbers can be trusted.
   against 552.2 ms and 963.7 ms, and does not change the verdict.
 - **The quiet-host check sees this machine only.** A stack on another host pointed
   at the same database is invisible to it.
-- **The time estimates in `AGENTS.md` and the Makefile help are wrong.** They say
-  about 25 minutes; each recorded run took about 16. They are outside `docs/` and
+- **The time estimates in `AGENTS.md` and the Makefile help were wrong.** They said
+  about 25 minutes; each recorded run took about 16. They were outside `docs/` and
   were left alone so that nothing outside `docs/` changed after the measured commit.
+  M8D2 corrected them (see "M8D2" below).
 - **The benchmark uses the demonstration handlers.** If M8C gates them in a
   deployed worker, the benchmark has to run against one that registers them.
 - **Hosted CI on the final head is not recorded here,** because a commit cannot
@@ -2853,13 +2869,13 @@ compared with one another.
   deferred drop and leaves `taskforge_imagesmoke_<pid>`. By design this is not
   verified, and nothing sweeps old ones. The smoke needs a role that can `CREATE
   DATABASE`; the compose role can, locally and on hosted CI.
-- **`make bench-smoke` can fail on a kill that lands on an idle worker.** In the
+- **`make bench-smoke` could fail on a kill that landed on an idle worker.** In the
   final-code gate run it failed once ("the kill hit an attempt, and it was recovered:
   0 abandoned") and then passed three runs in a row. Nothing under `scripts/bench`,
   `scripts/internal`, `cmd` or `internal` changed in this milestone. M8A's section
-  records that kills can hit nothing; the smoke's own check evidently does not make
-  that impossible. CI runs this smoke in the integration job, so it is a possible
-  source of a red job.
+  records that kills can hit nothing; the smoke's own check evidently did not make
+  that impossible. CI runs this smoke in the integration job, so it was a possible
+  source of a red job. M8D2 fixed it (see "M8D2" below).
 - **Reachable-only is a scope, not a proof.** A vulnerability in code that is
   imported and never called is not reported by govulncheck here, by the owner's
   decision.
@@ -3111,12 +3127,13 @@ the 2 probes. Before the table nothing compared them in this direction.
   unlisted route fails `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` until its path
   is added to `goldenUnlisted` and the golden is regenerated deliberately, reviewing every
   new row.
-- **The path rule is a literal prefix.** A pattern whose first segment is a wildcard,
-  such as `GET /{a}/v1/{b}`, matches a request under `/internal/` without carrying the
-  prefix: `net/http`'s mux hands `GET /internal/v1/nonexistent` to it ahead of the `/`
-  catch-all (checked with a scratch program). Neither the consistency rule nor
-  `checkRouteBoundaries` would see such an entry, and neither rejects one. No entry has
-  one. **This is open for the owner to decide**; it was not changed here.
+- **The path rule was a literal prefix, and a wildcard first segment escaped it.** A
+  pattern whose first segment is a wildcard, such as `GET /{a}/v1/{b}`, matches a
+  request under `/internal/` without carrying the prefix: `net/http`'s mux hands
+  `GET /internal/v1/nonexistent` to it ahead of the `/` catch-all (checked with a
+  scratch program). Neither the consistency rule nor `checkRouteBoundaries` saw such an
+  entry. No entry had one. **Closed in M8D2**: both now refuse any route or fallback
+  whose first path segment begins with `{`, except `/{$}` (see "M8D2" below).
 - **The path-selected behavior tests are the second line, not the first.** With the
   startup check in place a breaching table panics every server before they run, so they
   are shown failing by assertion only with the check stubbed out (run (b) above), by
@@ -3143,6 +3160,284 @@ the 2 probes. Before the table nothing compared them in this direction.
 ### Breaking change
 
 None. No schema, API, CLI, SDK, dashboard or configuration changed.
+
+## M8D2 — the matrix drift check, the bench-smoke flake, and the M8A documentation items
+
+M8D2 is the second slice of M8D, narrowed by the owner when it began: the 50.04 s
+recovery-outlier investigation moved to M8D3, which needs an experiment, and this slice
+keeps the rest ([ROADMAP.md](ROADMAP.md) records the order M8B, M8D1, M8D2, M8D3, M8C).
+It carries the verification-matrix drift check, the `make bench-smoke` flake M8B
+recorded, three of the four items the M8A review raised, and the wildcard gap M8D1
+recorded. The throughput derivation is
+[ADR-0023](adr/0023-the-throughput-tolerance-derived-from-the-headline-record.md). This
+section keeps three things apart: what it does, what evidence exists, and what is still
+limited.
+
+**What changed in production code: `internal/api/routes.go` only, by one rule.**
+`scripts/bench` and `scripts/readdb` are developer tooling and are not built by `make
+build`; they changed so that the smoke aims its kill, and they change nothing a recorded
+run does. Everything else is tests, docs, and two lines of text in the Makefile and
+`AGENTS.md`. `api/openapi.yaml`, the SDK, the CLI, the dashboard, the migrations, the
+schema and both committed benchmark records are unchanged, and
+`internal/api/testdata/route_behavior.golden` and the AST check's file
+(`route_registration_test.go`) have no diff against `main`.
+
+### Behavior
+
+**The drift check** (`tests/verification`). A line the matrix cites as where a test
+asserts durable state is valid only if both hold. **(a)** An assertion call covers it: in
+the named test's body, including nested `t.Run` subtests and closures defined in it, a
+call expression whose source span covers the line is a call through `require` or `assert`
+(resolved from the file's own imports, so a renamed import is followed and an unrelated
+package called `require` is not), or `Fatal`, `Fatalf`, `Error`, `Errorf`, `Fail` or
+`FailNow` called on a `*testing.T`, or a call to a same-package function that takes a
+`*testing.T` and whose body directly contains one of those (one level of helper only).
+**(b)** It is on the test's own goroutine: not inside a function literal launched by a `go`
+statement, and not inside one passed to `Eventually`, `Eventuallyf`, `EventuallyWithT`,
+`EventuallyWithTf`, `Never`, `Neverf`, `Condition` or `Conditionf`. Every check the drift
+test made before is kept. The rule is a pure function over parsed sources and is tested
+on in-test Go fixtures; see "Evidence".
+
+(b) is read to cover the cited **line** as well as the call: the line must not lie in the
+body of such a closure. Read as the prompt wrote it (about the call alone), the outer
+`require.Eventually` call would itself satisfy (a) and (b) for every line of its closure,
+and the required fixture "a line inside a `require.Eventually` closure" would be accepted.
+The call's own first line and its closing line are accepted like any line of an assertion
+call. A call to a closure the test declares for itself (`name := func(...)`) is not a
+same-package helper, so a citation of such a call is refused with a message that says to
+cite the assertion inside the closure; that is what the two corrections below do.
+
+**`make bench-smoke`'s kill is aimed.** Its fault phase submits 3 s jobs
+(`smokeFaultJobDuration`, the new `options.faultJobDuration`, threaded into the submitter
+in place of the `jobDurationMS` constant); its throughput phase keeps `demo.sleep` for
+50 ms. `options.targetableKills` makes `killOne` draw its victim, with the same seeded
+draw and sorted candidates, among workers holding a **targetable** attempt: `LEASED`
+(its sleep has not begun), or `RUNNING` with `started_at >= clock_timestamp() - (duration
+- margin)`, where the margin is half the duration, so at least 1.5 s of a 3 s job is left.
+`readdb.TargetableAttempts` reads it on PostgreSQL's clock; an attempt that started
+exactly `duration - margin` ago is a target (the comparison is `>=`). `killOne` waits up
+to `occupancyWait` (2 s) for one. If none appears the kill is **not made**, the observation
+says why, and the smoke fails a new check, **"faults: a kill target held an attempt with
+time left"**, and does not ask the two checks about the recovery of a kill that never
+happened ("the kill hit an attempt, and it was recovered" and "every recovery time is
+positive"), so a harness miss is not read as a recovery failure. With the option off, which
+is every recorded run, `killOne` takes the original path: the same `Occupancy` query and
+the same fallback to any live worker. `validateRecordable` also refuses a run that has
+either option changed, and the new result field is `json:"-"`, so a recorded run's JSON is
+unchanged. The smoke is now 14 checks.
+
+**The renderer** ends a record with the last Limitations line and exactly one `"\n"`; its
+trailing `w("")` is gone. A test checks the renderer's output and another checks every
+committed `docs/benchmarks/*.md`, which are not edited.
+
+**The run-time estimate** in the Makefile (two places) and `AGENTS.md` is "about 16
+minutes", from the committed records' own fields: the throughput phase's warm-up starts at
+`window_start - warmup_seconds` and `recorded_at` is written after both phases, so the
+headline run took 2026-10-05T03:06:30.056Z - 02:50:26.603Z = 963.5 s = **16.1 min** and the
+tuned run 03:23:47.061Z - 03:08:08.150Z = 938.9 s = **15.7 min**. That excludes `make
+build`, `make up`, `make migrate` and the first stack's start-up, and a run that does not
+finish early waits up to five minutes after its last submission, so it is "about", not a
+bound. No Make behavior changed.
+
+**The throughput tolerance** is derived in ADR-0023 and §7's verdict cell reworded
+(below). ADR-0020 is an accepted record and is not edited: ADR-0023 is the later record,
+and ADR-0020's status line names the two sentences it replaces. `JudgeThroughput`, the
+coded 1% and every recorded verdict are unchanged.
+
+**A wildcard first segment is refused.** `checkRouteBoundaries` rejects any route or derived
+fallback whose first path segment begins with `{`, except exactly `/{$}`, naming the
+pattern, and `registerRoutes` panics on it like any other breach; the table-consistency test
+asserts the same on the table. `net/http`'s own mux already refuses such a pattern while
+the dashboard is wired, because it conflicts with `GET /dashboard/`; the rule is what holds
+when it is not. `TestRoutes_TableIsInternallyConsistent` and the golden-matrix test now
+read the table without building a `Handler()`, so they fail by assertion and not by the
+panic `Handler()` raises on exactly the tables they judge.
+
+### Evidence
+
+**The 54 citations, before the matrix was touched.** The new rule, run over the matrix's 54
+distinct `file:line` locations (72 citations in 30 rows) before any edit, accepted 52 and
+rejected 2. The line text is the source line; every location is in `tests/integration/`.
+
+| # | Location | Rows | Verdict | Line text |
+| --- | --- | --- | --- | --- |
+| 1 | `api_keys_test.go:739` | S1 | VALID | `require.Equal(t, 1, attempts)` |
+| 2 | `cancellation_test.go:223` | I2 | VALID | `require.Equal(t, "SUCCEEDED", readJob(t, fence.JobID).status)` |
+| 3 | `cancellation_test.go:466` | I14 | VALID | `require.Equal(t, "CANCELED", readJob(t, fence.JobID).status)` |
+| 4 | `cancellation_test.go:568` | I14,S9 | VALID | `require.Equal(t, "CANCEL_REQUESTED", state.job)` |
+| 5 | `cancellation_test.go:603` | S9 | VALID | `require.Equal(t, "SUCCEEDED", state.job, "a terminal job never becomes canceled")` |
+| 6 | `crash_recovery_test.go:300` | I1 | VALID | `require.Equal(t, []string{"ABANDONED", "SUCCEEDED"}, attemptHistory(t, submitted))` |
+| 7 | `failure_retry_test.go:119` | I13 | VALID | `require.True(t, job.availableAt.Equal(*attempt.retryAt),` |
+| 8 | `failure_retry_test.go:274` | S10 | VALID | `require.Equal(t, []string{"ATTEMPTS_EXHAUSTED"}, dlqRows(t, jobID))` |
+| 9 | `failure_retry_test.go:617` | I9 | VALID | `require.Equal(t, "SUCCEEDED", readAttemptOutcome(t, fence.AttemptID).status)` |
+| 10 | `heartbeat_renewal_test.go:72` | I18 | VALID | `require.True(t, second.LastHeartbeatAt.Equal(stored),` |
+| 11 | `heartbeat_renewal_test.go:584` | I8 | VALID | `require.Equal(t, "ACTIVE", status, "a rejected renewal must not close the lease eit...` |
+| 12 | `ingress_test.go:232` | I10,S4 | VALID | `require.Equal(t, 1, countRows(t, "jobs"))` |
+| 13 | `ingress_test.go:254` | I11,S5 | VALID | `require.Equal(t, 1, countRows(t, "jobs"))` |
+| 14 | `ingress_test.go:364` | I1,I17,S11 | VALID | `require.Equal(t, 1, countRows(t, "jobs"))` |
+| 15 | `invariant_proofs_test.go:182` | I2 | VALID | `require.Equal(t, before[status], durableSnapshot(t, fence.JobID),` |
+| 16 | `invariant_proofs_test.go:233` | I5 | VALID | `require.Equal(t, []int{1, 2, 3, 4}, numbers,` |
+| 17 | `invariant_proofs_test.go:248` | I5 | VALID | `require.Equal(t, "job_attempts_job_id_attempt_number_key", pgErr.ConstraintName)` |
+| 18 | `invariant_proofs_test.go:354` | I15 | VALID | `"a release reported more than once must not have freed a second slot")` |
+| 19 | `late_completion_test.go:111` | I8,S3 | VALID | `require.Equal(t, beforeLate, durableSnapshot(t, jobID),` |
+| 20 | `late_completion_test.go:136` | I9,S3 | VALID | `require.Equal(t, 1, countRows(t, "results"))` |
+| 21 | `lifecycle_e2e_test.go:385` | S12 | VALID | `require.Equal(t, 1, countRows(t, "job_attempts"),` |
+| 22 | `lifecycle_e2e_test.go:523` | S10 | VALID | `require.Equal(t, []string{"ATTEMPTS_EXHAUSTED"}, dlqRows(t, jobID))` |
+| 23 | `migrations_test.go:140` | I3 | VALID | `require.Contains(t, def, "WHERE (status = 'ACTIVE'::text)")` |
+| 24 | `migrations_test.go:698` | I4 | **REJECTED** | `requireConstraintViolation(t, err, "job_attempts_session_fkey")` |
+| 25 | `migrations_test.go:733` | I4 | **REJECTED** | `requireConstraintViolation(t, err, "leases_attempt_binding_fkey")` |
+| 26 | `outbox_test.go:128` | S6 | VALID | `require.Equal(t, 3, countPendingOutbox(t))` |
+| 27 | `outbox_test.go:149` | S6 | VALID | `require.Equal(t, 3, countPublishedOutbox(t))` |
+| 28 | `outbox_test.go:311` | I17,S11 | VALID | `require.Equal(t, 5, countPublishedOutbox(t))` |
+| 29 | `outcome_replay_test.go:772` | I9 | VALID | `require.Equal(t, before, readResultRow(t, jobID),` |
+| 30 | `reconciliation_test.go:289` | S2 | VALID | `require.Equal(t, []string{"ABANDONED", "SUCCEEDED"}, attemptHistory(t, fence.JobID))` |
+| 31 | `reconciliation_test.go:360` | I16 | VALID | `require.Len(t, newPendingOutbox(t, outboxBefore), 1, "exactly one recovery notifica...` |
+| 32 | `reconciliation_test.go:415` | I16 | VALID | `"one recovery notification per recovered job, and no duplicates")` |
+| 33 | `reconciliation_test.go:550` | I16 | VALID | `"an unobserved commit followed by a rerun must still produce one recovery event")` |
+| 34 | `restart_durability_test.go:186` | I13,I17,S11 | VALID | `require.Len(t, events, 2, "exactly one fresh notification for the promotion")` |
+| 35 | `restart_durability_test.go:303` | I17 | VALID | `"the repair that was interrupted left nothing behind")` |
+| 36 | `restart_durability_test.go:326` | S11 | VALID | `require.Equal(t, 2, countRows(t, "job_attempts"), "no attempt was abandoned twice")` |
+| 37 | `restart_durability_test.go:334` | I16 | VALID | `require.Equal(t, settled, []string{durableSnapshot(t, first.JobID), durableSnapshot...` |
+| 38 | `scheduler_test.go:513` | S12 | VALID | `require.Len(t, events, 2)` |
+| 39 | `time_authority_test.go:139` | I18 | VALID | `require.True(t, baseline.Equal(storedHeartbeat()), "a refused heartbeat records not...` |
+| 40 | `time_authority_test.go:153` | I18 | VALID | `requireWithin(t, storedHeartbeat(), lo, hi, "last_heartbeat_at with "+name+" in the...` |
+| 41 | `time_authority_test.go:321` | I18 | VALID | `require.Equal(t, "UNHEALTHY", sessionStatus(t, session.ID))` |
+| 42 | `timeout_test.go:239` | S10 | VALID | `require.Equal(t, []string{"ATTEMPTS_EXHAUSTED"}, dlqRows(t, fence.JobID))` |
+| 43 | `timeout_test.go:271` | I16 | VALID | `require.Equal(t, finished, readAttemptOutcome(t, fence.AttemptID))` |
+| 44 | `worker_control_test.go:180` | I17 | VALID | `require.Equal(t, "ACTIVE", leaseStatus)` |
+| 45 | `worker_control_test.go:267` | I3,I12,S7 | VALID | `require.Equal(t, 1, countActiveLeases(t))` |
+| 46 | `worker_control_test.go:397` | I3,S8 | VALID | `require.Equal(t, 1, activeLeases)` |
+| 47 | `worker_control_test.go:416` | I7,S8 | VALID | `require.Equal(t, 3, countActiveLeases(t))` |
+| 48 | `worker_control_test.go:440` | I6 | VALID | `require.Equal(t, 2, countActiveLeases(t))` |
+| 49 | `worker_control_test.go:747` | I8 | VALID | `require.Equal(t, "RUNNING", jobStatus)` |
+| 50 | `worker_process_crash_test.go:480` | I1,I17,S2,S11 | VALID | `require.Equal(t, []string{"ABANDONED", "SUCCEEDED"}, attemptHistory(t, jobID))` |
+| 51 | `worker_process_crash_test.go:481` | S2 | VALID | `require.Equal(t, []string{"EXPIRED", "COMPLETED"}, leaseHistory(t, jobID))` |
+| 52 | `worker_process_crash_test.go:499` | I4 | VALID | `require.NotEqual(t, sessionA, attemptSessions[1])` |
+| 53 | `worker_runtime_test.go:89` | I12,S7 | VALID | `require.Equal(t, 1, countRows(t, "job_attempts"),` |
+| 54 | `worker_runtime_test.go:99` | S1 | VALID | `require.Equal(t, "COMPLETED", leaseStatus)` |
+
+The two rejections are both calls to `requireConstraintViolation`, a closure declared inside
+`TestSchema_CompositeForeignKeysRejectMismatchedBindings`, so they do not count as a helper.
+Each is corrected to the line inside the same test that asserts what the row's cell says
+(PostgreSQL refuses a mismatched binding with SQLSTATE 23503, and names the constraint):
+
+| Row | Old location and line text | New location and line text |
+| --- | --- | --- |
+| I4 | `migrations_test.go:698` `requireConstraintViolation(t, err, "job_attempts_session_fkey")` | `migrations_test.go:689` `require.Equal(t, "23503", pgErr.Code, "a mismatched binding must be a foreign-key violation")` |
+| I4 | `migrations_test.go:733` `requireConstraintViolation(t, err, "leases_attempt_binding_fkey")` | `migrations_test.go:690` `require.Equal(t, constraint, pgErr.ConstraintName)` |
+
+After the correction all 54 locations are valid, and the matrix's description of the check
+says what it does and does not prove. Many rows cite the closing *message* line of a
+multi-line `require` call, which the rule accepts by design.
+
+**Fixtures.** Each of the following is rejected by `TestAssertionRule_RejectsALineThatIsNotAnAssertion`
+with a message naming the reason: a setup line, a blank line inside the test, a comment
+line, a line inside a `require.Eventually` closure, a line inside a `go func(){...}()`, a
+call to a same-package helper that takes a `*testing.T` and contains no assertion, a call to
+a helper of a helper, a call to a closure the test declares, and a setup line inside a
+closure. Each of these is accepted by `TestAssertionRule_AcceptsALineAnAssertionCallCovers`:
+the first line of a multi-line `require` call, a continuation line and the message line of
+one, an assertion inside `t.Run`, an assertion inside a closure (with a renamed import), a
+`t.Fatalf`, a one-level helper call, and the first and closing lines of a `require.Eventually`
+call. `TestAssertionRule_ResolvesTheAssertionPackageFromTheFilesImports` and
+`TestAssertionRule_ARejectionNamesItsReasonInTheMatrixCheck` pin the import resolution and
+the matrix-level message, and the two `TestMatrixChecker_FailsWhenACitedLine…` tests run the
+real `validate` over a directory for the closure and helper cases.
+
+**Mutations, each applied, shown applied, failing, and reverted with the tree clean** (the
+first five against the committed tree, the sixth as in M8D1 with the startup check on and
+stubbed out):
+
+| # | Mutation | Result |
+| --- | --- | --- |
+| 1 | Point I10's citation at `ingress_test.go:220`, `wg.Wait()`, a setup line in its own test | `TestVerificationMatrix_EveryRowResolves` fails: `I10 (line 71): …ingress_test.go:220 is not an assertion line: TestSubmit_ConcurrentIdenticalRequestsCreateExactlyOneJob: the line is not inside an assertion call: it is setup…`. **`origin/main`'s checker, run over the same mutated matrix, passes**, which is what the old check accepted. |
+| 2 | A citation inside a `require.Eventually` closure. **No cited test has one** (a scan of every line of every cited test found none), so this is fixture-level | The check over a real fixture directory fails naming the row, the line and `closure passed to require.Eventually`. Mutating the rule (`pollingMethods` emptied) fails `TestAssertionRule_RejectsALineThatIsNotAnAssertion` and `TestMatrixChecker_FailsWhenACitedLineIsInAClosureThatRunsElsewhere` (their Eventually cases). The real matrix test stays green, as it should. |
+| 3 | A citation at a call to a non-asserting helper. **No cited test makes one**, so this is fixture-level | The check over a fixture directory fails naming `helper noopHelper, which takes a *testing.T but contains no assertion call` and, for a helper of a helper, `only one level of helper counts`. Mutating the rule (`directlyAsserts` always true) fails four tests. |
+| 4a | The smoke's targeting off and its duration back to 50 ms (`smokeOptions`) | `TestSmokeOptions_LengthenOnlyTheFaultPhaseAndAimTheKill` fails; `TestOptions_RecordedRunsKeepTheirWorkloadAndTheirVictimSelection` correctly stays green. |
+| 4b | The predicate's boundary flipped, `>=` to `>`, in `readdb.TargetableAttempts` | `TestBenchQueries_TargetableAttempts` fails against PostgreSQL: **expected 3 attempts, actual 2** (the one exactly on the boundary dropped). |
+| 4c | The smoke on that old configuration, repeated | Ten runs of the smoke on that old configuration (50 ms jobs, the victim drawn as before), with the tree otherwise as committed: **all ten passed; no miss occurred.** Each killed a worker that held 1 to 4 attempts and abandoned 1 to 4 (per run 3, 1, 1, 2, 3, 3, 1, 3, 4, 3). So I did not reproduce the flake, and ten clean runs do not show it cannot happen on the old configuration: the 95% upper bound on its per-run rate from 10 clean runs is about 26%, and M8B saw 1 failure in 4. The fix does not rest on this repeat. |
+| 5 | Restore the renderer's trailing `w("")` | `TestRenderMarkdown_EndsWithExactlyOneNewline` fails (`shipped record must not end in a blank line`); `TestCommittedRecords_EndInExactlyOneNewline` correctly stays green, since it reads the files. |
+| 6 | Add `GET /{a}/v1/{b}` (unlisted, `dashboard`, `chainNone`, reason "x") | (a) `TestRoutes_TableIsInternallyConsistent` fails by assertion (`has a wildcard in its first path segment…`), the golden test panics with `Handler()`'s message naming the pattern, and the golden-matrix test fails; (b) with the startup call stubbed out the consistency test still fails by assertion, and `net/http`'s own mux then panics (`conflicts with pattern "GET /dashboard/"`). |
+
+**The smoke series.** `make bench-smoke` was run ten times in a row on the committed code, one run after another and none skipped. Before the series `pmset` read **AC Power, charging, Low Power Mode off**, no TaskForge process was running, and the compose services were up; I could not verify the lid. The owner plugged the machine in after it had been on battery at 7%. A first attempt at the series produced no runs at all, because my own shell command failed on a glob before the first one started; the table is the second attempt, and every run in it is reported.
+
+| Run | Exit | Wall | Result | Targetable attempts the victim held | Abandoned / replaced / never replaced | Recovery, worst | Power, battery |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 41s | PASS (14 of 14 checks met) | 2 | 4 / 4 / 0 | 15.06 s | AC Power 7% |
+| 2 | 0 | 31s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.89 s | AC Power 7% |
+| 3 | 0 | 31s | PASS (14 of 14 checks met) | 4 | 4 / 4 / 0 | 14.82 s | AC Power 7% |
+| 4 | 0 | 30s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.90 s | AC Power 8% |
+| 5 | 0 | 31s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.90 s | AC Power 8% |
+| 6 | 0 | 32s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.88 s | AC Power 8% |
+| 7 | 0 | 30s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.90 s | AC Power 9% |
+| 8 | 0 | 31s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.90 s | AC Power 9% |
+| 9 | 0 | 31s | PASS (14 of 14 checks met) | 2 | 4 / 4 / 0 | 14.94 s | AC Power 9% |
+| 10 | 0 | 31s | PASS (14 of 14 checks met) | 3 | 4 / 4 / 0 | 14.87 s | AC Power 10% |
+
+Every run exited 0 and passed all 14 checks, including the new one. Each killed a worker that held 2 to 4 attempts with time left, abandoned 4 attempts, replaced all 4 and left none unreplaced; the worst recovery was between 14.82 s and 15.06 s (the 10 s tuned lease plus the scans). Wall time, from the start of `make bench-smoke` to its exit with the build, `make up` and `make migrate` included, was 30 s to 41 s: the first run took 41 s, which I did not investigate, and the other nine took 30 to 32 s (median 31 s).
+
+**Why 3 s jobs fit the smoke's bounds.** The smoke's fault phase submits 60 jobs at 1,200 a
+minute, which is 3 s of submission, to 4 workers of 4 slots. Sixteen slots take 60 jobs in
+four rounds of 3 s, 12 s for the jobs alone; a killed worker's four attempts are abandoned
+when the tuned profile's 10 s lease expires and are re-run for 3 s more. The smoke's deadline
+is 90 s after the last submission, so the run has about four times what it needs, and
+`TestSmokeOptions_LengthenOnlyTheFaultPhaseAndAimTheKill` pins that the jobs alone take under
+half of it. The throughput phase is unchanged. Measured, the smoke takes 30 to 41 s wall (see the series), under the "about a minute" that `AGENTS.md` and the Makefile help say, which is left as it is.
+
+**The throughput derivation** is in ADR-0023 with the record's numbers: 16.6706 jobs/s ×
+(1.009416 s + 0.050 s) = 17.66 jobs, 3.53 jobs a minute, 0.35% over the 4.999819-minute
+window, against a measured shortfall of 2 jobs (5,001 created and 4,999 finished, 0.400 a
+minute). The recorded verdict stands. §7's cell now reads "Met: kept pace with the offered
+load (999.83 of 1000.23/min offered, within the window-boundary bound derived in
+[ADR-0023](…)); headroom not measured". The coded 1% (990 a minute) is 2.83 times looser
+than the bound and would also admit a real shortfall; tightening `JudgeThroughput` waits for
+the next recorded run, so a committed record and the code that judged it stay consistent.
+ADR-0023 also records that ADR-0020's prose (the shortfall is judged against the rate that
+was offered) and the code (an absolute 990 floor on each of measured and offered) differ.
+
+### Limitations
+
+- **The drift check still does not prove the assertion reads durable state.** A cited line
+  that asserts an HTTP status or an in-memory value passes the rule as readily as one that
+  reads PostgreSQL. That is the reviewer's job, and the matrix says so.
+- **`require.New(t)` counts as an assertion call.** The rule accepts any call through
+  `require` or `assert`, as written, so a line that only constructs an `*Assertions` passes.
+  A method called on such a value (`r.Equal(...)`) is not recognised as an assertion.
+- **A helper counts only if it is a top-level function of the same package.** A method, a
+  function in another package, and a closure the test declares are not, by the rule as
+  written; the two refused citations were of the last kind. A helper that asserts only inside
+  a `go` or `Eventually` closure does not count.
+- **The rule sees one package at a time and reads every file in the directory**, including
+  files under other build tags, so a helper defined twice under different tags is judged by
+  its first definition.
+- **The mutations of the drift check are a point-in-time record.** Nothing in CI re-runs
+  them; the rule's fixtures are what run on every `make test-unit`. Two of the three
+  mutations (Eventually closure, non-asserting helper) are fixture-level because no cited
+  test has those shapes today.
+- **The aimed kill is a property of the smoke, not of recorded runs.** A recorded run's kills
+  still draw a victim that held an attempt when the kill was due, with 50 ms attempts, and
+  eleven of the headline run's 24 kills still hit nothing (see M8A). Nothing about that
+  changed, deliberately.
+- **The margin is half the duration, and the arithmetic assumes the two round trips are
+  fast.** `killOne` reads the session and then the clock before the signal. With 1.5 s left
+  at selection that is ample on this machine; a database a few hundred milliseconds away
+  would shrink it, and the new check would then report a miss only if no attempt had time left,
+  not if the kill landed late.
+- **The smoke series is one machine, one day.** Ten passes in ten runs cannot show the flake is gone. With no failure in 10 trials the 95% upper bound on the per-run failure rate is about 26% (the rule of three gives 30%), and the one recorded failure of this kind, in M8B's gate run, was 1 run in 4. What makes a miss impossible rather than unlikely is the mechanism, an attempt with at least half its 3 s left, and the new check, which makes a miss a named failure; the ten runs show the mechanism working on this machine.
+- **ADR-0020's text is unchanged and its prose still says the shortfall is judged against
+  the rate offered**; ADR-0020's status line and ADR-0023 record that the code does not.
+- **The route rule still keys on `/internal/` and `/v1/` and now on a wildcard first
+  segment.** A route that matches under those prefixes by some other means (a path built
+  with a trailing-slash subtree, for example) is held by the other checks in M8D1, not by
+  this one.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
+  own CI result: the pull request's checks are the record.
+
+### Breaking change
+
+None for a user. A contributor who adds a route whose first path segment is a wildcard now
+gets a startup panic naming it; a contributor who cites a non-assertion line in
+`docs/VERIFICATION_MATRIX.md` now gets a test failure naming the reason.
 
 ## Verification
 
@@ -3725,6 +4020,35 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8D2 gates
+
+Run locally on the branch, 2026-10-06, on the final code commit **`c34ae13`** (everything
+after it changes `docs/` only) with no other TaskForge process running. PostgreSQL 16,
+ElasticMQ and the object store from `make up`, on host Go 1.27.0. **AC power, charging, Low
+Power Mode off; the lid I could not verify.** The machine was on battery at 7% until the owner
+plugged it in at about 14:45. Before that, one probe run of the smoke (at 8%) checked that the
+new path worked end to end; it passed, and it is not part of the series. Every other smoke run,
+including the ten repeats of mutation 4c (which ran with `smokeOptions` edited, since reverted),
+was on AC power.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: `gofmt -w .` changed nothing (0 diff lines) |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 26 packages `ok`. Top-level tests: `tests/verification` 45, `scripts/bench` 113, `internal/api` 147, all passing. 18 new, by name: `TestAssertionRule_RejectsALineThatIsNotAnAssertion`, `TestAssertionRule_AcceptsALineAnAssertionCallCovers`, `TestAssertionRule_ResolvesTheAssertionPackageFromTheFilesImports`, `TestAssertionRule_ARejectionNamesItsReasonInTheMatrixCheck`, `TestMatrixChecker_FailsWhenACitedLineIsInAClosureThatRunsElsewhere`, `TestMatrixChecker_FailsWhenACitedLineCallsAHelperThatAssertsNothing`, `TestOptions_RecordedRunsKeepTheirWorkloadAndTheirVictimSelection`, `TestSmokeOptions_LengthenOnlyTheFaultPhaseAndAimTheKill`, `TestSubmit_TheDurationIsTheOnlyThingAnotherWorkloadChanges`, `TestRunThroughput_UsesTheFixedWorkload`, `TestRunFaults_ThreadsTheFaultJobDurationIntoItsSubmitter`, `TestAnalyzeFaults_AKillThatWasNotMadeIsNotAKill`, `TestAnalyzeFaults_UntargetedKillsAreNotInTheSummaryJSON`, `TestTargetableCandidates_AreTheLiveWorkersHoldingATargetableAttempt`, `TestSmokeChecks_ATargetingFailureFailsItsOwnCheckAndNotTheRecoveryChecks`, `TestRenderMarkdown_EndsWithExactlyOneNewline`, `TestCommittedRecords_EndInExactlyOneNewline`, and the integration test `TestBenchQueries_TargetableAttempts`. Changed: `TestRouteBoundaries_RefuseEachBreach` (the wildcard cases), `TestRoutes_TableIsInternallyConsistent`, `TestRoutes_HandlerRefusesATableThatBreaksABoundary`, `TestSmokeChecks_EachKindOfBrokenMeasurementFailsItsOwnCheck`, and the checker's own fixtures. `TestRouteBehavior_MatchesTheGolden` and `TestRoutes_NothingRegistersAroundTheTable` pass with their files unchanged. |
+| `GOTOOLCHAIN=go1.25.14 go test ./internal/api ./tests/verification ./scripts/bench` | PASS: all three `ok`; CI's toolchain |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  85.348s`, including `TestBenchQueries_TargetableAttempts` against PostgreSQL |
+| `make test-race` | PASS: 27 packages `ok` under `-race`; `ok  …/tests/integration  81.911s`; no `DATA RACE` |
+| `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)` |
+| `make bench-smoke`, ten consecutive runs | PASS ×10, each `14 of 14 checks met` (the series above) |
+| `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`; every image labelled with revision `ee09261`; `migrate: applies every embedded migration to an empty database`: applied 18, then dropped its throwaway database, and `pg_database` listed no `taskforge_imagesmoke_%` database afterwards. **Run normally**: `docker-credential-desktop` returned this time, so the credential-free `DOCKER_CONFIG` M8D1 needed was not used. |
+| `make scan` | recorded in the pull request, not here: it is run in a fresh clone of the pushed final head, which includes this documentation commit, and a commit cannot contain its own result. In the working checkout it fails, as in M8B, on the leftover local branch `backup-pre-fix`, which I did not touch. |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test`, `make demo-failure`, `docker compose config --quiet` | NOT RUN locally: nothing they cover changed |
+
+The mutation results, the inventory, and the smoke series are under "Evidence" in the M8D2
+section.
 
 ### M8D1 gates
 
@@ -4788,19 +5112,16 @@ two targets belong in its version.
 
 ## Next objective
 
-M8D2: the verification-matrix drift check, four items from the M8A review, and the
-`make bench-smoke` flake. See [ROADMAP.md](ROADMAP.md)'s M8D2 entry. It is not started.
-It is the matrix drift check's AST fix, which finds the cited assertion in the syntax
-tree instead of trusting a line number; ADR-0020's justification of the throughput
-tolerance with the §7 wording "kept pace with offered load; headroom not measured"; an
-investigation of the 50.04 s recovery outlier; the benchmark record renderer's extra
-newline; the run-time estimate in `AGENTS.md`; and the smoke's random kill, which can
-land on an idle worker and fail "the kill hit an attempt, and it was recovered". M8C
-(deployment) follows it and **needs its own owner decision before any work starts**:
-the non-loopback bind, which M6E's note says has to be revisited together with the Host
-rule; protection of `/internal`; and the decision ADR-0019 leaves, whether to gate the
-demonstration handlers in a deployed worker. Every M7 scenario can also be watched from
-the dashboard.
+M8D3: investigate the 50.04 s worker-failure recovery outlier. See
+[ROADMAP.md](ROADMAP.md)'s M8D3 entry. It is not started. It is a reproduction, under
+the benchmark harness or in an integration test, with a kill timed after submission
+ends on an otherwise idle system, and then either an explanation backed by evidence or,
+if a defect is found, a stop and a report without a fix. M8C (deployment) follows it and
+**needs its own owner decision before any work starts**: the non-loopback bind, which
+M6E's note says has to be revisited together with the Host rule; protection of
+`/internal`; and the decision ADR-0019 leaves, whether to gate the demonstration
+handlers in a deployed worker. Every M7 scenario can also be watched from the
+dashboard.
 
 Open, and not any milestone's deliverable: whether the shipped lease and outbox
 interval should change is a question the two M8A records answer only as numbers, not

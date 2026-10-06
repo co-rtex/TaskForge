@@ -335,3 +335,106 @@ func TestBenchQueries_CurrentSessionAndOccupancy(t *testing.T) {
 	_, err = readdb.ClockNow(ctx, testPool)
 	require.NoError(t, err)
 }
+
+// TestBenchQueries_TargetableAttempts proves the query the smoke aims its kill with,
+// against real PostgreSQL and rows whose timestamps the test writes.
+//
+// An attempt is targetable if it is LEASED (its sleep has not begun), or RUNNING and
+// started no longer ago than duration-margin, so at least margin of its duration is
+// left. The cases sit on and either side of that boundary, judged at an explicit
+// instant so they are exact, and one case reads PostgreSQL's own clock.
+//
+// The boundary is pinned: an attempt that started EXACTLY duration-margin ago is
+// targetable (the comparison is >=). It has exactly margin left, which is what
+// "at least margin" means.
+func TestBenchQueries_TargetableAttempts(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	seed := benchSeed{t: t, scope: benchScope}
+
+	const duration, margin = 3 * time.Second, 1500 * time.Millisecond
+	asOf := at(10 * time.Second)
+	boundary := asOf.Add(-(duration - margin)) // started exactly this long ago: margin left
+
+	busy := seed.worker("worker-busy")
+	busySession := seed.session(busy, at(0), "HEALTHY", nil)
+	idle := seed.worker("worker-idle")
+	idleSession := seed.session(idle, at(0), "HEALTHY", nil)
+
+	attempt := func(worker, session uuid.UUID, status string, started, finished *time.Time) {
+		job := uuid.New()
+		seed.job(job, "RUNNING", at(time.Second), nil)
+		seed.attempt(job, 1, worker, session, status, at(time.Second), started, finished)
+	}
+	// Targetable: its sleep has not begun.
+	attempt(busy, busySession, "LEASED", nil, nil)
+	// Targetable: it has just started, with nearly all of its duration left.
+	attempt(busy, busySession, "RUNNING", ptr(asOf.Add(-100*time.Millisecond)), nil)
+	// Targetable, and pinned: it started exactly duration-margin ago, so exactly
+	// margin is left.
+	attempt(busy, busySession, "RUNNING", ptr(boundary), nil)
+	// Not targetable: one millisecond past the boundary, so just under margin left.
+	attempt(busy, busySession, "RUNNING", ptr(boundary.Add(-time.Millisecond)), nil)
+	// Not targetable: nearly finished.
+	attempt(busy, busySession, "RUNNING", ptr(asOf.Add(-(duration - 10*time.Millisecond))), nil)
+	// Not targetable: no longer holds a slot at all.
+	attempt(busy, busySession, "SUCCEEDED", ptr(asOf.Add(-2*duration)), ptr(asOf.Add(-duration)))
+	// A worker whose only attempt is too old holds nothing a kill could catch.
+	attempt(idle, idleSession, "RUNNING", ptr(asOf.Add(-(duration - time.Millisecond))), nil)
+
+	// Another scope's attempts are not this scope's, however targetable.
+	other := benchSeed{t: t, scope: "bench-queries-other"}
+	otherWorker := other.worker("worker-busy")
+	otherSession := other.session(otherWorker, at(0), "HEALTHY", nil)
+	otherJob := uuid.New()
+	other.job(otherJob, "RUNNING", at(time.Second), nil)
+	other.attempt(otherJob, 1, otherWorker, otherSession, "LEASED", at(time.Second), nil, nil)
+
+	got, err := readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, margin, asOf)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"worker-busy": 3}, got,
+		"LEASED, just started and exactly on the boundary count; one millisecond past it, a nearly finished attempt and a SUCCEEDED one do not; worker-idle holds nothing a kill could catch; another scope's attempt is not counted")
+
+	t.Run("margin decides where the boundary is", func(t *testing.T) {
+		// Demanding 2 s left moves the boundary to 1 s ago: the attempt started exactly
+		// 1.5 s ago is no longer a target, and only the LEASED and the just-started
+		// ones are.
+		got, err := readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, 2*time.Second, asOf)
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"worker-busy": 2}, got)
+
+		// A margin of 0 asks for any time left at all: every RUNNING attempt that
+		// started within one duration, the nearly finished one included, and the
+		// LEASED one. worker-idle's attempt, 1 ms inside a full duration, counts.
+		got, err = readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, 0, asOf)
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"worker-busy": 5, "worker-idle": 1}, got)
+	})
+
+	t.Run("the parameters are checked", func(t *testing.T) {
+		_, err := readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, duration+time.Millisecond, asOf)
+		require.Error(t, err, "a margin longer than the job can never be left")
+		_, err = readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, 0, 0, asOf)
+		require.Error(t, err)
+	})
+
+	t.Run("without an instant it reads PostgreSQL's own clock", func(t *testing.T) {
+		reset(t)
+		seed := benchSeed{t: t, scope: benchScope}
+		worker := seed.worker("worker-live")
+		session := seed.session(worker, at(0), "HEALTHY", nil)
+		now, err := readdb.ClockNow(ctx, testPool)
+		require.NoError(t, err)
+
+		young, old := uuid.New(), uuid.New()
+		seed.job(young, "RUNNING", at(time.Second), nil)
+		seed.job(old, "RUNNING", at(time.Second), nil)
+		seed.attempt(young, 1, worker, session, "RUNNING", at(time.Second), ptr(now.Add(-100*time.Millisecond)), nil)
+		seed.attempt(old, 1, worker, session, "RUNNING", at(time.Second), ptr(now.Add(-10*time.Second)), nil)
+
+		got, err := readdb.TargetableAttempts(ctx, testPool, benchScope, duration, margin)
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"worker-live": 1}, got,
+			"the attempt that started 100 ms before PostgreSQL's now is a target; the one 10 s before it is not")
+	})
+}

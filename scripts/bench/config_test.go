@@ -126,3 +126,59 @@ func TestDefaultOptions_TheCompletionDeadlineIsTheFixedOne(t *testing.T) {
 	require.Equal(t, 5*time.Minute, defaultOptions().deadline)
 	require.Equal(t, completionDeadline, defaultOptions().deadline)
 }
+
+// TestOptions_RecordedRunsKeepTheirWorkloadAndTheirVictimSelection pins what a
+// recorded run does and must keep doing: its fault run's jobs are the owner's
+// fixed workload, demo.sleep for 50 ms, and its kills draw their victim as
+// ADR-0020 defines it, not among attempts with time left. The defaults and a
+// parsed --record invocation both carry that, and a run that changed either could
+// not be recorded.
+func TestOptions_RecordedRunsKeepTheirWorkloadAndTheirVictimSelection(t *testing.T) {
+	recorded, err := parseArgs([]string{"throughput", "faults", "--record"})
+	require.NoError(t, err)
+
+	for name, o := range map[string]options{"the defaults": defaultOptions(), "a parsed --record invocation": recorded} {
+		require.Equal(t, 50*time.Millisecond, o.faultJobDuration, "%s: the fault run's jobs sleep for 50 ms", name)
+		require.Equal(t, jobDurationMS*time.Millisecond, o.faultJobDuration, name)
+		require.False(t, o.targetableKills, "%s: the victim is drawn as before", name)
+		require.Nil(t, targetingFor(o), "%s: no targeting, so killOne takes its original path", name)
+	}
+	require.NoError(t, recorded.validateRecordable())
+
+	for name, mutate := range map[string]func(*options){
+		"a longer fault-run job": func(o *options) { o.faultJobDuration = 3 * time.Second },
+		"targeted kills":         func(o *options) { o.targetableKills = true },
+	} {
+		o := recorded
+		mutate(&o)
+		err := o.validateRecordable()
+		require.Errorf(t, err, "a recorded run must refuse: %s", name)
+	}
+}
+
+// TestSmokeOptions_LengthenOnlyTheFaultPhaseAndAimTheKill pins what the smoke does
+// differently: its fault run's jobs are long enough that a kill aimed at an attempt
+// with time left cannot find it finished, and its kill is aimed. Its throughput
+// phase has no option for the duration and keeps the fixed 50 ms (see
+// TestRunThroughput_UsesTheFixedWorkload).
+func TestSmokeOptions_LengthenOnlyTheFaultPhaseAndAimTheKill(t *testing.T) {
+	o := smokeOptions()
+
+	require.Equal(t, smokeFaultJobDuration, o.faultJobDuration)
+	require.Equal(t, 3*time.Second, o.faultJobDuration)
+	require.True(t, o.targetableKills)
+	require.Equal(t, 1500*time.Millisecond, o.targetMargin(), "half the duration must be left")
+
+	target := targetingFor(o)
+	require.NotNil(t, target)
+	require.Equal(t, 3*time.Second, target.duration)
+	require.Equal(t, 1500*time.Millisecond, target.margin)
+
+	// The smoke's own bounds still hold with the longer jobs: a fault run of 60 jobs
+	// over 16 slots drains in about 12 s, far inside the smoke's 90 s deadline. The
+	// arithmetic is in CURRENT_STATE; this keeps the two numbers from drifting
+	// apart without anyone noticing.
+	slots := o.workers * o.concurrency
+	drain := time.Duration((o.jobs+slots-1)/slots) * o.faultJobDuration
+	require.Less(t, drain, o.deadline/2, "the jobs alone must take well under the completion deadline")
+}

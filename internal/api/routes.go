@@ -397,12 +397,25 @@ const (
 // invariants of the paths, so this is the check that holds them regardless of what
 // any entry says.
 //
+// One more rule closes the gap the prefix rule leaves. A pattern whose FIRST path
+// segment is a wildcard, such as GET /{a}/v1/{b}, matches a request under
+// /internal/ or /v1/ without carrying either prefix, so the checks above could not
+// see it, and net/http's mux would hand it such a request ahead of the "/"
+// catch-all and past the guard. No route may have one, with the single exception of
+// "/{$}", which matches the bare root and nothing else.
+//
 // It is a pure function of its arguments so a test can hand it a table that breaks
 // the rule without Handler() panicking; registerRoutes is what turns a non-nil
 // result into a refusal to build the server.
 func checkRouteBoundaries(routes []route, fallbacks []fallback) error {
 	var breaches []error
 	for _, rt := range routes {
+		if firstSegmentIsWildcard(rt.path) {
+			breaches = append(breaches, fmt.Errorf(
+				"route %q has a wildcard in its first path segment; such a pattern can match under /internal/ or /v1/ without carrying the prefix, so the path rule could not see it (only \"/{$}\" is allowed)",
+				rt.pattern()))
+			continue
+		}
 		switch {
 		case strings.HasPrefix(rt.path, internalPathPrefix):
 			if rt.chain != chainGuard && rt.chain != chainGuardWorkerKey {
@@ -419,6 +432,12 @@ func checkRouteBoundaries(routes []route, fallbacks []fallback) error {
 		}
 	}
 	for _, fb := range fallbacks {
+		if firstSegmentIsWildcard(fb.path) {
+			breaches = append(breaches, fmt.Errorf(
+				"405 fallback %q has a wildcard in its first path segment; such a pattern can match under /internal/ or /v1/ without carrying the prefix, so the path rule could not see it (only \"/{$}\" is allowed)",
+				fb.path))
+			continue
+		}
 		switch {
 		case strings.HasPrefix(fb.path, internalPathPrefix):
 			if fb.chain != chainGuard && fb.chain != chainGuardWorkerKey {
@@ -435,6 +454,17 @@ func checkRouteBoundaries(routes []route, fallbacks []fallback) error {
 		}
 	}
 	return errors.Join(breaches...)
+}
+
+// firstSegmentIsWildcard reports whether a path's first segment begins with "{",
+// which makes it a wildcard whatever follows. The one path allowed to is "/{$}",
+// the end-anchor that matches the bare root only.
+func firstSegmentIsWildcard(path string) bool {
+	if path == "/{$}" {
+		return false
+	}
+	first, _, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
+	return strings.HasPrefix(first, "{")
 }
 
 // registerRoutes registers every enabled route, then every derived fallback,

@@ -30,12 +30,30 @@ now is [CURRENT_STATE.md](CURRENT_STATE.md).
 `make test-unit` and in CI with no infrastructure. It parses this file and checks
 that I1–I18 and S1–S12 each appear exactly once in the right table; that every
 named test is a real top-level test function in the file named, parsed with
-`go/parser` so `//go:build integration` files are read too; that every cited
-assertion line lies inside one of that row's own tests; and that every code path
-still exists. It does **not** check that a test is load-bearing. A test that
-still exists and no longer proves its row passes it. Whether an assertion
-bites is settled by mutating the production code it guards and watching it fail,
-which is how M7A's new tests were checked (see [CURRENT_STATE.md](CURRENT_STATE.md)).
+`go/parser` so `//go:build integration` files are read too; that every code path
+still exists; and that every cited line lies inside one of that row's own tests
+**and is an assertion line there**. An assertion line is covered by an assertion
+call: a call through `require` or `assert` (resolved from the file's own imports,
+so a renamed import is followed), a `Fatal`, `Fatalf`, `Error`, `Errorf`, `Fail` or
+`FailNow` called on a `*testing.T`, or a call to a function in the same package
+that takes a `*testing.T` and whose body directly contains one of those (one level
+of helper; a helper that asserts only through another helper does not count). The
+call must be on the test's own goroutine: a line inside a function literal launched
+by a `go` statement, or inside a closure passed to `Eventually`, `Eventuallyf`,
+`EventuallyWithT`, `EventuallyWithTf`, `Never`, `Neverf`, `Condition` or
+`Conditionf`, is refused. A setup line, a blank line, a comment, a call to a helper
+that asserts nothing, and a call to a closure the test declares for itself (cite the
+assertion inside the closure) are each refused, with the reason.
+
+It does **not** check that the assertion reads **durable state**. A cited line that
+asserts an HTTP status or an in-memory value passes the rule as readily as one that
+reads PostgreSQL, and that cannot be decided from the syntax: whether the line is
+where a test reads the database after the operation stays the reviewer's job, as the
+"Durable-state assertion" column above says. Nor does it check that a test is
+load-bearing. A test that still exists and no longer proves its row passes it.
+Whether an assertion bites is settled by mutating the production code it guards and
+watching it fail, which is how M7A's new tests were checked (see
+[CURRENT_STATE.md](CURRENT_STATE.md)).
 
 ## Invariants
 
@@ -44,7 +62,7 @@ which is how M7A's new tests were checked (see [CURRENT_STATE.md](CURRENT_STATE.
 | I1 | PostgreSQL is authoritative for all control-plane state. | `TestSubmit_SurvivesAPIRestart` (tests/integration/ingress_test.go)<br>`TestOutbox_SurvivesPublisherRestart` (tests/integration/outbox_test.go)<br>`TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath` (tests/integration/crash_recovery_test.go)<br>`TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries` (tests/integration/worker_process_crash_test.go) | tests/integration/ingress_test.go:364 (SQL count of jobs after the API restarts onto a new pool)<br>tests/integration/crash_recovery_test.go:300 (attempt history read from PostgreSQL after recovery)<br>tests/integration/worker_process_crash_test.go:480 (the same, across real processes) | `internal/jobs/store.go:Submit`<br>`internal/workers/store.go:Claim`<br>`internal/workers/reconcile.go:ReconcileExpiredLeases` | COVERED |
 | I2 | A terminal job never returns to a non-terminal state. | `TestInvariant_TerminalJobsStayTerminalUnderEveryMutator` (tests/integration/invariant_proofs_test.go)<br>`TestCancel_TerminalJobsAreAStableConflict` (tests/integration/cancellation_test.go) | tests/integration/invariant_proofs_test.go:182 (each terminal job's rows in jobs, job_attempts, leases, results, dlq_entries and outbox_events, before and after every mutator)<br>tests/integration/cancellation_test.go:223 (SQL read of the job after a refused cancel) | `internal/jobs/schedule.go:promoteDueJob`<br>`internal/jobs/schedule.go:renotifyStrandedJob`<br>`internal/jobs/cancel.go:RequestCancel`<br>`internal/workers/store.go:lockAuthorityRows` | CLOSED-M7A |
 | I3 | A job has at most one active lease. | `TestClaim_ExactlyOneWorkerWinsAContestedJob` (tests/integration/worker_control_test.go)<br>`TestClaim_DuplicateNotificationAcrossSessionsConsumesOnlyOneJob` (tests/integration/worker_control_test.go)<br>`TestMigrations_ApplyCleanlyToAFreshDatabase` (tests/integration/migrations_test.go) | tests/integration/worker_control_test.go:397 (SQL count of ACTIVE leases after a 24-way contested claim)<br>tests/integration/worker_control_test.go:267 (the same, for one notification claimed twice)<br>tests/integration/migrations_test.go:140 (the partial unique index definition, read from pg_indexes) | `migrations/0002_workers_sessions_and_claims.sql:leases_one_active_per_job_idx`<br>`internal/workers/store.go:Claim` | COVERED |
-| I4 | An attempt belongs to exactly one job and one worker process session. | `TestSchema_CompositeForeignKeysRejectMismatchedBindings` (tests/integration/migrations_test.go)<br>`TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries` (tests/integration/worker_process_crash_test.go) | tests/integration/migrations_test.go:698 (PostgreSQL refuses a mismatched attempt binding: SQLSTATE 23503 and the constraint name)<br>tests/integration/migrations_test.go:733 (and a mismatched lease binding)<br>tests/integration/worker_process_crash_test.go:499 (two attempts of one job read back bound to two different sessions) | `migrations/0002_workers_sessions_and_claims.sql:job_attempts_session_fkey`<br>`migrations/0002_workers_sessions_and_claims.sql:leases_attempt_binding_fkey` | COVERED |
+| I4 | An attempt belongs to exactly one job and one worker process session. | `TestSchema_CompositeForeignKeysRejectMismatchedBindings` (tests/integration/migrations_test.go)<br>`TestWorkerProcessCrash_SigkillRecoversThroughTheRealBinaries` (tests/integration/worker_process_crash_test.go) | tests/integration/migrations_test.go:689 (PostgreSQL refuses a mismatched binding with SQLSTATE 23503: the assertion in `requireConstraintViolation`, which every attempt-binding case and every lease-binding case of the test calls)<br>tests/integration/migrations_test.go:690 (and names the constraint that refused it: `job_attempts_session_fkey`, `job_attempts_job_fkey` or `leases_attempt_binding_fkey`)<br>tests/integration/worker_process_crash_test.go:499 (two attempts of one job read back bound to two different sessions) | `migrations/0002_workers_sessions_and_claims.sql:job_attempts_session_fkey`<br>`migrations/0002_workers_sessions_and_claims.sql:leases_attempt_binding_fkey` | COVERED |
 | I5 | Attempt numbers increase monotonically and are unique per job. | `TestInvariant_AttemptNumbersIncreaseWithoutGapsAndAreUniquePerJob` (tests/integration/invariant_proofs_test.go) | tests/integration/invariant_proofs_test.go:233 (attempt_number read back from job_attempts across four real attempts)<br>tests/integration/invariant_proofs_test.go:248 (PostgreSQL itself refuses a duplicate: SQLSTATE 23505) | `internal/workers/store.go:Claim`<br>`migrations/0002_workers_sessions_and_claims.sql:attempt_number` | CLOSED-M7A |
 | I6 | A worker never exceeds its declared concurrency limit. | `TestClaim_QueueAndWorkerCapacityHoldUnderContention` (tests/integration/worker_control_test.go) | tests/integration/worker_control_test.go:440 (SQL count of ACTIVE leases equals the worker limit after 16 concurrent claims) | `internal/workers/store.go:Claim` | COVERED |
 | I7 | A queue never exceeds its configured global execution limit. | `TestClaim_QueueAndWorkerCapacityHoldUnderContention` (tests/integration/worker_control_test.go) | tests/integration/worker_control_test.go:416 (SQL count of ACTIVE leases equals the queue limit after 16 concurrent claims) | `internal/workers/store.go:Claim` | COVERED |

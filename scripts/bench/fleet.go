@@ -54,6 +54,9 @@ type fleet struct {
 	st          *stack.Stack
 	workers     []*workerHandle
 	concurrency int
+	// target is non-nil only when kills are aimed at attempts with time left (the
+	// smoke). Nil is the recorded runs' selection.
+	target *targeting
 }
 
 // startFleet starts the stack (api, outbox, scheduler, reconciler, a broker queue
@@ -68,7 +71,7 @@ func startFleet(ctx context.Context, o options, out io.Writer) (*fleet, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &fleet{st: st, concurrency: o.concurrency}
+	f := &fleet{st: st, concurrency: o.concurrency, target: targetingFor(o)}
 	if err := st.Setup(ctx); err != nil {
 		st.Cleanup()
 		return nil, err
