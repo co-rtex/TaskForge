@@ -99,9 +99,11 @@ demo-failure: build up migrate ## Run the failure demo: a worker killed mid-job,
 # demonstrations. `make bench` is the one recorded run: it refuses to start on a
 # dirty tree, runs the throughput measurement and then the fault-injection one
 # with the shipped default timings, and writes docs/benchmarks/<date>-<sha>.md and
-# .json. It takes about twenty-five minutes. `make bench-smoke` runs both in
-# miniature, asserts the harness measured validly, records nothing, and is what CI
-# runs; CI never records numbers. See docs/adr/0020-benchmark-methodology.md.
+# .json. It took about sixteen minutes in the two committed records (16.1 and
+# 15.7, from the first warm-up to the record being written; see
+# docs/CURRENT_STATE.md). `make bench-smoke` runs both in miniature, asserts the
+# harness measured validly, records nothing, and is what CI runs; CI never
+# records numbers. See docs/adr/0020-benchmark-methodology.md.
 #
 # BENCH_ARGS passes extra flags through, e.g. `make bench BENCH_ARGS="--profile
 # tuned"` for the one labelled tuned run.
@@ -112,7 +114,7 @@ demo-failure: build up migrate ## Run the failure demo: a worker killed mid-job,
 BENCH_ARGS ?=
 KEEP_AWAKE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate -dimsu")
 
-bench: build up migrate ## Run the full benchmark and record it in docs/benchmarks (clean tree; about 25 minutes; lid open, on power)
+bench: build up migrate ## Run the full benchmark and record it in docs/benchmarks (clean tree; about 16 minutes; lid open, on power)
 	$(KEEP_AWAKE) $(GO) run ./scripts/bench throughput faults --record $(BENCH_ARGS)
 
 bench-smoke: build up migrate ## Smoke-test the benchmark harness: about a minute, records nothing, fails if it measured wrongly

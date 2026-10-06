@@ -97,7 +97,7 @@ make test-race         # race detector
 make build             # compile all binaries into ./bin
 make demo              # success demonstration: succeed, retry, dead-letter
 make demo-failure      # failure demonstration: a killed and a frozen worker
-make bench             # the recorded benchmark: throughput, then faults (clean tree, ~25 min)
+make bench             # the recorded benchmark: throughput, then faults (clean tree, ~16 min)
 make bench-smoke       # the benchmark harness in miniature: ~1 min, records nothing
 make images            # build the dashboard, then the six service images as taskforge-<service>:dev
 make images-smoke      # build the images, then inspect and run them (needs `make up`)
