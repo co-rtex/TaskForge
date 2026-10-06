@@ -1,6 +1,14 @@
 # ADR-0018: Browser-origin guard on the internal surface
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded by
+  [ADR-0022](0022-the-route-table-is-the-single-source-of-routes.md). Two sentences
+  of its "Registration: per route, inside the mux" section are replaced: the ones
+  saying fail-closed coverage comes from two tests, one of which reads `server.go`
+  for `/internal` patterns registered around `handleInternal`. That test no longer
+  exists; every route is registered from one table, and an AST check over the
+  package's non-test files holds that nothing registers around it. The guard, its
+  rules, its order and its outermost position are unchanged, and every other
+  section stands.
 - **Date:** 2026-10-01
 
 ## Context
