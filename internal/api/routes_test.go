@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/co-rtex/TaskForge/internal/metrics"
 )
@@ -40,6 +41,28 @@ func newRouteBed(t *testing.T, off ...group) *routeBed {
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
 
+	server, probe := wireRouteServer(t, provider.Tracer("routes-test"), off...)
+	return &routeBed{server: server, handler: server.Handler(), probe: probe, exporter: exporter}
+}
+
+// routeTableOf returns the route table of a server with every feature group
+// wired on, WITHOUT building its Handler().
+//
+// A test that only reads the table uses this rather than newRouteBed so that it
+// does not depend on Handler() accepting the table. Handler() refuses a table that
+// breaks a boundary rule (registerRoutes), and net/http's mux refuses a pattern
+// that conflicts with another, so a test that built a handler first could only
+// fail by a panic on exactly the tables it exists to judge.
+func routeTableOf(t *testing.T) []route {
+	t.Helper()
+	server, _ := wireRouteServer(t, nil)
+	return server.routeTable()
+}
+
+// wireRouteServer builds a server with each feature group wired to a recording
+// fake, except those named in off. A nil tracer leaves the server's default.
+func wireRouteServer(t *testing.T, tracer trace.Tracer, off ...group) (*Server, *guardProbe) {
+	t.Helper()
 	disabled := map[group]bool{}
 	for _, g := range off {
 		require.NotEqualf(t, groupAlways, g, "the %s group cannot be turned off", g)
@@ -48,8 +71,10 @@ func newRouteBed(t *testing.T, off ...group) *routeBed {
 
 	probe := &guardProbe{}
 	server := NewServer(nil, Config{MaxRequestBytes: 4096}, discardLogger()).
-		WithTracer(provider.Tracer("routes-test")).
 		WithResults(acceptingResults(), nil)
+	if tracer != nil {
+		server.WithTracer(tracer)
+	}
 	if !disabled[groupKeys] {
 		server.WithAuth(probeKeys{probe})
 	}
@@ -65,7 +90,7 @@ func newRouteBed(t *testing.T, off ...group) *routeBed {
 	if !disabled[groupDashboard] {
 		server.WithDashboard(testDashboardAssets())
 	}
-	return &routeBed{server: server, handler: server.Handler(), probe: probe, exporter: exporter}
+	return server, probe
 }
 
 // serve sends one request and returns the response with the route pattern the
@@ -216,7 +241,7 @@ func sortedKeys(set map[string]bool) []string {
 // with the surface. The behavioral tests below catch the consequence; this one
 // names the cause.
 func TestRoutes_TableIsInternallyConsistent(t *testing.T) {
-	table := newRouteBed(t).server.routeTable()
+	table := routeTableOf(t)
 	require.NotEmpty(t, table)
 
 	type pathFacts struct {
@@ -244,6 +269,17 @@ func TestRoutes_TableIsInternallyConsistent(t *testing.T) {
 		// internal at a path outside it, is a disagreement and not a free choice.
 		// The prefixes are literals, not routes.go's constants: a test that read the
 		// same constant would follow it if it were changed.
+		//
+		// A path whose FIRST segment is a wildcard can match under /internal/ or
+		// /v1/ without carrying the prefix (net/http hands GET /internal/v1/x to
+		// "GET /{a}/v1/{b}" ahead of the catch-all), so neither prefix rule below
+		// could see it. Only "/{$}", which matches the bare root, may start with one.
+		firstSegment, _, _ := strings.Cut(strings.TrimPrefix(rt.path, "/"), "/")
+		if strings.HasPrefix(firstSegment, "{") && rt.path != "/{$}" {
+			require.Failf(t, "wildcard first segment",
+				"%s has a wildcard in its first path segment, which can match under /internal/ or /v1/ without the prefix and so escape the guard and the API key; only \"/{$}\" may start with one",
+				name)
+		}
 		underInternal := strings.HasPrefix(rt.path, "/internal/")
 		underPublic := strings.HasPrefix(rt.path, "/v1/")
 		switch {
@@ -730,6 +766,21 @@ func TestRouteBoundaries_RefuseEachBreach(t *testing.T) {
 			fallbacks: []fallback{{path: "/v1/debug", methods: []string{http.MethodGet}, chain: chainAPIKey}},
 			wantNamed: "/v1/debug", wantRule: "unwrapped",
 		},
+		// A wildcard in the first segment matches under a guarded prefix without
+		// carrying it. The chain is the right one for the path it would match, to
+		// show the pattern is refused for its shape, not for a wrong wrapper.
+		"a route with a wildcard in its middle that matches under /v1/": {
+			routes:    []route{entry("/{a}/v1/{b}", chainAPIKey)},
+			wantNamed: "GET /{a}/v1/{b}", wantRule: "wildcard in its first path segment",
+		},
+		"a route that is only a wildcard": {
+			routes:    []route{entry("/{x}", chainNone)},
+			wantNamed: "GET /{x}", wantRule: "wildcard in its first path segment",
+		},
+		"a fallback whose first segment is a wildcard": {
+			fallbacks: []fallback{{path: "/{a}/internal/v1", methods: []string{http.MethodGet}, chain: chainGuard}},
+			wantNamed: "/{a}/internal/v1", wantRule: "wildcard in its first path segment",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := checkRouteBoundaries(tc.routes, tc.fallbacks)
@@ -757,6 +808,11 @@ func TestRouteBoundaries_RefuseEachBreach(t *testing.T) {
 				entry("/v1/c", chainAPIKey),
 				entry("/healthz", chainNone),
 				entry("/debug/vars", chainNone),
+				// The one path that may begin with a wildcard: it matches the bare
+				// root and nothing else.
+				entry("/{$}", chainNone),
+				// A wildcard later in the path is not a first segment.
+				entry("/v1/jobs/{job_id}", chainAPIKey),
 			},
 			[]fallback{
 				{path: "/internal/v1/a", methods: []string{http.MethodGet}, chain: chainGuard},
@@ -828,6 +884,8 @@ func TestRoutes_HandlerRefusesATableThatBreaksABoundary(t *testing.T) {
 			entry("/v1/debug", surfaceUnlisted, chainNone), "GET /v1/debug", "requireAPIKey"},
 		"a probe under /v1/": {
 			entry("/v1/debug", surfaceProbe, chainNone), "GET /v1/debug", "requireAPIKey"},
+		"a route whose first segment is a wildcard": {
+			entry("/{a}/v1/{b}", surfaceUnlisted, chainNone), "GET /{a}/v1/{b}", "wildcard in its first path segment"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			panicked := build(tc.extra)
@@ -855,7 +913,7 @@ func TestRoutes_HandlerRefusesATableThatBreaksABoundary(t *testing.T) {
 // is added to goldenUnlisted and the golden is regenerated deliberately.
 func TestRoutes_GoldenMatrixCoversEveryUnlistedRoute(t *testing.T) {
 	inTable := map[string]bool{}
-	for _, rt := range newRouteBed(t).server.routeTable() {
+	for _, rt := range routeTableOf(t) {
 		if rt.surface != surfaceUnlisted {
 			continue
 		}
