@@ -611,13 +611,15 @@ evidence, the way M5, M6 and M7 were: M8A measures, M8B is the supply chain
 (images and scanning), M8D carries the two gates M7A deferred together with four
 items the M8A review raised, and M8C is deployment. The owner split M8D in two
 when M8D began: M8D1 is the route registry and nothing else, and M8D2 is the rest.
-The original objective, deliverables, and acceptance sentence are preserved across
-them, not reduced.
+When M8D2 began the owner split it again: the 50.04 s recovery-outlier investigation
+moved to M8D3, which needs an experiment and not a documentation change. The original
+objective, deliverables, and acceptance sentence are preserved across them, not
+reduced.
 
-**Order: M8B, then M8D1, then M8D2, then M8C.** M8C keeps its name.
+**Order: M8B, then M8D1, then M8D2, then M8D3, then M8C.** M8C keeps its name.
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
-complete; see PR #23. M8D2 and M8C are planned.
+complete; see PR #23. M8D2 is complete; see PR #24. M8D3 and M8C are planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -706,28 +708,56 @@ review items, the `make bench-smoke` flake, any change to `api/openapi.yaml`,
 `scripts/bench`, the SDK, the CLI, the dashboard, migrations or the schema, and a
 runtime route listing.
 
-#### M8D2 — The matrix drift check, the M8A review items, and the bench-smoke flake
-**Objective.** Close the other gate M7A deferred, the four items the M8A review
-raised, and the one flake M8B recorded.
-**Deliverables.** A verification-matrix drift check that finds the cited assertion in
-the syntax tree instead of trusting a line number (see
-[VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)); the four items carried from the
-M8A review:
-- ADR-0020's justification of the throughput tolerance, and the wording of
-  [PROJECT_SPEC.md](PROJECT_SPEC.md) §7 for that target: "kept pace with offered
-  load; headroom not measured";
-- an investigation of the 50.04 s worker-failure recovery outlier;
-- the benchmark record renderer's extra newline;
-- the run-time estimate in [AGENTS.md](../AGENTS.md);
-
-and the `make bench-smoke` flake: its random kill can land on an idle worker, so the
-check "the kill hit an attempt, and it was recovered" fails although nothing is
-wrong. It failed once in M8B's gate run and CI runs the smoke.
+#### M8D2 — The matrix drift check, the bench-smoke flake, and the M8A documentation items
+**Objective.** Close the other gate M7A deferred, the one flake M8B recorded, three of
+the four items the M8A review raised, and the gap M8D1 recorded in the route rule.
+**Deliverables.**
+- A verification-matrix drift check that finds the cited assertion in the syntax tree
+  instead of trusting a line number: a cited line must be covered by an assertion call
+  on the test's own goroutine (see [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)).
+- `make bench-smoke`'s flake: its fault phase submits 3 s jobs and aims its kill at an
+  attempt that PostgreSQL shows has time left, so a kill can no longer land on an
+  attempt that is about to finish, and a miss fails its own check and is not read as a
+  recovery failure. Recorded runs are untouched.
+- The benchmark record renderer's extra newline.
+- The run-time estimate in [AGENTS.md](../AGENTS.md) and the Makefile, from the
+  committed records.
+- [ADR-0023](adr/0023-the-throughput-tolerance-derived-from-the-headline-record.md):
+  the throughput tolerance derived from the headline record, and
+  [PROJECT_SPEC.md](PROJECT_SPEC.md) §7's wording for that target: "kept pace with the
+  offered load; headroom not measured". The coded 1% and the recorded verdict are
+  unchanged.
+- The route rule's wildcard gap: a route or fallback whose first path segment is a
+  wildcard, other than `/{$}`, is refused, so the guard and the API key cannot be
+  stepped around by a pattern that does not carry the prefix.
 **Acceptance.** The drift check fails on a cited line that is inside the named test
-but is not an assertion; each of the four review items is closed or recorded as
-deliberately left; and `make bench-smoke` cannot fail because a kill landed on an
-idle worker.
+but is not an assertion, and all 54 citations are inventoried; the smoke kills only a
+targetable attempt and passed ten consecutive runs; the renderer ends a record in one
+newline and a test holds every committed record to it; the estimate is the measured
+one; ADR-0023 and §7 carry the derivation with the code and the verdict unchanged;
+and a wildcard first segment is refused with the golden byte-identical.
 **Depends on.** M8D1.
+**Status:** complete; see PR #24 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited.
+
+Deliberately **not** in scope: the 50.04 s recovery outlier (M8D3), any change to a
+recorded run's workload, victim selection, rules or record format, to
+`JudgeThroughput` or any other `Judge*` function, to either committed record, to
+`api/openapi.yaml`, the SDK, the CLI, the dashboard, migrations or the schema.
+
+#### M8D3 — Investigate the 50.04 s worker-failure recovery outlier
+**Objective.** Find out why one worker-failure recovery in the headline run took 50.04 s
+against a median of 32.02 s, when the shipped lease is 30 s.
+**Deliverables.** A reproduction of the outlier, with a kill timed after submission
+ends on an otherwise idle system, under the benchmark harness or in an integration
+test; and then one of two outcomes. Either the outlier is **explained with evidence**,
+a mechanism that the reproduction shows and that accounts for the extra time; or a
+**defect is found, and the work stops and reports it without fixing it**, because a
+fix to recovery is a change to the control plane and is the owner's decision.
+**Acceptance.** The report names which of the two it is, shows the reproduction, and,
+for an explanation, shows the evidence that the mechanism and not chance produced the
+figure.
+**Depends on.** M8D2.
 **Status:** planned.
 
 #### M8C — Deployment
@@ -742,7 +772,7 @@ whether the demonstration handlers are gated in a deployed worker
 ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
 a gate open).
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8B; follows M8D2 in the owner's order (M8B, M8D1, M8D2, M8C). **Needs its
+**Depends on.** M8B; follows M8D3 in the owner's order (M8B, M8D1, M8D2, M8D3, M8C). **Needs its
 own owner decision before any work starts:** the bind, `/internal` and the handler
 gate are trust-boundary decisions, and the infrastructure costs money.
 **Status:** planned.
