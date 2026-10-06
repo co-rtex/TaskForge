@@ -34,16 +34,24 @@ type submitStats struct {
 }
 
 func newSubmitter(apiURL, apiKey, runID string) *submitter {
-	// The workload is fixed: demo.sleep for jobDurationMS. max_attempts and
-	// timeout_seconds are sent rather than left to the API's defaults, so the
-	// record can say what they were.
+	return newSubmitterWithDuration(apiURL, apiKey, runID, jobDurationMS*time.Millisecond)
+}
+
+// newSubmitterWithDuration is newSubmitter for jobs that sleep for jobDuration. The
+// throughput run and every recorded run call newSubmitter, which is the fixed
+// workload; only the smoke's fault run asks for another duration (see
+// options.faultJobDuration).
+func newSubmitterWithDuration(apiURL, apiKey, runID string, jobDuration time.Duration) *submitter {
+	// The workload is demo.sleep for jobDuration, which is jobDurationMS unless the
+	// smoke's fault run says otherwise. max_attempts and timeout_seconds are sent
+	// rather than left to the API's defaults, so the record can say what they were.
 	body, err := json.Marshal(struct {
 		Queue          string         `json:"queue"`
 		JobType        string         `json:"job_type"`
 		Payload        map[string]int `json:"payload"`
 		MaxAttempts    int            `json:"max_attempts"`
 		TimeoutSeconds int            `json:"timeout_seconds"`
-	}{"default", jobType, map[string]int{"duration_ms": jobDurationMS}, jobMaxAttempts, jobTimeoutSecs})
+	}{"default", jobType, map[string]int{"duration_ms": int(jobDuration / time.Millisecond)}, jobMaxAttempts, jobTimeoutSecs})
 	if err != nil {
 		panic(fmt.Sprintf("marshal a constant workload: %v", err)) // cannot happen: no input
 	}

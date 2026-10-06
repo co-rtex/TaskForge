@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,4 +120,61 @@ func TestAnalyzeFaults_AProblemTheRunnerObservedMakesTheRunInvalid(t *testing.T)
 
 	require.False(t, got.Valid)
 	require.Contains(t, got.Problems, "worker w09 exited on its own during the run")
+}
+
+// A kill that was not made is not a kill. With aimed kills (only the smoke) a kill
+// can find no attempt with time left and is skipped; it must not be counted as one
+// made, must not contribute a victim, a session or a recovery, and must make the
+// run invalid with a problem that says why.
+func TestAnalyzeFaults_AKillThatWasNotMadeIsNotAKill(t *testing.T) {
+	skipped := killObservation{Index: 0, ScheduledOffset: time.Second, NotMade: "no worker held an attempt with at least 1.5s of its 3s left within 2s"}
+	res := analyzeFaults(faultInputs(skipped))
+
+	require.Equal(t, 1, res.KillsScheduled)
+	require.Equal(t, 0, res.KillsDone, "nothing was killed")
+	require.Equal(t, 1, res.KillsUntargeted)
+	require.Empty(t, res.Kills, "a skipped kill has no victim, session or time to record")
+	require.Zero(t, res.Affected)
+	require.False(t, res.Valid, "a run that did not make its kill is not a valid fault run")
+	require.Contains(t, strings.Join(res.Problems, "; "), "kill 0 was not made: no worker held an attempt with at least 1.5s")
+
+	// And it is not mistaken for a restart failure or a recovery problem.
+	for _, problem := range res.Problems {
+		require.NotContains(t, problem, "could not be restarted")
+		require.NotContains(t, problem, "never replaced")
+	}
+}
+
+// The new field must not reach the summary a recorded run writes. A recorded run
+// can never have an unmade kill, so its JSON must be exactly what it was.
+func TestAnalyzeFaults_UntargetedKillsAreNotInTheSummaryJSON(t *testing.T) {
+	res := analyzeFaults(faultInputs(killAt(0, 20*time.Second, "w03", 1, replacedAt(51*time.Second))))
+	require.Zero(t, res.KillsUntargeted)
+
+	encoded, err := json.Marshal(res)
+	require.NoError(t, err)
+	require.NotContains(t, strings.ToLower(string(encoded)), "untargeted")
+	require.NotContains(t, string(encoded), "NotMade")
+	require.Contains(t, string(encoded), `"kills_done":1`)
+}
+
+// targetableCandidates is the filter between what the database says and who may be
+// killed: a worker is a candidate only if it holds a targetable attempt AND is
+// running now.
+func TestTargetableCandidates_AreTheLiveWorkersHoldingATargetableAttempt(t *testing.T) {
+	held := map[string]int{"w01": 2, "w02": 0, "w03": 1, "w09": 4}
+	live := []string{"w01", "w02", "w03", "w04"}
+
+	require.ElementsMatch(t, []string{"w01", "w03"}, targetableCandidates(held, live),
+		"w02 holds none, w04 is absent, and w09 holds some but is not running")
+	require.Empty(t, targetableCandidates(map[string]int{}, live))
+	require.Empty(t, targetableCandidates(held, nil))
+
+	// With the same draw the same state picks the same worker: the candidates are
+	// sorted by ChooseVictim, so the order they were filtered in cannot matter.
+	a, err := ChooseVictim(7, targetableCandidates(held, []string{"w03", "w01"}))
+	require.NoError(t, err)
+	b, err := ChooseVictim(7, targetableCandidates(held, []string{"w01", "w03"}))
+	require.NoError(t, err)
+	require.Equal(t, a, b)
 }

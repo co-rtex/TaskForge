@@ -3,9 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -139,4 +145,80 @@ func TestSubmit_StopsWhenTheContextEnds(t *testing.T) {
 	started := time.Now()
 	require.Error(t, s.submit(ctx, 1))
 	require.Less(t, time.Since(started), 5*time.Second)
+}
+
+// The duration is the one thing newSubmitterWithDuration changes. newSubmitter,
+// which the throughput run and every recorded run use, is the fixed workload.
+func TestSubmit_TheDurationIsTheOnlyThingAnotherWorkloadChanges(t *testing.T) {
+	srv, seen := recordingServer(t, http.StatusCreated)
+
+	require.NoError(t, newSubmitterWithDuration(srv.URL, "k", "run1", 3*time.Second).submit(context.Background(), 1))
+	require.NoError(t, newSubmitter(srv.URL, "k", "run1").submit(context.Background(), 2))
+
+	require.Len(t, *seen, 2)
+	long, fixed := (*seen)[0].body, (*seen)[1].body
+	require.Equal(t, float64(3000), long["payload"].(map[string]any)["duration_ms"], "3 s is 3000 ms")
+	require.Equal(t, float64(50), fixed["payload"].(map[string]any)["duration_ms"], "newSubmitter is demo.sleep for 50 ms")
+
+	delete(long, "payload")
+	delete(fixed, "payload")
+	require.Equal(t, fixed, long, "queue, job type, max_attempts and timeout are the same for both")
+}
+
+// requireCallsIn parses a source file of this package and returns, for each call to
+// one of the named functions inside the named function, the source text of its
+// arguments. It lets a test pin WHICH constructor a run calls and with what, which
+// a unit test cannot observe by running them: both runs need a real stack.
+func requireCallsIn(t *testing.T, file, inFunc string, callee ...string) map[string][]string {
+	t.Helper()
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	require.NoError(t, err)
+
+	found := map[string][]string{}
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != inFunc {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := call.Fun.(*ast.Ident)
+			if !ok || !slices.Contains(callee, ident.Name) {
+				return true
+			}
+			var args []string
+			for _, arg := range call.Args {
+				args = append(args, types.ExprString(arg))
+			}
+			found[ident.Name] = append(found[ident.Name], strings.Join(args, ", "))
+			return true
+		})
+		return found
+	}
+	require.Failf(t, "function not found", "%s is not declared in %s", inFunc, file)
+	return nil
+}
+
+// TestRunThroughput_UsesTheFixedWorkload pins that the throughput run, which the
+// smoke runs too, builds its submitter with newSubmitter, the fixed 50 ms workload,
+// and never with a duration of its own.
+func TestRunThroughput_UsesTheFixedWorkload(t *testing.T) {
+	calls := requireCallsIn(t, "run_throughput.go", "runThroughput", "newSubmitter", "newSubmitterWithDuration")
+	require.Len(t, calls["newSubmitter"], 1, "runThroughput builds its submitter with newSubmitter")
+	require.Empty(t, calls["newSubmitterWithDuration"], "and never with a duration of its own")
+}
+
+// TestRunFaults_ThreadsTheFaultJobDurationIntoItsSubmitter pins that the fault run
+// builds its submitter from the options' fault-job duration, which is 50 ms unless
+// the smoke lengthens it, and not from the jobDurationMS constant.
+func TestRunFaults_ThreadsTheFaultJobDurationIntoItsSubmitter(t *testing.T) {
+	calls := requireCallsIn(t, "run_faults.go", "runFaults", "newSubmitter", "newSubmitterWithDuration")
+	require.Empty(t, calls["newSubmitter"], "runFaults must not fall back to the fixed workload")
+	require.Len(t, calls["newSubmitterWithDuration"], 1)
+	require.True(t, strings.HasSuffix(calls["newSubmitterWithDuration"][0], "o.faultJobDuration"),
+		"the duration is the option's, got: %s", calls["newSubmitterWithDuration"][0])
 }

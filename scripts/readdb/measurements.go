@@ -164,6 +164,61 @@ func Occupancy(ctx context.Context, q Querier, scope string) (map[string]int, er
 		GROUP BY w.name`, scope)
 }
 
+// TargetableAttempts is the number of attempts each of the scope's workers holds
+// that a kill could still catch mid-work, keyed by the worker's name. A worker with
+// none is absent.
+//
+// An attempt is targetable if it is LEASED, because its sleep has not begun, or it
+// is RUNNING and started no longer ago than duration-margin, so that at least margin
+// of its duration is left. Both are read on PostgreSQL's clock, `clock_timestamp()`,
+// the one every other instant in the harness is read from, and not this machine's:
+// started_at is PostgreSQL's now() when the worker reported the start.
+//
+// It exists for the smoke. Occupancy counts an attempt that is 50 ms from
+// finishing exactly like one that has just begun, so a kill aimed at the worker
+// holding it can find nothing left to abandon by the time the signal is sent.
+func TargetableAttempts(ctx context.Context, q Querier, scope string, duration, margin time.Duration) (map[string]int, error) {
+	return targetableAttempts(ctx, q, scope, duration, margin, nil)
+}
+
+// TargetableAttemptsAsOf is TargetableAttempts judged at a given instant instead
+// of PostgreSQL's clock, so a test can place an attempt exactly on, just inside and
+// just outside the boundary. Nothing outside tests calls it.
+func TargetableAttemptsAsOf(ctx context.Context, q Querier, scope string, duration, margin time.Duration, asOf time.Time) (map[string]int, error) {
+	return targetableAttempts(ctx, q, scope, duration, margin, &asOf)
+}
+
+func targetableAttempts(ctx context.Context, q Querier, scope string, duration, margin time.Duration, asOf *time.Time) (map[string]int, error) {
+	if duration <= 0 || margin < 0 || margin > duration {
+		return nil, fmt.Errorf("a targetable attempt needs 0 <= margin <= duration; got duration %s, margin %s", duration, margin)
+	}
+	rows, err := q.Query(ctx, `
+		SELECT w.name, count(*)
+		FROM job_attempts a
+		JOIN workers w ON w.id = a.worker_id AND w.scope = a.scope
+		WHERE a.scope = $1
+		  AND (a.status = 'LEASED'
+		       OR (a.status = 'RUNNING'
+		           AND a.started_at >= COALESCE($4::timestamptz, clock_timestamp())
+		                               - (($2::bigint - $3::bigint) * interval '1 millisecond')))
+		GROUP BY w.name`,
+		scope, duration.Milliseconds(), margin.Milliseconds(), asOf)
+	if err != nil {
+		return nil, fmt.Errorf("count targetable attempts: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var name string
+		var n int
+		if err := rows.Scan(&name, &n); err != nil {
+			return nil, fmt.Errorf("scan a targetable count: %w", err)
+		}
+		out[name] = n
+	}
+	return out, rows.Err()
+}
+
 func countBy(ctx context.Context, q Querier, sql, scope string) (map[string]int, error) {
 	rows, err := q.Query(ctx, sql, scope)
 	if err != nil {

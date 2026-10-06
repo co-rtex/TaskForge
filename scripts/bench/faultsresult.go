@@ -27,6 +27,11 @@ type killObservation struct {
 	RestartMS       float64
 	RestartError    string
 	Abandoned       []readdb.Recovery
+	// NotMade is why no kill was made, when none was: with targeted kills on (only
+	// the smoke), no worker held an attempt with time left. It is never set for a
+	// recorded run, whose victim is drawn as ADR-0020 defines it. A kill that was not
+	// made is not a kill: it has no victim, no session and no time.
+	NotMade string
 }
 
 // KillRecord is one kill as the summary records it.
@@ -92,6 +97,10 @@ type FaultsResult struct {
 	KillsScheduled int          `json:"kills_scheduled"`
 	KillsDone      int          `json:"kills_done"`
 	Kills          []KillRecord `json:"kills"`
+	// KillsUntargeted is how many scheduled kills were not made because no worker
+	// held an attempt with time left. It is not in the summary: only the smoke can
+	// have one, and a recorded run's JSON must not change.
+	KillsUntargeted int `json:"-"`
 
 	SubmissionSeconds         float64   `json:"submission_seconds"`
 	CompletionDeadlineSeconds float64   `json:"completion_deadline_seconds_after_last_submission"`
@@ -118,8 +127,8 @@ func analyzeFaults(in faultsInputs) FaultsResult {
 	res := FaultsResult{
 		Profile: in.profile, Seed: in.seed, Workers: in.workers, Concurrency: in.concurrency, TargetRate: in.targetRate,
 		JobsTarget: in.jobsTarget, JobsSubmitted: in.submitted, SubmitErrors: in.submitErrors, SubmitRetries: in.retries,
-		JobsInDatabase: in.jobsInDatabase,
-		KillsScheduled: in.scheduledKills, KillsDone: len(in.kills),
+		JobsInDatabase:    in.jobsInDatabase,
+		KillsScheduled:    in.scheduledKills,
 		SubmissionSeconds: in.submissionDuration.Seconds(), CompletionDeadlineSeconds: in.deadline.Seconds(),
 		DeadlineAt: in.deadlineAt, EndedBy: in.endedBy,
 		FinalStatuses: in.statuses, DLQReasons: in.dlq,
@@ -140,6 +149,11 @@ func analyzeFaults(in faultsInputs) FaultsResult {
 
 	var all []time.Duration
 	for _, k := range in.kills {
+		if k.NotMade != "" {
+			res.KillsUntargeted++
+			problem("kill %d was not made: %s", k.Index, k.NotMade)
+			continue
+		}
 		rec := recoveryTimes(k.KilledAt, k.Abandoned)
 		all = append(all, rec.Durations...)
 		res.Affected += rec.Affected
@@ -165,8 +179,9 @@ func analyzeFaults(in faultsInputs) FaultsResult {
 	res.Recovery = Summarize(all)
 	res.RecoveryMS = toMS(res.Recovery)
 
-	if len(in.kills) < in.scheduledKills {
-		problem("only %d of the %d scheduled kills were made", len(in.kills), in.scheduledKills)
+	res.KillsDone = len(in.kills) - res.KillsUntargeted
+	if res.KillsDone < in.scheduledKills {
+		problem("only %d of the %d scheduled kills were made", res.KillsDone, in.scheduledKills)
 	}
 	if in.jobsInDatabase != in.submitted {
 		problem("the API accepted %d submissions and the database holds %d jobs in this run's scope", in.submitted, in.jobsInDatabase)

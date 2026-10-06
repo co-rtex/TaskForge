@@ -59,6 +59,7 @@ const (
 	checkThroughputSucceeded = "throughput: every job reached SUCCEEDED"
 	checkFaultsRan           = "the fault run completed"
 	checkFaultJobs           = "faults: at least 50 jobs, every one in the database"
+	checkTargeted            = "faults: a kill target held an attempt with time left"
 	checkKill                = "faults: one kill, stamped with PostgreSQL's time and the killed session"
 	checkRecovered           = "faults: the kill hit an attempt, and it was recovered"
 	checkPositive            = "faults: every recovery time is positive"
@@ -100,26 +101,49 @@ func smokeChecks(th ThroughputResult, thErr error, f FaultsResult, fErr error) [
 			f.JobsInDatabase >= minSmokeJobs && f.JobsInDatabase == f.JobsSubmitted,
 			"%d accepted, %d in the database", f.JobsSubmitted, f.JobsInDatabase)
 
+		// Whether the harness found an attempt to kill is a different question from
+		// whether the system recovered one, and it is asked first. A kill that
+		// found nothing to aim at is not made, and the smoke fails THIS check for
+		// it, so a harness miss is never read as a recovery failure. When it
+		// fails, the two checks about the recovery of a kill that never happened
+		// are not asked at all.
+		targeted := f.KillsUntargeted == 0
+		add(checkTargeted, targeted, "%s", targetedDetail(f))
+
 		killOK := f.KillsDone == 1 && len(f.Kills) == 1 && !f.Kills[0].KilledAt.IsZero() && f.Kills[0].Session != ""
 		add(checkKill, killOK, "%d kills made", f.KillsDone)
 
-		add(checkRecovered,
-			f.Affected >= 1 && f.Recovery.N >= 1 && f.Unrecovered == 0,
-			"%d abandoned, %d replaced, %d never replaced", f.Affected, f.Recovery.N, f.Unrecovered)
+		if targeted {
+			add(checkRecovered,
+				f.Affected >= 1 && f.Recovery.N >= 1 && f.Unrecovered == 0,
+				"%d abandoned, %d replaced, %d never replaced", f.Affected, f.Recovery.N, f.Unrecovered)
 
-		positive := len(f.Kills) > 0
-		for _, k := range f.Kills {
-			for _, s := range k.RecoverySeconds {
-				positive = positive && s > 0
+			positive := len(f.Kills) > 0
+			for _, k := range f.Kills {
+				for _, s := range k.RecoverySeconds {
+					positive = positive && s > 0
+				}
 			}
+			add(checkPositive, positive, "worst %s", fmtDur(f.Recovery.Max))
 		}
-		add(checkPositive, positive, "worst %s", fmtDur(f.Recovery.Max))
 		add(checkFaultsSucceeded,
 			f.JobsInDatabase > 0 && f.Succeeded == f.JobsInDatabase,
 			"%d of %d; %s", f.Succeeded, f.JobsInDatabase, counts(f.FinalStatuses))
 		add(checkFaultsValid, f.Valid, "%s", problems(f.Problems))
 	}
 	return cs
+}
+
+// targetedDetail says what the targeting did: how many attempts with time left the
+// victim held when it was chosen, or that there was none to aim at.
+func targetedDetail(f FaultsResult) string {
+	if f.KillsUntargeted > 0 {
+		return fmt.Sprintf("%d of the scheduled kills found no worker holding an attempt with time left, and were not made", f.KillsUntargeted)
+	}
+	if len(f.Kills) == 0 {
+		return "no kill was made"
+	}
+	return fmt.Sprintf("the victim held %d attempts with time left", f.Kills[0].HeldAtSelection)
 }
 
 func errText(err error) string {
