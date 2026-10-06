@@ -1,6 +1,14 @@
 # ADR-0020: Benchmark methodology: PostgreSQL's clock, the shipped defaults, and a CI that only smokes
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded by
+  [ADR-0023](0023-the-throughput-tolerance-derived-from-the-headline-record.md). Two
+  sentences of its "What Met and MISSED mean" section are replaced: the one
+  justifying the 1% throughput tolerance ("completes it to within the jobs in flight
+  at each end of the window"), which ADR-0023 derives from the headline record's own
+  figures, and the one saying the shortfall "is judged against the rate that was
+  actually offered", which the code does not do (it floors measured and offered at
+  990 each). The 1%, the Met and MISSED rules as coded, every recorded verdict and
+  every other section stand.
 - **Date:** 2026-10-03
 
 ## Context

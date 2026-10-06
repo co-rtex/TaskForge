@@ -166,7 +166,7 @@ the system's favor, and a target that was missed says so.
 
 | Target | Value | Measured ([record](benchmarks/2026-10-05-d796722.md)) | Met? |
 | --- | --- | --- | --- |
-| Sustained throughput | 1,000 jobs/minute across 12 workers | 999.83 jobs/min completed over a 5 minute window, with 1000.23 offered | **Met**, within the 1% tolerance ADR-0020 fixed before the run. It is 0.17 jobs/min below 1,000. |
+| Sustained throughput | 1,000 jobs/minute across 12 workers | 999.83 jobs/min completed over a 5 minute window, with 1000.23 offered | **Met**: kept pace with the offered load (999.83 of 1000.23/min offered, within the window-boundary bound derived in [ADR-0023](adr/0023-the-throughput-tolerance-derived-from-the-headline-record.md)); headroom not measured. |
 | Dispatch latency | p95 < 500 ms | p95 963.7 ms (p50 552.2 ms, p99 1009.4 ms, max 1046.6 ms; n = 5,001) | **MISSED**, beside `TASKFORGE_OUTBOX_POLL_INTERVAL=1s` |
 | Fault-injection volume | 10,000 jobs | 10,000 jobs, with 24 workers killed | **Met** |
 | Completion under fault injection | ≥ 99.7% | 10,000 of 10,000 `SUCCEEDED` (100.000%), 5 minutes after the last submission | **Met** |
