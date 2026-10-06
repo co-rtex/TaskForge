@@ -3823,7 +3823,7 @@ once, shown by `git diff`, run, and reverted. Each is caught by named tests in
 | (b) delete the `origin` rule | 47 | the same five tests |
 | (c) delete the `host` rule | 150 | the refusal table, `..._EveryBrowserMarkingNamesItsRule`, `..._FirstRuleToFireNamesTheRefusal`, `..._RefusalIsObservable` |
 | (d) a `Host` split error falls back to accepting | 60 | the refusal table (the unparseable Hosts) and `..._EveryBrowserMarkingNamesItsRule` |
-| (e) register `POST /internal/v1/claims` without the helper | 18 | the refusal table, for exactly that route, and `TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which names `server.go:256` |
+| (e) register `POST /internal/v1/claims` without the helper | 18 | the refusal table, for exactly that route, and `TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which names `server.go:256` (that test was replaced in M8D1 by `TestRoutes_NothingRegistersAroundTheTable`; see "M8D1") |
 | (f) swap the guard and `requireWorkerKey` | 19 | the refusal table, `..._RunsBeforeAuthenticationAndBefore405`, and the source-scan test |
 
 The mutated source diffs and failing output are in the pull request's handoff.
