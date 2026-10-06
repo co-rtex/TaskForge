@@ -68,6 +68,12 @@ type Server struct {
 	cfg       Config
 	log       *slog.Logger
 	checks    []ReadinessCheck
+	// routeTableHook, when non-nil, may add to or replace the entries of the route
+	// table before it is registered. It exists only so a test can show that
+	// Handler() refuses a table that breaks a boundary rule (see
+	// checkRouteBoundaries); nothing in production sets it, and it is unexported,
+	// so nothing outside this package can.
+	routeTableHook func([]route) []route
 }
 
 // Results reads a job's recorded result. See internal/results.Store.

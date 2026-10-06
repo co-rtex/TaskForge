@@ -131,6 +131,37 @@ func tableRoutes(t *testing.T, surfaces ...surface) []route {
 	return routes
 }
 
+// routesUnderPath returns every ENABLED route of the bed's server whose path
+// starts with prefix, and the path of every derived 405 fallback that does,
+// whatever surface, chain or group each entry declares.
+//
+// Selection is by PATH, never by declaration, on purpose. What makes a route an
+// /internal route, or a public one, is where a client can reach it, not what its
+// table entry says it is. An entry that declared itself unlisted or a probe while
+// sitting at /internal/v1/... would be skipped by exactly the tests that exist to
+// catch it if they selected by surface, and the consistency rule would be the only
+// thing standing between it and an unguarded route. A fallback is taken from the
+// derivation's own output, so one it forgot to guard is still found, and the
+// helper never reads the chain the derivation assigned it.
+func routesUnderPath(t *testing.T, bed *routeBed, prefix string) (routes []route, fallbackPaths []string) {
+	t.Helper()
+	enabled := bed.server.enabledRoutes()
+	for _, rt := range enabled {
+		if strings.HasPrefix(rt.path, prefix) {
+			routes = append(routes, rt)
+		}
+	}
+	for _, fb := range fallbacksFor(enabled) {
+		if strings.HasPrefix(fb.path, prefix) {
+			fallbackPaths = append(fallbackPaths, fb.path)
+		}
+	}
+	sort.Strings(fallbackPaths)
+	require.NotEmptyf(t, routes, "no enabled route is under %s; the test would prove nothing", prefix)
+	require.NotEmptyf(t, fallbackPaths, "no 405 fallback is under %s; the test would prove nothing", prefix)
+	return routes, fallbackPaths
+}
+
 // openAPIMethods are the keys of a path item that name an operation.
 var openAPIMethods = map[string]bool{
 	"get": true, "put": true, "post": true, "delete": true,
@@ -205,6 +236,32 @@ func TestRoutes_TableIsInternallyConsistent(t *testing.T) {
 		require.Containsf(t, goldenMethods, rt.method, "%s: unexpected method", name)
 		require.Truef(t, strings.HasPrefix(rt.path, "/"), "%s: a path starts with /", name)
 		require.NotNilf(t, rt.handler, "%s has no handler", name)
+
+		// The surface an entry declares must agree with the PATH it is registered at,
+		// in both directions. A surface is a label the entry gives itself; where a
+		// client can reach the route is what decides how it must be wrapped, so a
+		// route under /internal/ that calls itself unlisted, or one that calls itself
+		// internal at a path outside it, is a disagreement and not a free choice.
+		// The prefixes are literals, not routes.go's constants: a test that read the
+		// same constant would follow it if it were changed.
+		underInternal := strings.HasPrefix(rt.path, "/internal/")
+		underPublic := strings.HasPrefix(rt.path, "/v1/")
+		switch {
+		case underInternal && rt.surface != surfaceInternal:
+			require.Failf(t, "path and surface disagree",
+				"%s is under /internal/ but is declared %s; every route under /internal/ must be surfaceInternal so that it is guarded (a probe or an unlisted route may not live there)",
+				name, rt.surface)
+		case underPublic && rt.surface != surfacePublic:
+			require.Failf(t, "path and surface disagree",
+				"%s is under /v1/ but is declared %s; every route under /v1/ must be surfacePublic so that it requires an API key (a probe or an unlisted route may not live there)",
+				name, rt.surface)
+		case rt.surface == surfaceInternal && !underInternal:
+			require.Failf(t, "path and surface disagree",
+				"%s is declared surfaceInternal but its path is not under /internal/; surfaceInternal is for /internal/ paths only", name)
+		case rt.surface == surfacePublic && !underPublic:
+			require.Failf(t, "path and surface disagree",
+				"%s is declared surfacePublic but its path is not under /v1/; surfacePublic is for /v1/ paths only", name)
+		}
 
 		switch rt.surface {
 		case surfacePublic:
@@ -325,10 +382,13 @@ func TestRoutes_UnlistedEntriesAreDeliberate(t *testing.T) {
 	}
 }
 
-// TestRoutes_PublicRoutesRequireAnAPIKey proves, by behavior, that every public
-// entry is wrapped in requireAPIKey: with no key it answers 401 unauthorized
+// TestRoutes_PublicRoutesRequireAnAPIKey proves, by behavior, that every route
+// under /v1/ is wrapped in requireAPIKey: with no key it answers 401 unauthorized
 // with WWW-Authenticate, and with a key presented it asks the credential store
 // about it.
+//
+// Routes are selected by their PATH, whatever surface they declare (see
+// routesUnderPath), so an entry that mislabels itself cannot step outside the test.
 //
 // The second half is what the first cannot show. Every public handler also
 // refuses an unauthenticated caller itself, so a route registered without the
@@ -336,7 +396,8 @@ func TestRoutes_UnlistedEntriesAreDeliberate(t *testing.T) {
 // credential reaching the store proves the wrapper is there.
 func TestRoutes_PublicRoutesRequireAnAPIKey(t *testing.T) {
 	bed := newRouteBed(t)
-	for _, rt := range tableRoutes(t, surfacePublic) {
+	publicRoutes, _ := routesUnderPath(t, bed, "/v1/")
+	for _, rt := range publicRoutes {
 		t.Run(rt.pattern(), func(t *testing.T) {
 			bed.probe.reset()
 			rec, _ := bed.serve(t, routeRequest(rt.method, rt.path))
@@ -354,18 +415,21 @@ func TestRoutes_PublicRoutesRequireAnAPIKey(t *testing.T) {
 }
 
 // TestRoutes_InternalRoutesAreGuardedOutermost proves, by behavior, that the
-// browser-origin guard is the OUTERMOST layer of every internal entry and of
-// every internal path's 405 fallback.
+// browser-origin guard is the OUTERMOST layer of every route under /internal/ and
+// of every derived 405 fallback under it.
 //
-// With a browser Origin, each internal entry answers 403 origin_refused, ahead
-// of any 401 and ahead of any dependency; each internal path, asked for a method
-// the table does not hold for it, answers 403 and not the 405, and does not
-// advertise Allow. Internal-ness is read from the table's surface, never from
-// the chain the derivation reports for a fallback, so a fallback derived outside
-// the guard is caught rather than skipped.
+// With a browser Origin, each such route answers 403 origin_refused, ahead of any
+// 401 and ahead of any dependency; each such fallback, asked for a method the
+// table does not hold for its path, answers 403 and not the 405, and does not
+// advertise Allow.
+//
+// Routes and fallbacks are selected by their PATH, whatever surface or chain they
+// declare, and a fallback by the derivation's own output, never by the chain it
+// reports (see routesUnderPath). An entry that mislabelled itself, or a fallback
+// derived outside the guard, is caught rather than skipped.
 func TestRoutes_InternalRoutesAreGuardedOutermost(t *testing.T) {
 	bed := newRouteBed(t)
-	internal := tableRoutes(t, surfaceInternal)
+	internal, fallbackPaths := routesUnderPath(t, bed, "/internal/")
 
 	refuse := func(t *testing.T, req *http.Request) {
 		t.Helper()
@@ -378,9 +442,7 @@ func TestRoutes_InternalRoutesAreGuardedOutermost(t *testing.T) {
 		require.Empty(t, bed.probe.all(), "a refused request reached a dependency: %v", bed.probe.all())
 	}
 
-	paths := map[string]bool{}
 	for _, rt := range internal {
-		paths[rt.path] = true
 		t.Run("route "+rt.pattern(), func(t *testing.T) {
 			refuse(t, routeRequest(rt.method, rt.path))
 		})
@@ -395,7 +457,7 @@ func TestRoutes_InternalRoutesAreGuardedOutermost(t *testing.T) {
 			})
 		}
 	}
-	for _, path := range sortedKeys(paths) {
+	for _, path := range fallbackPaths {
 		t.Run("fallback "+path, func(t *testing.T) {
 			// No internal route uses DELETE, so it is a method every internal
 			// path's fallback answers.
@@ -620,5 +682,215 @@ func TestRoutes_FeatureGroupsGateTheirRoutesAndNothingElse(t *testing.T) {
 			}
 			require.NotZerof(t, gated, "no route belongs to the %s group; the test would prove nothing", off)
 		})
+	}
+}
+
+// TestRouteBoundaries_RefuseEachBreach proves checkRouteBoundaries, the pure
+// function behind the startup check, reports a route or fallback that sits under a
+// guarded prefix without the wrapper that prefix requires, and names it: an
+// /internal route with no wrapper or with only requireAPIKey, an /internal
+// fallback with no wrapper, a /v1 route with no wrapper or with the guard in place
+// of requireAPIKey, and a /v1 fallback that carries a wrapper.
+//
+// The entries below declare whatever surface suits the case; the function never
+// reads it, which is the point (see checkRouteBoundaries).
+func TestRouteBoundaries_RefuseEachBreach(t *testing.T) {
+	noop := func(http.ResponseWriter, *http.Request) {}
+	entry := func(path string, c chain) route {
+		return route{method: http.MethodGet, path: path, surface: surfaceUnlisted, chain: c, group: groupAlways, handler: noop, reason: "x"}
+	}
+
+	for name, tc := range map[string]struct {
+		routes    []route
+		fallbacks []fallback
+		wantNamed string // the pattern the error must name
+		wantRule  string // and the wrapper it says is required
+	}{
+		"an /internal route with no wrapper": {
+			routes:    []route{entry("/internal/v1/debug", chainNone)},
+			wantNamed: "GET /internal/v1/debug", wantRule: "browser-origin guard",
+		},
+		"an /internal route wrapped only in requireAPIKey": {
+			routes:    []route{entry("/internal/v1/debug", chainAPIKey)},
+			wantNamed: "GET /internal/v1/debug", wantRule: "browser-origin guard",
+		},
+		"an /internal fallback with no wrapper": {
+			fallbacks: []fallback{{path: "/internal/v1/debug", methods: []string{http.MethodGet}, chain: chainNone}},
+			wantNamed: "/internal/v1/debug", wantRule: "browser-origin guard",
+		},
+		"a /v1 route with no wrapper": {
+			routes:    []route{entry("/v1/debug", chainNone)},
+			wantNamed: "GET /v1/debug", wantRule: "requireAPIKey",
+		},
+		"a /v1 route behind the guard instead of an API key": {
+			routes:    []route{entry("/v1/debug", chainGuard)},
+			wantNamed: "GET /v1/debug", wantRule: "requireAPIKey",
+		},
+		"a /v1 fallback that carries a wrapper": {
+			fallbacks: []fallback{{path: "/v1/debug", methods: []string{http.MethodGet}, chain: chainAPIKey}},
+			wantNamed: "/v1/debug", wantRule: "unwrapped",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := checkRouteBoundaries(tc.routes, tc.fallbacks)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), fmt.Sprintf("%q", tc.wantNamed), "the error must name the offending pattern")
+			require.Contains(t, err.Error(), tc.wantRule)
+		})
+	}
+
+	t.Run("every breach is reported, not only the first", func(t *testing.T) {
+		err := checkRouteBoundaries(
+			[]route{entry("/internal/v1/one", chainNone), entry("/v1/two", chainNone)},
+			[]fallback{{path: "/internal/v1/three", methods: []string{http.MethodGet}, chain: chainNone}})
+		require.Error(t, err)
+		for _, named := range []string{"GET /internal/v1/one", "GET /v1/two", "/internal/v1/three"} {
+			require.Contains(t, err.Error(), fmt.Sprintf("%q", named))
+		}
+	})
+
+	t.Run("what the rules allow is accepted", func(t *testing.T) {
+		require.NoError(t, checkRouteBoundaries(
+			[]route{
+				entry("/internal/v1/a", chainGuard),
+				entry("/internal/v1/b", chainGuardWorkerKey),
+				entry("/v1/c", chainAPIKey),
+				entry("/healthz", chainNone),
+				entry("/debug/vars", chainNone),
+			},
+			[]fallback{
+				{path: "/internal/v1/a", methods: []string{http.MethodGet}, chain: chainGuard},
+				{path: "/v1/c", methods: []string{http.MethodGet}, chain: chainNone},
+				{path: "/healthz", methods: []string{http.MethodGet}, chain: chainNone},
+			}))
+	})
+}
+
+// TestRouteBoundaries_TheRealTableIsAccepted proves the table the server really
+// registers satisfies the rule, with every feature group on, with every one off,
+// and with each off on its own, so the startup check refuses nothing a real
+// configuration builds.
+func TestRouteBoundaries_TheRealTableIsAccepted(t *testing.T) {
+	groups := []group{groupMetrics, groupDashboard, groupKeys, groupWorkerKeys, groupControl}
+	configurations := map[string][]group{"every group on": nil, "every group off": groups}
+	for _, off := range groups {
+		configurations[off.String()+" off"] = []group{off}
+	}
+
+	for name, off := range configurations {
+		t.Run(name, func(t *testing.T) {
+			enabled := newRouteBed(t, off...).server.enabledRoutes()
+			require.NotEmpty(t, enabled)
+			require.NoError(t, checkRouteBoundaries(enabled, fallbacksFor(enabled)))
+		})
+	}
+}
+
+// TestRoutes_HandlerRefusesATableThatBreaksABoundary proves the startup check is
+// wired in: Handler() panics, naming the pattern and the wrapper it needs, when
+// the table holds a route under /internal/ or /v1/ without it, whatever surface
+// the entry declares, and it does not panic for a route the rules allow.
+//
+// The table is changed through Server.routeTableHook, an unexported seam that
+// exists for this test and that nothing in production sets. A fallback cannot be
+// made to breach the rule this way, because fallbacks are derived from the table;
+// the pure-function test above covers that case, and the guard test covers it by
+// behavior.
+func TestRoutes_HandlerRefusesATableThatBreaksABoundary(t *testing.T) {
+	build := func(extra route) (panicked any) {
+		probe := &guardProbe{}
+		server := NewServer(nil, Config{MaxRequestBytes: 4096}, discardLogger()).
+			WithAuth(probeKeys{probe}).
+			WithWorkerAuth(probeWorkerKeys{probe}).
+			WithWorkerControl(probeControl{probe}).
+			WithResults(acceptingResults(), nil)
+		extra.handler = server.handleLiveness
+		server.routeTableHook = func(table []route) []route { return append(table, extra) }
+
+		defer func() { panicked = recover() }()
+		server.Handler()
+		return nil
+	}
+	entry := func(path string, s surface, c chain) route {
+		return route{method: http.MethodGet, path: path, surface: s, chain: c, group: groupAlways, reason: "x"}
+	}
+
+	for name, tc := range map[string]struct {
+		extra     route
+		wantNamed string
+		wantRule  string
+	}{
+		"an unlisted route under /internal/": {
+			entry("/internal/v1/debug", surfaceUnlisted, chainNone), "GET /internal/v1/debug", "browser-origin guard"},
+		"an internal route wrapped only in requireAPIKey": {
+			entry("/internal/v1/debug", surfaceInternal, chainAPIKey), "GET /internal/v1/debug", "browser-origin guard"},
+		"an unlisted route under /v1/": {
+			entry("/v1/debug", surfaceUnlisted, chainNone), "GET /v1/debug", "requireAPIKey"},
+		"a probe under /v1/": {
+			entry("/v1/debug", surfaceProbe, chainNone), "GET /v1/debug", "requireAPIKey"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			panicked := build(tc.extra)
+			require.NotNil(t, panicked, "Handler() must refuse a table that breaks a boundary rule")
+			message := fmt.Sprint(panicked)
+			require.Contains(t, message, fmt.Sprintf("%q", tc.wantNamed))
+			require.Contains(t, message, tc.wantRule)
+		})
+	}
+
+	t.Run("a route the rules allow is registered", func(t *testing.T) {
+		require.Nil(t, build(entry("/debug/vars", surfaceUnlisted, chainNone)),
+			"the rule keys on /internal/ and /v1/ only; a route elsewhere is not its business")
+	})
+}
+
+// TestRoutes_GoldenMatrixCoversEveryUnlistedRoute proves the behavior golden's
+// list of unlisted paths (goldenUnlisted) is the table's: every unlisted entry's
+// path is in it, and nothing else is.
+//
+// The golden's other paths come from the spec, so a new spec path enters its
+// matrix by itself. An unlisted route is by definition not in the spec, so
+// without this a new one would be registered, held by every other test, and
+// missing from the golden that pins routing behavior. It now fails until the path
+// is added to goldenUnlisted and the golden is regenerated deliberately.
+func TestRoutes_GoldenMatrixCoversEveryUnlistedRoute(t *testing.T) {
+	inTable := map[string]bool{}
+	for _, rt := range newRouteBed(t).server.routeTable() {
+		if rt.surface != surfaceUnlisted {
+			continue
+		}
+		path := rt.path
+		// The golden writes the bare root as "/", the path a client sends; the
+		// table holds the pattern "/{$}", which matches only that path. This is the
+		// one place the two spell the same route differently.
+		if path == "/{$}" {
+			path = "/"
+		}
+		inTable[path] = true
+	}
+	inGolden := map[string]bool{}
+	for _, path := range goldenUnlisted {
+		inGolden[path] = true
+	}
+	require.NotEmpty(t, inTable)
+
+	var missingFromGolden, notInTable []string
+	for _, path := range sortedKeys(inTable) {
+		if !inGolden[path] {
+			missingFromGolden = append(missingFromGolden, path)
+		}
+	}
+	for _, path := range sortedKeys(inGolden) {
+		if !inTable[path] {
+			notInTable = append(notInTable, path)
+		}
+	}
+	if len(missingFromGolden) > 0 || len(notInTable) > 0 {
+		require.Failf(t, "goldenUnlisted and the route table's unlisted entries disagree",
+			"unlisted in the table but not in goldenUnlisted (%d): %v\n"+
+				"in goldenUnlisted but not unlisted in the table (%d): %v\n"+
+				"Add the path to goldenUnlisted in route_golden_test.go and regenerate the golden "+
+				"deliberately (-update-route-golden), reviewing every new row.",
+			len(missingFromGolden), missingFromGolden, len(notInTable), notInTable)
 	}
 }

@@ -1,9 +1,11 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 )
 
 // This file is the one place a route is declared. Handler() registers every
@@ -202,7 +204,7 @@ func (s *Server) routeTable() []route {
 		metricsHandler = s.metrics.Handler().ServeHTTP
 	}
 
-	return []route{
+	table := []route{
 		// --- Public surface. ---------------------------------------------------
 		{method: http.MethodPost, path: "/v1/jobs", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleSubmitJob},
 		{method: http.MethodGet, path: "/v1/jobs", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleListJobs},
@@ -286,6 +288,10 @@ func (s *Server) routeTable() []route {
 		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/fail", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleFailAttempt},
 		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/cancel", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleCancelAttempt},
 	}
+	if s.routeTableHook != nil {
+		table = s.routeTableHook(table)
+	}
+	return table
 }
 
 // enabledRoutes is the table filtered to the groups wired on this server: the
@@ -365,14 +371,89 @@ func fallbacksFor(routes []route) []fallback {
 	return fallbacks
 }
 
+// The two path prefixes that decide how a route MUST be wrapped, whatever the
+// table entry that declares it says about itself.
+const (
+	internalPathPrefix = "/internal/"
+	publicPathPrefix   = "/v1/"
+)
+
+// checkRouteBoundaries reports every route and fallback that sits under a guarded
+// prefix without the wrapper that prefix requires. It returns nil when none does,
+// and otherwise one error naming every offender.
+//
+// The rule is keyed on the PATH, never on the surface an entry declares:
+//
+//   - a route under /internal/ must go through the browser-origin guard (chain
+//     guard, or guard+worker-key for registration), and so must its 405 fallback;
+//   - a route under /v1/ must be wrapped in requireAPIKey (chain api-key), and its
+//     405 fallback must be unwrapped, as it always was.
+//
+// A surface is a label the entry gives itself, and a label can be wrong: an entry
+// declared unlisted or a probe at /internal/v1/debug would otherwise be registered
+// with no guard, and its derived fallback with none either, and every check that
+// reads the label would agree with it. Where a client can reach a route is what
+// decides what it must carry. ADR-0018's guard and ADR-0013's authentication are
+// invariants of the paths, so this is the check that holds them regardless of what
+// any entry says.
+//
+// It is a pure function of its arguments so a test can hand it a table that breaks
+// the rule without Handler() panicking; registerRoutes is what turns a non-nil
+// result into a refusal to build the server.
+func checkRouteBoundaries(routes []route, fallbacks []fallback) error {
+	var breaches []error
+	for _, rt := range routes {
+		switch {
+		case strings.HasPrefix(rt.path, internalPathPrefix):
+			if rt.chain != chainGuard && rt.chain != chainGuardWorkerKey {
+				breaches = append(breaches, fmt.Errorf(
+					"route %q is under %s but its chain is %s; every /internal route must go through the browser-origin guard (chain guard or guard+worker-key)",
+					rt.pattern(), internalPathPrefix, rt.chain))
+			}
+		case strings.HasPrefix(rt.path, publicPathPrefix):
+			if rt.chain != chainAPIKey {
+				breaches = append(breaches, fmt.Errorf(
+					"route %q is under %s but its chain is %s; every /v1 route must be wrapped in requireAPIKey (chain api-key)",
+					rt.pattern(), publicPathPrefix, rt.chain))
+			}
+		}
+	}
+	for _, fb := range fallbacks {
+		switch {
+		case strings.HasPrefix(fb.path, internalPathPrefix):
+			if fb.chain != chainGuard && fb.chain != chainGuardWorkerKey {
+				breaches = append(breaches, fmt.Errorf(
+					"405 fallback %q is under %s but its chain is %s; an /internal fallback must go through the browser-origin guard",
+					fb.path, internalPathPrefix, fb.chain))
+			}
+		case strings.HasPrefix(fb.path, publicPathPrefix):
+			if fb.chain != chainNone {
+				breaches = append(breaches, fmt.Errorf(
+					"405 fallback %q is under %s but its chain is %s; a /v1 fallback is unwrapped (chain none)",
+					fb.path, publicPathPrefix, fb.chain))
+			}
+		}
+	}
+	return errors.Join(breaches...)
+}
+
 // registerRoutes registers every enabled route, then every derived fallback,
 // then the "/" catch-all. It is the only code that iterates the table.
+//
+// Before it registers anything it checks every enabled route and every derived
+// fallback against checkRouteBoundaries and panics on a breach: a table that would
+// register an unguarded /internal route, or an unauthenticated /v1 one, is a server
+// that never starts, not one that serves it. The check changes no response.
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	enabled := s.enabledRoutes()
+	fallbacks := fallbacksFor(enabled)
+	if err := checkRouteBoundaries(enabled, fallbacks); err != nil {
+		panic(fmt.Sprintf("api: the route table breaks a boundary rule: %v", err))
+	}
 	for _, rt := range enabled {
 		s.register(mux, rt.pattern(), rt.chain, rt.handler)
 	}
-	for _, fb := range fallbacksFor(enabled) {
+	for _, fb := range fallbacks {
 		s.register(mux, fb.path, fb.chain, s.methodNotAllowed(fb.methods...))
 	}
 	// The one registration that is not in the table: it answers every path
