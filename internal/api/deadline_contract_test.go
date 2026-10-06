@@ -92,9 +92,23 @@ type openAPIDoc struct {
 	} `yaml:"paths"`
 }
 
+// openAPIEnv names a file to read in place of api/openapi.yaml. It exists so a
+// test can be shown to fail against a document with an operation removed or
+// added, without editing the real one. Nothing sets it in CI or in a Makefile
+// target; a test run without it reads the committed document.
+const openAPIEnv = "TASKFORGE_TEST_OPENAPI"
+
+// openAPIPath is the OpenAPI document every test in this package reads.
+func openAPIPath() string {
+	if override := os.Getenv(openAPIEnv); override != "" {
+		return override
+	}
+	return filepath.Join("..", "..", "api", "openapi.yaml")
+}
+
 func loadOpenAPI(t *testing.T) openAPIDoc {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	raw, err := os.ReadFile(openAPIPath())
 	require.NoError(t, err)
 	var doc openAPIDoc
 	require.NoError(t, yaml.Unmarshal(raw, &doc))
@@ -275,7 +289,7 @@ func TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode(t *testing.T) {
 	// The enum is the client's branching contract, so a code the handlers can
 	// emit but the spec never lists is a broken contract.
 	t.Run("every stable error code appears in the spec enum", func(t *testing.T) {
-		raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+		raw, err := os.ReadFile(openAPIPath())
 		require.NoError(t, err)
 		var document struct {
 			Components struct {
@@ -397,7 +411,7 @@ func TestOpenAPI_ReplayRoutesShareOneIdempotencyNamespace(t *testing.T) {
 
 	// The shared namespace is described in the document's own idempotency
 	// section, where a reader looks for it.
-	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	raw, err := os.ReadFile(openAPIPath())
 	require.NoError(t, err)
 	description := flatten(string(raw))
 	require.Contains(t, description, "same operation and require an `idempotency-key`")
@@ -521,7 +535,7 @@ func TestOpenAPI_StartDocumentsTheCancelFirstRefusal(t *testing.T) {
 // left behind — and SUCCEEDED is not even in the enum, so the contract would be
 // self-contradictory if the implementation ever answered that way.
 func TestOpenAPI_OutcomeJobStatusIsTheDecisionNotTheCurrentStatus(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	raw, err := os.ReadFile(openAPIPath())
 	require.NoError(t, err)
 	document := flatten(string(raw))
 

@@ -62,10 +62,10 @@ func authenticatedScope(ctx context.Context) (string, bool) {
 
 // requireAPIKey wraps one public handler with authentication.
 //
-// It is applied per route rather than as an outer layer so the set of
-// authenticated routes is visible at registration in Handler(), instead of being
-// an inclusion list buried in a middleware that would have to be kept in sync
-// with the mux.
+// It is applied per route, by the chain each entry of the route table names,
+// rather than as an outer layer, so the set of authenticated routes is readable
+// in routeTable (routes.go) instead of being an inclusion list buried in a
+// middleware that would have to be kept in sync with the mux.
 //
 // When no credential store is wired, this fails CLOSED: every public request is
 // unauthenticated because nothing can authenticate it, so 401 is the honest

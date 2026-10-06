@@ -602,35 +602,6 @@ func TestInternalGuard_EveryBrowserMarkingNamesItsRule(t *testing.T) {
 	}
 }
 
-// pattern registration is the invariant the whole guard rests on, and it is
-// "visible in the route table" only if nothing registers around the helper.
-// TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation proves the
-// result for every documented operation; this proves the cause, so an /internal
-// pattern that is registered but undocumented cannot slip past both.
-func TestServer_EveryInternalPatternIsRegisteredThroughTheGuard(t *testing.T) {
-	source, err := os.ReadFile("server.go")
-	require.NoError(t, err)
-
-	registration := regexp.MustCompile(`mux\.Handle(Func)?\(`)
-	internalPath := regexp.MustCompile(`"(?:[A-Z]+ )?/internal/`)
-	var guarded int
-	for number, line := range strings.Split(string(source), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "//") || !internalPath.MatchString(line) {
-			continue
-		}
-		require.Falsef(t, registration.MatchString(line),
-			"server.go:%d registers an /internal pattern directly on the mux; use s.handleInternal so the browser-origin guard wraps it:\n%s",
-			number+1, line)
-		if strings.Contains(line, "s.handleInternal(mux,") {
-			guarded++
-		}
-	}
-	// 14 documented operations and 12 method-less fallbacks (one per path with
-	// a registered handler is not the rule -- the fallback list is per path).
-	require.Equal(t, 26, guarded, "the number of /internal registrations changed; update this count deliberately")
-}
-
 // The contract: every /internal operation documents the guard's refusal, the
 // enum names it, and the /v1 operations do not claim it.
 func TestOpenAPI_EveryInternalOperationDocumentsTheOriginGuardRefusal(t *testing.T) {
@@ -652,7 +623,7 @@ func TestOpenAPI_EveryInternalOperationDocumentsTheOriginGuardRefusal(t *testing
 		}
 	}
 
-	raw, err := os.ReadFile("../../api/openapi.yaml")
+	raw, err := os.ReadFile(openAPIPath())
 	require.NoError(t, err)
 	var spec struct {
 		Components struct {

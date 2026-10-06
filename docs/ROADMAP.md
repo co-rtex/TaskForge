@@ -609,13 +609,15 @@ and two gates M7A deferred), and deployment (a trust-boundary decision and
 infrastructure that costs money). It is split into slices so each ships on its own
 evidence, the way M5, M6 and M7 were: M8A measures, M8B is the supply chain
 (images and scanning), M8D carries the two gates M7A deferred together with four
-items the M8A review raised, and M8C is deployment. The original objective,
-deliverables, and acceptance sentence are preserved across them, not reduced.
+items the M8A review raised, and M8C is deployment. The owner split M8D in two
+when M8D began: M8D1 is the route registry and nothing else, and M8D2 is the rest.
+The original objective, deliverables, and acceptance sentence are preserved across
+them, not reduced.
 
-**Order: M8B, then M8D, then M8C.** M8C keeps its name.
+**Order: M8B, then M8D1, then M8D2, then M8C.** M8C keeps its name.
 
-**Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D and M8C
-are planned.
+**Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
+complete; see PR #23. M8D2 and M8C are planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -675,26 +677,57 @@ OpenAPI, the SDK or the dashboard; a registry push or registry credentials;
 multi-architecture builds in CI; an image vulnerability scanner; Dependabot; and the
 items that moved to M8D.
 
-#### M8D — The two gates M7A deferred, and the M8A review items
-**Objective.** Close the two gates M7A deferred and four items the M8A review
-raised.
-**Deliverables.** A route registry inside `Handler()` checked against
-`api/openapi.yaml` so that a route added to one and not the other fails, in both
-directions; a verification-matrix drift check that finds the cited assertion in the
-syntax tree instead of trusting a line number (see
-[VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)); and the four items carried from
-the M8A review:
+#### M8D1 — The route registry
+**Objective.** Close the first of the two gates M7A deferred: make every route
+`taskforge-api` registers one entry of a table, and prove the table agrees with
+`api/openapi.yaml`.
+**Deliverables.** One route table in `internal/api` (method, path, surface, wrapper
+chain, feature group, handler, and for an unlisted route a reason) from which
+`Handler()` registers every route, every derived `405` fallback and the `/` catch-all,
+and nothing else; an AST check over the package's non-test files that nothing
+registers around it; table-versus-spec, unlisted-entry, wrapper, fallback and
+feature-group tests that replace the hand-maintained `publicRoutes` and
+`publicOperations` lists and the test that counted `s.handleInternal(mux,` lines; a
+behavior golden generated from the hand-registered server and left byte-identical by
+the refactor; and [ADR-0022](adr/0022-the-route-table-is-the-single-source-of-routes.md).
+Routes the spec does not document (`/metrics`, `/dashboard/`, `/{$}`) stay out of it
+as explicit unlisted entries with reasons; the spec is not edited.
+**Acceptance.** Every route is registered from the table and the AST check proves
+nothing registers around it; the table equals the spec in both directions and
+unlisted entries are enforced; the golden was generated before the refactor and the
+refactor leaves it unchanged; and no status, `Allow` header, error code, wrapper
+order, matched pattern, span name or metric route label changed.
+**Depends on.** M8B.
+**Status:** complete; see PR #23 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited.
+
+Deliberately **not** in scope: the verification-matrix drift check, the four M8A
+review items, the `make bench-smoke` flake, any change to `api/openapi.yaml`,
+`scripts/bench`, the SDK, the CLI, the dashboard, migrations or the schema, and a
+runtime route listing.
+
+#### M8D2 — The matrix drift check, the M8A review items, and the bench-smoke flake
+**Objective.** Close the other gate M7A deferred, the four items the M8A review
+raised, and the one flake M8B recorded.
+**Deliverables.** A verification-matrix drift check that finds the cited assertion in
+the syntax tree instead of trusting a line number (see
+[VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)); the four items carried from the
+M8A review:
 - ADR-0020's justification of the throughput tolerance, and the wording of
   [PROJECT_SPEC.md](PROJECT_SPEC.md) §7 for that target: "kept pace with offered
   load; headroom not measured";
 - an investigation of the 50.04 s worker-failure recovery outlier;
 - the benchmark record renderer's extra newline;
-- the run-time estimate in [AGENTS.md](../AGENTS.md).
-**Acceptance.** The route table and `api/openapi.yaml` are checked against each
-other in both directions; the drift check fails on a cited line that is inside the
-named test but is not an assertion; and each of the four review items is closed or
-recorded as deliberately left.
-**Depends on.** M8B.
+- the run-time estimate in [AGENTS.md](../AGENTS.md);
+
+and the `make bench-smoke` flake: its random kill can land on an idle worker, so the
+check "the kill hit an attempt, and it was recovered" fails although nothing is
+wrong. It failed once in M8B's gate run and CI runs the smoke.
+**Acceptance.** The drift check fails on a cited line that is inside the named test
+but is not an assertion; each of the four review items is closed or recorded as
+deliberately left; and `make bench-smoke` cannot fail because a kill landed on an
+idle worker.
+**Depends on.** M8D1.
 **Status:** planned.
 
 #### M8C — Deployment
@@ -709,7 +742,7 @@ whether the demonstration handlers are gated in a deployed worker
 ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
 a gate open).
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8B; follows M8D in the owner's order (M8B, M8D, M8C). **Needs its
+**Depends on.** M8B; follows M8D2 in the owner's order (M8B, M8D1, M8D2, M8C). **Needs its
 own owner decision before any work starts:** the bind, `/internal` and the handler
 gate are trust-boundary decisions, and the infrastructure costs money.
 **Status:** planned.

@@ -1,15 +1,16 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8B. Each milestone's line
+planned. It records the implemented state through M8D1. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
 follow-up to it, not a fifth slice. M7 is split into M7A, the proof audit, and
 M7B, the demonstration targets, and is complete with both. M8 is split into M8A,
-the measured benchmarks, M8B, the supply chain (container images and scanning), M8D,
-the two gates M7A deferred and four items from the M8A review, and M8C, deployment,
-in the order M8B, M8D, M8C; M8A and M8B are complete and the other two are planned.
+the measured benchmarks, M8B, the supply chain (container images and scanning), M8D1,
+the route registry, M8D2, the verification-matrix drift check with four items from
+the M8A review and the bench-smoke flake, and M8C, deployment, in the order M8B, M8D1,
+M8D2, M8C; M8A, M8B and M8D1 are complete and the other two are planned.
 
 ## Milestone status
 
@@ -49,12 +50,17 @@ in the order M8B, M8D, M8C; M8A and M8B are complete and the other two are plann
   npm audit, blocking CI, with two acceptance mechanisms: a dated file for the three
   dependency scanners and `.gitleaks.toml` for gitleaks. No application code changed;
   `go.mod`'s Go moved from 1.25.0 to 1.25.14 because the first scan found 35
-  reachable standard-library vulnerabilities. See "M8B" below. M8D (the two gates
-  M7A deferred, and four items from the M8A review) and M8C (deployment) are
-  planned.
+  reachable standard-library vulnerabilities. See "M8B" below.
+- **M8D1 — the route registry:** complete; see PR #23. Every route `taskforge-api`
+  registers is one entry of a table in `internal/api/routes.go`, `Handler()` registers
+  from it and from nothing else, an AST check holds that, and the table is held to
+  `api/openapi.yaml` in both directions. Nothing observable changed, which a golden
+  generated from the hand-registered server and left byte-identical by the refactor
+  shows. See "M8D1" below. M8D2 (the matrix drift check, four items from the M8A
+  review, and the bench-smoke flake) and M8C (deployment) are planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
-M7 into two, and M8 into four, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
+M7 into two, and M8 into five, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
@@ -2179,7 +2185,7 @@ was not re-observed and its fix was not observed passing there.
   that still exists and no longer proves its row passes it. The mutation results
   above are a point-in-time record; nothing in CI re-runs them. It also proves a
   cited line lies inside the named test, not that the line is the assertion, and
-  the AST fix for that is deferred to M8 (now M8D).
+  the AST fix for that is deferred to M8 (now M8D2).
 - **A "restart" of the scheduler and the reconciler is a connection pool, an
   engine, and a loop, stopped and replaced in one test process.** Only the worker
   has a real-binary kill test. The reconciler's replacement runs one `RunOnce`
@@ -2193,9 +2199,9 @@ was not re-observed and its fix was not observed passing there.
 - **The late-completion rejection is layered,** so a mutation of any one layer
   changes the error code but not the outcome. The test pins the code; see the
   table.
-- **The route table and `api/openapi.yaml` are still not checked against each
-  other.** That is deferred to M8 (now M8D) and recorded under "Deliberately not
-  implemented yet". M7A did not touch the hand-maintained maps.
+- **At M7A, the route table and `api/openapi.yaml` were not checked against each
+  other.** M7A did not touch the hand-maintained maps and deferred the check to M8;
+  M8D1 delivered it (see "M8D1" below).
 - **Hosted CI on the final head is not recorded here,** because a commit cannot
   contain its own CI result: the pull request's checks are the record.
 - **M7B was out of scope for M7A.** It is the next section.
@@ -2442,7 +2448,7 @@ four values. No schema, API, CLI, SDK, dashboard or configuration changed.
 
 ## M8A — load generator and measured benchmarks
 
-M8 is split into M8A, this milestone, M8B, M8D and M8C; [ROADMAP.md](ROADMAP.md)
+M8 is split into M8A, this milestone, M8B, M8D (later split into M8D1 and M8D2) and M8C; [ROADMAP.md](ROADMAP.md)
 records why. M8A adds a harness that runs the real binaries, records one measured
 run of [PROJECT_SPEC.md](PROJECT_SPEC.md) §7's targets, and carries three small
 items from M7. This section keeps three things apart: what it does, what evidence
@@ -2590,7 +2596,7 @@ changed.
 ## M8B — supply chain (container images and scanning)
 
 M8B is the supply-chain slice of M8; [ROADMAP.md](ROADMAP.md) records the split and
-the order (M8B, M8D, M8C). It adds six container images, a smoke that inspects and
+the order (M8B, M8D, M8C; M8D was later split into M8D1 and M8D2). It adds six container images, a smoke that inspects and
 runs them, and four scanners that block CI. The decisions and their alternatives are
 in [ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md). This section
 keeps three things apart: what it does, what evidence exists, and what is still
@@ -2890,6 +2896,253 @@ Go download 1.25.14 automatically (`GOTOOLCHAIN=auto`); one who sets
 `tool: gitleaks` in `security/scan-exceptions.yaml`, which the first version of this
 milestone accepted, is now an error. No schema, API, CLI, SDK, dashboard or
 configuration changed.
+
+## M8D1 — the route registry
+
+M8D1 is the first half of M8D, which the owner split: [ROADMAP.md](ROADMAP.md) records
+the order (M8B, M8D1, M8D2, M8C). It makes one table the only place a route is
+declared, and proves the table and `api/openapi.yaml` describe the same operations. The
+decisions and their alternatives are in
+[ADR-0022](adr/0022-the-route-table-is-the-single-source-of-routes.md). This section
+keeps three things apart: what it does, what evidence exists, and what is still
+limited.
+
+**What changed in production code: `internal/api` only, and nothing a caller can
+observe.** `internal/api/routes.go` is new. `Handler()` in `server.go` no longer
+registers routes by hand; it calls `registerRoutes`, which registers from the table.
+Two doc comments changed (`handleInternal`'s and `requireAPIKey`'s), because both
+described the old registration. Nothing under `cmd/`, `migrations/`, `api/`, `sdk/`,
+`dashboard/` or `scripts/` changed, and `api/openapi.yaml` is not edited. Every
+status, `Allow` header, error code, wrapper order, matched route pattern, span name
+and metric route label is the same for every table the server accepts; the evidence below
+is how that was checked. `Handler()` now also refuses, at startup, a table that breaks
+the path rule described under "Behavior".
+
+### Behavior
+
+**The table.** `routeTable` in `internal/api/routes.go` holds 30 entries when every
+feature group is on: 11 public `/v1` routes, 2 health probes, 14 internal routes
+(`/internal/v1`), and 3 unlisted routes. An entry has a method and a path (the pattern
+ServeMux sees is `method + " " + path`), a surface (`public`, `internal`, `probe`,
+`unlisted`), a wrapper chain, a feature group, a handler, a `noFallback` mark, and, for
+an unlisted route, a reason.
+
+**Registration.** `Handler()` registers every enabled entry from the table, then the
+`405` fallbacks derived from it, then the single `/` catch-all, and nothing else.
+Wrappers follow the chain: a public route is `requireAPIKey(handler)`; an internal
+route goes through `handleInternal`, which puts the browser-origin guard outside
+everything else; registration alone is `refuseBrowserOrigin(requireWorkerKey(handler))`;
+probes and unlisted routes are unwrapped. The worker-session asymmetry
+([ADR-0014](adr/0014-worker-control-authentication.md)) is unchanged and is now the one
+`guard+worker-key` entry in the table.
+
+**The boundary rule is keyed by path, not by what an entry declares.** Every route
+under `/internal/` must carry the browser-origin guard, and so must its derived `405`
+fallback; every route under `/v1/` must be wrapped in `requireAPIKey`, and its fallback
+must be unwrapped, whatever surface, chain or group its entry declares
+([ADR-0022](adr/0022-the-route-table-is-the-single-source-of-routes.md)). Three checks
+hold it: the table-consistency test ties surface to path in both directions; the two
+wrapper tests (`TestRoutes_InternalRoutesAreGuardedOutermost`,
+`TestRoutes_PublicRoutesRequireAnAPIKey`) select by path through one helper; and
+`registerRoutes` runs `checkRouteBoundaries`, a pure function, over every enabled route
+and every derived fallback before it registers anything and **panics**, naming the
+pattern and the wrapper it needs, so such a table never serves. The check changes no
+response. `Server.routeTableHook` is an unexported seam that only a test sets, so a test
+can show `Handler()` refusing a breaching table.
+
+**Fallbacks are derived.** For each path the table holds, the method-less pattern that
+answers any other method with the structured `405` has an `Allow` header equal to the
+methods the table holds for that path, sorted. It is registered only when its group is
+on, and an internal path's fallback goes through the guard. With every group on there
+are 25: 12 public (ten `/v1` paths and the two probes), 1 for `/dashboard/`, and 12
+internal. Two paths have none, deliberately: `GET /metrics` and `GET /{$}` keep
+answering a wrong method with the catch-all's `404`, as they did before.
+
+**Feature groups.** `metrics`, `dashboard`, `keys` (`WithAuth`: three routes),
+`workerKeys` (`WithWorkerAuth`: three) and `control` (`WithWorkerControl`: eight). A
+group that is off registers none of its routes or their fallbacks, and the paths fall
+to the `/` catch-all.
+
+**Unlisted routes** are registered but deliberately not in the spec, each with a reason
+(the owner's decision): `GET /metrics` (Prometheus text for an operator's scraper on the
+loopback listener), `GET /dashboard/` (the embedded dashboard's static files) and
+`GET /{$}` (the redirect to it, part of serving the same files).
+
+**Adding a route now takes two things:** an entry in `routeTable`, and either an
+operation in `api/openapi.yaml` or a reason it is not there. A route registered any
+other way fails a test.
+
+**The tests.** Added: `TestRouteBehavior_MatchesTheGolden` and
+`TestRouteBehavior_GoldenIsNotVacuous`; `TestRoutes_NothingRegistersAroundTheTable` and
+`TestRoutes_RegistrationCheckerAcceptsTheCompliantShapeAndReportsEveryBreach` (an AST
+check over the package's non-test files, and its own tests on synthetic sources);
+`TestRoutes_TableMatchesTheSpec`, `TestRoutes_UnlistedEntriesAreDeliberate`,
+`TestRoutes_TableIsInternallyConsistent`, `TestRoutes_PublicRoutesRequireAnAPIKey`,
+`TestRoutes_InternalRoutesAreGuardedOutermost`,
+`TestRoutes_RegistrationAloneRequiresAWorkerKey`,
+`TestRoutes_ProbesAndUnlistedRoutesNeedNoCredentialAndNoGuard`,
+`TestRoutes_FallbacksAreDerivedFromTheTable` and
+`TestRoutes_FeatureGroupsGateTheirRoutesAndNothingElse`; and, added when the review of
+PR #23 found the hole under "Evidence", `TestRouteBoundaries_RefuseEachBreach`,
+`TestRouteBoundaries_TheRealTableIsAccepted`,
+`TestRoutes_HandlerRefusesATableThatBreaksABoundary` and
+`TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` (the golden's list of unlisted paths is
+the table's). `TestRoutes_TableIsInternallyConsistent`,
+`TestRoutes_PublicRoutesRequireAnAPIKey` and
+`TestRoutes_InternalRoutesAreGuardedOutermost` were changed in that round to key on the
+path. Removed:
+`TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which counted
+`s.handleInternal(mux,` lines in `server.go` and cannot hold for a table-driven
+`Handler()`, replaced by the AST check; and the hand lists `publicRoutes` and
+`publicOperations`, whose loops now walk the table with every assertion kept (including
+those on the spec's text). The three `TestAuth_*` tests that looped over `publicRoutes`
+and `TestOpenAPI_EveryPublicOperationRequiresAnAPIKey` changed only in what they loop
+over.
+`TASKFORGE_TEST_OPENAPI` points the internal/api tests at another copy of the spec; it
+exists so a test can be shown to fail against a spec with an operation removed or
+added, and nothing sets it in CI.
+
+### Evidence
+
+**The golden was generated from the old `server.go`, and the refactor leaves it
+byte-identical.** `internal/api/testdata/route_behavior.golden` was generated at
+`dfd57b5`, where `Handler()` still registered by hand. `git diff dfd57b5 c49e735 --
+internal/api/testdata/` is empty (0 bytes). It has 1,200 rows: 30 paths (the 24 paths
+of the spec with their parameters filled, the three unlisted paths, and three nothing
+registers) by five methods, four request variants and two configurations (every group
+on, every group off). A row is the status, the `Allow` header, the structured error
+code and the matched route pattern; nothing that varies between runs. Counts by
+status: with every group on, 200 ×24, 302 ×4, 400 ×19, 401 ×34, 403 ×120, 404 ×93,
+405 ×296, 422 ×3, 500 ×7; with every group off, 200 ×8, 401 ×44, 404 ×360, 405 ×188.
+It passes twice in a row and under both Go 1.27.0 and Go 1.25.14 (the toolchain CI
+uses), and `TestRouteBehavior_GoldenIsNotVacuous` requires matched patterns, 401, 403
+`origin_refused`, 404 and 405 rows, and a difference between the configurations for
+every gated path.
+
+**The matched pattern is the value `withSpanRoute` publishes.** It is read three ways
+that must agree: the `http.route` attribute of the span (and the span's name), a
+`routeHolder` put on the context under `routeCtxKey` when metrics are off, and, when
+they are on (`withHTTPMetrics` replaces any holder an outer layer installs), the
+`route` label of `taskforge_http_requests_total` summed over the run, which must equal
+the rows exactly.
+
+**A fourth variant was needed.** The plan's three variants (no credential, a browser
+`Origin`, a non-loopback `Host`) cannot tell a public route wrapped in `requireAPIKey`
+from one whose handler merely refuses an unauthenticated caller itself, because both
+answer the same `401`. Dropping the wrapper from one route on the old `server.go`
+changed exactly one row, `all-on credentialed GET /v1/queues` (500 → 401), so the
+golden carries a variant that presents a valid credential.
+
+**Nine mutations, each applied, shown applied, failing, and reverted with the tree
+clean:**
+
+| # | Mutation | Failed |
+| --- | --- | --- |
+| 1 | Add a table entry with no spec operation (`GET /v1/extra`) | `TestRoutes_TableMatchesTheSpec`, naming the entry; and `TestOpenAPI_EveryPublicOperationRequiresAnAPIKey` |
+| 2 | Delete one operation (`GET /v1/queues`) from a temporary copy of the spec, via `TASKFORGE_TEST_OPENAPI` | `TestRoutes_TableMatchesTheSpec`, naming it, with the real spec's control passing; the public-operation test also fails, and so does the golden, because its path list is read from the spec |
+| 3 | `mux.HandleFunc("GET /v1/direct", …)` in `Handler()` | `TestRoutes_NothingRegistersAroundTheTable` only, reporting `internal/api/server.go:196` |
+| 4 | Drop `requireAPIKey` from `GET /v1/queues` | `TestRoutes_PublicRoutesRequireAnAPIKey` (that route), the golden (one row), `TestRoutes_TableIsInternallyConsistent`, `TestAuth_EveryPublicRouteConsultsTheCredentialStore` |
+| 5 | Register `POST /internal/v1/claims` without the guard | `TestRoutes_InternalRoutesAreGuardedOutermost` (403 expected, 400 actual), the golden (the `origin` and `foreign-host` rows), `TestRoutes_TableIsInternallyConsistent`, `TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation` |
+| 6 | Add `GET /metrics` to a spec copy | `TestRoutes_UnlistedEntriesAreDeliberate/GET_/metrics`; also `TestRoutes_TableMatchesTheSpec` and `TestRoutes_FallbacksAreDerivedFromTheTable` |
+| 7 | Change `GET /v1/queues` to `GET /v1/queues/` | the golden (40 rows: ServeMux now redirects with 307), and five more tests |
+| 8 | Derive the fallback of `/internal/v1/claims` outside the guard | `TestRoutes_InternalRoutesAreGuardedOutermost/fallback_/internal/v1/claims` (403 expected, 405 actual) and the golden (8 rows). **No older test caught it.** |
+| 9 | Remove the reason from the unlisted `GET /metrics` | `TestRoutes_UnlistedEntriesAreDeliberate/GET_/metrics` and `TestRoutes_TableIsInternallyConsistent` |
+
+A tenth, not in the plan, followed from writing this section: an unlisted entry with no
+group is never enabled, so it would simply not be registered. The consistency test did
+not check it, and now requires an unlisted entry to be in the `metrics` or `dashboard`
+group; with `GET /metrics` stripped of its group, that test fails by name.
+
+**The review of PR #23 found a hole, and what closed it is shown.** The first version
+keyed the guard and API-key tests, and the fallback derivation, on an entry's declared
+surface, not its path. Reproduced on `60d1764` before anything was changed: adding
+`{GET /internal/v1/debug, surfaceUnlisted, chainNone, groupDashboard}` and
+`{GET /v1/debug, surfaceUnlisted, chainNone, groupDashboard}` left `go test ./internal/api`
+at `ok`, with an unguarded `/internal` route and an unauthenticated `/v1` route registered.
+The test the table change had removed selected by the `/internal/` path text, so this was a
+regression of [ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)'s
+fail-closed property. The fix is in the code commit `71d403b`, and the golden is
+byte-identical to `60d1764` (`git diff` of `internal/api/testdata/` is 0 bytes).
+
+With the startup check on, a breaching table makes `Handler()` panic, so every test that
+builds a server fails by panic before it can fail by assertion. To show each check failing
+on its own, every mutation was run twice: **(a)** as is, and **(b)** with only the call to
+`checkRouteBoundaries` in `registerRoutes` replaced by `error(nil)`, so that the
+consistency rule and the path-selected tests fail by assertion. Each was applied, shown
+applied, failing, and reverted with the tree clean.
+
+| # | Mutation | (a) all three checks on | (b) startup check stubbed out |
+| --- | --- | --- | --- |
+| M10 | Add `GET /internal/v1/debug`, unlisted, `chainNone`, reason "x" | panic at `Handler()`: `route "GET /internal/v1/debug" is under /internal/ but its chain is none; every /internal route must go through the browser-origin guard` | the consistency test (`… is under /internal/ but is declared unlisted …`); `TestRoutes_InternalRoutesAreGuardedOutermost` (**403 expected, 200 actual**: the unguarded route was served); `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute`. The golden still passes: the path is not in its matrix, which is the gap the last test closes. |
+| M11 | The same shape at `/v1/debug` | panic naming `GET /v1/debug` and `requireAPIKey` | the consistency test; `TestRoutes_PublicRoutesRequireAnAPIKey` (**401 expected, 200 actual**); the golden-matrix test. The guard test passes, as it should. |
+| M12 | In `fallbacksFor`, force every fallback to `chainNone` | panic naming `405 fallback "/internal/v1/api-keys"` | the 12 `fallback_/internal/…` subtests of the guard test (403 expected, 405 actual), and the golden (92 rows). The consistency test passes: fallbacks are derived, not table data. |
+| M13 | Add an unlisted `GET /debug/vars` (`metrics`, `chainNone`, with a reason) outside both prefixes | **only `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` fails** across the whole package; the consistency test, both wrapper tests, the boundary tests and the `Handler()` test pass | not run: nothing to stub, and nothing else fails, so the rule is not over-broad |
+| M5, rerun | `POST /internal/v1/claims` without the guard | panic naming `POST /internal/v1/claims` | the guard test (403 expected, 400 actual), the golden (2 rows), the consistency test |
+| M8, rerun | The fallback of `/internal/v1/claims` outside the guard | panic naming `405 fallback "/internal/v1/claims"` | the guard test's `fallback_/internal/v1/claims` subtest (403 expected, 405 actual), the golden (8 rows) |
+
+The nine mutations in the table above were run before the startup check existed, so for
+mutations 4, 5 and 8 they describe what the tests alone caught. M5 and M8 are the same
+mutations rerun here. A first attempt at these runs used a shell helper that reported
+`PASS` for a test name that matched nothing (zsh does not split an unquoted variable); it
+was caught because both runs of M10 read `PASS` for every test at once, replaced with one
+that reports `NO TEST RAN` and checked against a name that matches nothing, and the
+results above are from the corrected helper.
+
+**Table versus spec.** With every group on, the 27 non-unlisted entries and the 27
+operations parsed from `api/openapi.yaml` are the same set: 11 public, 14 internal and
+the 2 probes. Before the table nothing compared them in this direction.
+
+### Limitations
+
+- **The AST check reads `internal/api` only, and syntactically.** The four background
+  services' own health muxes (`cmd/*/health.go`) register their probes directly and are
+  outside it. A `ServeMux` is recognised by the declared type of the receiver
+  parameter, not by type-checking; the check fails closed on any call named `Handle`
+  or `HandleFunc` outside `registerRoutes`, `register` and `handleInternal`, and
+  renaming those functions means updating the check, which says so. Two things are
+  outside it: a registration through a method value (`h := mux.HandleFunc`, then
+  `h(...)`), which is neither a call to `Handle` nor one to `HandleFunc`, and a
+  middleware that matches `r.URL.Path` and answers before the mux sees the request, which
+  registers nothing.
+- **The table is compared with the spec by method and path only.** Parameters,
+  schemas and responses are not compared here; the contract tests that read the spec's
+  text still are.
+- **The golden covers its matrix.** A new spec path enters it automatically. A new
+  unlisted route fails `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute` until its path
+  is added to `goldenUnlisted` and the golden is regenerated deliberately, reviewing every
+  new row.
+- **The path rule is a literal prefix.** A pattern whose first segment is a wildcard,
+  such as `GET /{a}/v1/{b}`, matches a request under `/internal/` without carrying the
+  prefix: `net/http`'s mux hands `GET /internal/v1/nonexistent` to it ahead of the `/`
+  catch-all (checked with a scratch program). Neither the consistency rule nor
+  `checkRouteBoundaries` would see such an entry, and neither rejects one. No entry has
+  one. **This is open for the owner to decide**; it was not changed here.
+- **The path-selected behavior tests are the second line, not the first.** With the
+  startup check in place a breaching table panics every server before they run, so they
+  are shown failing by assertion only with the check stubbed out (run (b) above), by
+  mutation, not by a test in the tree. They are what holds the invariant if the check is
+  removed or weakened.
+- **The golden's `credentialed` rows run real handler code against a nil job store.** A
+  public route with a valid key panics into the recovery middleware's `500`, as the
+  existing tests rely on. A change in that behavior shows as changed rows.
+- **A wrong method on `/metrics` or on `/` is still a `404`, not a `405`.** That is
+  preserved behavior, not a decision that it is right; deriving a fallback for either
+  would change an observable response.
+- **Two hand-maintained, one-directional maps remain** in
+  `internal/api/deadline_contract_test.go`
+  (`TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode` and
+  `TestOpenAPI_DocumentsEveryImplementedPublicRoute`). They were not on the list of
+  things to replace and are now redundant with `TestRoutes_TableMatchesTheSpec`.
+- **The routing golden was generated on Go 1.27.0** and passes on Go 1.25.14. ServeMux
+  behavior could differ in a later release; the golden is what would show it.
+- **The spec's operation for `/{$}` and `/dashboard/` does not exist,** by decision;
+  nothing in the document tells a client that they are served.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain
+  its own CI result: the pull request's checks are the record.
+
+### Breaking change
+
+None. No schema, API, CLI, SDK, dashboard or configuration changed.
 
 ## Verification
 
@@ -3473,6 +3726,46 @@ Recorded as risks, not worked around silently.
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
 
+### M8D1 gates
+
+Run locally on the branch, 2026-10-06, on the final code commit **`71d403b`** (the review
+fix; the commit after it changes `docs/` only) with no other TaskForge process running.
+PostgreSQL 16, ElasticMQ and the object store from `make up`, on host Go 1.27.0. The first
+round's results, on `5fbcbb4`, are in the second table. **The machine was on battery
+power (38% to 46%, discharging), not AC, with Low Power Mode off; I could not verify the
+lid.** That matters only for `make bench-smoke`, which records nothing, and which was not
+rerun in the review round.
+
+| Command | Result on `71d403b` |
+| --- | --- |
+| `make fmt` | PASS — `gofmt -w .` changed nothing (0 diff lines) |
+| `make lint` | PASS — `go vet ./...` silent |
+| `make build` | PASS — seven binaries |
+| `make test-unit` | PASS — 26 packages `ok`. `internal/api` runs **147** top-level tests, all passing (143 before the review fix, plus 4). Run by name: `TestRoutes_TableIsInternallyConsistent`, `TestRoutes_PublicRoutesRequireAnAPIKey`, `TestRoutes_InternalRoutesAreGuardedOutermost` (changed to key on the path), and the new `TestRouteBoundaries_RefuseEachBreach`, `TestRouteBoundaries_TheRealTableIsAccepted`, `TestRoutes_HandlerRefusesATableThatBreaksABoundary`, `TestRoutes_GoldenMatrixCoversEveryUnlistedRoute`. The two path-selected tests still run 11 and 27 subtests, as before. `TestRouteBehavior_MatchesTheGolden` and `TestRoutes_NothingRegistersAroundTheTable` pass with their files unchanged. |
+| `GOTOOLCHAIN=go1.25.14 go test ./internal/api ./tests/verification` | PASS — both `ok`; CI's toolchain |
+| `make test-integration` | PASS — `ok  github.com/co-rtex/TaskForge/tests/integration  95.121s` |
+| `make test-race` | PASS — 27 packages `ok` under `-race`; `ok  …/internal/api  4.162s`; `ok  …/tests/integration  94.627s`; no `DATA RACE` |
+| `make demo` | PASS — `RESULT: PASS (21 of 21 expectations met)`. Not required this round; run because it starts the real `taskforge-api` binary, so it shows the startup check passing on the real configuration. |
+| `make scan` | recorded in the pull request, not here: it is run in a fresh clone of the pushed final head, which includes this documentation commit, and a commit cannot contain its own result. In the working checkout it fails, as in M8B, on the leftover local branch `backup-pre-fix`, which I did not touch. |
+| `make bench-smoke`, `make images-smoke` | NOT RUN in the review round — nothing outside `internal/api` and `docs/` changed. Their first-round results are below. |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test`, `make demo-failure`, `docker compose config --quiet` | NOT RUN locally — nothing they cover changed |
+
+First round, on `5fbcbb4` (before the review fix; `internal/api` has since changed, nothing
+else has):
+
+| Command | Result on `5fbcbb4` |
+| --- | --- |
+| `make fmt`, `lint`, `build`, `test-unit` | PASS — 26 packages `ok`; `internal/api` 143 top-level tests |
+| `make test-integration` | PASS — `87.711s` |
+| `make test-race` | PASS — 27 packages, no `DATA RACE` |
+| `make demo` | PASS — 21 of 21 |
+| `make bench-smoke`, three runs | PASS — `13 of 13 checks met` each, **on battery power**; no idle-worker kill failure |
+| `make images-smoke` | PASS — `41 of 41 checks met` (labels `5fbcbb4`; `migrate` applied 18 migrations into an empty throwaway database and dropped it; the `api` image served the real dashboard build). **Run with a credential-free `DOCKER_CONFIG` and `DOCKER_HOST` set to Docker Desktop's socket,** because on this machine `docker-credential-desktop get` hung and so did every Docker Hub lookup; the first two attempts hung on that lookup and I stopped them. Neither the Makefile nor the repository changed. |
+| `make scan` | PASS in a fresh clone at `5fbcbb4`; run with the same credential-free `DOCKER_CONFIG` |
+
+The mutation results, and the golden's row counts, are under "Evidence" in the M8D1
+section.
+
 ### M8B gates
 
 Run locally on the branch, 2026-10-05, on code commit `fd57822` (the commits after it
@@ -3617,7 +3910,7 @@ once, shown by `git diff`, run, and reverted. Each is caught by named tests in
 | (b) delete the `origin` rule | 47 | the same five tests |
 | (c) delete the `host` rule | 150 | the refusal table, `..._EveryBrowserMarkingNamesItsRule`, `..._FirstRuleToFireNamesTheRefusal`, `..._RefusalIsObservable` |
 | (d) a `Host` split error falls back to accepting | 60 | the refusal table (the unparseable Hosts) and `..._EveryBrowserMarkingNamesItsRule` |
-| (e) register `POST /internal/v1/claims` without the helper | 18 | the refusal table, for exactly that route, and `TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which names `server.go:256` |
+| (e) register `POST /internal/v1/claims` without the helper | 18 | the refusal table, for exactly that route, and `TestServer_EveryInternalPatternIsRegisteredThroughTheGuard`, which names `server.go:256` (that test was replaced in M8D1 by `TestRoutes_NothingRegistersAroundTheTable`; see "M8D1") |
 | (f) swap the guard and `requireWorkerKey` | 19 | the refusal table, `..._RunsBeforeAuthenticationAndBefore405`, and the source-scan test |
 
 The mutated source diffs and failing output are in the pull request's handoff.
@@ -4427,21 +4720,15 @@ same shape, equally unexercised.
   there is narrower and deliberate: no write operation, no search, no sorting
   beyond keyset order, no cross-scope listing, no lifetime queue totals, and no
   cursor-following iterator helpers on the SDK's new listings.
-- There is no automated check that the route table and `api/openapi.yaml`
-  describe the same set of routes. `publicRoutes` (in
-  `internal/api/auth_test.go`) and `publicOperations` (in
-  `internal/api/auth_contract_test.go`) are hand-maintained lists derived from
-  two different sources, and they are what makes them agree — but nothing walks
-  the mux, so a route added without being added to both is uncovered rather
-  than failing. A real completeness gate needs a route registry inside
-  `Handler()`; it is a small, separate change and is not claimed here.
-  **M7A recorded this as deferred to M8** and did not touch the maps. Two
-  hand-maintained, one-directional maps in
-  `internal/api/deadline_contract_test.go` are what keeps the document from
-  falling behind the handlers — `TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode`
-  (line 236) and `TestOpenAPI_DocumentsEveryImplementedPublicRoute` (line 364) —
-  and each walks from its list into the document, never from the mux into the
-  list. [ROADMAP.md](ROADMAP.md) carries the deferral under M8D.
+- The route table and `api/openapi.yaml` are checked against each other since M8D1:
+  every route is an entry of the table in `internal/api/routes.go`, and
+  `TestRoutes_TableMatchesTheSpec` requires the non-unlisted entries and the spec's
+  operations to be the same set. What it does not check, and what remains by hand,
+  is anything beyond method and path (see "M8D1" below), and the two one-directional
+  maps in `internal/api/deadline_contract_test.go`
+  (`TestOpenAPI_DocumentsEveryImplementedRouteAndErrorCode` and
+  `TestOpenAPI_DocumentsEveryImplementedPublicRoute`) still exist, now redundant with
+  it.
 - Tracing shipped in M6B, but three parts of it are
   deliberately absent rather than pending: the worker's own control-plane calls
   after the claim (start, renew, succeed, fail) are not traced, the Python SDK
@@ -4501,18 +4788,19 @@ two targets belong in its version.
 
 ## Next objective
 
-M8D: the two gates M7A deferred, and four items from the M8A review. See
-[ROADMAP.md](ROADMAP.md)'s M8D entry. It is not started. It is a route registry
-inside `Handler()` checked against `api/openapi.yaml` in both directions; the
-verification-matrix drift check's AST fix; ADR-0020's justification of the
-throughput tolerance with the §7 wording "kept pace with offered load; headroom not
-measured"; an investigation of the 50.04 s recovery outlier; the benchmark record
-renderer's extra newline; and the run-time estimate in `AGENTS.md`. M8C
-(deployment) follows it and **needs its own owner decision before any work
-starts**: the non-loopback bind, which M6E's note says has to be revisited together
-with the Host rule; protection of `/internal`; and the decision ADR-0019 leaves,
-whether to gate the demonstration handlers in a deployed worker. Every M7 scenario
-can also be watched from the dashboard.
+M8D2: the verification-matrix drift check, four items from the M8A review, and the
+`make bench-smoke` flake. See [ROADMAP.md](ROADMAP.md)'s M8D2 entry. It is not started.
+It is the matrix drift check's AST fix, which finds the cited assertion in the syntax
+tree instead of trusting a line number; ADR-0020's justification of the throughput
+tolerance with the §7 wording "kept pace with offered load; headroom not measured"; an
+investigation of the 50.04 s recovery outlier; the benchmark record renderer's extra
+newline; the run-time estimate in `AGENTS.md`; and the smoke's random kill, which can
+land on an idle worker and fail "the kill hit an attempt, and it was recovered". M8C
+(deployment) follows it and **needs its own owner decision before any work starts**:
+the non-loopback bind, which M6E's note says has to be revisited together with the Host
+rule; protection of `/internal`; and the decision ADR-0019 leaves, whether to gate the
+demonstration handlers in a deployed worker. Every M7 scenario can also be watched from
+the dashboard.
 
 Open, and not any milestone's deliverable: whether the shipped lease and outbox
 interval should change is a question the two M8A records answer only as numbers, not
