@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -159,4 +161,47 @@ func TestRecordPaths(t *testing.T) {
 	md, js = recordPaths("docs/benchmarks", when, "9904420", profileTuned)
 	require.Equal(t, "docs/benchmarks/2026-10-03-9904420-tuned.md", md)
 	require.Equal(t, "docs/benchmarks/2026-10-03-9904420-tuned.json", js)
+}
+
+// requireOneTrailingNewline asserts text ends in a non-empty line and exactly one
+// "\n" after it: no missing newline, and no blank line at the end.
+func requireOneTrailingNewline(t *testing.T, text, what string) {
+	t.Helper()
+	require.NotEmpty(t, text, what)
+	require.Truef(t, strings.HasSuffix(text, "\n"), "%s must end in a newline", what)
+	require.Falsef(t, strings.HasSuffix(text, "\n\n"), "%s must not end in a blank line", what)
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	require.NotEmptyf(t, strings.TrimSpace(lines[len(lines)-1]), "%s: the last line must have text in it", what)
+}
+
+// TestRenderMarkdown_EndsWithExactlyOneNewline proves the renderer's output ends
+// with the last Limitations line and exactly one "\n": no trailing blank line.
+//
+// A record is written to disk exactly as rendered, so a trailing blank line here
+// is a trailing blank line in every file a run commits. The two records already in
+// docs/benchmarks were trimmed by hand to avoid it.
+func TestRenderMarkdown_EndsWithExactlyOneNewline(t *testing.T) {
+	for _, profile := range []string{profileShipped, profileTuned} {
+		md := renderMarkdown(fixtureRecord(t, profile))
+		requireOneTrailingNewline(t, md, profile+" record")
+
+		lines := strings.Split(strings.TrimSuffix(md, "\n"), "\n")
+		require.Contains(t, lines[len(lines)-1], "Power and sleep",
+			"the output ends with the last Limitations line, not with something after it")
+	}
+}
+
+// TestCommittedRecords_EndInExactlyOneNewline proves every committed record's
+// Markdown ends in exactly one "\n". It guards the two hand-trimmed files and
+// every record a future run commits alike, so a renderer that regressed would be
+// caught the first time its output was committed.
+func TestCommittedRecords_EndInExactlyOneNewline(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "docs", "benchmarks", "*.md"))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(paths), 2, "the two committed records must be found; an empty glob would prove nothing")
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		requireOneTrailingNewline(t, string(content), path)
+	}
 }
