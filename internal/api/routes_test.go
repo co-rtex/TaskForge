@@ -223,6 +223,10 @@ func TestRoutes_TableIsInternallyConsistent(t *testing.T) {
 			require.Containsf(t, []string{"/healthz", "/readyz"}, rt.path, "%s", name)
 		case surfaceUnlisted:
 			require.Equalf(t, chainNone, rt.chain, "%s is unlisted and carries no wrapper", name)
+			// A zero or unknown group is never enabled, so without this an unlisted
+			// entry that forgot its group would simply not be registered.
+			require.Containsf(t, []group{groupMetrics, groupDashboard}, rt.group,
+				"%s: an unlisted route is gated by metrics or dashboard", name)
 		default:
 			require.Failf(t, "invalid surface", "%s has surface %v", name, rt.surface)
 		}
