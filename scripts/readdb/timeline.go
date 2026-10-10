@@ -141,6 +141,10 @@ func RecoveryTimeline(ctx context.Context, q Querier, scope string, sessionID uu
 //	S4  event published_at - event created_at       the outbox publisher
 //	S5  replacement's claim - event published_at    broker delivery and the claim
 //
+// published_at is stamped by the publisher's own transaction after SendMessage
+// returns, so it is an upper bound on the send: a worker can receive and claim
+// before the mark commits, and S5 can then be a few milliseconds below zero.
+//
 // They telescope, so their sum is the replacement's claim minus the kill: the
 // recovery figure ADR-0020 defines.
 type Segments struct{ S1, S2, S3, S4, S5 time.Duration }
@@ -212,4 +216,28 @@ func ForeignActivity(ctx context.Context, q Querier, scope string) (Foreign, err
 		return Foreign{}, fmt.Errorf("count work outside scope %q: %w", scope, err)
 	}
 	return f, nil
+}
+
+// ActiveLeaseExpiries is the expires_at of every lease of the session that is
+// still ACTIVE: after a kill, when each of the dead session's attempts becomes
+// recoverable. A lease the worker renewed before it died expires sooner than a
+// lease length after the kill.
+func ActiveLeaseExpiries(ctx context.Context, q Querier, scope string, sessionID uuid.UUID) ([]time.Time, error) {
+	rows, err := q.Query(ctx, `
+		SELECT expires_at FROM leases
+		WHERE scope = $1 AND worker_session_id = $2 AND status = 'ACTIVE'
+		ORDER BY expires_at`, scope, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("read the session's active leases: %w", err)
+	}
+	defer rows.Close()
+	var out []time.Time
+	for rows.Next() {
+		var t time.Time
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("scan a lease expiry: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }

@@ -96,6 +96,9 @@ const (
 	// probePollEvery is how often the probe reads the timeline once a lease is
 	// about to expire. It bounds how late the broker is read after a publish.
 	probePollEvery = 20 * time.Millisecond
+	// probeClaimLogSlack is how far past the replacement's claim the S5 claim count
+	// reaches, because the api logs a request when it ends.
+	probeClaimLogSlack = 500 * time.Millisecond
 	// probeExtraTrials is how many trials beyond N a condition may run to replace
 	// trials whose kill hit nothing.
 	probeExtraTrials = 5
@@ -492,8 +495,21 @@ func runProbeTrial(parent context.Context, o options, timings stack.Timings, con
 
 	// Watch the recovery: the broker right after each recovery event is published,
 	// and every replacement.
+	// Polling starts a second before the earliest of the dead session's leases
+	// expires. That is up to a lease after the kill, and less for a lease the
+	// worker renewed before it died (C's).
+	from := tr.killedAt.Add(timings.Lease)
+	expiries, err := readdb.ActiveLeaseExpiries(ctx, st.DB, st.Scope, tr.session)
+	if err != nil {
+		return tr, err
+	}
+	for _, e := range expiries {
+		if e.Before(from) {
+			from = e
+		}
+	}
 	deadline := tr.killedAt.Add(timings.Lease + probeReplacementWait)
-	hops, snapshots, err := watchRecovery(ctx, st, tr.session, tr.killedAt.Add(timings.Lease-time.Second), deadline, tr.held)
+	hops, snapshots, err := watchRecovery(ctx, st, tr.session, from.Add(-time.Second), deadline, tr.held)
 	if err != nil {
 		return tr, err
 	}
@@ -526,8 +542,9 @@ func runProbeTrial(parent context.Context, o options, timings stack.Timings, con
 		}
 	}
 
-	closeFleet()
+	// The watchdog first, so that stopping the workers is not read as a crash.
 	stop(nil)
+	closeFleet()
 	apiLog, logErr := os.ReadFile(filepath.Join(st.LogDir, "api.log"))
 	if logErr != nil {
 		tr.notes = append(tr.notes, "could not read the api log: "+logErr.Error())
@@ -544,7 +561,10 @@ func runProbeTrial(parent context.Context, o options, timings stack.Timings, con
 		if h.EventPublishedAt != nil {
 			r.published = snapshots[h.EventPublishedAt.UnixNano()]
 			if h.ReplacementCreatedAt != nil {
-				r.claims = claimsBetween(claims, h.EventPublishedAt.Add(offset), h.ReplacementCreatedAt.Add(offset), h.JobID)
+				// The api logs a request when it ends, after the claim's created_at,
+				// so the window runs probeClaimLogSlack past the replacement's claim.
+				r.claims = claimsBetween(claims, h.EventPublishedAt.Add(offset),
+					h.ReplacementCreatedAt.Add(offset+probeClaimLogSlack), h.JobID)
 			}
 		}
 		tr.hops = append(tr.hops, r)

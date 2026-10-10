@@ -205,8 +205,8 @@ func printTrial(out io.Writer, tr trialResult, lease time.Duration) {
 			fmt.Fprintf(out, "  broker right after publish (%s): %s\n", lag, h.published)
 		}
 		if h.complete {
-			fmt.Fprintf(out, "  claims the api served during S5: %d, %d took a job (%d took this one), %d took nothing, %d failed\n",
-				h.claims.requests, h.claims.tookJob, h.claims.tookThis, h.claims.requests-h.claims.tookJob, h.claims.failed)
+			fmt.Fprintf(out, "  claims the api served during S5 (+%s): %d, %d took a job (%d took this one), %d took nothing, %d failed\n",
+				probeClaimLogSlack, h.claims.requests, h.claims.tookJob, h.claims.tookThis, h.claims.requests-h.claims.tookJob, h.claims.failed)
 		}
 		if overThreshold(h, lease) {
 			fmt.Fprintf(out, "  OVER THRESHOLD (recovery > %s)\n", lease+probeOverThresholdSlack)

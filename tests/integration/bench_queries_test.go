@@ -701,6 +701,23 @@ func TestBenchQueries_HeldBySessionAndForeignActivity(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, held)
 
+	// Active leases of the dead session, soonest first; a released one is not listed.
+	soon, later, released := uuid.New(), uuid.New(), uuid.New()
+	for i, job := range []uuid.UUID{soon, later, released} {
+		seed.job(job, "RUNNING", at(time.Duration(10+i)*time.Second), nil)
+	}
+	a := seed.attempt(later, 1, worker, dead, "RUNNING", at(10*time.Second), ptr(at(10*time.Second)), nil)
+	seed.releasedLease(a, later, worker, dead, uuid.New(), at(10*time.Second), at(40*time.Second), nil)
+	a = seed.attempt(soon, 1, worker, dead, "RUNNING", at(11*time.Second), ptr(at(11*time.Second)), nil)
+	seed.releasedLease(a, soon, worker, dead, uuid.New(), at(11*time.Second), at(27*time.Second), nil)
+	a = seed.attempt(released, 1, worker, dead, "SUCCEEDED", at(12*time.Second), ptr(at(12*time.Second)), ptr(at(13*time.Second)))
+	seed.releasedLease(a, released, worker, dead, uuid.New(), at(12*time.Second), at(42*time.Second), ptr(at(13*time.Second)))
+	expiries, err := readdb.ActiveLeaseExpiries(ctx, testPool, benchScope, dead)
+	require.NoError(t, err)
+	require.Len(t, expiries, 2)
+	require.True(t, expiries[0].Equal(at(27*time.Second)), "a renewed lease's earlier expiry comes first: %v", expiries)
+	require.True(t, expiries[1].Equal(at(40*time.Second)))
+
 	// This scope's own work is never foreign. reset leaves no job and no event.
 	own := uuid.New()
 	seed.job(own, "QUEUED", at(time.Second), nil)
