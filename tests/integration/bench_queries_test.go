@@ -503,3 +503,174 @@ func TestBenchQueries_TargetableAttempts(t *testing.T) {
 			"the attempt that started 100 ms before PostgreSQL's now is a target; the one 10 s before it is not")
 	})
 }
+
+// releasedLease writes a lease with every instant chosen by the test and the claim
+// request id given, so a case can say which notification produced which claim.
+// released nil writes an ACTIVE lease.
+func (s benchSeed) releasedLease(attemptID, jobID, workerID, sessionID, claimRequestID uuid.UUID,
+	acquired, expires time.Time, released *time.Time) {
+	s.t.Helper()
+	status := "ACTIVE"
+	if released != nil {
+		status = "EXPIRED"
+	}
+	_, err := testPool.Exec(context.Background(), `
+		INSERT INTO leases (
+			id, job_id, attempt_id, scope, queue, worker_id, worker_session_id,
+			claim_request_id, status, acquired_at, renewed_at, expires_at, released_at
+		) VALUES (gen_random_uuid(), $1, $2, $3, 'default', $4, $5, $6, $7, $8, $8, $9, $10)`,
+		jobID, attemptID, s.scope, workerID, sessionID, claimRequestID, status, acquired, expires, released)
+	require.NoError(s.t, err)
+}
+
+// event writes one work.available outbox event for a job, published or not.
+func (s benchSeed) event(jobID uuid.UUID, generation int, created time.Time, published *time.Time,
+	attempts int, lastError *string) uuid.UUID {
+	s.t.Helper()
+	id := uuid.New()
+	status := "PENDING"
+	if published != nil {
+		status = "PUBLISHED"
+	}
+	_, err := testPool.Exec(context.Background(), `
+		INSERT INTO outbox_events (
+			id, event_type, schema_version, payload, job_id, notification_generation,
+			status, attempts, available_at, created_at, published_at, last_error
+		) VALUES ($1, 'work.available', 1, $9::jsonb, $2, $3, $4, $5, $6, $6, $7, $8)`,
+		id, jobID, generation, status, attempts, created, published, lastError,
+		`{"queue":"default","job_id":"`+jobID.String()+`"}`)
+	require.NoError(s.t, err)
+	return id
+}
+
+// TestBenchQueries_RecoveryTimeline proves the query the recovery probe splits a
+// recovery with (M8D3), on rows whose every instant the test writes.
+//
+// The story it seeds is the one the probe has to be able to tell: a job (X) whose
+// abandoned attempt was recovered, but whose recovery event's notification claimed
+// a different job (Y), so that X was claimed later by Y's notification. The recovery
+// event must be found exactly, between the job's earlier submission event and a
+// later re-notification, neither of which may be picked.
+func TestBenchQueries_RecoveryTimeline(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	seed := benchSeed{t: t, scope: benchScope}
+
+	worker := seed.worker("worker-killed")
+	killedAt := at(10 * time.Second)
+	killed := seed.session(worker, at(0), "OFFLINE", ptr(at(10*time.Second+200*time.Millisecond)))
+	seed.session(worker, at(10*time.Second+200*time.Millisecond), "HEALTHY", nil)
+	other := seed.worker("worker-other")
+	otherSession := seed.session(other, at(0), "HEALTHY", nil)
+
+	// Job X. Its submission event (E0) produced attempt 1, on the killed session.
+	jobX := uuid.New()
+	seed.job(jobX, "RUNNING", at(0), nil)
+	e0 := seed.event(jobX, 1, at(0), ptr(at(100*time.Millisecond)), 1, nil)
+	x1 := seed.attempt(jobX, 1, worker, killed, "ABANDONED", at(time.Second), nil, ptr(at(33*time.Second+200*time.Millisecond)))
+	seed.releasedLease(x1, jobX, worker, killed, e0, at(time.Second), at(31*time.Second), ptr(at(33*time.Second+200*time.Millisecond)))
+	// The recovery event (E1): created at the reconciler transaction's start, 50 ms
+	// BEFORE the lease's released_at, which that transaction sampled after its locks.
+	e1 := seed.event(jobX, 2, at(33*time.Second+150*time.Millisecond), ptr(at(34*time.Second)), 1, nil)
+	// A later re-notification of X (E3), after the lease was released: not it either.
+	seed.event(jobX, 3, at(95*time.Second), nil, 0, nil)
+
+	// Job Y, submitted before the kill. Its own notification (E2) was received and
+	// not claimed; E1's notification claimed Y, the queue's oldest eligible job.
+	jobY := uuid.New()
+	seed.job(jobY, "RUNNING", at(20*time.Second), nil)
+	e2 := seed.event(jobY, 1, at(20*time.Second), ptr(at(20*time.Second+500*time.Millisecond)), 1, nil)
+	y1 := seed.attempt(jobY, 1, other, otherSession, "RUNNING", at(34*time.Second+100*time.Millisecond),
+		ptr(at(34*time.Second+150*time.Millisecond)), nil)
+	seed.releasedLease(y1, jobY, other, otherSession, e1, at(34*time.Second+100*time.Millisecond), at(64*time.Second+100*time.Millisecond), nil)
+	// ...and E2's notification, back from the broker, claimed X: attempt 2, at 52 s.
+	x2 := seed.attempt(jobX, 2, other, otherSession, "RUNNING", at(52*time.Second),
+		ptr(at(52*time.Second+50*time.Millisecond)), nil)
+	seed.releasedLease(x2, jobX, other, otherSession, e2, at(52*time.Second), at(82*time.Second), nil)
+
+	// Job Z: abandoned on the killed session, and its recovery event has failed to
+	// publish twice. No replacement.
+	jobZ := uuid.New()
+	seed.job(jobZ, "QUEUED", at(0), nil)
+	z0 := seed.event(jobZ, 1, at(0), ptr(at(100*time.Millisecond)), 1, nil)
+	z1 := seed.attempt(jobZ, 1, worker, killed, "ABANDONED", at(2*time.Second), nil, ptr(at(33*time.Second+300*time.Millisecond)))
+	seed.releasedLease(z1, jobZ, worker, killed, z0, at(2*time.Second), at(32*time.Second), ptr(at(33*time.Second+300*time.Millisecond)))
+	boom := "send message: connection refused"
+	e4 := seed.event(jobZ, 2, at(33*time.Second+250*time.Millisecond), nil, 2, &boom)
+
+	// Not returned: an attempt of the killed session that finished before the kill.
+	done := uuid.New()
+	seed.job(done, "SUCCEEDED", at(0), nil)
+	seed.attempt(done, 1, worker, killed, "SUCCEEDED", at(3*time.Second), ptr(at(3*time.Second+time.Millisecond)), ptr(at(3*time.Second+60*time.Millisecond)))
+
+	got, err := readdb.RecoveryTimeline(ctx, testPool, benchScope, killed)
+	require.NoError(t, err)
+	require.Len(t, got, 2, "X and Z, the two abandoned attempts; not the finished one")
+	byJob := map[uuid.UUID]readdb.RecoveryHop{}
+	for _, h := range got {
+		byJob[h.JobID] = h
+	}
+
+	x := byJob[jobX]
+	require.Equal(t, 1, x.AbandonedAttempt)
+	require.True(t, x.LeaseAcquiredAt.Equal(at(time.Second)))
+	require.True(t, x.LeaseRenewedAt.Equal(at(time.Second)))
+	require.True(t, x.LeaseExpiresAt.Equal(at(31*time.Second)))
+	require.NotNil(t, x.LeaseReleasedAt)
+	require.True(t, x.LeaseReleasedAt.Equal(at(33*time.Second+200*time.Millisecond)))
+	require.NotNil(t, x.EventID)
+	require.Equal(t, e1, *x.EventID, "the recovery event, not the submission event (%s) and not the later re-notification", e0)
+	require.True(t, x.EventCreatedAt.Equal(at(33*time.Second+150*time.Millisecond)))
+	require.True(t, x.EventPublishedAt.Equal(at(34*time.Second)))
+	require.Equal(t, 1, *x.EventAttempts)
+	require.Nil(t, x.EventLastError)
+	require.NotNil(t, x.EventClaimedJobID)
+	require.Equal(t, jobY, *x.EventClaimedJobID, "the recovery event's notification claimed the oldest eligible job, Y")
+	require.True(t, x.ReplacementCreatedAt.Equal(at(52*time.Second)))
+	require.Equal(t, otherSession, *x.ReplacementSessionID)
+	require.Equal(t, e2, *x.ReplacementEventID, "X's replacement was claimed by Y's notification")
+	require.Equal(t, jobY, *x.ReplacementEventJobID)
+	require.True(t, x.ReplacementEventCreatedAt.Equal(at(20*time.Second)))
+	require.True(t, x.ReplacementEventPublishedAt.Equal(at(20*time.Second+500*time.Millisecond)))
+
+	segments, ok := x.Segments(killedAt)
+	require.True(t, ok)
+	require.Equal(t, readdb.Segments{
+		S1: 21 * time.Second,                     // expires 31 s - kill 10 s
+		S2: 2*time.Second + 200*time.Millisecond, // released 33.2 s - expires 31 s
+		S3: -50 * time.Millisecond,               // created 33.15 s - released 33.2 s
+		S4: 850 * time.Millisecond,               // published 34 s - created 33.15 s
+		S5: 18 * time.Second,                     // replacement 52 s - published 34 s
+	}, segments)
+
+	// The identity: the five segments sum to the recovery Recoveries measures.
+	recoveries, err := readdb.Recoveries(ctx, testPool, benchScope, killed)
+	require.NoError(t, err)
+	var recovery time.Duration
+	for _, r := range recoveries {
+		if r.JobID == jobX {
+			recovery, ok = r.After(killedAt)
+			require.True(t, ok)
+		}
+	}
+	require.Equal(t, 42*time.Second, recovery)
+	require.Equal(t, recovery, segments.Sum())
+
+	z := byJob[jobZ]
+	require.NotNil(t, z.EventID)
+	require.Equal(t, e4, *z.EventID)
+	require.Nil(t, z.EventPublishedAt, "not published yet")
+	require.Equal(t, 2, *z.EventAttempts)
+	require.Equal(t, boom, *z.EventLastError)
+	require.Nil(t, z.EventClaimedJobID)
+	require.Nil(t, z.ReplacementCreatedAt)
+	require.Nil(t, z.ReplacementEventID)
+	_, ok = z.Segments(killedAt)
+	require.False(t, ok, "no publish and no replacement, so no segments")
+
+	t.Run("two events inside one lease's window are refused, not chosen between", func(t *testing.T) {
+		seed.event(jobX, 4, at(33*time.Second+180*time.Millisecond), nil, 0, nil)
+		_, err := readdb.RecoveryTimeline(ctx, testPool, benchScope, killed)
+		require.ErrorContains(t, err, "2 work.available events")
+	})
+}
