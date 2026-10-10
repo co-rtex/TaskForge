@@ -418,6 +418,71 @@ func TestBenchQueries_TargetableAttempts(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("only the worker's current session counts", func(t *testing.T) {
+		// A worker the harness killed and restarted keeps its name, so it has two
+		// sessions: the dead boot and the running one. The dead boot's attempts stay
+		// LEASED or RUNNING until their leases expire, but a kill now ends the running
+		// boot, which cannot catch them. Only the current session's attempt counts.
+		reset(t)
+		seed := benchSeed{t: t, scope: benchScope}
+		worker := seed.worker("worker-restarted")
+		dead := seed.session(worker, at(0), "OFFLINE", ptr(at(5*time.Second)))
+		current := seed.session(worker, at(6*time.Second), "HEALTHY", nil)
+
+		heldByDead := uuid.New()
+		seed.job(heldByDead, "RUNNING", at(time.Second), nil)
+		seed.attempt(heldByDead, 1, worker, dead, "RUNNING", at(time.Second), ptr(asOf.Add(-100*time.Millisecond)), nil)
+		heldByCurrent := uuid.New()
+		seed.job(heldByCurrent, "LEASED", at(7*time.Second), nil)
+		seed.attempt(heldByCurrent, 1, worker, current, "LEASED", at(7*time.Second), nil, nil)
+
+		got, err := readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, margin, asOf)
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"worker-restarted": 1}, got,
+			"the dead session's RUNNING attempt has time left but is not the running process's; only the current session's LEASED attempt counts")
+
+		// A worker whose only targetable attempt belongs to a dead session is absent.
+		reset(t)
+		seed = benchSeed{t: t, scope: benchScope}
+		worker = seed.worker("worker-restarted")
+		dead = seed.session(worker, at(0), "OFFLINE", ptr(at(5*time.Second)))
+		seed.session(worker, at(6*time.Second), "HEALTHY", nil)
+		orphan := uuid.New()
+		seed.job(orphan, "RUNNING", at(time.Second), nil)
+		seed.attempt(orphan, 1, worker, dead, "RUNNING", at(time.Second), ptr(asOf.Add(-100*time.Millisecond)), nil)
+
+		got, err = readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, margin, asOf)
+		require.NoError(t, err)
+		require.Empty(t, got, "nothing the running process holds; the restarted worker is not a target")
+	})
+
+	t.Run("two sessions registered at the same instant: the id decides, as CurrentSession reads it", func(t *testing.T) {
+		reset(t)
+		seed := benchSeed{t: t, scope: benchScope}
+		worker := seed.worker("worker-tie")
+		first := seed.session(worker, at(0), "OFFLINE", ptr(at(5*time.Second)))
+		second := seed.session(worker, at(0), "HEALTHY", nil)
+
+		// Two attempts on one session and one on the other, so the count says which
+		// session was taken as current.
+		for i, session := range []uuid.UUID{first, first, second} {
+			job := uuid.New()
+			seed.job(job, "LEASED", at(time.Duration(i+1)*time.Second), nil)
+			seed.attempt(job, 1, worker, session, "LEASED", at(time.Duration(i+1)*time.Second), nil, nil)
+		}
+		currentID, err := readdb.CurrentSession(ctx, testPool, benchScope, "worker-tie")
+		require.NoError(t, err)
+		want := 1
+		if currentID == first {
+			want = 2
+		}
+
+		got, err := readdb.TargetableAttemptsAsOf(ctx, testPool, benchScope, duration, margin, asOf)
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"worker-tie": want}, got,
+			"the session counted is the one CurrentSession names (%s)", currentID)
+	})
+
 	t.Run("without an instant it reads PostgreSQL's own clock", func(t *testing.T) {
 		reset(t)
 		seed := benchSeed{t: t, scope: benchScope}
