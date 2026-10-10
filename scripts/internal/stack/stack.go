@@ -47,6 +47,11 @@ type Options struct {
 	// developer can tell whose leftovers they are looking at.
 	Prefix string
 	Timing Timings
+	// QueueAttributes are SQS attributes the run's own queue is created with. Nil,
+	// what scripts/demo, `make bench` and `make bench-smoke` pass, creates it with
+	// the broker's defaults; only the recovery probe sets one, to vary the
+	// visibility timeout under control.
+	QueueAttributes map[string]string
 }
 
 // Stack is one run: the processes it started, the credentials it created, and
@@ -69,6 +74,7 @@ type Stack struct {
 	WorkDir string // an empty directory: the working directory of every child
 
 	QueueName, QueueURL string
+	queueAttributes     map[string]string
 
 	APIAddr, OutboxAddr, SchedulerAddr, ReconcilerAddr string
 	APIURL                                             string
@@ -135,7 +141,8 @@ func New(opts Options) (*Stack, error) {
 		// A queue of this run's own. A shared queue would let any worker already
 		// running against it receive this run's notifications, and would let a
 		// message a killed worker was holding in flight surface in a later run.
-		QueueName: "taskforge-" + opts.Prefix + "-" + runID,
+		QueueName:       "taskforge-" + opts.Prefix + "-" + runID,
+		queueAttributes: opts.QueueAttributes,
 	}
 
 	// Free ports, chosen now so every process's configuration can name all of
@@ -258,7 +265,7 @@ func sortedEnv(env map[string]string) []string {
 // four background services, and a pair of keys in this run's scope.
 func (s *Stack) Setup(ctx context.Context) error {
 	var err error
-	if s.QueueURL, err = createQueue(ctx, s.Infra.BrokerEndpoint, s.QueueName); err != nil {
+	if s.QueueURL, err = createQueue(ctx, s.Infra.BrokerEndpoint, s.QueueName, s.queueAttributes); err != nil {
 		return fmt.Errorf("create this run's broker queue: %w", err)
 	}
 	s.Say("Created broker queue %s for this run alone.", s.QueueName)
@@ -293,6 +300,13 @@ func (s *Stack) Setup(ctx context.Context) error {
 	s.Say("All four services report ready.")
 
 	return s.createKeys(ctx)
+}
+
+// QueueAttributes reads the run's own broker queue's attributes with
+// GetQueueAttributes: its message counts and its configuration, as the broker
+// reports them at that moment.
+func (s *Stack) QueueAttributes(ctx context.Context) (map[string]string, error) {
+	return queueAttributes(ctx, s.Infra.BrokerEndpoint, s.QueueURL)
 }
 
 // createKeys mints this run's credentials with taskforge-cli. The scope is

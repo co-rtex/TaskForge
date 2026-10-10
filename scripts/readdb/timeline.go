@@ -163,3 +163,53 @@ func (h RecoveryHop) Segments(kill time.Time) (Segments, bool) {
 		S5: h.ReplacementCreatedAt.Sub(*h.EventPublishedAt),
 	}, true
 }
+
+// HeldBySession is the number of attempts a session holds a slot with right now:
+// LEASED or RUNNING. Read just after a kill, it is how many attempts the kill will
+// abandon, since a dead process can no longer finish any of them; zero means the
+// kill missed.
+func HeldBySession(ctx context.Context, q Querier, scope string, sessionID uuid.UUID) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, `
+		SELECT count(*) FROM job_attempts
+		WHERE scope = $1 AND worker_session_id = $2 AND status IN ('LEASED', 'RUNNING')`,
+		scope, sessionID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count the attempts session %s holds: %w", sessionID, err)
+	}
+	return n, nil
+}
+
+// Foreign is work outside one scope that a run's own services would act on.
+// The reconciler, the outbox publisher and the scheduler scan the whole database,
+// not one scope: an expired lease anywhere is requeued with a fresh notification,
+// a pending event anywhere is published, and a QUEUED job anywhere is
+// re-notified every TASKFORGE_SCHEDULER_RENOTIFY_AFTER. Each lands in the run's
+// own broker queue, so any of it would put messages there that the run did not
+// cause.
+type Foreign struct {
+	// NonTerminalJobs is jobs of other scopes in any status but SUCCEEDED,
+	// DEAD_LETTERED or CANCELED.
+	NonTerminalJobs int
+	// PendingEvents is unpublished outbox events, of any scope but this one.
+	PendingEvents int
+}
+
+// None reports whether there is nothing foreign to act on.
+func (f Foreign) None() bool { return f.NonTerminalJobs == 0 && f.PendingEvents == 0 }
+
+// ForeignActivity counts the work outside scope that the run's services would
+// act on. An outbox event's scope is its job's; an event with no job is counted.
+func ForeignActivity(ctx context.Context, q Querier, scope string) (Foreign, error) {
+	var f Foreign
+	err := q.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM jobs
+		   WHERE scope <> $1 AND status NOT IN ('SUCCEEDED', 'DEAD_LETTERED', 'CANCELED')),
+		  (SELECT count(*) FROM outbox_events e LEFT JOIN jobs j ON j.id = e.job_id
+		   WHERE e.status = 'PENDING' AND j.scope IS DISTINCT FROM $1)`, scope).Scan(&f.NonTerminalJobs, &f.PendingEvents)
+	if err != nil {
+		return Foreign{}, fmt.Errorf("count work outside scope %q: %w", scope, err)
+	}
+	return f, nil
+}

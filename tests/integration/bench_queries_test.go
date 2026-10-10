@@ -674,3 +674,53 @@ func TestBenchQueries_RecoveryTimeline(t *testing.T) {
 		require.ErrorContains(t, err, "2 work.available events")
 	})
 }
+
+func TestBenchQueries_HeldBySessionAndForeignActivity(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	seed := benchSeed{t: t, scope: benchScope}
+	worker := seed.worker("worker-1")
+	dead := seed.session(worker, at(0), "OFFLINE", ptr(at(5*time.Second)))
+	current := seed.session(worker, at(6*time.Second), "HEALTHY", nil)
+	for i, status := range []string{"LEASED", "RUNNING", "SUCCEEDED", "ABANDONED"} {
+		job := uuid.New()
+		seed.job(job, "RUNNING", at(time.Duration(i)*time.Second), nil)
+		var started, finished *time.Time
+		if status != "LEASED" {
+			started = ptr(at(time.Duration(i)*time.Second + time.Millisecond))
+		}
+		if status == "SUCCEEDED" || status == "ABANDONED" {
+			finished = ptr(at(time.Duration(i)*time.Second + 2*time.Millisecond))
+		}
+		seed.attempt(job, 1, worker, dead, status, at(time.Duration(i)*time.Second), started, finished)
+	}
+	held, err := readdb.HeldBySession(ctx, testPool, benchScope, dead)
+	require.NoError(t, err)
+	require.Equal(t, 2, held, "LEASED and RUNNING; not SUCCEEDED or ABANDONED")
+	held, err = readdb.HeldBySession(ctx, testPool, benchScope, current)
+	require.NoError(t, err)
+	require.Zero(t, held)
+
+	// This scope's own work is never foreign. reset leaves no job and no event.
+	own := uuid.New()
+	seed.job(own, "QUEUED", at(time.Second), nil)
+	seed.event(own, 1, at(time.Second), nil, 0, nil)
+	f, err := readdb.ForeignActivity(ctx, testPool, benchScope)
+	require.NoError(t, err)
+	require.True(t, f.None(), "%+v", f)
+
+	// Another scope's terminal job is not; its QUEUED job and its pending event are.
+	other := benchSeed{t: t, scope: "bench-queries-other"}
+	other.job(uuid.New(), "SUCCEEDED", at(0), nil)
+	f, err = readdb.ForeignActivity(ctx, testPool, benchScope)
+	require.NoError(t, err)
+	require.True(t, f.None(), "a terminal job of another scope gives the services nothing to do: %+v", f)
+
+	queued := uuid.New()
+	other.job(queued, "QUEUED", at(0), nil)
+	other.event(queued, 1, at(0), nil, 0, nil)
+	f, err = readdb.ForeignActivity(ctx, testPool, benchScope)
+	require.NoError(t, err)
+	require.Equal(t, readdb.Foreign{NonTerminalJobs: 1, PendingEvents: 1}, f)
+	require.False(t, f.None())
+}

@@ -42,6 +42,13 @@ func newSubmitter(apiURL, apiKey, runID string) *submitter {
 // workload; only the smoke's fault run asks for another duration (see
 // options.faultJobDuration).
 func newSubmitterWithDuration(apiURL, apiKey, runID string, jobDuration time.Duration) *submitter {
+	return newSubmitterFor(apiURL, apiKey, runID, jobDuration, jobTimeoutSecs)
+}
+
+// newSubmitterFor is newSubmitterWithDuration with the jobs' timeout_seconds
+// given too. Only the recovery probe's idle condition passes anything but
+// jobTimeoutSecs: its one job sleeps longer than that.
+func newSubmitterFor(apiURL, apiKey, runID string, jobDuration time.Duration, timeoutSecs int) *submitter {
 	// The workload is demo.sleep for jobDuration, which is jobDurationMS unless the
 	// smoke's fault run says otherwise. max_attempts and timeout_seconds are sent
 	// rather than left to the API's defaults, so the record can say what they were.
@@ -51,7 +58,7 @@ func newSubmitterWithDuration(apiURL, apiKey, runID string, jobDuration time.Dur
 		Payload        map[string]int `json:"payload"`
 		MaxAttempts    int            `json:"max_attempts"`
 		TimeoutSeconds int            `json:"timeout_seconds"`
-	}{"default", jobType, map[string]int{"duration_ms": int(jobDuration / time.Millisecond)}, jobMaxAttempts, jobTimeoutSecs})
+	}{"default", jobType, map[string]int{"duration_ms": int(jobDuration / time.Millisecond)}, jobMaxAttempts, timeoutSecs})
 	if err != nil {
 		panic(fmt.Sprintf("marshal a constant workload: %v", err)) // cannot happen: no input
 	}
