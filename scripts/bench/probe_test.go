@@ -122,3 +122,27 @@ func TestOverThreshold_IsLeasePlusFiveSecondsOrNeverRecovered(t *testing.T) {
 	require.True(t, overThreshold(hopResult{complete: true, recovery: 35*time.Second + time.Millisecond}, lease))
 	require.True(t, overThreshold(hopResult{complete: false}, lease), "a recovery that never completed is over")
 }
+
+func TestParseArgs_NoRestartIsAProbeVariation(t *testing.T) {
+	o, err := parseArgs([]string{"recovery-probe", "--no-restart"})
+	require.NoError(t, err)
+	require.True(t, o.probe.noRestart)
+	o, err = parseArgs([]string{"recovery-probe"})
+	require.NoError(t, err)
+	require.False(t, o.probe.noRestart, "the killed worker is restarted unless asked, as the fault run does")
+}
+
+func TestParseClaims_ReadsTheRequestDurationSoTheMidpointCanBePlaced(t *testing.T) {
+	log := []byte(`{"time":"2026-10-10T10:00:01.000Z","msg":"http request","request_id":"r","method":"POST","path":"/internal/v1/claims","status":200,"duration":40000000}`)
+	claims := parseClaims(log)
+	require.Len(t, claims, 1)
+	require.Equal(t, 40*time.Millisecond, claims[0].took)
+	require.True(t, claims[0].midpoint().Equal(time.Date(2026, 10, 10, 10, 0, 0, 980_000_000, time.UTC)),
+		"the end of the request minus half its duration: %v", claims[0].midpoint())
+}
+
+func TestDescribeCapacity_NamesEachWorkerAndItsDeadBootLeases(t *testing.T) {
+	got := describeCapacity([]readdb.AtCapacity{{Worker: "probeb-123-w01", Active: 4, DeadBoots: 1, Limit: 4}}, nil)
+	require.Equal(t, "at their limit: w01 held 4 of 4 (1 on a dead boot)", got)
+	require.Contains(t, describeCapacity(nil, nil), "no worker was at its limit")
+}

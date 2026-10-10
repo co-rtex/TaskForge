@@ -201,6 +201,7 @@ recovery-probe flags
   --b-job-duration D     B's job duration              (default 50ms)
   --visibility-timeout D the queue's VisibilityTimeout (default: the broker's own)
   --poll-wait D          the workers' poll wait        (default: the profile's)
+  --no-restart           leave the killed worker dead  (default: restart it, as faults does)
   --out DIR              where the output and the logs go (default: a new temp dir)
 `
 

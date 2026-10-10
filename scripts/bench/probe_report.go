@@ -34,7 +34,8 @@ func short(id uuid.UUID) string { return id.String()[:8] }
 
 // claim is one POST /internal/v1/claims the api served, read from its log.
 type claim struct {
-	at        time.Time // the log line's time: this machine's clock, at the end of the request
+	at        time.Time     // the log line's time: this machine's clock, at the end of the request
+	took      time.Duration // the request's duration, as the api logged it
 	requestID string
 	status    int
 	jobID     string // the job it claimed, from the api's "job claimed" line; empty if none
@@ -54,6 +55,7 @@ func parseClaims(raw []byte) []claim {
 		Method    string    `json:"method"`
 		Path      string    `json:"path"`
 		Status    int       `json:"status"`
+		Duration  int64     `json:"duration"` // slog writes a time.Duration as nanoseconds
 		JobID     string    `json:"job_id"`
 	}
 	var requests []claim
@@ -67,7 +69,7 @@ func parseClaims(raw []byte) []claim {
 		}
 		switch {
 		case l.Msg == "http request" && l.Method == "POST" && l.Path == "/internal/v1/claims":
-			requests = append(requests, claim{at: l.Time, requestID: l.RequestID, status: l.Status})
+			requests = append(requests, claim{at: l.Time, took: time.Duration(l.Duration), requestID: l.RequestID, status: l.Status})
 		case l.Msg == "job claimed":
 			claimed[l.RequestID] = l.JobID
 		}
@@ -212,6 +214,10 @@ func printTrial(out io.Writer, tr trialResult, lease time.Duration) {
 			fmt.Fprintf(out, "  OVER THRESHOLD (recovery > %s)\n", lease+probeOverThresholdSlack)
 		}
 	}
+	fmt.Fprintf(out, "claims that took nothing from the kill to the last replacement: %d\n", len(tr.empty))
+	for _, e := range tr.empty {
+		fmt.Fprintf(out, "  at PostgreSQL ~%s (%s after the kill): %s\n", stamp(e.at), fmtMS(e.at.Sub(tr.killedAt)), e.capacity)
+	}
 	for _, n := range tr.notes {
 		fmt.Fprintf(out, "note: %s\n", n)
 	}
@@ -350,3 +356,28 @@ func copyLogs(src, dst string) error {
 	}
 	return nil
 }
+
+// emptyClaim is a claim that took no job, placed on PostgreSQL's clock, with the
+// logical workers that were at their limit at that instant.
+type emptyClaim struct {
+	at       time.Time
+	capacity string
+}
+
+// describeCapacity renders WorkersAtCapacity's answer.
+func describeCapacity(at []readdb.AtCapacity, err error) string {
+	if err != nil {
+		return "capacity unavailable: " + err.Error()
+	}
+	if len(at) == 0 {
+		return "no worker was at its limit (so not CAPACITY_EXHAUSTED by this reconstruction)"
+	}
+	parts := make([]string, 0, len(at))
+	for _, c := range at {
+		parts = append(parts, fmt.Sprintf("%s held %d of %d (%d on a dead boot)", c.Worker[strings.LastIndex(c.Worker, "-")+1:], c.Active, c.Limit, c.DeadBoots))
+	}
+	return "at their limit: " + strings.Join(parts, "; ")
+}
+
+// midpoint is the middle of a logged request, on this machine's clock.
+func (c claim) midpoint() time.Time { return c.at.Add(-c.took / 2) }

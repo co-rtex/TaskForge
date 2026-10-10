@@ -114,7 +114,11 @@ type probeOptions struct {
 	// keeps it. They exist for the controlled variations.
 	visibilityTimeout time.Duration
 	pollWait          time.Duration
-	outDir            string
+	// noRestart leaves the killed worker dead instead of restarting it under the
+	// same name, so no new boot of that logical worker exists while the dead
+	// boot's leases still count against its capacity.
+	noRestart bool
+	outDir    string
 }
 
 // parseProbeArgs reads the probe's flags. It takes only its own: a flag of the
@@ -141,6 +145,7 @@ func parseProbeArgs(o options, args []string) (options, error) {
 	fs.DurationVar(&po.bJob, "b-job-duration", po.bJob, "")
 	fs.DurationVar(&po.visibilityTimeout, "visibility-timeout", 0, "")
 	fs.DurationVar(&po.pollWait, "poll-wait", 0, "")
+	fs.BoolVar(&po.noRestart, "no-restart", false, "")
 	fs.StringVar(&po.outDir, "out", "", "")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
@@ -230,11 +235,28 @@ func runProbe(ctx context.Context, o options, stdout io.Writer) error {
 	} else {
 		fmt.Fprintf(out, "queue: created with the broker's default attributes, as every other mode creates it\n")
 	}
+	if po.noRestart {
+		fmt.Fprintf(out, "VARIATION: the killed worker is NOT restarted\n")
+	}
 	fmt.Fprintf(out, "fleet: %d workers x %d slots; offered rate %.0f jobs/minute (A and B)\n", o.workers, o.concurrency, o.rate)
 	fmt.Fprintf(out, "workloads: A demo.sleep %s; B demo.sleep %s; C one demo.sleep %s (timeout %ds)\n",
 		probeAJobDuration, po.bJob, probeCJobDuration, probeCJobTimeout)
 	fmt.Fprintf(out, "over threshold: recovery > lease + %s = %s\n", probeOverThresholdSlack, timings.Lease+probeOverThresholdSlack)
 	fmt.Fprintf(out, "seed %d; output and logs under %s\n\n", o.seed, po.outDir)
+
+	// A read-only pool of the probe's own, for what it reads after a trial's stack
+	// has stopped and closed the stack's pool.
+	infra, err := stack.LoadInfra()
+	if err != nil {
+		file.Close()
+		return err
+	}
+	db, err := readdb.Open(ctx, infra.DatabaseURL)
+	if err != nil {
+		file.Close()
+		return err
+	}
+	defer db.Close()
 
 	rng := rand.New(rand.NewSource(o.seed))
 	results := map[string][]trialResult{}
@@ -247,7 +269,7 @@ func runProbe(ctx context.Context, o options, stdout io.Writer) error {
 				break
 			}
 			n := len(results[c]) + misses + 1
-			tr, err := runProbeTrial(ctx, o, timings, c, n, rng.Uint64(), out)
+			tr, err := runProbeTrial(ctx, o, timings, c, n, rng.Uint64(), db, out)
 			if err != nil {
 				runErr = fmt.Errorf("condition %s trial %d: %w", c, n, err)
 				break
@@ -357,12 +379,14 @@ type trialResult struct {
 	logDir           string
 	notes            []string
 	jobDuration      time.Duration
+	empty            []emptyClaim // claims that took nothing, kill to last replacement
 	allJobsTerminal  bool
 	replacementsSeen bool
 }
 
 // runProbeTrial runs one trial of one condition on a stack of its own.
-func runProbeTrial(parent context.Context, o options, timings stack.Timings, cond string, n int, pick uint64, out io.Writer) (tr trialResult, err error) {
+func runProbeTrial(parent context.Context, o options, timings stack.Timings, cond string, n int, pick uint64,
+	db readdb.Querier, out io.Writer) (tr trialResult, err error) {
 	tr = trialResult{cond: cond, n: n}
 	trialOptions := o
 	switch cond {
@@ -482,7 +506,7 @@ func runProbeTrial(parent context.Context, o options, timings stack.Timings, con
 	if err := (realClock{}).SleepUntil(ctx, killAt); err != nil {
 		return tr, err
 	}
-	if err := fl.probeKill(ctx, pick, &tr); err != nil {
+	if err := fl.probeKill(ctx, pick, !o.probe.noRestart, &tr); err != nil {
 		return tr, err
 	}
 	if tr.missed {
@@ -551,6 +575,23 @@ func runProbeTrial(parent context.Context, o options, timings stack.Timings, con
 	}
 	claims := parseClaims(apiLog)
 	offset := tr.localKill.Sub(tr.killedAt)
+	// Every claim that took nothing between the kill and the last replacement,
+	// with the logical workers at their limit at its midpoint. The database is
+	// still reachable through the probe's own pool after the stack has stopped.
+	end := tr.killedAt
+	for _, h := range hops {
+		if h.ReplacementCreatedAt != nil && h.ReplacementCreatedAt.After(end) {
+			end = *h.ReplacementCreatedAt
+		}
+	}
+	for _, c := range claims {
+		at := c.midpoint().Add(-offset)
+		if c.jobID != "" || at.Before(tr.killedAt) || at.After(end) {
+			continue
+		}
+		capacity, capErr := readdb.WorkersAtCapacity(parent, db, st.Scope, at)
+		tr.empty = append(tr.empty, emptyClaim{at: at, capacity: describeCapacity(capacity, capErr)})
+	}
 	for _, h := range hops {
 		r := hopResult{hop: h}
 		r.segments, r.complete = h.Segments(tr.killedAt)
@@ -636,7 +677,7 @@ func waitHeld(ctx context.Context, q readdb.Querier, scope string, limit time.Du
 // reads the broker, and restarts it under the same name, as the fault run does.
 // A kill that finds no target, or whose victim turns out to hold nothing once it
 // is dead, is a miss.
-func (f *fleet) probeKill(ctx context.Context, pick uint64, tr *trialResult) error {
+func (f *fleet) probeKill(ctx context.Context, pick uint64, restart bool, tr *trialResult) error {
 	st := f.st
 	byName := map[string]*workerHandle{}
 	var live []string
@@ -678,15 +719,19 @@ func (f *fleet) probeKill(ctx context.Context, pick uint64, tr *trialResult) err
 	}
 	st.Say("Kill: SIGKILL %s (targetable attempts when chosen: %d; held when dead: %d) at PostgreSQL time %s.",
 		victim.label, held[name], tr.held, tr.killedAt.UTC().Format("15:04:05.000"))
-	fresh, err := st.StartWorkerNamed(ctx, victim.label, name, f.concurrency)
-	if err != nil {
-		return fmt.Errorf("restart: %w", err)
+	if restart {
+		fresh, err := st.StartWorkerNamed(ctx, victim.label, name, f.concurrency)
+		if err != nil {
+			return fmt.Errorf("restart: %w", err)
+		}
+		victim.replace(fresh)
+		victim.setDown(false)
+		if tr.restartedSession, err = readdb.CurrentSession(ctx, st.DB, st.Scope, name); err != nil {
+			return err
+		}
 	}
-	victim.replace(fresh)
-	victim.setDown(false)
-	if tr.restartedSession, err = readdb.CurrentSession(ctx, st.DB, st.Scope, name); err != nil {
-		return err
-	}
+	// Without a restart the victim stays marked down, so the watchdog does not read
+	// the absence as a crash.
 	if tr.held == 0 {
 		tr.missed, tr.missReason = true, "the victim held no attempt by the time it was dead"
 	}
