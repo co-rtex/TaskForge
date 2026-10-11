@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -40,9 +41,21 @@ func sqsCall(ctx context.Context, endpoint string, form url.Values) (string, err
 	return string(body), nil
 }
 
-// createQueue creates the queue named name and returns its URL.
-func createQueue(ctx context.Context, endpoint, name string) (string, error) {
-	body, err := sqsCall(ctx, endpoint, url.Values{"Action": {"CreateQueue"}, "QueueName": {name}})
+// createQueue creates the queue named name and returns its URL. attributes are
+// SQS queue attributes (VisibilityTimeout, ...); nil creates the queue with the
+// broker's defaults, which is what every program but the recovery probe does.
+func createQueue(ctx context.Context, endpoint, name string, attributes map[string]string) (string, error) {
+	form := url.Values{"Action": {"CreateQueue"}, "QueueName": {name}}
+	names := make([]string, 0, len(attributes))
+	for attribute := range attributes {
+		names = append(names, attribute)
+	}
+	sort.Strings(names)
+	for i, attribute := range names {
+		form.Set(fmt.Sprintf("Attribute.%d.Name", i+1), attribute)
+		form.Set(fmt.Sprintf("Attribute.%d.Value", i+1), attributes[attribute])
+	}
+	body, err := sqsCall(ctx, endpoint, form)
 	if err != nil {
 		return "", err
 	}
@@ -57,4 +70,26 @@ func createQueue(ctx context.Context, endpoint, name string) (string, error) {
 func deleteQueue(ctx context.Context, endpoint, queueURL string) error {
 	_, err := sqsCall(ctx, endpoint, url.Values{"Action": {"DeleteQueue"}, "QueueUrl": {queueURL}})
 	return err
+}
+
+var queueAttributePattern = regexp.MustCompile(`<Attribute>\s*<Name>([^<]+)</Name>\s*<Value>([^<]*)</Value>\s*</Attribute>`)
+
+// queueAttributes returns every attribute GetQueueAttributes reports for a queue:
+// among them ApproximateNumberOfMessages (visible), ApproximateNumberOfMessagesNotVisible
+// (received and neither deleted nor returned yet) and VisibilityTimeout.
+func queueAttributes(ctx context.Context, endpoint, queueURL string) (map[string]string, error) {
+	body, err := sqsCall(ctx, endpoint, url.Values{
+		"Action": {"GetQueueAttributes"}, "QueueUrl": {queueURL}, "AttributeName.1": {"All"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, match := range queueAttributePattern.FindAllStringSubmatch(body, -1) {
+		out[match[1]] = match[2]
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("GetQueueAttributes returned no attributes: %s", body)
+	}
+	return out, nil
 }

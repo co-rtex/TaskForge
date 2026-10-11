@@ -63,11 +63,22 @@ type fleet struct {
 // and a pair of keys in a scope of this run's own) and then the workers. Nothing
 // it starts outlives close.
 func startFleet(ctx context.Context, o options, out io.Writer) (*fleet, error) {
+	return startFleetWith(ctx, o, out, nil)
+}
+
+// startFleetWith is startFleet with a hook that may change the stack's options
+// before anything starts. Only the recovery probe passes one (to set the queue's
+// visibility timeout or the workers' poll wait); nil is startFleet exactly.
+func startFleetWith(ctx context.Context, o options, out io.Writer, adjust func(*stack.Options)) (*fleet, error) {
 	timing, err := o.timings()
 	if err != nil {
 		return nil, err
 	}
-	st, err := stack.New(stack.Options{Out: out, Prefix: "bench", Timing: timing})
+	stackOptions := stack.Options{Out: out, Prefix: "bench", Timing: timing}
+	if adjust != nil {
+		adjust(&stackOptions)
+	}
+	st, err := stack.New(stackOptions)
 	if err != nil {
 		return nil, err
 	}

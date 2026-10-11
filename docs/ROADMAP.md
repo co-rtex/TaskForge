@@ -619,7 +619,8 @@ reduced.
 **Order: M8B, then M8D1, then M8D2, then M8D3, then M8C.** M8C keeps its name.
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
-complete; see PR #23. M8D2 is complete; see PR #24. M8D3 and M8C are planned.
+complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8C is
+planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -750,15 +751,24 @@ recorded run's workload, victim selection, rules or record format, to
 against a median of 32.02 s, when the shipped lease is 30 s.
 **Deliverables.** A reproduction of the outlier, with a kill timed after submission
 ends on an otherwise idle system, under the benchmark harness or in an integration
-test; and then one of two outcomes. Either the outlier is **explained with evidence**,
-a mechanism that the reproduction shows and that accounts for the extra time; or a
-**defect is found, and the work stops and reports it without fixing it**, because a
-fix to recovery is a change to the control plane and is the owner's decision.
-**Acceptance.** The report names which of the two it is, shows the reproduction, and,
+test; and then one of three outcomes, which the owner fixed when M8D3 began. Either the
+outlier is **explained with evidence**, a mechanism that the reproduction shows and that
+puts the extra time in a named segment of the recovery; or a **defect is found, and the
+work stops and reports it without fixing it**, because a fix to recovery is a change to
+the control plane and is the owner's decision; or it is **not reproduced**: the planned
+trials (10 loaded, 20 at the tail, 10 idle) ran with no recovery above the lease plus
+5 s, and the report records the trial count, the 95% upper bound on the rate (about 3/N
+for N clean trials) and the per-segment distributions, and leaves the outlier listed as
+unexplained.
+**Acceptance.** The report names which of the three it is, shows the reproduction, and,
 for an explanation, shows the evidence that the mechanism and not chance produced the
-figure.
+figure: a controlled variation of a harness setting that moves or removes the excess as
+the mechanism predicts.
 **Depends on.** M8D2.
-**Status:** planned.
+**Status:** complete; see PR #25 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited. The outcome is **explained**
+([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)), and the
+owner accepted the behavior as intended on 2026-10-10: no control-plane change follows.
 
 #### M8C — Deployment
 **Objective.** Make deployment credible without applying it.

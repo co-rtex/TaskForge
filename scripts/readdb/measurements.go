@@ -174,6 +174,13 @@ func Occupancy(ctx context.Context, q Querier, scope string) (map[string]int, er
 // the one every other instant in the harness is read from, and not this machine's:
 // started_at is PostgreSQL's now() when the worker reported the start.
 //
+// Only the worker's current session counts: the newest worker_sessions row for that
+// worker by registered_at, with the id as the tie-break, which is exactly the
+// session CurrentSession returns and so the process a kill ends. A worker the
+// harness killed and restarted keeps its name, and the dead boot's attempts stay
+// LEASED or RUNNING until their leases expire; counting them would aim a kill at a
+// running process that holds none of them.
+//
 // It exists for the smoke. Occupancy counts an attempt that is 50 ms from
 // finishing exactly like one that has just begun, so a kill aimed at the worker
 // holding it can find nothing left to abandon by the time the signal is sent.
@@ -197,6 +204,13 @@ func targetableAttempts(ctx context.Context, q Querier, scope string, duration, 
 		FROM job_attempts a
 		JOIN workers w ON w.id = a.worker_id AND w.scope = a.scope
 		WHERE a.scope = $1
+		  -- The current session, read the way CurrentSession reads it.
+		  AND a.worker_session_id = (
+		      SELECT s.id
+		      FROM worker_sessions s
+		      WHERE s.worker_id = w.id AND s.scope = w.scope
+		      ORDER BY s.registered_at DESC, s.id DESC
+		      LIMIT 1)
 		  AND (a.status = 'LEASED'
 		       OR (a.status = 'RUNNING'
 		           AND a.started_at >= COALESCE($4::timestamptz, clock_timestamp())

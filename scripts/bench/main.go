@@ -5,6 +5,7 @@
 //
 //	go run ./scripts/bench throughput faults --record     # make bench
 //	go run ./scripts/bench smoke                          # make bench-smoke
+//	go run ./scripts/bench recovery-probe                 # M8D3; no Make target
 //
 // The definitions, and why each was chosen, are in
 // docs/adr/0020-benchmark-methodology.md. Briefly: every measured instant is
@@ -66,6 +67,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if o.modes[0] == modeProbe {
+		if err := RequireQuietHost(listProcesses); err != nil {
+			fmt.Fprintf(stderr, "bench: %v\n", err)
+			return exitFailed
+		}
+		err := runProbe(ctx, o, stdout)
+		return finish(ctx, err, stderr)
+	}
 
 	if o.modes[0] == modeSmoke {
 		if err := RequireQuietHost(listProcesses); err != nil {

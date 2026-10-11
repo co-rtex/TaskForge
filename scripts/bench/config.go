@@ -16,6 +16,9 @@ const (
 	modeThroughput = "throughput"
 	modeFaults     = "faults"
 	modeSmoke      = "smoke"
+	// modeProbe is M8D3's investigation of a slow worker-failure recovery. It
+	// measures no target, is never recorded, and has no Make target; see probe.go.
+	modeProbe = "recovery-probe"
 
 	profileShipped = "shipped"
 	profileTuned   = "tuned"
@@ -106,6 +109,8 @@ type options struct {
 	// there is none; see killOne. It is off for a recorded run, whose victim
 	// selection is fixed, and on only for the smoke.
 	targetableKills bool
+	// probe is the recovery probe's own settings, and nil for every other mode.
+	probe *probeOptions
 }
 
 func defaultOptions() options {
@@ -165,6 +170,11 @@ modes
   faults       submit 10,000 jobs while workers are SIGKILLed on a seeded schedule
   smoke        a short run of both that asserts the harness measured validly and
                records nothing (make bench-smoke; the CI check)
+  recovery-probe
+               M8D3's investigation: kills one worker per trial, on a fresh stack
+               each time, and splits each recovery into the segments PostgreSQL
+               records. Never recorded, no Make target; runs by itself and takes
+               only the flags listed under it below.
 
   A full run is "throughput faults --record" (make bench): it writes
   docs/benchmarks/<date>-<sha>.md and .json. Refuses on a dirty tree.
@@ -180,6 +190,19 @@ flags
   --window D             steady window                  (at least 5m when recording)
   --jobs N               jobs in the fault run          (fixed at 10000 when recording)
   --kills N              workers killed in the fault run (at least 20 when recording)
+
+recovery-probe flags
+  --profile shipped|tuned  timing profile (default shipped)
+  --seed N               seed of the victim draws (default 20261002)
+  --conditions LIST      which conditions, of A,B,C (default A,B,C)
+  --trials-a N           trials of A, loaded           (default 10)
+  --trials-b N           trials of B, tail             (default 20)
+  --trials-c N           trials of C, idle             (default 10)
+  --b-job-duration D     B's job duration              (default 50ms)
+  --visibility-timeout D the queue's VisibilityTimeout (default: the broker's own)
+  --poll-wait D          the workers' poll wait        (default: the profile's)
+  --no-restart           leave the killed worker dead  (default: restart it, as faults does)
+  --out DIR              where the output and the logs go (default: a new temp dir)
 `
 
 // parseArgs reads the modes, which come first, and then the flags.
@@ -189,6 +212,10 @@ func parseArgs(args []string) (options, error) {
 	for i < len(args) && !strings.HasPrefix(args[i], "-") {
 		o.modes = append(o.modes, args[i])
 		i++
+	}
+
+	if slices.Contains(o.modes, modeProbe) {
+		return parseProbeArgs(o, args[i:])
 	}
 
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
@@ -211,7 +238,7 @@ func parseArgs(args []string) (options, error) {
 	}
 
 	if len(o.modes) == 0 {
-		return options{}, errors.New("name a mode: throughput, faults or smoke")
+		return options{}, errors.New("name a mode: throughput, faults, smoke or recovery-probe")
 	}
 	seen := map[string]bool{}
 	for _, m := range o.modes {
@@ -248,6 +275,11 @@ func parseArgs(args []string) (options, error) {
 func (o options) validateRecordable() error {
 	var problems []string
 	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
+
+	if slices.Contains(o.modes, modeProbe) {
+		add("recovery-probe is an investigation and is never recorded: it measures where a recovery's time goes, " +
+			"not a target, and it may run with settings ADR-0020 does not allow")
+	}
 
 	modes := slices.Clone(o.modes)
 	slices.Sort(modes)
