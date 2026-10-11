@@ -1,7 +1,7 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8D2. Each milestone's line
+planned. It records the implemented state through M8D3. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -11,7 +11,7 @@ the measured benchmarks, M8B, the supply chain (container images and scanning), 
 the route registry, M8D2, the verification-matrix drift check with the bench-smoke
 flake and three items from the M8A review, M8D3, the investigation of the 50.04 s
 recovery outlier, and M8C, deployment, in the order M8B, M8D1, M8D2, M8D3, M8C; M8A,
-M8B, M8D1 and M8D2 are complete and the other two are planned.
+M8B, M8D1, M8D2 and M8D3 are complete and M8C is planned.
 
 ## Milestone status
 
@@ -65,8 +65,15 @@ M8B, M8D1 and M8D2 are complete and the other two are planned.
   kill can no longer land on an attempt about to finish; the benchmark renderer ends a
   record in one newline; the run-time estimate is the measured one; ADR-0023 derives the
   throughput tolerance; and a route whose first path segment is a wildcard is refused.
-  Recorded benchmark runs are untouched. See "M8D2" below. M8D3 (the 50.04 s recovery
-  outlier) and M8C (deployment) are planned.
+  Recorded benchmark runs are untouched. See "M8D2" below.
+- **M8D3 — the 50.04 s recovery outlier:** complete; see PR #25. **Explained:** a killed
+  worker's restarted boot, still charged for its dead boot's lease, gets
+  `CAPACITY_EXHAUSTED` and leaves a notification unacknowledged for the 30 s visibility
+  timeout, and at the tail the recovery notification claims the job that message left
+  stranded ([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)).
+  The kill targeting counts only a worker's current session, and `go run ./scripts/bench
+  recovery-probe` splits a recovery into the segments PostgreSQL records. No production
+  code changed. See "M8D3" below. M8C (deployment) is planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into five, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -2578,12 +2585,14 @@ numbers can be trusted.
   pace with the offered load; headroom not measured"
   ([ADR-0023](adr/0023-the-throughput-tolerance-derived-from-the-headline-record.md));
   the coded 1% is looser than that bound and was not changed.
-- **The 50.04 s recovery has not been explained.** Fourteen of the sixteen
-  recovered attempts took 31.96 to 33.98 s, which is the 30 s lease plus the 2 s
-  reconciler scan plus the outbox poll. The last kill's two attempts took 50.04 s
-  each, and the tuned run had no such outlier. A guess is a notification handed to
-  the killed worker's open long poll and redelivered later; it was not
-  investigated, and it is not asserted.
+- **The 50.04 s recovery is explained by M8D3** (see "M8D3" below and
+  [ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)).
+  Fourteen of the sixteen recovered attempts took 31.96 to 33.98 s, which is the 30 s
+  lease plus the 2 s reconciler scan plus the outbox poll. The last kill's two
+  attempts took 50.04 s each: its lease expired after the last submission, and the
+  recovered job waited for a notification the restarted worker had left
+  unacknowledged at `CAPACITY_EXHAUSTED`, held for the 30 s visibility timeout. The
+  tuned run's last kill recovered before its last submission, so it could not show it.
 - **Eleven of the headline run's 24 kills hit nothing.** Each chose a worker that
   held an attempt, but a 50 ms attempt can finish between the choice and the
   signal, so recovery is measured on 16 attempts, not 24.
@@ -3439,6 +3448,256 @@ None for a user. A contributor who adds a route whose first path segment is a wi
 gets a startup panic naming it; a contributor who cites a non-assertion line in
 `docs/VERIFICATION_MATRIX.md` now gets a test failure naming the reason.
 
+## M8D3 — the 50.04 s recovery outlier
+
+M8D3 is the third slice of M8D ([ROADMAP.md](ROADMAP.md)): reproduce the headline run's
+50.04 s worker-failure recovery and name it as explained, a defect, or not reproduced.
+**Outcome: EXPLAINED.** The extra time is in S5, broker delivery and the claim, and it is
+three documented decisions acting together at the tail of a run
+([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)). No
+production code changed. This section keeps three things apart: what it adds, what
+evidence exists, and what is still limited.
+
+**What changed:** `scripts/readdb`, `scripts/bench`, `scripts/internal/stack` (developer
+tooling `make build` does not build), two integration test files, and docs. Nothing under
+`cmd/` or `internal/`, no migration, no API or OpenAPI change;
+`internal/api/testdata/route_behavior.golden` and both committed benchmark records are
+byte-identical to `main`.
+
+### Behavior
+
+**The targeting fix.** `readdb.TargetableAttempts` counted attempts by worker name, so a
+worker the harness had killed and restarted still counted its dead boot's LEASED and
+RUNNING attempts until their leases expired, and a kill could be aimed at a running
+process that held none of them. It now counts only attempts of the worker's current
+session: the newest `worker_sessions` row by `registered_at`, with the id as the
+tie-break, as `CurrentSession` reads it, in the same SQL statement. `make bench-smoke` is
+otherwise unchanged; recorded runs never call it.
+
+**The recovery probe**, `go run ./scripts/bench recovery-probe`. It kills one worker per
+trial, each trial on a stack of its own (a new run id, so a new key scope, a new broker
+queue, and new api, outbox, scheduler, reconciler and worker processes), under three
+conditions on the real binaries and the shipped profile: **A**, loaded, 50 ms jobs at
+1,000 a minute with the kill 20 s in and recovery while load continues; **B**, tail, 50 ms
+jobs (the targeted kill hit at 50 ms, so the recorded workload is kept) for 45 s with the
+kill 21 s before the last submission, as kill 23 was; **C**, idle, one 40 s
+`demo.sleep` job (timeout 300 s) killed 3 s into its run. Trials default to A=10, B=20,
+C=10. For each abandoned attempt it prints S1..S5
+(`readdb.RecoveryTimeline` and `Segments`), checks that they sum to `Recoveries`' figure,
+reads the run queue's `ApproximateNumberOfMessages` and `…NotVisible` at the kill and
+within a poll of each recovery event's publish, says which outbox event's notification
+claimed the replacement and what the recovery event's own claim took, and lists every
+claim that took nothing with the logical workers at their limit during it
+(`readdb.WorkersAtCapacityDuring`). Its output goes to a file under `--out` (a temp
+directory by default) with each trial's logs. It is never recorded (`--record` is a usage
+error, exit 2, and `validateRecordable` refuses the mode), has no Make target, refuses a
+trial while another scope holds non-terminal jobs or unpublished events (the reconciler,
+outbox and scheduler scan every scope), and takes three controlled variations:
+`--visibility-timeout`, `--poll-wait` and `--no-restart`.
+
+**How the recovery event is found.** The schema links an outbox event to its job, not to
+the attempt whose abandonment wrote it. The recovery event is the job's `work.available`
+event with `expires_at <= created_at <= released_at`: the reconciler's scan sees the
+lease expired before its transaction begins, and `released_at` is a `clock_timestamp()`
+sampled inside that transaction after its row locks. Two events in that window is an
+error, never a choice. The two instants are not equal, so S3 is a few milliseconds below
+zero, and S5 can be too, because `published_at` is stamped after `SendMessage` returns.
+
+### Evidence
+
+**The mechanism**, shown in every over-threshold trial on the shipped settings:
+
+1. The killed worker is restarted under the same name. Its dead boot's active lease still
+   counts against the logical worker (ADR-0006), but the new boot polls with all four
+   slots. About 13 to 15 s after the kill a burst of notifications reaches it while it is
+   at its limit, and a claim is `CAPACITY_EXHAUSTED`, which is not safe to acknowledge
+   (ADR-0003 step 5): the broker keeps that message invisible for 30 s.
+2. A claim takes the oldest eligible job, not the job its notification names. While load
+   continues, the held message's job is claimed by a later notification and the shortfall
+   moves to the newest job; when submission ends one job is left with no live message.
+3. When the killed worker's lease is reconciled (about kill + 33 s), the recovery
+   notification's claim takes that stranded job, and the recovered job is claimed only
+   when the held message returns: at the hold's start plus the visibility timeout.
+
+**Series 3, the planned N**, run hands-off on `1208cc2`'s probe binary, 2026-10-10
+23:38–00:27 UTC, on AC power with Low Power Mode off and a power guard that would have
+stopped the run on battery (it did not fire), against a fresh database
+`taskforge_m8d3_probe2`. Every identity S1+..+S5 = recovery held (44 of 44).
+
+| Condition | Trials | Hops | Segment | min | median | max |
+| --- | --- | --- | --- | --- | --- | --- |
+| A, loaded | 10 | 11 | S1 / S2 / S3 / S4 / S5 | 29985 / 1975 / -63 / 961 / 3 ms | 29989 / 2019 / -35 / 1002 / 13 ms | 29998 / 2059 / -14 / 1029 / 77 ms |
+| | | | recovery | 32971 ms | 32994 ms | 33061 ms |
+| B, tail | 20 | 23 | S1 / S2 / S3 / S4 / S5 | 29922 / 32 / -30 / 947 / 1 ms | 29989 / 2001 / -19 / 1005 / 9952 ms | 29996 / 2041 / -1 / 1116 / 12103 ms |
+| | | | recovery | 31679 ms | 43039 ms | 45051 ms |
+| C, idle | 10 | 10 | S1 / S2 / S3 / S4 / S5 | 26942 / 1925 / -23 / 126 / 5 ms | 26962 / 1983 / -19 / 1033 / 10 ms | 26979 / 2010 / -15 / 1081 / 31 ms |
+| | | | recovery | 29024 ms | 29972 ms | 30061 ms |
+
+No A or C recovery exceeded lease + 5 s (35 s). **Twelve of the twenty B trials did**,
+one hop each, every one with its excess in S5 (9.9 to 12.1 s), every replacement claimed
+by another job's notification published 30.017 to 30.060 s before it, and every recovery
+event's own claim taking another job:
+
+| B trial | Recovery | S5 | Held message published before the claim | The hold began (recovery − 30 s) | Restarted victim at its limit during a claim that took nothing |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 43.100 s | 12.103 s | 30.060 s | kill + 13.10 s | w10, 4 of 4 (1 on the dead boot), claim ended + 13.110 s |
+| 2 | 43.060 s | 10.069 s | 30.035 s | kill + 13.06 s | w09, 4 of 4 (1), + 13.097 s |
+| 4 | 45.033 s | 12.070 s | 30.034 s | kill + 15.03 s | w01, 4 of 4 (2), + 15.067 s |
+| 5 | 43.620 s | 12.073 s | 30.035 s | kill + 13.62 s | w10, 4 of 4 (2), + 13.647 s |
+| 10 | 43.039 s | 9.952 s | 30.033 s | kill + 13.04 s | w12, 4 of 4 (1), + 13.101 s |
+| 11 | 43.061 s | 10.078 s | 30.034 s | kill + 13.06 s | w01, 4 of 4 (1), + 13.092 s |
+| 12 | 43.088 s | 10.107 s | 30.017 s | kill + 13.09 s | w05, 4 of 4 (1), + 13.193 s |
+| 13 | 43.045 s | 10.065 s | 30.035 s | kill + 13.05 s | w10, 4 of 4 (2), + 13.053 s |
+| 16 | 43.049 s | 10.034 s | 30.042 s | kill + 13.05 s | w02, 4 of 4 (1), + 13.054 s |
+| 18 | 43.065 s | 10.079 s | 30.031 s | kill + 13.07 s | w05, 4 of 4 (1), + 13.099 s |
+| 19 | 45.051 s | 12.084 s | 30.027 s | kill + 15.05 s | w01, 4 of 4 (1), + 15.078 s |
+| 20 | 45.044 s | 12.068 s | 30.021 s | kill + 15.04 s | w09, 4 of 4 (2), + 15.089 s |
+
+A positive dead-boot count can only be the victim, the one worker with a dead boot. In
+all twelve, a claim that took nothing ended within 0.15 s of the instant the hold began,
+while the restarted victim was at its limit.
+
+**The hypotheses, settled:**
+
+- **H-S2, the reconciler: against.** S2 never exceeded 2.06 s in A, 2.04 s in B or 2.01 s
+  in C, the 2 s reconciler poll, and no excess was in S2.
+- **H-S4, a publish failure and backoff: against.** Every recovery event was published on
+  its first attempt (`attempts` 1, no `last_error`) in every trial, and S4 never exceeded
+  1.12 s, the 1 s outbox poll.
+- **H-S5a, a receive that never claimed and waited out the visibility timeout: for**, in
+  the form above. The broker read 15 to 42 ms after each slow hop's recovery event was
+  published showed no visible message and one in flight (two in B5, which had two held
+  messages); the replacement was claimed by a message whose publish
+  preceded it by the visibility timeout (30.02–30.06 s, and 45.03–45.07 s when it was 45);
+  the api log shows a claim that took nothing at the hold's start; and the reconstruction
+  shows the restarted victim at its limit then. A second, smaller source exists too:
+  messages the victim had received, or its open long polls received, when it died, which
+  come back at kill + the visibility timeout. With the shipped 30 s that is before the
+  recovery event, so they cost nothing; they produced two of the 45 s variation's excesses
+  (below).
+- **H-S5b, delivery held by idle long polls: against.** With a 2 s poll wait the excess
+  stayed (below). S5 near 10 s in the shipped series is the hold (about kill + 13 s) plus
+  30 s minus the recovery's publish (about kill + 33 s), not the 10 s poll wait.
+- **H-other, a stall:** see the first series below; it produced congestion, not a
+  different mechanism.
+
+**Controlled variations**, condition B, 8 trials each, on the same binary and power, the
+same night:
+
+| Variation | Mechanism predicts | Trials over 35 s | Recoveries | Held messages |
+| --- | --- | --- | --- | --- |
+| Shipped (series 3) | — | 12 of 20 | 31.7–45.1 s, median 43.0 s | 30.02–30.06 s |
+| `--visibility-timeout 45s` | the hold is 45 s and the excess grows by 15 s | 7 of 8 | 45.0–65.1 s, median 58.0 s | **45.03–45.07 s** |
+| `--visibility-timeout 15s` | the held message is back before the recovery event; the excess (mostly) goes | **0 of 8** | 31.0–34.0 s | 15.02 s, once, 1.06 s after the publish |
+| `--poll-wait 2s` | no change (against H-S5b) | 8 of 8 | 35.1–51.8 s, median 44.0 s | 30.03–32.54 s |
+| `--no-restart` | no restarted boot to be at its limit; the excess goes | **0 of 8** | 32.96–33.05 s | 30.04 s, once, harmless (held at the kill) |
+
+Every over-threshold trial of every run was matched against its hold
+(`recovery − visibility timeout`) and the claims that took nothing: series 3, 12 of 12
+were `CAPACITY_EXHAUSTED` at the restarted victim; the 45 s variation, 5 of 7, and the
+other 2 (recoveries 45.04 and 46.04 s) were holds that began at the kill itself; the 2 s
+poll-wait variation, 7 of 8, and the eighth (trial 7, 51.79 s) was in a trial whose claims
+took up to 1.7 s, where the victim was at its limit 2.5 s before the computed instant, so
+it is reported unmatched rather than stretched to fit.
+
+**The original record fits it.** Kill 23 abandoned two attempts and both took 50.04 s: a
+hold that began about 20 s after the kill, near the end of submission (599.96 s against a
+kill at 578.9 s), which is the restarted boot's `CAPACITY_EXHAUSTED`; a hold at the kill
+would have given about 30 s. The probe reproduced 49.9 to 51.5 s in the first series
+(below). The original database is gone, so this is a match of mechanism and arithmetic,
+not a reading of the original rows.
+
+**The first series**, run earlier the same night on `7ed4108`'s probe, also on AC power,
+also completed the planned N, and is reported rather than discarded. A: 12 hops, 31.5–33.9
+s. C: 10 hops, 28.5–30.0 s. B: 15 of 20 trials over threshold (19 hops, 43.0–51.5 s,
+median 43.1 s), every excess in S5 and every replacement claimed by a message held 30.02–30.47
+s; trial 5's two hops took 49.91 and 50.84 s and trial 9's one took 50.05 s. **It was
+perturbed by my own work:** I compiled and vetted code while it ran, and eight trials (A7,
+B5, B6, B8, B9, B10, B13, B20) show claims slower than 500 ms at the 99th percentile, B20
+up to 4.7 s. Eleven of its fifteen over-threshold trials match the mechanism as above; the
+other four (B6, B8, B13, B20) are all among the congested ones and are unmatched within the
+0.15 s tolerance. Series 3 was run to have the planned N without that. A second attempt in
+between, also on AC, aborted at B trial 13 when the machine switched to battery
+(20:21:45 UTC): a worker's session was fenced by the pause, and the harness's watchdog
+stopped the trial. Nothing timed ran on battery.
+
+**Q3: a regression test.** `tests/integration/recovery_outlier_test.go` drives the real
+store step by step, with no clock: a restarted boot at its limit gets `CAPACITY_EXHAUSTED`,
+not safe to acknowledge; after reconciliation the recovery notification's claim takes the
+older job whose message is held; the held message then claims the recovered job; and
+`readdb.RecoveryTimeline` reads that story back. Two mutations of the mechanism, each
+applied, failed and reverted: counting capacity by process session instead of logical
+worker (`CAPACITY_EXHAUSTED` expected, `CLAIMED` actual), and making `CAPACITY_EXHAUSTED`
+safe to acknowledge ("Should be false"). The behavior is intended, so the test pins it
+rather than a fix; ADR-0024 records the finding and replaces ADR-0020's recovery
+limitation.
+
+**Mutations of the new code**, each shown by its diff, run, reverted, and confirmed with a
+clean `git status`:
+
+| Mutation | Caught by | What it said |
+| --- | --- | --- |
+| 1. targeting without the current-session condition | `TestBenchQueries_TargetableAttempts` | two subtests failed: the restarted worker counted 2, not 1; the tie counted 3, not 1 |
+| 2. the timeline picks the job's earliest `work.available` event | `TestBenchQueries_RecoveryTimeline`, and the regression test | the event id was the submission event's, not the recovery event's |
+| 3. `recovery-probe --record` | the entry point | "recovery-probe is an investigation and is never recorded", exit 2 |
+| 4a. capacity counted by session | `TestRecoveryOutlier_…` | `CAPACITY_EXHAUSTED` expected, `CLAIMED` actual |
+| 4b. `CAPACITY_EXHAUSTED` safe to acknowledge | `TestRecoveryOutlier_…` | "Should be false" |
+
+**Outputs**, under the session's scratch directory, never committed
+(`/private/tmp/claude-501/…/scratchpad/`): `series3/recovery-probe.txt` sha256
+`25ed77c63bfa816e49c195bd1fc5d82e54133714826aaeed1600c88795c6766a`;
+`var3-vt45` `60ad7f0d89857680d90024825ac4ca3a080c07aab9e977c219a87601016eb8ea`;
+`var3-vt15` `378ececcd0a289aa7793a7affb03982414e1b36eb9528b78796b5398469ba5ec`;
+`var3-poll2` `f514bb258b2332abc4cb1ab0a2d3797a6c250d174cd2dfb6ac1391de1f75b949`;
+`var3-norestart` `c455b4b05edb48d0be56a938da1c8ad7dcb843861618d151bde55f7a5a6f9a43`;
+the first series, `series-main/recovery-probe.txt`,
+`498ed5d8462dcb8134c9d6c8744e40d5e2d2c1108001db2bf1e29f3f19fa4478`. Each trial's logs are
+beside its output.
+
+### Limitations
+
+- **ElasticMQ is not SQS.** The visibility timeout and the long-poll behavior are
+  ElasticMQ's; SQS's are documented to be the same in kind, but nothing here measured SQS.
+- **The probe is a reproduction attempt, not the original run.** It runs 45 s of load per
+  B trial, not ten minutes, on one machine, one night.
+- **The original database is gone**, so kill 23 is matched by mechanism and arithmetic, not
+  by its own rows.
+- **S5 cannot be split by the database.** Nothing records when the broker delivered a
+  message or what a claim's disposition was. The probe infers both: the held message from
+  its publish time and the replacement's claim, the disposition from the api log (a claim
+  with no "job claimed" line) and from leases reconstructed over the claim's span. The
+  reconstruction is not a record of the claim's decision.
+- **The trials were analysed with a later tool than the one that ran them.** Series 3 and
+  the variations ran on `1208cc2`'s probe, whose capacity check sampled each claim's
+  midpoint and whose summary judged a slow segment against the condition's other hops; both
+  were wrong when most hops were slow, and `8fb001c` fixed them (the claim's whole span; a
+  nominal value per segment). The measurements are unchanged; the matching above used
+  `8fb001c`'s `WorkersAtCapacityDuring`, through a throwaway program over the saved logs and
+  the probe databases, not committed.
+- **Four B trials had no abandoned attempt.** In series 3's B14, the 45 s variation's trial
+  1 and the 15 s variation's trials 5 and 6, the killed worker's attempts had started, and
+  their persisted deadline (the harness submits `timeout_seconds` 30, the lease's length)
+  had passed by the time the reconciler reached the lapsed lease, so the documented
+  precedence made them `TIMED_OUT`, not `ABANDONED`. They contribute no hop. **The same
+  applies to the recorded runs:** `Recoveries` counts only abandoned attempts, so some of
+  the headline run's "eleven of 24 kills hit nothing" may have hit a running attempt that
+  timed out instead. That is a gap in the benchmark's recovery measurement, not in M8D3's
+  scope, and it is not fixed here.
+- **The probe ran against databases of its own**, `taskforge_m8d3_probe` and
+  `taskforge_m8d3_probe2`, created on the local server and left in place, because the
+  integration tests leave non-terminal rows in the shared database that the trial's
+  services would act on. The original run used the shared one.
+- **Whether a recovery that can wait one extra visibility timeout at the tail is
+  acceptable is the owner's decision**, and so is whether to change any of the three
+  decisions behind it (ADR-0024 lists the obvious candidates). Nothing was fixed.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
+  own CI result: the pull request's checks are the record.
+
+### Breaking change
+
+None. `make bench-smoke` aims its kill only at the current session's attempts, which is
+what it was meant to do.
+
 ## Verification
 
 ### M5A gates
@@ -4020,6 +4279,29 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8D3 gates
+
+Run locally on the branch, 2026-10-11, on **`7db1b21`**, the last commit before this
+documentation (everything after it changes `docs/` only), with no other TaskForge process
+running. PostgreSQL 16, ElasticMQ and the object store from `make up`, host Go 1.27.0.
+**Every timed run on AC power with Low Power Mode off**, checked with `pmset -g batt`
+before each; the lid open. The probe series are under "M8D3" above.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no diff (0 lines) |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 26 packages `ok`. New, by name: `TestRun_TheRecoveryProbeIsNeverRecorded`, `TestValidateRecordable_RefusesTheProbeWhateverElseIsTrue`, `TestParseArgs_TheProbesDefaultsAndFlags`, `TestParseArgs_TheProbeRefusesWhatItCannotDo`, `TestParseArgs_NoRestartIsAProbeVariation`, `TestBKillAt_PlacesTheKillAsKill23WasPlaced`, `TestParseClaims_ACountsOnlyClaimRequestsAndJoinsWhatTheyTook`, `TestParseClaims_ReadsTheRequestDuration`, `TestExcessSegment_NamesTheSegmentFurthestAboveItsNominalValue`, `TestOverThreshold_IsLeasePlusFiveSecondsOrNeverRecovered`, `TestDescribeCapacity_NamesEachWorkerAndItsDeadBootLeases` |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  101.963s`. New: `TestBenchQueries_RecoveryTimeline`, `TestBenchQueries_HeldBySessionAndForeignActivity`, `TestBenchQueries_WorkersAtCapacityDuringCountsADeadBootsLeases`, `TestRecoveryOutlier_ARestartedWorkersCapacityHoldsANotificationAndTheRecoveryClaimsAnOlderJob`; extended: `TestBenchQueries_TargetableAttempts` (two subtests) |
+| `make test-race` | PASS: 27 packages `ok` under `-race`; `ok  …/tests/integration  96.857s`; no `DATA RACE` |
+| `GOTOOLCHAIN=go1.25.14 go test ./scripts/... ./tests/verification ./internal/api` | PASS: every package `ok` (`scripts/readdb` has no test files of its own; its queries are tested in `tests/integration`) |
+| `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)` |
+| `make bench-smoke`, three runs | PASS ×3, each `14 of 14 checks met`; the aimed kill's victim held 3, 3 and 2 attempts with time left |
+| `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, labelled with revision `7db1b21`; run normally, without a `DOCKER_CONFIG` workaround |
+| `make scan` | recorded in the pull request, not here: it runs in a fresh clone of the pushed final head, which includes this documentation commit |
+| `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test`, `make demo-failure`, `docker compose config --quiet` | NOT RUN: nothing they cover changed |
 
 ### M8D2 gates
 
@@ -5112,16 +5394,12 @@ two targets belong in its version.
 
 ## Next objective
 
-M8D3: investigate the 50.04 s worker-failure recovery outlier. See
-[ROADMAP.md](ROADMAP.md)'s M8D3 entry. It is not started. It is a reproduction, under
-the benchmark harness or in an integration test, with a kill timed after submission
-ends on an otherwise idle system, and then either an explanation backed by evidence or,
-if a defect is found, a stop and a report without a fix. M8C (deployment) follows it and
+M8C: deployment. See [ROADMAP.md](ROADMAP.md)'s M8C entry. It is not started, and it
 **needs its own owner decision before any work starts**: the non-loopback bind, which
 M6E's note says has to be revisited together with the Host rule; protection of
 `/internal`; and the decision ADR-0019 leaves, whether to gate the demonstration
-handlers in a deployed worker. Every M7 scenario can also be watched from the
-dashboard.
+handlers in a deployed worker. The infrastructure also costs money. Every M7 scenario can
+also be watched from the dashboard.
 
 Open, and not any milestone's deliverable: whether the shipped lease and outbox
 interval should change is a question the two M8A records answer only as numbers, not

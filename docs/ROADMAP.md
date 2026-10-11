@@ -619,7 +619,8 @@ reduced.
 **Order: M8B, then M8D1, then M8D2, then M8D3, then M8C.** M8C keeps its name.
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
-complete; see PR #23. M8D2 is complete; see PR #24. M8D3 and M8C are planned.
+complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8C is
+planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -764,7 +765,9 @@ for an explanation, shows the evidence that the mechanism and not chance produce
 figure: a controlled variation of a harness setting that moves or removes the excess as
 the mechanism predicts.
 **Depends on.** M8D2.
-**Status:** planned.
+**Status:** complete; see PR #25 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence and for what remains limited. The outcome is **explained**
+([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)).
 
 #### M8C — Deployment
 **Objective.** Make deployment credible without applying it.
