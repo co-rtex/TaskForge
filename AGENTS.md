@@ -124,6 +124,8 @@ harness measured validly and records nothing; it is the only part CI runs, and C
 never records numbers. The definitions are in
 [ADR-0020](docs/adr/0020-benchmark-methodology.md).
 
+`go run ./scripts/bench recovery-probe` is M8D3's non-recording investigation tool (no Make target, `--record` refused; the planned 10/20/10 trials take about 50 minutes).
+
 `make images` builds `internal/dashboard/dist` first (the api embeds it; a clean
 clone has only a placeholder) and then one image per service from the root
 `Dockerfile`, each labelled with the commit. `make images-smoke` runs

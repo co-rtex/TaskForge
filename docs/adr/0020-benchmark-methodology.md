@@ -8,7 +8,11 @@
   figures, and the one saying the shortfall "is judged against the rate that was
   actually offered", which the code does not do (it floors measured and offered at
   990 each). The 1%, the Met and MISSED rules as coded, every recorded verdict and
-  every other section stand.
+  every other section stand. Also partially superseded by
+  [ADR-0024](0024-the-50s-recovery-is-a-held-notification-at-the-tail.md), which
+  replaces one limitation, "Recovery with the shipped lease is bounded below by the
+  lease", with a fuller one: a kill whose lease expires after the last submission can
+  add up to one broker visibility timeout. The definition of recovery is unchanged.
 - **Date:** 2026-10-03
 
 ## Context
