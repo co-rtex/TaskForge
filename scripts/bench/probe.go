@@ -294,7 +294,7 @@ func runProbe(ctx context.Context, o options, stdout io.Writer) error {
 	}
 	for _, c := range po.conditions {
 		if len(results[c]) > 0 {
-			printSummary(out, c, results[c], timings.Lease)
+			printSummary(out, c, results[c], timings)
 		}
 	}
 	if err := file.Close(); err != nil && runErr == nil {
@@ -585,12 +585,13 @@ func runProbeTrial(parent context.Context, o options, timings stack.Timings, con
 		}
 	}
 	for _, c := range claims {
-		at := c.midpoint().Add(-offset)
-		if c.jobID != "" || at.Before(tr.killedAt) || at.After(end) {
+		ended := c.at.Add(-offset)
+		began := ended.Add(-c.took)
+		if c.jobID != "" || ended.Before(tr.killedAt) || began.After(end) {
 			continue
 		}
-		capacity, capErr := readdb.WorkersAtCapacity(parent, db, st.Scope, at)
-		tr.empty = append(tr.empty, emptyClaim{at: at, capacity: describeCapacity(capacity, capErr)})
+		capacity, capErr := readdb.WorkersAtCapacityDuring(parent, db, st.Scope, began, ended)
+		tr.empty = append(tr.empty, emptyClaim{at: ended, capacity: describeCapacity(capacity, capErr)})
 	}
 	for _, h := range hops {
 		r := hopResult{hop: h}

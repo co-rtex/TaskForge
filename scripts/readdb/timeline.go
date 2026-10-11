@@ -242,51 +242,69 @@ func ActiveLeaseExpiries(ctx context.Context, q Querier, scope string, sessionID
 	return out, rows.Err()
 }
 
-// AtCapacity is one logical worker that, at some instant, held as many active
-// leases as its concurrency limit, counting the leases of its earlier, dead
-// boots: the count the claim transaction compares with the limit
+// AtCapacity is one logical worker that, at some instant inside an interval, held
+// as many active leases as its concurrency limit, counting the leases of its
+// earlier, dead boots: the count the claim transaction compares with the limit
 // (internal/workers/store.go, "Count by logical worker, not just process
 // session"), so a claim it made then was CAPACITY_EXHAUSTED.
 type AtCapacity struct {
 	Worker string
-	// Active is the leases the logical worker held at the instant; DeadBoots is
-	// how many of them belong to a session other than its newest at that instant.
+	// At is the first instant in the interval at which it was at its limit;
+	// Active is the leases it held then, and DeadBoots how many of them belong to
+	// a session other than its newest by then.
+	At                time.Time
 	Active, DeadBoots int
 	Limit             int
 }
 
-// WorkersAtCapacity reconstructs, from the leases' acquired_at and released_at,
-// which of the scope's logical workers were at their concurrency limit at the
-// given instant. The limit is that of the worker's newest session registered by
-// then. It is a reconstruction from durable timestamps, not a record of any
-// claim's decision; the claim's own snapshot can differ from it by whatever
-// committed in the instant between them.
-func WorkersAtCapacity(ctx context.Context, q Querier, scope string, at time.Time) ([]AtCapacity, error) {
+// WorkersAtCapacityDuring reconstructs, from the leases' acquired_at and
+// released_at, which of the scope's logical workers were at their concurrency
+// limit at any instant in [from, to]. The limit is that of the worker's newest
+// session registered by then.
+//
+// It takes an interval and not an instant because a claim's capacity check runs at
+// an instant the logs do not record: claims queue on the queue row's lock, so the
+// check can come at any point of the request, and with 50 ms jobs the leases a
+// worker holds change within a request's span. The candidate instants are the
+// interval's start and every lease acquisition inside it, the only instants at
+// which a count can rise. It is a reconstruction from durable timestamps, not a
+// record of any claim's decision.
+func WorkersAtCapacityDuring(ctx context.Context, q Querier, scope string, from, to time.Time) ([]AtCapacity, error) {
 	rows, err := q.Query(ctx, `
-		SELECT w.name, count(l.id),
-		       count(l.id) FILTER (WHERE l.worker_session_id <> cs.id),
-		       cs.concurrency_limit
-		FROM workers w
-		JOIN LATERAL (
-		    SELECT s.id, s.concurrency_limit FROM worker_sessions s
-		    WHERE s.worker_id = w.id AND s.scope = w.scope AND s.registered_at <= $2
-		    ORDER BY s.registered_at DESC, s.id DESC
-		    LIMIT 1
-		) cs ON true
-		JOIN leases l ON l.worker_id = w.id AND l.scope = w.scope
-		             AND l.acquired_at <= $2 AND (l.released_at IS NULL OR l.released_at > $2)
-		WHERE w.scope = $1
-		GROUP BY w.name, cs.concurrency_limit
-		HAVING count(l.id) >= cs.concurrency_limit
-		ORDER BY w.name`, scope, at)
+		WITH instants AS (
+		    SELECT $2::timestamptz AS at
+		    UNION
+		    SELECT l.acquired_at FROM leases l
+		    WHERE l.scope = $1 AND l.acquired_at > $2 AND l.acquired_at <= $3
+		), counts AS (
+		    SELECT w.name, i.at, count(l.id) AS active,
+		           count(l.id) FILTER (WHERE l.worker_session_id <> cs.id) AS dead_boots,
+		           cs.concurrency_limit
+		    FROM instants i
+		    CROSS JOIN workers w
+		    JOIN LATERAL (
+		        SELECT s.id, s.concurrency_limit FROM worker_sessions s
+		        WHERE s.worker_id = w.id AND s.scope = w.scope AND s.registered_at <= i.at
+		        ORDER BY s.registered_at DESC, s.id DESC
+		        LIMIT 1
+		    ) cs ON true
+		    JOIN leases l ON l.worker_id = w.id AND l.scope = w.scope
+		                 AND l.acquired_at <= i.at AND (l.released_at IS NULL OR l.released_at > i.at)
+		    WHERE w.scope = $1
+		    GROUP BY w.name, i.at, cs.concurrency_limit
+		    HAVING count(l.id) >= cs.concurrency_limit
+		)
+		SELECT DISTINCT ON (name) name, at, active, dead_boots, concurrency_limit
+		FROM counts
+		ORDER BY name, at`, scope, from, to)
 	if err != nil {
-		return nil, fmt.Errorf("reconstruct capacity at %s: %w", at, err)
+		return nil, fmt.Errorf("reconstruct capacity in [%s, %s]: %w", from, to, err)
 	}
 	defer rows.Close()
 	var out []AtCapacity
 	for rows.Next() {
 		var c AtCapacity
-		if err := rows.Scan(&c.Worker, &c.Active, &c.DeadBoots, &c.Limit); err != nil {
+		if err := rows.Scan(&c.Worker, &c.At, &c.Active, &c.DeadBoots, &c.Limit); err != nil {
 			return nil, fmt.Errorf("scan a worker at capacity: %w", err)
 		}
 		out = append(out, c)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/co-rtex/TaskForge/scripts/internal/stack"
 	"github.com/co-rtex/TaskForge/scripts/readdb"
 )
 
@@ -117,8 +118,7 @@ func overThreshold(h hopResult, lease time.Duration) bool {
 }
 
 // excessSegment names the segment holding a slow hop's excess: the one furthest
-// above that segment's baseline median. The baseline is the condition's other
-// hops; see printSummary.
+// above its nominal value (see nominalSegments).
 func excessSegment(s readdb.Segments, baseline []time.Duration) (string, time.Duration) {
 	best, bestBy := "", time.Duration(0)
 	for i, v := range segmentValues(s) {
@@ -129,22 +129,14 @@ func excessSegment(s readdb.Segments, baseline []time.Duration) (string, time.Du
 	return best, bestBy
 }
 
-// segmentMedians is the nearest-rank median of each segment over complete hops.
-func segmentMedians(hops []hopResult) []time.Duration {
-	out := make([]time.Duration, len(segmentNames))
-	for i := range segmentNames {
-		var vs []time.Duration
-		for _, h := range hops {
-			if h.complete {
-				vs = append(vs, segmentValues(h.segments)[i])
-			}
-		}
-		slices.Sort(vs)
-		if len(vs) > 0 {
-			out[i] = NearestRank(vs, 50)
-		}
-	}
-	return out
+// nominalSegments is what each segment is expected to take with nothing going
+// wrong, from the profile alone: S1 the lease, S2 a reconciler poll interval, S3
+// nothing, S4 an outbox poll interval, S5 nothing. They are what a slow hop's
+// segments are compared with to say where its excess was. A baseline taken from
+// the condition's own hops would not do: when most hops are slow, the "normal"
+// hops are few, and the comparison says more about them than about the slow one.
+func nominalSegments(t stack.Timings) []time.Duration {
+	return []time.Duration{t.Lease, t.PollInterval, 0, t.OutboxPoll, 0}
 }
 
 // printTrial writes one trial's block.
@@ -216,7 +208,7 @@ func printTrial(out io.Writer, tr trialResult, lease time.Duration) {
 	}
 	fmt.Fprintf(out, "claims that took nothing from the kill to the last replacement: %d\n", len(tr.empty))
 	for _, e := range tr.empty {
-		fmt.Fprintf(out, "  at PostgreSQL ~%s (%s after the kill): %s\n", stamp(e.at), fmtMS(e.at.Sub(tr.killedAt)), e.capacity)
+		fmt.Fprintf(out, "  ended at PostgreSQL ~%s (%s after the kill): %s\n", stamp(e.at), fmtMS(e.at.Sub(tr.killedAt)), e.capacity)
 	}
 	for _, n := range tr.notes {
 		fmt.Fprintf(out, "note: %s\n", n)
@@ -266,8 +258,9 @@ func eventTook(h readdb.RecoveryHop) string {
 // printSummary writes one condition's summary: count, min, median and max of
 // each segment and of the recovery, and every hop over the threshold with the
 // segment that held its excess.
-func printSummary(out io.Writer, cond string, trials []trialResult, lease time.Duration) {
-	var hops, normal []hopResult
+func printSummary(out io.Writer, cond string, trials []trialResult, timings stack.Timings) {
+	lease := timings.Lease
+	var hops []hopResult
 	identityHeld, identityChecked := 0, 0
 	for _, tr := range trials {
 		for _, h := range tr.hops {
@@ -276,9 +269,6 @@ func printSummary(out io.Writer, cond string, trials []trialResult, lease time.D
 				identityChecked++
 				if h.identity {
 					identityHeld++
-				}
-				if !overThreshold(h, lease) {
-					normal = append(normal, h)
 				}
 			}
 		}
@@ -307,10 +297,7 @@ func printSummary(out io.Writer, cond string, trials []trialResult, lease time.D
 		}
 		fmt.Fprintf(out, "%-9s %6d %10s %10s %10s\n", name, len(vs), fmtMS(vs[0]), fmtMS(NearestRank(vs, 50)), fmtMS(vs[len(vs)-1]))
 	}
-	baseline := segmentMedians(normal)
-	if len(normal) == 0 {
-		baseline = segmentMedians(hops)
-	}
+	baseline := nominalSegments(timings)
 	over := 0
 	for _, tr := range trials {
 		for _, h := range tr.hops {
@@ -323,7 +310,7 @@ func printSummary(out io.Writer, cond string, trials []trialResult, lease time.D
 				continue
 			}
 			name, by := excessSegment(h.segments, baseline)
-			fmt.Fprintf(out, "OVER: %s trial %d job %s recovery %s: excess in %s (%s above its baseline median); replacement claimed by %s\n",
+			fmt.Fprintf(out, "OVER: %s trial %d job %s recovery %s: excess in %s (%s above its nominal value); replacement claimed by %s\n",
 				cond, tr.n, short(h.hop.JobID), fmtMS(h.recovery), name, fmtMS(by), claimedBy(h.hop))
 		}
 	}
@@ -370,14 +357,11 @@ func describeCapacity(at []readdb.AtCapacity, err error) string {
 		return "capacity unavailable: " + err.Error()
 	}
 	if len(at) == 0 {
-		return "no worker was at its limit (so not CAPACITY_EXHAUSTED by this reconstruction)"
+		return "no worker reached its limit during the claim (so not CAPACITY_EXHAUSTED by this reconstruction)"
 	}
 	parts := make([]string, 0, len(at))
 	for _, c := range at {
-		parts = append(parts, fmt.Sprintf("%s held %d of %d (%d on a dead boot)", c.Worker[strings.LastIndex(c.Worker, "-")+1:], c.Active, c.Limit, c.DeadBoots))
+		parts = append(parts, fmt.Sprintf("%s held %d of %d (%d on a dead boot) at %s", c.Worker[strings.LastIndex(c.Worker, "-")+1:], c.Active, c.Limit, c.DeadBoots, stamp(c.At)))
 	}
 	return "at their limit: " + strings.Join(parts, "; ")
 }
-
-// midpoint is the middle of a logged request, on this machine's clock.
-func (c claim) midpoint() time.Time { return c.at.Add(-c.took / 2) }

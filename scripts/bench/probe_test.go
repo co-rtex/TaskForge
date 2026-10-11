@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/co-rtex/TaskForge/scripts/internal/stack"
 	"github.com/co-rtex/TaskForge/scripts/readdb"
 )
 
@@ -102,13 +103,15 @@ func TestParseClaims_ACountsOnlyClaimRequestsAndJoinsWhatTheyTook(t *testing.T) 
 	require.Equal(t, 1, w.requests, "the window is (from, to]: r2 at exactly from is out, r4 at exactly to is in")
 }
 
-func TestExcessSegment_NamesTheSegmentFurthestAboveItsBaseline(t *testing.T) {
-	baseline := []time.Duration{29900 * time.Millisecond, 1100 * time.Millisecond, 0, 600 * time.Millisecond, 20 * time.Millisecond}
+func TestExcessSegment_NamesTheSegmentFurthestAboveItsNominalValue(t *testing.T) {
+	baseline := nominalSegments(stack.ShippedTimings())
+	require.Equal(t, []time.Duration{30 * time.Second, 2 * time.Second, 0, time.Second, 0}, baseline,
+		"the lease, a reconciler poll, nothing, an outbox poll, nothing")
 	slow := readdb.Segments{S1: 29950 * time.Millisecond, S2: 1200 * time.Millisecond, S3: -time.Millisecond,
 		S4: 700 * time.Millisecond, S5: 18020 * time.Millisecond}
 	name, by := excessSegment(slow, baseline)
 	require.Equal(t, "S5", name)
-	require.Equal(t, 18*time.Second, by)
+	require.Equal(t, 18020*time.Millisecond, by)
 
 	reconciler := slow
 	reconciler.S5, reconciler.S2 = 20*time.Millisecond, 19*time.Second
@@ -132,17 +135,16 @@ func TestParseArgs_NoRestartIsAProbeVariation(t *testing.T) {
 	require.False(t, o.probe.noRestart, "the killed worker is restarted unless asked, as the fault run does")
 }
 
-func TestParseClaims_ReadsTheRequestDurationSoTheMidpointCanBePlaced(t *testing.T) {
+func TestParseClaims_ReadsTheRequestDuration(t *testing.T) {
 	log := []byte(`{"time":"2026-10-10T10:00:01.000Z","msg":"http request","request_id":"r","method":"POST","path":"/internal/v1/claims","status":200,"duration":40000000}`)
 	claims := parseClaims(log)
 	require.Len(t, claims, 1)
-	require.Equal(t, 40*time.Millisecond, claims[0].took)
-	require.True(t, claims[0].midpoint().Equal(time.Date(2026, 10, 10, 10, 0, 0, 980_000_000, time.UTC)),
-		"the end of the request minus half its duration: %v", claims[0].midpoint())
+	require.Equal(t, 40*time.Millisecond, claims[0].took, "slog writes a duration in nanoseconds")
 }
 
 func TestDescribeCapacity_NamesEachWorkerAndItsDeadBootLeases(t *testing.T) {
-	got := describeCapacity([]readdb.AtCapacity{{Worker: "probeb-123-w01", Active: 4, DeadBoots: 1, Limit: 4}}, nil)
-	require.Equal(t, "at their limit: w01 held 4 of 4 (1 on a dead boot)", got)
-	require.Contains(t, describeCapacity(nil, nil), "no worker was at its limit")
+	at := time.Date(2026, 10, 10, 23, 52, 45, 539_000_000, time.UTC)
+	got := describeCapacity([]readdb.AtCapacity{{Worker: "probeb-123-w01", At: at, Active: 4, DeadBoots: 1, Limit: 4}}, nil)
+	require.Equal(t, "at their limit: w01 held 4 of 4 (1 on a dead boot) at 23:52:45.539 UTC", got)
+	require.Contains(t, describeCapacity(nil, nil), "no worker reached its limit")
 }

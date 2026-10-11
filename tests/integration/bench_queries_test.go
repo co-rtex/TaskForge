@@ -742,11 +742,12 @@ func TestBenchQueries_HeldBySessionAndForeignActivity(t *testing.T) {
 	require.False(t, f.None())
 }
 
-// TestBenchQueries_WorkersAtCapacityCountsADeadBootsLeases proves the
-// reconstruction the probe uses to say which logical worker was at its limit when a
-// claim took nothing: leases are counted by logical worker, a dead boot's included,
-// against the limit of the newest session registered by then.
-func TestBenchQueries_WorkersAtCapacityCountsADeadBootsLeases(t *testing.T) {
+// TestBenchQueries_WorkersAtCapacityDuringCountsADeadBootsLeases proves the
+// reconstruction the probe uses to say which logical worker was at its limit while
+// a claim that took nothing was in progress: leases are counted by logical worker,
+// a dead boot's included, against the limit of the newest session registered by
+// then, at any instant of the interval and not only at one sample of it.
+func TestBenchQueries_WorkersAtCapacityDuringCountsADeadBootsLeases(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
 	seed := benchSeed{t: t, scope: benchScope}
@@ -762,27 +763,47 @@ func TestBenchQueries_WorkersAtCapacityCountsADeadBootsLeases(t *testing.T) {
 		a := seed.attempt(job, 1, worker, session, "RUNNING", acquired, ptr(acquired), nil)
 		seed.releasedLease(a, job, worker, session, uuid.New(), acquired, acquired.Add(30*time.Second), released)
 	}
-	// The dead boot's lease, active until it is released at 40 s; three on the new
-	// boot from 20 s. The limit is 4 (benchSeed.session).
+	// The dead boot's lease, active until it is released at 40 s. The new boot takes
+	// three more at 20.030, 20.036 and 20.039 s, each held for 150 ms, which is the
+	// shape a 50 ms workload leaves: the logical worker is at its limit of 4 only
+	// from 20.039 s to 20.180 s.
 	lease(restarted, dead, at(9*time.Second), ptr(at(40*time.Second)))
-	for range 3 {
-		lease(restarted, current, at(20*time.Second), nil)
+	for _, ms := range []int{30, 36, 39} {
+		acquired := at(20*time.Second + time.Duration(ms)*time.Millisecond)
+		lease(restarted, current, acquired, ptr(acquired.Add(150*time.Millisecond)))
 	}
-	// Another worker with three: under its limit.
+	// Another worker with three: under its limit throughout.
 	for range 3 {
 		lease(other, otherSession, at(20*time.Second), nil)
 	}
 
-	got, err := readdb.WorkersAtCapacity(ctx, testPool, benchScope, at(25*time.Second))
+	// A claim from 19.976 s to 20.045 s: its midpoint (20.010 s) sees one lease, but
+	// the worker reaches its limit at 20.039 s, inside the claim.
+	got, err := readdb.WorkersAtCapacityDuring(ctx, testPool, benchScope,
+		at(19*time.Second+976*time.Millisecond), at(20*time.Second+45*time.Millisecond))
 	require.NoError(t, err)
-	require.Equal(t, []readdb.AtCapacity{{Worker: "w01", Active: 4, DeadBoots: 1, Limit: 4}}, got,
-		"three on the new boot and one on the dead boot is the limit; w02's three are not")
+	require.Len(t, got, 1)
+	require.Equal(t, "w01", got[0].Worker)
+	require.Equal(t, 4, got[0].Active)
+	require.Equal(t, 1, got[0].DeadBoots, "one of the four is the dead boot's")
+	require.Equal(t, 4, got[0].Limit)
+	require.True(t, got[0].At.Equal(at(20*time.Second+39*time.Millisecond)), "the first instant at the limit: %v", got[0].At)
 
-	got, err = readdb.WorkersAtCapacity(ctx, testPool, benchScope, at(41*time.Second))
+	// The same claim ending one millisecond before the third acquisition: never at the limit.
+	got, err = readdb.WorkersAtCapacityDuring(ctx, testPool, benchScope,
+		at(19*time.Second+976*time.Millisecond), at(20*time.Second+38*time.Millisecond))
 	require.NoError(t, err)
-	require.Empty(t, got, "once the dead boot's lease is released w01 holds three of four")
+	require.Empty(t, got)
 
-	got, err = readdb.WorkersAtCapacity(ctx, testPool, benchScope, at(15*time.Second))
+	// An interval that starts while it is at the limit counts from its start.
+	got, err = readdb.WorkersAtCapacityDuring(ctx, testPool, benchScope,
+		at(20*time.Second+100*time.Millisecond), at(20*time.Second+110*time.Millisecond))
 	require.NoError(t, err)
-	require.Empty(t, got, "before the new boot's three leases only the dead boot's one is held")
+	require.Len(t, got, 1)
+	require.True(t, got[0].At.Equal(at(20*time.Second+100*time.Millisecond)))
+
+	// After the dead boot's lease is released, three of four.
+	got, err = readdb.WorkersAtCapacityDuring(ctx, testPool, benchScope, at(41*time.Second), at(42*time.Second))
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
