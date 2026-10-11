@@ -11,8 +11,11 @@
   every other section stand. Also partially superseded by
   [ADR-0024](0024-the-50s-recovery-is-a-held-notification-at-the-tail.md), which
   replaces one limitation, "Recovery with the shipped lease is bounded below by the
-  lease", with a fuller one: a kill whose lease expires after the last submission can
-  add up to one broker visibility timeout. The definition of recovery is unchanged.
+  lease", with a fuller one: a kill whose lease expires after the last submission was
+  observed to add up to about one broker visibility timeout (30 s by default) in every
+  reproduction; a second hold is not excluded, and re-notification after
+  `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` (60 s shipped) is the backstop. The definition of
+  recovery is unchanged.
 - **Date:** 2026-10-03
 
 ## Context

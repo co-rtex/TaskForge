@@ -16,8 +16,8 @@ not reproduced.
 minus the kill, and says among its limitations that recovery with the shipped lease
 is "bounded below by the lease". It says nothing about what can add to it. This record
 replaces that limitation with a fuller one, because the investigation found that a
-recovery at the end of a run can include up to one broker visibility timeout. It does
-not change what recovery measures.
+recovery at the end of a run can include about one broker visibility timeout more. It
+does not change what recovery measures.
 
 ## Decision
 
@@ -53,26 +53,36 @@ So the recovered job waits until the held message's receive plus the visibility
 timeout. With the receive about 20 s after the kill, near the end of submission, that
 is about 50 s after the kill, which is what the record shows.
 
-### It is explained, not a defect
+### It is explained, not a defect, and it is accepted
 
-Each of the three is a recorded decision with its reason, and the outcome they produce
-is bounded: the held message comes back after one visibility timeout, and
-[ADR-0011](0011-notification-generations-and-bounded-renotification.md)'s
-re-notification would repair a job left with no message at all. In every trial the
-recovered job was claimed, by the held message, when it returned. M8D3 changes no
-production code. Whether a recovery that can wait
-one extra visibility timeout at the tail is acceptable, and whether to change any of
-the three decisions, is the owner's decision, not this record's.
+Each of the three is a recorded decision with its reason. In every reproduction the held
+message came back after one visibility timeout, and in every over-threshold hop the
+recovered job was claimed by the held message when it returned. Nothing proves that is
+the most a recovery can wait: a message that returns is received by some worker, and with
+several kills in a run it could reach another restarted boot at its limit and be held
+again. The backstop is [ADR-0011](0011-notification-generations-and-bounded-renotification.md)'s
+re-notification. A recovered job that is still `QUEUED` when its `last_notification_at`,
+stamped at the requeue, is older than `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` (60 s shipped)
+gets a fresh notification on its current generation, because its own recovery event has
+been published and so is no longer pending, whatever claim consumed it. M8D3 changes no
+production code.
+
+**Decision (the owner, 2026-10-10):** the tail delay is accepted as intended behavior. The
+three decisions behind it stay as they are: capacity counted by logical worker
+(ADR-0006), no acknowledgement on `CAPACITY_EXHAUSTED` (ADR-0003 step 5), and the claim
+taking the oldest eligible job (ADR-0003). No control-plane change follows from M8D3.
 
 ### What it means for the benchmark
 
 - The definition of recovery is unchanged, and so is the recorded verdict (MISSED; it
   would be missed at 32 s too).
 - ADR-0020's limitation "Recovery with the shipped lease is bounded below by the lease"
-  is replaced by: **recovery with the shipped lease is bounded below by the lease, and
-  a kill whose lease expires after the last submission can add up to one broker
-  visibility timeout (30 s by default) to it, by the mechanism above.** A kill made
-  while load continues does not, because later notifications claim the stranded job.
+  is replaced by: **recovery with the shipped lease is bounded below by the lease; a kill
+  whose lease expires after the last submission was observed to add up to about one broker
+  visibility timeout (30 s by default) in every reproduction, by the mechanism above; a
+  second hold is not excluded, and re-notification after
+  `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` (60 s shipped) is the backstop.** No kill made
+  while load continued showed it, because later notifications claim the stranded job.
 - The mechanism is pinned in `tests/integration/recovery_outlier_test.go`, through the
   real store and with no clock, so a change to any of the three decisions that removes
   it will be seen.
@@ -83,10 +93,10 @@ the three decisions, is the owner's decision, not this record's.
 recovery figure can contain, and a reader of ADR-0020 would otherwise still read the
 lease as the only thing that shapes it.
 
-**Call it a defect and propose a fix.** Not this record's to make. A worker could poll
-only with its logical capacity, acknowledge a `CAPACITY_EXHAUSTED` message, or claim
-the job its notification names; each changes the control plane's claim and
-acknowledgement contract, and each is the owner's decision.
+**Change one of the three decisions.** Considered and not taken, by the owner's decision
+above. A worker could poll only with its logical capacity, acknowledge a
+`CAPACITY_EXHAUSTED` message, or claim the job its notification names; each changes the
+control plane's claim and acknowledgement contract.
 
 ## Consequences
 
