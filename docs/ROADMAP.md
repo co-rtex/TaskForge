@@ -767,7 +767,8 @@ the mechanism predicts.
 **Depends on.** M8D2.
 **Status:** complete; see PR #25 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
 evidence and for what remains limited. The outcome is **explained**
-([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)).
+([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)), and the
+owner accepted the behavior as intended on 2026-10-10: no control-plane change follows.
 
 #### M8C — Deployment
 **Objective.** Make deployment credible without applying it.

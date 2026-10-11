@@ -3455,7 +3455,11 @@ M8D3 is the third slice of M8D ([ROADMAP.md](ROADMAP.md)): reproduce the headlin
 **Outcome: EXPLAINED.** The extra time is in S5, broker delivery and the claim, and it is
 three documented decisions acting together at the tail of a run
 ([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)). No
-production code changed. This section keeps three things apart: what it adds, what
+production code changed. **Decision (the owner, 2026-10-10):** the tail delay is accepted
+as intended behavior, and the three decisions behind it (capacity counted by logical
+worker, no acknowledgement on `CAPACITY_EXHAUSTED`, the claim taking the oldest eligible
+job) stay as they are; no control-plane change follows. The alternatives ADR-0024 lists
+were considered and not taken. This section keeps three things apart: what it adds, what
 evidence exists, and what is still limited.
 
 **What changed:** `scripts/readdb`, `scripts/bench`, `scripts/internal/stack` (developer
@@ -3524,16 +3528,17 @@ zero, and S5 can be too, because `published_at` is stamped after `SendMessage` r
 stopped the run on battery (it did not fire), against a fresh database
 `taskforge_m8d3_probe2`. Every identity S1+..+S5 = recovery held (44 of 44).
 
-| Condition | Trials | Hops | Segment | min | median | max |
+| Condition | Trials run (with ≥1 hop) | Hops | Segment | min | median | max |
 | --- | --- | --- | --- | --- | --- | --- |
-| A, loaded | 10 | 11 | S1 / S2 / S3 / S4 / S5 | 29985 / 1975 / -63 / 961 / 3 ms | 29989 / 2019 / -35 / 1002 / 13 ms | 29998 / 2059 / -14 / 1029 / 77 ms |
+| A, loaded | 10 (10) | 11 | S1 / S2 / S3 / S4 / S5 | 29985 / 1975 / -63 / 961 / 3 ms | 29989 / 2019 / -35 / 1002 / 13 ms | 29998 / 2059 / -14 / 1029 / 77 ms |
 | | | | recovery | 32971 ms | 32994 ms | 33061 ms |
-| B, tail | 20 | 23 | S1 / S2 / S3 / S4 / S5 | 29922 / 32 / -30 / 947 / 1 ms | 29989 / 2001 / -19 / 1005 / 9952 ms | 29996 / 2041 / -1 / 1116 / 12103 ms |
+| B, tail | 20 (19; B14 had no hop, `TIMED_OUT`) | 23 | S1 / S2 / S3 / S4 / S5 | 29922 / 32 / -30 / 947 / 1 ms | 29989 / 2001 / -19 / 1005 / 9952 ms | 29996 / 2041 / -1 / 1116 / 12103 ms |
 | | | | recovery | 31679 ms | 43039 ms | 45051 ms |
-| C, idle | 10 | 10 | S1 / S2 / S3 / S4 / S5 | 26942 / 1925 / -23 / 126 / 5 ms | 26962 / 1983 / -19 / 1033 / 10 ms | 26979 / 2010 / -15 / 1081 / 31 ms |
+| C, idle | 10 (10) | 10 | S1 / S2 / S3 / S4 / S5 | 26942 / 1925 / -23 / 126 / 5 ms | 26962 / 1983 / -19 / 1033 / 10 ms | 26979 / 2010 / -15 / 1081 / 31 ms |
 | | | | recovery | 29024 ms | 29972 ms | 30061 ms |
 
-No A or C recovery exceeded lease + 5 s (35 s). **Twelve of the twenty B trials did**,
+No A or C recovery exceeded lease + 5 s (35 s): 0 of 10 A trials and 0 of 10 C trials, all
+with a hop. **In B, 12 of 19 trials with a hop did** (20 run; 1 with no hop, `TIMED_OUT`),
 one hop each, every one with its excess in S5 (9.9 to 12.1 s), every replacement claimed
 by another job's notification published 30.017 to 30.060 s before it, and every recovery
 event's own claim taking another job:
@@ -3584,17 +3589,17 @@ while the restarted victim was at its limit.
 **Controlled variations**, condition B, 8 trials each, on the same binary and power, the
 same night:
 
-| Variation | Mechanism predicts | Trials over 35 s | Recoveries | Held messages |
+| Variation | Mechanism predicts | Trials over 35 s: over of trials with ≥1 hop (trials run; with no hop) | Recoveries | Held messages |
 | --- | --- | --- | --- | --- |
-| Shipped (series 3) | — | 12 of 20 | 31.7–45.1 s, median 43.0 s | 30.02–30.06 s |
-| `--visibility-timeout 45s` | the hold is 45 s and the excess grows by 15 s | 7 of 8 | 45.0–65.1 s, median 58.0 s | **45.03–45.07 s** |
-| `--visibility-timeout 15s` | the held message is back before the recovery event; the excess (mostly) goes | **0 of 8** | 31.0–34.0 s | 15.02 s, once, 1.06 s after the publish |
-| `--poll-wait 2s` | no change (against H-S5b) | 8 of 8 | 35.1–51.8 s, median 44.0 s | 30.03–32.54 s |
-| `--no-restart` | no restarted boot to be at its limit; the excess goes | **0 of 8** | 32.96–33.05 s | 30.04 s, once, harmless (held at the kill) |
+| Shipped (series 3) | — | 12 of 19 (20 run; 1 with no hop, `TIMED_OUT`) | 31.7–45.1 s, median 43.0 s | 30.02–30.06 s |
+| `--visibility-timeout 45s` | the hold is 45 s and the excess grows by 15 s | 7 of 7 (8 run; 1 with no hop, `TIMED_OUT`) | 45.0–65.1 s, median 58.0 s | **45.03–45.07 s** |
+| `--visibility-timeout 15s` | the held message is back before the recovery event; the excess (mostly) goes | **0 of 6** (8 run; 2 with no hop, `TIMED_OUT`) | 31.0–34.0 s | 15.02 s, once, 1.06 s after the publish |
+| `--poll-wait 2s` | no change (against H-S5b) | 8 of 8 (8 run; 0 with no hop) | 35.1–51.8 s, median 44.0 s | 30.03–32.54 s |
+| `--no-restart` | no restarted boot to be at its limit; the excess goes | **0 of 8** (8 run; 0 with no hop) | 32.96–33.05 s | 30.04 s, once, harmless (held at the kill) |
 
 Every over-threshold trial of every run was matched against its hold
-(`recovery − visibility timeout`) and the claims that took nothing: series 3, 12 of 12
-were `CAPACITY_EXHAUSTED` at the restarted victim; the 45 s variation, 5 of 7, and the
+(`recovery − visibility timeout`) and the claims that took nothing, counting
+over-threshold trials: series 3, 12 of 12 were `CAPACITY_EXHAUSTED` at the restarted victim; the 45 s variation, 5 of 7, and the
 other 2 (recoveries 45.04 and 46.04 s) were holds that began at the kill itself; the 2 s
 poll-wait variation, 7 of 8, and the eighth (trial 7, 51.79 s) was in a trial whose claims
 took up to 1.7 s, where the victim was at its limit 2.5 s before the computed instant, so
@@ -3609,7 +3614,8 @@ not a reading of the original rows.
 
 **The first series**, run earlier the same night on `7ed4108`'s probe, also on AC power,
 also completed the planned N, and is reported rather than discarded. A: 12 hops, 31.5–33.9
-s. C: 10 hops, 28.5–30.0 s. B: 15 of 20 trials over threshold (19 hops, 43.0–51.5 s,
+s. C: 10 hops, 28.5–30.0 s. B: 15 of 20 trials with a hop over threshold (20 run; none
+with no hop; 19 hops, 43.0–51.5 s,
 median 43.1 s), every excess in S5 and every replacement claimed by a message held 30.02–30.47
 s; trial 5's two hops took 49.91 and 50.84 s and trial 9's one took 50.05 s. **It was
 perturbed by my own work:** I compiled and vetted code while it ran, and eight trials (A7,
@@ -3674,8 +3680,9 @@ beside its output.
   nominal value per segment). The measurements are unchanged; the matching above used
   `8fb001c`'s `WorkersAtCapacityDuring`, through a throwaway program over the saved logs and
   the probe databases, not committed.
-- **Four B trials had no abandoned attempt.** In series 3's B14, the 45 s variation's trial
-  1 and the 15 s variation's trials 5 and 6, the killed worker's attempts had started, and
+- **Four B trials had no abandoned attempt**, 4 of the 52 B trials of series 3 and the
+  variations (none of the first series' 20, and no A or C trial in either). In series 3's
+  B14, the 45 s variation's trial 1 and the 15 s variation's trials 5 and 6, the killed worker's attempts had started, and
   their persisted deadline (the harness submits `timeout_seconds` 30, the lease's length)
   had passed by the time the reconciler reached the lapsed lease, so the documented
   precedence made them `TIMED_OUT`, not `ABANDONED`. They contribute no hop. **The same
@@ -3687,9 +3694,21 @@ beside its output.
   `taskforge_m8d3_probe2`, created on the local server and left in place, because the
   integration tests leave non-terminal rows in the shared database that the trial's
   services would act on. The original run used the shared one.
-- **Whether a recovery that can wait one extra visibility timeout at the tail is
-  acceptable is the owner's decision**, and so is whether to change any of the three
-  decisions behind it (ADR-0024 lists the obvious candidates). Nothing was fixed.
+- **The delay is not proven bounded by one visibility timeout.** Every reproduction
+  observed at most about one (30 s by default) added to a tail recovery, but a returned
+  message is received by some worker, and with several kills in a run it could reach another
+  restarted boot at its limit and be held again. The backstop is ADR-0011's re-notification:
+  a recovered job still `QUEUED` when its `last_notification_at`, stamped at the requeue, is
+  older than `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` (60 s shipped) gets a fresh notification,
+  because its own recovery event is published and so no longer pending, whatever claim
+  consumed it.
+- **The supply-chain gate is red, on `main` as well.** `make scan` fails on this branch
+  and on `c18292f` alike: govulncheck reports 12 reachable standard-library advisories at
+  `go.mod`'s Go 1.25.14 (see "M8D3 gates"). Go 1.25 left support when Go 1.27.0 shipped on
+  2026-08-19; 1.25.14, released that day, is its latest release, and the fixes are in
+  1.26.9 and 1.27.2, released 2026-10-08. A separate toolchain-bump pull request is to fix
+  it; M8D3 does not. M8B's scan evidence above was true when it was recorded and is not
+  edited.
 - **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
   own CI result: the pull request's checks are the record.
 
@@ -4300,7 +4319,7 @@ before each; the lid open. The probe series are under "M8D3" above.
 | `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)` |
 | `make bench-smoke`, three runs | PASS ×3, each `14 of 14 checks met`; the aimed kill's victim held 3, 3 and 2 attempts with time left |
 | `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, labelled with revision `7db1b21`; run normally, without a `DOCKER_CONFIG` workaround |
-| `make scan` | recorded in the pull request, not here: it runs in a fresh clone of the pushed final head, which includes this documentation commit |
+| `make scan` | **FAIL, pre-existing.** In a fresh clone of the pushed head, govulncheck reports 12 reachable Go 1.25.14 standard-library advisories: GO-2026-6599, GO-2026-6600, GO-2026-6603, GO-2026-6605, GO-2026-6607, GO-2026-6608, GO-2026-6609, GO-2026-6610, GO-2026-6611, GO-2026-6612, GO-2026-6613 and GO-2026-6617. A fresh clone of `c18292f` (`main`) reports the identical 12. gitleaks (full history), pip-audit and npm audit report no findings in either. See the limitation on the supply-chain gate under "M8D3". |
 | `make sdk-lint`, `make sdk-test`, `make dash-lint`, `make dash-test`, `make demo-failure`, `docker compose config --quiet` | NOT RUN: nothing they cover changed |
 
 ### M8D2 gates
