@@ -82,7 +82,7 @@ correctness — which is exactly what bounded re-notification restores.
 
 ## Try what exists
 
-Needs Git, Go 1.25+, Docker, Docker Compose, and Make.
+Needs Git, Go 1.27.2+, Docker, Docker Compose, and Make.
 
 ```bash
 make bootstrap   # create .env from the example, download dependencies
