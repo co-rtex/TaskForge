@@ -3871,10 +3871,13 @@ recovery probe and its usage text), two new integration test files, and docs (`A
 ### Behavior
 
 **`readdb.KillOutcomes(ctx, q, scope, session, kill)`** returns every attempt of the killed
-session that was not finished at the kill instant (`created_at ≤ kill` and `finished_at` null
-or after it). For each one it gives:
+session that was not finished at the kill instant (`finished_at` null or after it). There is
+no bound on `created_at`: the kill is stamped just before the signal, so a claim the dying
+process had in flight can commit after the stamp, and that attempt is the kill's too. For
+each attempt it gives:
 
-- its state at the kill: `RUNNING` if `started_at ≤ kill`, otherwise `LEASED`;
+- its state at the kill: `CREATED_AFTER_KILL` if it was claimed after the stamp, `RUNNING` if
+  `started_at ≤ kill`, otherwise `LEASED`;
 - its final status, failure class and code, and its `started_at`, `timeout_at`,
   `finished_at` and `retry_at`;
 - its lease's status, `acquired_at`, `renewed_at`, `expires_at`, `released_at` and renewal
@@ -3882,9 +3885,12 @@ or after it). For each one it gives:
 - its job's status now and the job's DLQ reason;
 - the replacement's claim (attempt number + 1).
 
-Each attempt goes into one bucket: `ABANDONED`, `TIMED_OUT`, `DEAD_LETTERED_ON_TIMEOUT`,
-`CANCELED`, `UNRESOLVED` or `OTHER`. A report that was in flight at the kill and committed
-after it lands in `OTHER`.
+Each attempt goes into one bucket: `ABANDONED`, `DEAD_LETTERED_ON_ABANDON`, `TIMED_OUT`,
+`DEAD_LETTERED_ON_TIMEOUT`, `CANCELED`, `UNRESOLVED` or `OTHER`. The two dead-letter buckets
+are chosen by the attempt's own DLQ entry (`dlq_entries.terminal_attempt_id`), never by the
+job's status now: a job a later attempt dead-lettered says nothing about how an earlier
+attempt ended. A report that was in flight at the kill and committed after it lands in
+`OTHER`.
 
 Two related queries:
 
@@ -3908,8 +3914,13 @@ merged into recovery.
   **precedence identity**: an attempt that ended `ABANDONED` or `TIMED_OUT` is `TIMED_OUT`
   exactly when its lease's `released_at`, the deciding post-lock sample, is at or after
   `timeout_at`.
+- **The attempts held when dead against the outcomes**, per trial and per condition. A trial
+  with fewer outcomes than attempts its victim's session held once it was dead is flagged
+  `MISMATCH`.
 - **A per-condition outcome summary.** It runs over every trial that ran, missed ones
-  included, and states every denominator.
+  included, and states every denominator. A miss that never chose a victim is its own
+  category ("no victim"), outside the split of kills that abandoned nothing, whose
+  denominator is the trials with a victim.
 - **Two conditions and a flag:**
   - **D** submits 8 × 5 s `demo.sleep` jobs and kills 1 s after the first is held, with
     `timeout_seconds` 30. The attempts are `RUNNING` and never renewed.
@@ -3961,6 +3972,22 @@ Existing tests cover parts of these cases and are cited in the file rather than 
 
 ### Evidence
 
+**The tool commit.** The series ran on the probe at tool commit **`2b9dba1`**. The review of
+that commit then found three faults in the outcome reporting, fixed in `fddeccf` (B1 to B3
+under "Behavior" above). None of them changes a figure below:
+
+- **B1**, the dead-letter bucket chosen by the job's status rather than the attempt's own DLQ
+  entry, cannot change any of them, because every series' DLQ is empty (see the defect
+  check).
+- **B3**, a miss with no victim counted as "other", cannot change them, because no trial
+  missed.
+- **B2**, attempts claimed after the kill stamp dropped from the outcomes, was checked
+  against every trial. In all 70 trials the attempts held when dead equal the outcomes
+  printed. A query of each series' database found no attempt of a victim session created
+  after its kill stamp, and the database's count of attempts unfinished at each kill equals
+  the printed count in all 70. The pairs, the 70 queries and their results are saved with
+  the outputs: sha256 `ca50bb8d…` (pairs), `35262961…` (queries), `f7807686…` (results).
+
 **The series (E1).** Four series ran hands-off in one chained script on 2026-10-14, from
 06:01 to 07:11 UTC:
 
@@ -3982,7 +4009,10 @@ Existing tests cover parts of these cases and are cited in the file rather than 
 The outputs are under the session's scratch directory and are not committed.
 
 **Results (E2).** No trial missed in any series. Every attempt in the table was resolved
-(none `UNRESOLVED` or `OTHER`), and the precedence identity held for **181 of 181**.
+(none `UNRESOLVED` or `OTHER`), and the precedence identity held for **171 of 171**: every
+attempt that ended `ABANDONED` (89) or `TIMED_OUT` (82). The summaries' per-condition lines
+are 17, 24, 10, 40, 40 and 40. An earlier version of this section said 181, an arithmetic
+error.
 
 | Run | Trials run | With ≥1 attempt held | Held at kill (LEASED / RUNNING) | ABANDONED | TIMED_OUT | DLQ on timeout | Finished between choice and kill | Claim→start, RUNNING (min / median / max) | Kill→replacement, ABANDONED: the recovery figure | Kill→replacement, TIMED_OUT: its own figure |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -4032,7 +4062,9 @@ check before writing the predictions. The PR discloses it and it is not counted.
 `timeout_at − expires_at = started_at − acquired_at`, its claim→start latency. With
 `timeout_seconds` equal to the lease, that difference is the whole window in which a
 reconciler pass abandons the attempt rather than times it out. The windows measured were
-27–92 ms with no load and 218–225 ms under A's load, against a 2 s reconciler poll. The pass
+27–92 ms in D at `timeout_seconds` 30 (an idle fleet of 5 s jobs) and 218–225 ms under A's
+load, against a 2 s reconciler poll. C's idle claim→start was 12–24 ms, but at
+`timeout_seconds` 300 its window is not claim→start. The pass
 landed after the window for all 42 `RUNNING`, `timeout_seconds` 30 attempts (D's 40 and A's
 2). The outcome is set by the reconciler's phase against a window of tens or hundreds of
 milliseconds, not by anything about the attempt. With `timeout_seconds` 300, the same attempts
@@ -4149,7 +4181,7 @@ Under any of them cancellation stays first.
   the replacement (D 33.98 s against D-300 31.96 s, median). It consumes budget, exactly as
   an abandonment does. At exhaustion the DLQ reason is `ATTEMPTS_EXHAUSTED` with a final
   `TIMED_OUT` attempt. It contributes nothing to the recovery figure.
-- *Evidence for:* the identity held in 181 of 181. It is what ADR-0010 states, and it can
+- *Evidence for:* the identity held in 171 of 171. It is what ADR-0010 states, and it can
   never let a timing-out job skip backoff.
 - *Evidence against:* D shows the timeout being attributed to a crash. Its jobs sleep 5 s
   and could not have timed out; they were killed. Whether a given kill reads as a timeout or
@@ -4860,6 +4892,27 @@ TaskForge process was running. The timed gates ran after the probe series had en
 | `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, images labelled with revision `1d0fa02`. This run was on AC from 18:49:47 to 18:51:54 UTC, with no sleep during it. A first run on `2b9dba1` also passed 41 of 41, but it spanned an idle sleep (from 09:18 UTC) and then a battery, lid-closed sleep, so it is not counted |
 | `make scan` | PASS in a fresh full clone of the final head; the run is in the pull request |
 | `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change, and neither touches the probe, `readdb` or the reconciler |
+
+**After the review fixes** (`fddeccf`, B1 to B3), these gates ran again on 2026-10-14 under
+Go 1.27.2. The fixes change `scripts/` and tests only, with no service code, so `make demo`,
+`make bench-smoke` and `make images-smoke` were not run again.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make test-unit` | PASS: 27 packages `ok`. New: `TestNoAbandoned_AMissWithNoVictimIsItsOwnCategory`; changed: `TestKillOutcome_OutcomeBuckets` (13 subtests, keyed on the attempt's own DLQ entry), `TestPrintOutcomes_NamesEachAttemptsPathAndFigures` (held when dead against outcomes) |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  93.863s`. New: `TestPrecedence_AnEarlierTimeoutIsNotTheAttemptThatDeadLettered`; changed: `TestKillOutcomes_EveryAttemptUnfinishedAtTheKillAndWhatBecameOfIt` (an attempt created after the kill is now selected) and case (e) (the timeout sweep skips at `expires_at == serverNow`) |
+| `make test-race` | PASS: 28 packages `ok`; `ok  …/tests/integration  98.120s`; no `DATA RACE` |
+| `make scan` | PASS in a fresh full clone of the final head; the run is in the pull request |
+
+Each fix's test was shown failing on the old code first:
+
+- B1's unit table failed on two rows: a dead-lettering abandonment read `ABANDONED`, and an
+  earlier timeout of a job a later attempt dead-lettered read `DEAD_LETTERED_ON_TIMEOUT`. Its
+  integration fixture failed the same way.
+- B2's fixture had 6 outcomes, not 7.
+- B3's case read `"other"`, not `"no victim"`.
 
 ### M8D3 gates
 
