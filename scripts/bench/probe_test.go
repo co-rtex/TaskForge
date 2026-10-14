@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
@@ -34,7 +35,8 @@ func TestParseArgs_TheProbesDefaultsAndFlags(t *testing.T) {
 	require.NotNil(t, o.probe)
 	require.Equal(t, profileShipped, o.profile)
 	require.Equal(t, []string{"A", "B", "C"}, o.probe.conditions)
-	require.Equal(t, map[string]int{"A": 10, "B": 20, "C": 10}, o.probe.trials, "the owner's planned N")
+	require.Equal(t, map[string]int{"A": 10, "B": 20, "C": 10, "D": 10, "E": 10}, o.probe.trials, "the owner's planned N")
+	require.Zero(t, o.probe.timeoutSeconds, "each condition's own timeout unless varied")
 	require.Equal(t, 50*time.Millisecond, o.probe.bJob)
 	require.Zero(t, o.probe.visibilityTimeout, "the broker's own default unless varied")
 	require.Zero(t, o.probe.pollWait, "the profile's poll wait unless varied")
@@ -58,7 +60,15 @@ func TestParseArgs_TheProbeRefusesWhatItCannotDo(t *testing.T) {
 		{"recovery-probe", "faults"},
 		{"faults", "recovery-probe"},
 		{"recovery-probe", "--workers", "3"}, // another mode's flag is not silently ignored
-		{"recovery-probe", "--conditions", "D"},
+		{"recovery-probe", "--conditions", "F"},
+		{"recovery-probe", "--conditions", "D,d"},
+		{"recovery-probe", "--conditions", "D", "--trials-d", "0"},
+		{"recovery-probe", "--conditions", "E", "--trials-e", "-1"},
+		{"recovery-probe", "--timeout-seconds", "0"},
+		{"recovery-probe", "--timeout-seconds", "-5"},
+		{"recovery-probe", "--timeout-seconds", "1.5"},
+		{"recovery-probe", "--timeout-seconds", "86401"},
+		{"recovery-probe", "--timeout-seconds", "30s"},
 		{"recovery-probe", "--conditions", "A,A"},
 		{"recovery-probe", "--trials-c", "0"},
 		{"recovery-probe", "--visibility-timeout", "1500ms"},
@@ -147,4 +157,217 @@ func TestDescribeCapacity_NamesEachWorkerAndItsDeadBootLeases(t *testing.T) {
 	got := describeCapacity([]readdb.AtCapacity{{Worker: "probeb-123-w01", At: at, Active: 4, DeadBoots: 1, Limit: 4}}, nil)
 	require.Equal(t, "at their limit: w01 held 4 of 4 (1 on a dead boot) at 23:52:45.539 UTC", got)
 	require.Contains(t, describeCapacity(nil, nil), "no worker reached its limit")
+}
+
+func TestParseArgs_ConditionsDAndEAndTheTimeoutVariation(t *testing.T) {
+	o, err := parseArgs([]string{"recovery-probe", "--conditions", "d,E", "--trials-d", "3", "--trials-e", "4",
+		"--timeout-seconds", "300"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"D", "E"}, o.probe.conditions)
+	require.Equal(t, 3, o.probe.trials["D"])
+	require.Equal(t, 4, o.probe.trials["E"])
+	require.Equal(t, 300, o.probe.timeoutSeconds)
+
+	o, err = parseArgs([]string{"recovery-probe", "--timeout-seconds", "1"})
+	require.NoError(t, err)
+	require.Equal(t, 1, o.probe.timeoutSeconds, "1 is the smallest whole number allowed")
+	o, err = parseArgs([]string{"recovery-probe", "--timeout-seconds", "86400"})
+	require.NoError(t, err)
+	require.Equal(t, 86400, o.probe.timeoutSeconds, "the API's own upper bound")
+}
+
+func TestConditionTimeoutAndDuration_EachConditionsOwnUnlessVaried(t *testing.T) {
+	require.Equal(t, 30, conditionTimeout(condLoaded, 0), "A keeps the recorded runs' 30 s")
+	require.Equal(t, 30, conditionTimeout(condTail, 0))
+	require.Equal(t, 300, conditionTimeout(condIdle, 0))
+	require.Equal(t, 30, conditionTimeout(condRunning, 0), "D keeps the recorded runs' 30 s, the lease's length")
+	require.Equal(t, 25, conditionTimeout(condRenewed, 0), "E's deadline falls before its renewed lease's expiry")
+	for _, c := range []string{condLoaded, condTail, condIdle, condRunning, condRenewed} {
+		require.Equal(t, 300, conditionTimeout(c, 300), "--timeout-seconds applies to %s", c)
+	}
+
+	b := 70 * time.Millisecond
+	require.Equal(t, 50*time.Millisecond, conditionJobDuration(condLoaded, b))
+	require.Equal(t, b, conditionJobDuration(condTail, b))
+	require.Equal(t, 40*time.Second, conditionJobDuration(condIdle, b))
+	require.Equal(t, 5*time.Second, conditionJobDuration(condRunning, b), "RUNNING at a 1 s kill, never renewed")
+	require.Equal(t, 20*time.Second, conditionJobDuration(condRenewed, b), "longer than one 10 s renew interval")
+	require.Less(t, conditionJobDuration(condRenewed, b), time.Duration(conditionTimeout(condRenewed, 0))*time.Second,
+		"E's job would succeed if its worker lived")
+	require.Less(t, conditionJobDuration(condRunning, b), stack.ShippedTimings().Lease/3,
+		"D's job ends before the first renewal")
+}
+
+func TestRun_TheProbesNewFlagsAreRefusedWithRecord(t *testing.T) {
+	for _, args := range [][]string{
+		{"recovery-probe", "--conditions", "D", "--record"},
+		{"recovery-probe", "--conditions", "E", "--trials-e", "2", "--record"},
+		{"recovery-probe", "--timeout-seconds", "300", "--record"},
+		{"recovery-probe", "--record", "--trials-d", "1", "--timeout-seconds", "30"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := run(args, &stdout, &stderr)
+		require.Equal(t, exitUsage, code, "%v", args)
+		require.Contains(t, stderr.String(), "recovery-probe is an investigation and is never recorded", "%v", args)
+		require.Empty(t, stdout.String(), "%v: refused before anything started", args)
+	}
+}
+
+// outcome builds one KillOutcome for the report tests.
+func outcome(state, status, job, lease string, acquired time.Duration, started, timeout, released, replacement *time.Duration) readdb.KillOutcome {
+	at := func(d *time.Duration) *time.Time {
+		if d == nil {
+			return nil
+		}
+		v := probeBase.Add(*d)
+		return &v
+	}
+	o := readdb.KillOutcome{
+		JobID: uuid.New(), AttemptNumber: 1, StateAtKill: state, Status: status, JobStatus: job,
+		LeaseStatus: lease, LeaseAcquiredAt: probeBase.Add(acquired), LeaseExpiresAt: probeBase.Add(acquired + 30*time.Second),
+		StartedAt: at(started), TimeoutAt: at(timeout), LeaseReleasedAt: at(released), ReplacementClaimedAt: at(replacement),
+	}
+	if o.LeaseReleasedAt != nil {
+		o.FinishedAt = o.LeaseReleasedAt
+	}
+	return o
+}
+
+var probeBase = time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+
+func d(v time.Duration) *time.Duration { return &v }
+
+func TestPrecedenceIdentity_TimedOutExactlyWhenResolvedAtOrAfterTheDeadline(t *testing.T) {
+	// A killed RUNNING attempt never renewed: expires at acquired + 30 s, deadline at
+	// started + 30 s, 12 ms later. A pass inside those 12 ms abandons it.
+	abandoned := outcome(readdb.HeldRunning, "ABANDONED", "QUEUED", "EXPIRED", 0, d(12*time.Millisecond), d(30012*time.Millisecond), d(30005*time.Millisecond), d(31*time.Second))
+	applies, holds := precedenceIdentity(abandoned)
+	require.True(t, applies)
+	require.True(t, holds, "resolved 7 ms before the deadline: ABANDONED")
+
+	timedOut := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(12*time.Millisecond), d(30012*time.Millisecond), d(31*time.Second), d(34*time.Second))
+	applies, holds = precedenceIdentity(timedOut)
+	require.True(t, applies)
+	require.True(t, holds)
+
+	exact := timedOut
+	exact.LeaseReleasedAt = exact.TimeoutAt
+	_, holds = precedenceIdentity(exact)
+	require.True(t, holds, "resolved exactly at the deadline is due: TIMED_OUT")
+
+	wrong := abandoned
+	wrong.LeaseReleasedAt = wrong.TimeoutAt
+	_, holds = precedenceIdentity(wrong)
+	require.False(t, holds, "ABANDONED at the deadline would contradict the precedence")
+
+	leased := outcome(readdb.HeldLeased, "ABANDONED", "QUEUED", "EXPIRED", 0, nil, nil, d(31*time.Second), d(32*time.Second))
+	_, holds = precedenceIdentity(leased)
+	require.True(t, holds, "no deadline: ABANDONED")
+
+	for _, status := range []string{"SUCCEEDED", "CANCELED", "RUNNING"} {
+		o := timedOut
+		o.Status = status
+		applies, _ = precedenceIdentity(o)
+		require.False(t, applies, "%s is not decided by the timeout precedence", status)
+	}
+}
+
+func TestNoAbandoned_SplitsKillsThatAbandonedNothing(t *testing.T) {
+	abandoned := outcome(readdb.HeldLeased, "ABANDONED", "QUEUED", "EXPIRED", 0, nil, nil, d(31*time.Second), d(32*time.Second))
+	timedOut := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(time.Millisecond), d(30001*time.Millisecond), d(31*time.Second), d(34*time.Second))
+	dlq := timedOut
+	dlq.JobStatus = "DEAD_LETTERED"
+	succeeded := outcome(readdb.HeldRunning, "SUCCEEDED", "SUCCEEDED", "COMPLETED", 0, d(time.Millisecond), d(30001*time.Millisecond), d(40*time.Millisecond), nil)
+	failed := succeeded
+	failed.Status = "FAILED"
+	finished := []readdb.Finished{{Status: "SUCCEEDED"}}
+
+	require.Empty(t, noAbandoned(trialResult{outcomes: []readdb.KillOutcome{timedOut, abandoned}}), "one ABANDONED is enough")
+	require.Equal(t, "TIMED_OUT", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{timedOut}}))
+	require.Equal(t, "TIMED_OUT", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{dlq}}), "dead-lettered on a timeout")
+	require.Equal(t, "finished before the signal", noAbandoned(trialResult{finishedBeforeKill: finished}))
+	require.Equal(t, "finished before the signal", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{succeeded}}),
+		"a report committing as the signal was sent")
+	require.Equal(t, "other", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{failed}, finishedBeforeKill: finished}))
+	require.Equal(t, "other", noAbandoned(trialResult{}), "nothing caught and nothing finished")
+}
+
+func TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart(t *testing.T) {
+	kill := probeBase.Add(time.Second)
+	abandoned := outcome(readdb.HeldLeased, "ABANDONED", "QUEUED", "EXPIRED", 0, nil, nil, d(31*time.Second), d(33*time.Second))
+	timedOut := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(20*time.Millisecond), d(30020*time.Millisecond), d(31*time.Second), d(35*time.Second))
+	swept := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "RELEASED", 0, d(10*time.Millisecond), d(25010*time.Millisecond), d(26*time.Second), d(29*time.Second))
+	trials := []trialResult{
+		{killedAt: kill, outcomes: []readdb.KillOutcome{abandoned, timedOut}},
+		{killedAt: kill, outcomes: []readdb.KillOutcome{swept}},
+		{killedAt: kill, missed: true, finishedBeforeKill: []readdb.Finished{{Status: "SUCCEEDED"}}},
+	}
+	s := summarizeOutcomes(trials)
+	require.Equal(t, 3, s.trials)
+	require.Equal(t, 1, s.missed)
+	require.Equal(t, 2, s.withHeld)
+	require.Equal(t, map[string]int{readdb.HeldLeased: 1, readdb.HeldRunning: 2}, s.held)
+	require.Equal(t, map[string]int{readdb.OutcomeAbandoned: 1, readdb.OutcomeTimedOut: 2}, s.final)
+	require.Equal(t, 2, s.byState[readdb.HeldRunning][readdb.OutcomeTimedOut])
+	require.Equal(t, map[string]int{"the expired-lease path": 1, "the timeout sweep, lease live": 1}, s.takenBy)
+	require.Equal(t, 3, s.identityChecked)
+	require.Equal(t, 3, s.identityHeld)
+	require.Equal(t, []time.Duration{20 * time.Millisecond, 10 * time.Millisecond}, s.claimToStart, "RUNNING at the kill only")
+	require.Equal(t, []time.Duration{32 * time.Second}, s.abandonedToReplacement, "the recovery figure")
+	require.Equal(t, []time.Duration{34 * time.Second, 28 * time.Second}, s.timedOutToReplacement, "its own figure, never merged")
+	require.Equal(t, 2, s.noAbandonedTrials)
+	require.Equal(t, map[string]int{"TIMED_OUT": 1, "finished before the signal": 1}, s.noAbandoned)
+
+	var out bytes.Buffer
+	printOutcomeSummary(&out, condRunning, trials)
+	text := out.String()
+	require.Contains(t, text, "trials run 3 (2 counted, 1 missed and run again); trials with >=1 attempt unfinished at the kill: 2")
+	require.Contains(t, text, "final, of 3: ABANDONED 1, TIMED_OUT 2, DEAD_LETTERED_ON_TIMEOUT 0, CANCELED 0, UNRESOLVED 0, OTHER 0")
+	require.Contains(t, text, "precedence identity (TIMED_OUT exactly when released_at >= timeout_at): held in 3 of 3")
+	require.Contains(t, text, "kill->replacement, ABANDONED (the recovery figure): 1; min 32000 ms, median 32000 ms, max 32000 ms")
+	require.Contains(t, text, "kill->replacement, TIMED_OUT (its own figure, not a recovery): 2; min 28000 ms")
+	require.Contains(t, text, "trials with no ABANDONED attempt: 2 of 3 (finished before the signal 1, TIMED_OUT 1, other 0)")
+}
+
+func TestSummarizeOutcomes_AnUnreadableTrialIsCountedAndLeftOut(t *testing.T) {
+	s := summarizeOutcomes([]trialResult{{outcomeErr: errors.New("read failed")}})
+	require.Equal(t, 1, s.trials)
+	require.Equal(t, 1, s.outcomeErrors)
+	require.Zero(t, s.withHeld)
+	require.Zero(t, s.noAbandonedTrials, "not classified on no data")
+}
+
+func TestOutcomesSettled_WaitsForEveryHeldAttemptToBeReplacedOrFinished(t *testing.T) {
+	replaced := outcome(readdb.HeldRunning, "TIMED_OUT", "QUEUED", "EXPIRED", 0, d(time.Millisecond), d(30001*time.Millisecond), d(31*time.Second), d(34*time.Second))
+	waiting := replaced
+	waiting.JobStatus, waiting.ReplacementClaimedAt = "RETRY_WAIT", nil
+	dlq := waiting
+	dlq.JobStatus = "DEAD_LETTERED"
+	running := replaced
+	running.Status, running.ReplacementClaimedAt = "RUNNING", nil
+
+	require.True(t, outcomesSettled([]readdb.KillOutcome{replaced}, 1))
+	require.False(t, outcomesSettled([]readdb.KillOutcome{waiting}, 1), "RETRY_WAIT: the replacement is still to come")
+	require.True(t, outcomesSettled([]readdb.KillOutcome{dlq}, 1), "dead-lettered: no replacement will come")
+	require.False(t, outcomesSettled([]readdb.KillOutcome{running}, 1), "not resolved yet")
+	require.False(t, outcomesSettled([]readdb.KillOutcome{replaced}, 2), "fewer outcomes than attempts held")
+	require.False(t, outcomesSettled(nil, 0), "nothing to say settled about")
+}
+
+func TestPrintOutcomes_NamesEachAttemptsPathAndFigures(t *testing.T) {
+	kill := probeBase.Add(2 * time.Second)
+	o := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(15*time.Millisecond), d(30015*time.Millisecond), d(31*time.Second), d(35*time.Second))
+	code := "timeout"
+	o.ErrorCode = &code
+	retry := o.FinishedAt.Add(900 * time.Millisecond)
+	o.RetryAt = &retry
+	var out bytes.Buffer
+	printOutcomes(&out, trialResult{killedAt: kill, chosenAt: kill.Add(-4 * time.Millisecond), timeoutSeconds: 30, outcomes: []readdb.KillOutcome{o}})
+	text := out.String()
+	require.Contains(t, text, "outcomes (timeout_seconds 30): victim chosen at PostgreSQL 12:00:01.996 UTC, 4 ms before the kill; 1 attempt(s) unfinished at the kill (LEASED 0, RUNNING 1); 0 finished between the choice and the kill")
+	require.Contains(t, text, "RUNNING at the kill -> TIMED_OUT (job now RETRY_WAIT); code timeout; lease EXPIRED, renewed 0x; claim->start 15 ms; timeout_at - expires_at 15 ms; resolved 1000 ms after expires_at by the expired-lease path; retry_at = finished + 900 ms; kill->replacement 33000 ms; precedence identity HOLDS")
+
+	out.Reset()
+	printOutcomes(&out, trialResult{outcomeErr: errors.New("boom")})
+	require.Equal(t, "outcomes: UNAVAILABLE: boom\n", out.String())
 }
