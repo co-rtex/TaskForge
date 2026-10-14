@@ -19,9 +19,10 @@ import (
 // Node, which npm audit runs inside, is pinned in dashboard/Dockerfile and nowhere
 // else.
 const (
-	// govulncheck v1.8.0 needs Go 1.26; v1.7.0 is the newest that builds with the
-	// Go in go.mod. Raise this when go.mod's Go does.
-	govulncheckVersion = "v1.7.0"
+	// govulncheck runs under the Go in go.mod, so its tag must be one that builds
+	// with that Go: v1.8.0, the newest tag, declares go 1.26.0 and builds with
+	// go.mod's 1.27.2. Raise this when go.mod's Go does.
+	govulncheckVersion = "v1.8.0"
 
 	// gitleaks runs from its published container image, pinned by version and by
 	// multi-platform index digest. It is deliberately not gitleaks-action, which

@@ -1,7 +1,8 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8D3. Each milestone's line
+planned. It records the implemented state through M8D3 and the Go 1.27.2 toolchain
+bump that followed it. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -73,7 +74,11 @@ M8B, M8D1, M8D2 and M8D3 are complete and M8C is planned.
   stranded ([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)).
   The kill targeting counts only a worker's current session, and `go run ./scripts/bench
   recovery-probe` splits a recovery into the segments PostgreSQL records. No production
-  code changed. See "M8D3" below. M8C (deployment) is planned.
+  code changed. See "M8D3" below.
+- **Go 1.27.2 toolchain (maintenance after M8D3, not a milestone):** see PR #26. `go.mod`
+  and the image builder move to Go 1.27.2, govulncheck to v1.8.0 and `golang.org/x/net` to
+  v0.60.0, and `make scan` passes again. No behavior changed. See "Go 1.27.2 toolchain"
+  below. M8C (deployment) is planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into five, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -3708,7 +3713,9 @@ beside its output.
   2026-08-19; 1.25.14, released that day, is its latest release, and the fixes are in
   1.26.9 and 1.27.2, released 2026-10-08. A separate toolchain-bump pull request is to fix
   it; M8D3 does not. M8B's scan evidence above was true when it was recorded and is not
-  edited.
+  edited. **Fixed by PR #26** (see "Go 1.27.2 toolchain" below): four of the twelve IDs
+  were also reachable in `golang.org/x/net`, so it took Go 1.27.2 and `golang.org/x/net`
+  v0.60.0 together.
 - **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
   own CI result: the pull request's checks are the record.
 
@@ -3716,6 +3723,104 @@ beside its output.
 
 None. `make bench-smoke` aims its kill only at the current session's attempts, which is
 what it was meant to do.
+
+## Go 1.27.2 toolchain
+
+Maintenance after M8D3, not a milestone: `make scan` was red on `main` (see M8D3's
+limitation on the supply-chain gate), and this change makes it pass. It follows
+[ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md)'s rule that the image
+builder is pinned to exactly `go.mod`'s Go, and changes no behavior. See PR #26.
+
+### What changed
+
+- **`go.mod`:** `go 1.27.2`, with no `toolchain` line (the `go` directive already names an
+  exact patch release). Go 1.25 left support when Go 1.27.0 shipped on 2026-08-19, and
+  1.25.14 is its latest release, so its twelve reachable standard-library advisories have no
+  1.25 fix; 1.27.2 is the 2026-10-08 security release.
+- **`Dockerfile`:** the builder is `golang:1.27.2@sha256:5bc7f572bbaa98885a3a1fd9c0aa76b59e3e14e8628bfc316bbfd0c701e4818c`,
+  the official image's multi-platform index (linux/amd64 and linux/arm64 among its
+  platforms), the same kind of pin as before. `tests/verification` holds it equal to
+  `go.mod`.
+- **`scripts/scan`:** govulncheck v1.8.0, the newest tag; it declares go 1.26.0 and builds
+  with 1.27.2. The recorded scan fixtures still name Go 1.25.0 and 1.25.14: they are output
+  of past runs, not pins, and are unchanged.
+- **`golang.org/x/net` v0.60.0** (from v0.58.0), the first version fixed for GO-2026-6603,
+  -6610, -6611, -6612 and -6617 in that module, by the owner's decision. Its requirements
+  move `golang.org/x/sync` to v0.23.0, `golang.org/x/sys` to v0.48.0 and `golang.org/x/text`
+  to v0.42.0. All four are indirect: the OpenTelemetry OTLP exporter, grpc and the
+  prometheus libraries require them. No direct requirement's version changed.
+- **`github.com/prometheus/common` v0.71.0** moved from the indirect to the direct
+  requirements, at the same version, because `go mod tidy` puts it there: test files in
+  `cmd/`, `internal/api` and `tests/integration` import it directly. `main`'s `go.mod` was
+  already untidy (Go 1.25.14's own `go mod tidy` makes the same move), and that move left
+  `go.sum` unchanged; `go.sum` changes only for the four `golang.org/x` modules.
+- **`README.md`:** the prerequisite is Go 1.27.2 or newer.
+- **The local gates now run on the same Go as `go.mod`.** Earlier sections record gates run
+  on a host Go 1.27.0 while `go.mod` named 1.25.14, with a separate `GOTOOLCHAIN=go1.25.14`
+  run for CI's toolchain. Here every gate ran under `GOTOOLCHAIN=go1.27.2`, the version
+  `go.mod`, the builder and CI (which reads `go-version-file: go.mod`) all use.
+
+### Evidence
+
+**The scan, before and after**, each in a fresh full clone:
+
+| Commit | Go | govulncheck | Reachable findings | gitleaks, pip-audit, npm audit | Result |
+| --- | --- | --- | --- | --- | --- |
+| `2b69750` (`main`) | 1.25.14 | v1.7.0 | 12: GO-2026-6599, -6600, -6603, -6605, -6607, -6608, -6609, -6610, -6611, -6612, -6613, -6617 | no findings | **FAIL** |
+| `fc6f0af` (Go 1.27.2 and govulncheck v1.8.0 only) | 1.27.2 | v1.8.0 | 5, all in `golang.org/x/net` v0.58.0: GO-2026-6603, -6610, -6611, -6612, -6617 | no findings | **FAIL** |
+| `ace146f` (and `golang.org/x/net` v0.60.0) | 1.27.2 | v1.8.0 | **0** | no findings | **PASS** |
+
+The vulnerability database was the one modified 2026-10-08T22:31:09Z in all three.
+
+**A correction to what `main` reported.** The twelve IDs were described, in M8D3 and in the
+plan for this change, as standard-library advisories. Four of them (GO-2026-6603, -6611,
+-6612 and -6617) were reachable at `main` in **both** the standard library and
+`golang.org/x/net` v0.58.0, by govulncheck's own JSON; the scan's summary prints one line per
+advisory ID, so only the standard-library trace showed. GO-2026-6610's `golang.org/x/net`
+trace first appeared at Go 1.27.2. Go 1.27.2 fixes the standard-library half and
+`golang.org/x/net` v0.60.0 the module half. The `golang.org/x/net` traces enter at
+`internal/jobs/canonical.go:26` (`CanonicalJSON`) and `internal/worker/client.go:535`
+(`Ping`).
+
+**The invariant.** With the Dockerfile's builder set to `golang:1.27.1` and `go.mod` at
+1.27.2, `TestDockerfile_BuilderGoVersionIsExactlyGoMods` fails (expected `"1.27.2"`, actual
+`"1.27.1"`); reverted, the tree is clean and it passes.
+
+**Gates**, run locally on `ace146f`, the last commit that is not documentation, on
+2026-10-14, every one under `GOTOOLCHAIN=go1.27.2` with `go version` printing `go1.27.2` in
+the same shell. PostgreSQL 16, ElasticMQ and the object store from `make up`. **Every timed
+run on AC power with Low Power Mode off**, checked with `pmset -g batt` before each, with
+nothing else running.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no diff (0 lines) |
+| `make lint` | PASS: `go vet ./...` silent; no new diagnostic under Go 1.27.2 |
+| `make build` | PASS: seven binaries, each stamped `go1.27.2`; the six that link `golang.org/x/net` (all but `taskforge-cli`) link v0.60.0 |
+| `make test-unit` | PASS: 26 packages `ok`; no test's result changed from `main` |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  91.664s`. A first attempt failed in 0.5 s because Docker was not running and PostgreSQL was unreachable; it was rerun after `make up` |
+| `make test-race` | PASS: 27 packages `ok`; `ok  …/tests/integration  104.350s`; no `DATA RACE` |
+| `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)` |
+| `make bench-smoke` | PASS: `14 of 14 checks met` |
+| `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, labelled with revision `ace146f`, built `FROM golang:1.27.2@sha256:5bc7f572…`; the worker binary copied out of its image reports `go1.27.2` and `golang.org/x/net` v0.60.0 |
+| `make scan` | PASS in a fresh clone of `ace146f` (above); the final head's run is in the pull request |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change, and neither builds with Go |
+
+### Limitations
+
+- **The scan driver prints one trace per advisory ID,** so a finding reachable in two
+  modules shows only one of them. The gate still blocks correctly, because the finding
+  is reported either way; only the diagnostic is incomplete. It is not changed here.
+- **[ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md) still names Go 1.25.14
+  and govulncheck v1.7.0,** as of its date. Its rule, the builder pinned to exactly
+  `go.mod`'s Go, is followed, and the ADR is not edited.
+- **No benchmark was re-run.** Both committed records were measured with binaries built by
+  Go 1.25.x; whether 1.27.2 moves any figure is not measured.
+- **The `golang.org/x/net` change touches HTTP/2 paths** the worker's control-plane client
+  and the OTLP exporter use. The integration, race, demo, smoke and image gates passed on it;
+  nothing measured its performance.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
+  own CI result: the pull request's checks are the record.
 
 ## Verification
 
@@ -5390,8 +5495,8 @@ moves.
 
 ## Local environment
 
-- Go 1.25.14 or newer (`go.mod` names the patch release; an older 1.25 toolchain
-  downloads it)
+- Go 1.27.2 or newer (`go.mod` names the patch release; an older toolchain downloads
+  it under the default `GOTOOLCHAIN=auto`)
 - PostgreSQL 16 on `localhost:5442`
 - ElasticMQ on `localhost:9324`
 - Docker Compose and Make
@@ -5413,7 +5518,8 @@ two targets belong in its version.
 
 ## Next objective
 
-M8C: deployment. See [ROADMAP.md](ROADMAP.md)'s M8C entry. It is not started, and it
+By the owner's order, the investigation of kills whose attempts end `TIMED_OUT` rather than
+`ABANDONED` (see M8D3's limitations) comes first, and then M8C: deployment. See [ROADMAP.md](ROADMAP.md)'s M8C entry. It is not started, and it
 **needs its own owner decision before any work starts**: the non-loopback bind, which
 M6E's note says has to be revisited together with the Host rule; protection of
 `/internal`; and the decision ADR-0019 leaves, whether to gate the demonstration
