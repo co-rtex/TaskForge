@@ -173,8 +173,9 @@ modes
   recovery-probe
                M8D3's investigation: kills one worker per trial, on a fresh stack
                each time, and splits each recovery into the segments PostgreSQL
-               records. Never recorded, no Make target; runs by itself and takes
-               only the flags listed under it below.
+               records; M8D4 added what became of every attempt a kill caught.
+               Never recorded, no Make target; runs by itself and takes only the
+               flags listed under it below.
 
   A full run is "throughput faults --record" (make bench): it writes
   docs/benchmarks/<date>-<sha>.md and .json. Refuses on a dirty tree.
@@ -194,11 +195,15 @@ flags
 recovery-probe flags
   --profile shipped|tuned  timing profile (default shipped)
   --seed N               seed of the victim draws (default 20261002)
-  --conditions LIST      which conditions, of A,B,C (default A,B,C)
+  --conditions LIST      which conditions, of A,B,C,D,E (default A,B,C)
   --trials-a N           trials of A, loaded           (default 10)
   --trials-b N           trials of B, tail             (default 20)
   --trials-c N           trials of C, idle             (default 10)
+  --trials-d N           trials of D, RUNNING kill     (default 10)
+  --trials-e N           trials of E, renewed kill     (default 10)
   --b-job-duration D     B's job duration              (default 50ms)
+  --timeout-seconds N    every condition's timeout_seconds, 1 to 86400
+                         (default: 30 for A, B and D; 300 for C; 25 for E)
   --visibility-timeout D the queue's VisibilityTimeout (default: the broker's own)
   --poll-wait D          the workers' poll wait        (default: the profile's)
   --no-restart           leave the killed worker dead  (default: restart it, as faults does)

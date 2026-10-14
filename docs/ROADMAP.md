@@ -612,15 +612,17 @@ evidence, the way M5, M6 and M7 were: M8A measures, M8B is the supply chain
 items the M8A review raised, and M8C is deployment. The owner split M8D in two
 when M8D began: M8D1 is the route registry and nothing else, and M8D2 is the rest.
 When M8D2 began the owner split it again: the 50.04 s recovery-outlier investigation
-moved to M8D3, which needs an experiment and not a documentation change. The original
+moved to M8D3, which needs an experiment and not a documentation change. M8D3 found that
+some killed workers' attempts end `TIMED_OUT` rather than `ABANDONED`, and the owner
+added M8D4 to measure that before M8C. The original
 objective, deliverables, and acceptance sentence are preserved across them, not
 reduced.
 
-**Order: M8B, then M8D1, then M8D2, then M8D3, then M8C.** M8C keeps its name.
+**Order: M8B, then M8D1, then M8D2, then M8D3, then M8D4, then M8C.** M8C keeps its name.
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
-complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8C is
-planned.
+complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8D4 is
+complete; see PR #27. M8C is planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -770,6 +772,27 @@ evidence and for what remains limited. The outcome is **explained**
 ([ADR-0024](adr/0024-the-50s-recovery-is-a-held-notification-at-the-tail.md)), and the
 owner accepted the behavior as intended on 2026-10-10: no control-plane change follows.
 
+#### M8D4 — Killed attempts that end `TIMED_OUT`
+**Objective.** Measure how often a killed worker's attempts end `TIMED_OUT` rather than
+`ABANDONED`, test the mechanism that decides it, and give the owner what is needed to
+decide whether the reconciler's precedence should change. Investigation, measurement and
+pinning tests only: the precedence itself does not change in this milestone.
+**Deliverables.** `readdb.KillOutcomes` (what became of every attempt a kill caught,
+whatever status it ended in) and the recovery probe's outcome reporting; condition D (a
+RUNNING kill, never renewed), a renewed-kill condition, and a `--timeout-seconds`
+variation; deterministic integration tests that pin the precedence through the real store,
+with mutations shown; a read-only analysis of the worker paths that bear on the
+alternatives; and a decision memo that weighs them and decides nothing.
+**Acceptance.** Outcome rates reported with their denominators (trials run, trials with an
+attempt held, outcomes by status); a controlled `--timeout-seconds` variation that moves
+the outcomes as predicted, or a report that it did not; the precedence pinned by
+deterministic tests, with the mutations shown failing them; the worker-path analysis, with
+citations; and the decision memo.
+**Depends on.** M8D3.
+**Status:** complete; see PR #27 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
+evidence, the worker-path analysis and the decision memo. Any change to the precedence is
+the owner's decision and a separate, later milestone if one is chosen.
+
 #### M8C — Deployment
 **Objective.** Make deployment credible without applying it.
 **Deliverables.** Validated (not applied) Terraform for ALB, ECS services, RDS,
@@ -782,7 +805,7 @@ whether the demonstration handlers are gated in a deployed worker
 ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
 a gate open).
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8B; follows M8D3 in the owner's order (M8B, M8D1, M8D2, M8D3, M8C). **Needs its
+**Depends on.** M8B; follows M8D4 in the owner's order (M8B, M8D1, M8D2, M8D3, M8D4, M8C). **Needs its
 own owner decision before any work starts:** the bind, `/internal` and the handler
 gate are trust-boundary decisions, and the infrastructure costs money.
 **Status:** planned.

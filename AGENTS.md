@@ -124,7 +124,7 @@ harness measured validly and records nothing; it is the only part CI runs, and C
 never records numbers. The definitions are in
 [ADR-0020](docs/adr/0020-benchmark-methodology.md).
 
-`go run ./scripts/bench recovery-probe` is M8D3's non-recording investigation tool (no Make target, `--record` refused; the planned 10/20/10 trials take about 50 minutes).
+`go run ./scripts/bench recovery-probe` is M8D3's non-recording investigation tool, extended by M8D4 (no Make target, `--record` refused with any other flag). Conditions A, B and C run by default (the planned 10/20/10 trials take about 50 minutes); `--conditions D` (a RUNNING kill, never renewed) and `--conditions E` (a kill after every held attempt was renewed) run 10 trials each by default, about 7 and 9 minutes as measured in M8D4 (A, B and C together took 47). `--timeout-seconds N` replaces every condition's `timeout_seconds`. Every trial prints what became of each attempt its kill caught (`readdb.KillOutcomes`).
 
 `make images` builds `internal/dashboard/dist` first (the api embeds it; a clean
 clone has only a placeholder) and then one image per service from the root
