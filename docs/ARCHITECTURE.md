@@ -199,12 +199,12 @@ Every row is decided under the established lock order against one
 | Retryable failure, budget remaining | Exact live fence, before the deadline, `RETRYABLE`, attempts used `< max_attempts` | `RUNNING → RETRY_WAIT` | `RUNNING → FAILED` | `ACTIVE → RELEASED` | Safe error metadata, outcome identity, persisted jittered delay and `retry_at`, `available_at = retry_at`; **no** outbox event |
 | Permanent failure | Exact live fence, before the deadline, `PERMANENT` | `RUNNING → DEAD_LETTERED` | `RUNNING → FAILED` | `ACTIVE → RELEASED` | Exactly one DLQ entry, `PERMANENT_FAILURE` |
 | Attempts exhausted | A retryable failure, timeout, or abandonment consumes the final budget | executing → `DEAD_LETTERED` | truthful `FAILED`, `TIMED_OUT`, or `ABANDONED` | `RELEASED`, or `EXPIRED` when the lease had lapsed | Exactly one DLQ entry, `ATTEMPTS_EXHAUSTED` |
-| Timeout | `RUNNING`, persisted `timeout_at <=` post-lock server time | `RUNNING → RETRY_WAIT` or `DEAD_LETTERED` | `RUNNING → TIMED_OUT` | `ACTIVE → RELEASED` or `EXPIRED` | A retry decision, or exactly one DLQ entry |
+| Timeout | `RUNNING`, persisted `timeout_at <=` post-lock server time, and, if the lease has lapsed, `expires_at >= timeout_at` ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)) | `RUNNING → RETRY_WAIT` or `DEAD_LETTERED` | `RUNNING → TIMED_OUT` | `ACTIVE → RELEASED` (lease live) or `EXPIRED` (lapsed at or after the deadline) | A retry decision, or exactly one DLQ entry |
 | Cancellation before claim | `PENDING`, `QUEUED`, or `RETRY_WAIT` | source → `CANCELED` | none created | none active | `cancel_requested_at`; no new outbox event |
 | Cancellation while executing | `LEASED` or `RUNNING` | source → `CANCEL_REQUESTED` | unchanged for now | stays active for now | Heartbeat directive; start, success, failure, and renewal all stop committing |
 | Cooperative cancellation | `CANCEL_REQUESTED`, exact fence, active lease | `CANCEL_REQUESTED → CANCELED` | `LEASED \| RUNNING → CANCELED` | `ACTIVE → RELEASED` | Outcome identity stored; a duplicate is harmless |
 | Fallback cancellation | `CANCEL_REQUESTED`, lease expired | `CANCEL_REQUESTED → CANCELED` | `LEASED \| RUNNING → CANCELED` | `ACTIVE → EXPIRED` | Reconciler-owned and idempotent |
-| Abandonment | Lease expired, no cancellation, no due deadline | `LEASED \| RUNNING → QUEUED` or `DEAD_LETTERED` | `→ ABANDONED` | `ACTIVE → EXPIRED` | Immediate requeue with a fresh generation and event, or one DLQ entry ([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)) |
+| Abandonment | Lease expired, no cancellation, and no deadline, a deadline not yet due, or a lease that expired strictly before its deadline (due or not) | `LEASED \| RUNNING → QUEUED` or `DEAD_LETTERED` | `→ ABANDONED` | `ACTIVE → EXPIRED` | Immediate requeue with a fresh generation and event, or one DLQ entry ([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)) |
 | Delayed submission | Valid future `scheduled_at` | insert as `PENDING` | none | none | `available_at = scheduled_at`; no outbox event |
 | Retry or delayed eligibility | `PENDING` or `RETRY_WAIT`, `available_at <=` post-lock server time | source → `QUEUED` | prior history unchanged | prior leases unchanged | New notification generation and exactly one fresh transactional event |
 | Replay / operator retry | Original stays `DEAD_LETTERED` with a DLQ entry | original unchanged; insert a new `QUEUED` job | original history unchanged | original leases unchanged | New job linked by `replayed_from_job_id`, replay identity record, fresh outbox event |
@@ -238,7 +238,10 @@ finalization waits for the worker's acknowledgment or for the lease to lapse.
 
 Precedence among terminal outcomes is stated rather than incidental:
 cancellation, then a due deadline, then abandonment. See
-[ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md).
+[ADR-0010](adr/0010-durable-outcome-identity-and-terminal-precedence.md). On the
+expired-lease path a due deadline is a timeout only if the lease did not lapse
+before it; a lease that expired strictly before its deadline is an abandonment
+([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)).
 
 ---
 
@@ -579,11 +582,20 @@ could otherwise extend or finish the work checks the persisted deadline against
 the same post-lock sample, so a success or failure that waited across it is
 rejected rather than committed on a stale clock reading.
 
-If an expired-lease scan finds a running attempt whose deadline is already due,
-it uses the timeout path rather than misclassifying the attempt as `ABANDONED`.
-That distinction is load-bearing: abandonment requeues immediately with no
-backoff and no failure detail, so a job whose handler reliably takes too long
-would otherwise loop through its whole budget at full speed.
+If an expired-lease scan finds a running attempt whose deadline is already due
+**and whose lease did not lapse before that deadline** (`expires_at >=
+timeout_at`), it uses the timeout path rather than misclassifying the attempt as
+`ABANDONED`. That distinction is load-bearing: abandonment requeues immediately
+with no backoff and no failure detail, so a job whose handler reliably takes too
+long would otherwise loop through its whole budget at full speed. A live worker
+renews until the deadline, so such a handler's lease outlives it. A lease that
+expired strictly before the deadline was interrupted while its budget still had
+time left, and is abandoned whenever the reconciler reaches it: the outcome is a
+function of the two stored instants, not of the reconciler's phase
+([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)).
+Success and failure reports are unchanged: once the deadline is due they answer
+`attempt_timed_out` and record nothing, even for an attempt the reconciler will
+record `ABANDONED`.
 
 ### Cancellation
 
@@ -680,8 +692,11 @@ would strand exactly the cases this exists to recover.
    in the established order, sample PostgreSQL time afterwards, revalidate every
    mutable field, and then apply precedence —
    `CANCEL_REQUESTED` finalizes the cancellation (attempt `CANCELED`, lease
-   `EXPIRED`); an already-due deadline finalizes a timeout; otherwise the
-   attempt becomes `ABANDONED` with a `finished_at` (from `LEASED` or `RUNNING`
+   `EXPIRED`); an already-due deadline finalizes a timeout **only if the lease
+   did not lapse before it** (`expires_at >= timeout_at`, the tie a timeout;
+   [ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md));
+   otherwise, including a lease that expired strictly before a deadline that is
+   due by now, the attempt becomes `ABANDONED` with a `finished_at` (from `LEASED` or `RUNNING`
    alike) and the job either returns to `QUEUED` with a **fresh**
    `work.available` outbox event on a new generation, or becomes
    `DEAD_LETTERED` if that abandonment consumed the total attempt budget
@@ -743,9 +758,9 @@ success from committing and terminal `CANCELED` is never left.
 | Broker duplicates a notification | Globally idempotent event-id consumption admits one claim; another session gets a safe duplicate outcome. |
 | Broker loses a notification | The scheduler re-notifies a stranded queued job once the bounded interval elapses, using a new event id on the job's current notification generation. Reachability is repaired; nothing was ever at risk of corruption. |
 | Publisher crashes mid-publish | Event republished after the claim timeout/visibility window lapses. Documented at-least-once window. |
-| Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). |
+| Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). This holds even when the attempt's deadline is due by the time reconciliation reaches it, as long as the lease expired strictly before the deadline ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). |
 | Handler returns an error | The worker reports a fenced failure under a retained outcome identity. With budget remaining the job enters `RETRY_WAIT` with a persisted jittered delay; a permanent classification or an exhausted budget dead-letters it with exactly one DLQ entry. |
-| Handler outlives its execution budget | The worker cancels it locally at a conservative deadline and reports nothing. Reconciliation records `TIMED_OUT` against the persisted deadline and applies the same retry policy. |
+| Handler outlives its execution budget | The worker cancels it locally at a conservative deadline and reports nothing; it renewed its lease until then, so the lease outlives the deadline. Reconciliation records `TIMED_OUT` against the persisted deadline, by the timeout sweep while the lease is live or on the expired-lease path when `expires_at >= timeout_at`, and applies the same retry policy. A handler that starves its own renewals until its lease lapses before the deadline is recorded `ABANDONED` instead, bounded by `max_attempts` ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). |
 | Handler ignores cancellation entirely | Go cannot terminate it. Reconciliation finalizes the cancellation once the lease lapses, and every fenced operation refuses whatever the handler eventually produces. |
 | Operator cancels a running job | The job moves to `CANCEL_REQUESTED`, which immediately stops start, success, failure, and renewal from committing. The worker learns of it on its next heartbeat and acknowledges; if it never does, reconciliation finalizes it. |
 | Scheduler crashes mid-promotion | The transaction rolls back, so there is neither a promotion nor an event, and a later pass promotes it. An ambiguous commit is safe to rerun: the locked status and generation show it already happened. |
