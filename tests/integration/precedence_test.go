@@ -351,12 +351,12 @@ func TestPrecedence_TheTimeoutSweepRunsFirstInAPass(t *testing.T) {
 	}, discardLogger()).RunOnce(ctx)
 	require.NoError(t, err)
 
-	require.Equal(t, []string{"timeouts", "expired-leases"}, wrapped.order, "the order RunOnce ran the sweeps in")
-	require.Equal(t, 1, result.TimedOutAttempts, "one pass resolves it")
-	require.Zero(t, result.ExpiredLeases)
 	state := readState(t, fence)
-	require.Equal(t, "TIMED_OUT", state.attempt)
+	require.Equal(t, "TIMED_OUT", state.attempt, "one pass resolves it")
 	require.Equal(t, "RELEASED", state.lease, "found while the lease was live, so handed back rather than expired")
+	require.Equal(t, 1, result.TimedOutAttempts)
+	require.Zero(t, result.ExpiredLeases)
+	require.Equal(t, []string{"timeouts", "expired-leases"}, wrapped.order, "the order RunOnce ran the sweeps in")
 }
 
 // frozenClockSchema holds the test's own clock_timestamp(). It shadows
