@@ -370,16 +370,24 @@ func describeCapacity(at []readdb.AtCapacity, err error) string {
 
 // precedenceIdentity checks one resolved attempt against the reconciler's
 // precedence. Both sweeps decide on one post-lock clock sample, and the outcome
-// transaction writes that sample to the lease's released_at; the decision is
-// TIMED_OUT exactly when that sample is at or after timeout_at (fenceState.timedOut),
-// and ABANDONED otherwise. So for an attempt that ended ABANDONED or TIMED_OUT,
-// TIMED_OUT must equal released_at >= timeout_at. applies is false for any other
-// outcome, which a cancellation, a report or nothing at all decided.
+// transaction writes that sample to the lease's released_at. Since M8D5
+// (ADR-0025) the decision is TIMED_OUT exactly when that sample is at or after
+// timeout_at (fenceState.timedOut) AND the lease did not lapse before the
+// deadline (expires_at at or after timeout_at), and ABANDONED otherwise. The
+// timeout sweep only takes an attempt whose lease is still live, so its TIMED_OUT
+// satisfies the second clause as well. So for an attempt that ended ABANDONED or
+// TIMED_OUT, TIMED_OUT must equal released_at >= timeout_at AND expires_at >=
+// timeout_at. applies is false for any other outcome, which a cancellation, a
+// report or nothing at all decided.
+//
+// An outcome recorded before M8D5 by the old rule (released_at >= timeout_at
+// alone) FAILS this identity when its lease lapsed first; the recorded runs
+// predate the rule, and this is a check of runs made with it.
 func precedenceIdentity(o readdb.KillOutcome) (applies, holds bool) {
 	if (o.Status != "ABANDONED" && o.Status != "TIMED_OUT") || o.LeaseReleasedAt == nil {
 		return false, false
 	}
-	due := o.TimeoutAt != nil && !o.LeaseReleasedAt.Before(*o.TimeoutAt)
+	due := o.TimeoutAt != nil && !o.LeaseReleasedAt.Before(*o.TimeoutAt) && !o.LeaseExpiresAt.Before(*o.TimeoutAt)
 	return true, (o.Status == "TIMED_OUT") == due
 }
 
@@ -668,7 +676,7 @@ func printOutcomeSummary(out io.Writer, cond string, trials []trialResult) {
 		fmt.Fprintf(out, "  %s at the kill, of %d: %s\n", state, s.held[state], countsLine(s.byState[state], outcomeOrder))
 	}
 	fmt.Fprintf(out, "TIMED_OUT attempts taken by: %s\n", countsLine(s.takenBy, nil))
-	fmt.Fprintf(out, "precedence identity (TIMED_OUT exactly when released_at >= timeout_at): held in %d of %d\n", s.identityHeld, s.identityChecked)
+	fmt.Fprintf(out, "precedence identity (TIMED_OUT exactly when released_at >= timeout_at and expires_at >= timeout_at): held in %d of %d\n", s.identityHeld, s.identityChecked)
 	fmt.Fprintf(out, "finished between the choice and the kill: %d attempt(s), in %d of %d trials\n", s.finishedBeforeKill, s.trialsWithFinished, s.trials)
 	fmt.Fprintf(out, "claim->start (started_at - acquired_at), RUNNING at the kill: %s\n", spread(s.claimToStart))
 	fmt.Fprintf(out, "kill->replacement, ABANDONED (the recovery figure): %s\n", spread(s.abandonedToReplacement))
