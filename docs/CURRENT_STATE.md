@@ -4243,10 +4243,10 @@ M8D4's scope. Nothing here is decided, and no ADR is written.
 - **The self-starvation path in the worker-path analysis is named, not measured.**
 - **The databases `taskforge_m8d4_e1_abc`, `_d`, `_d300`, `_e` and `taskforge_m8d4_dryrun`
   were left on the local server,** as M8D3's were.
-- **`make images-smoke` did not get a valid AC-power run.** It passed, but its run spanned
-  idle sleep and then a battery, lid-closed sleep (see "M8D4 gates"). The probe series,
-  `make demo` and `make bench-smoke` all ran on AC with no sleep: the first sleep of the day
-  came about two hours after they ended.
+- **`make images-smoke` was run twice.** The first run spanned an idle sleep and then a
+  battery sleep, so it is not counted, and it was rerun on AC (see "M8D4 gates"). The probe
+  series, `make demo` and `make bench-smoke` all ran on AC with no sleep: the first sleep of
+  the day came about two hours after they ended.
 - **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
   own CI result: the pull request's checks are the record.
 
@@ -4857,7 +4857,7 @@ TaskForge process was running. The timed gates ran after the probe series had en
 | `go test ./tests/verification/...` | PASS |
 | `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)`, on AC |
 | `make bench-smoke` (once) | PASS: `14 of 14 checks met`, on AC |
-| `make images-smoke` | PASS, **but not a valid AC-power run:** `RESULT: PASS (41 of 41 checks met)`. It started on AC at 07:16 UTC, but the machine idle-slept from 09:18 UTC and later went to battery with the lid closed (from 16:49 UTC), and the run ended at 17:13 UTC. Its checks do not depend on timing. It was not rerun because the machine was still on battery when the documentation was written; see the limitations |
+| `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, images labelled with revision `1d0fa02`. This run was on AC from 18:49:47 to 18:51:54 UTC, with no sleep during it. A first run on `2b9dba1` also passed 41 of 41, but it spanned an idle sleep (from 09:18 UTC) and then a battery, lid-closed sleep, so it is not counted |
 | `make scan` | PASS in a fresh full clone of the final head; the run is in the pull request |
 | `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change, and neither touches the probe, `readdb` or the reconciler |
 
