@@ -403,20 +403,17 @@ func printOutcomes(out io.Writer, tr trialResult) {
 		fmt.Fprintf(out, "outcomes: UNAVAILABLE: %v\n", tr.outcomeErr)
 		return
 	}
-	leased, running := 0, 0
+	states := map[string]int{}
 	for _, o := range tr.outcomes {
-		if o.StateAtKill == readdb.HeldRunning {
-			running++
-		} else {
-			leased++
-		}
+		states[o.StateAtKill]++
 	}
 	chosen := "not recorded"
 	if !tr.chosenAt.IsZero() {
 		chosen = fmt.Sprintf("PostgreSQL %s, %s before the kill", stamp(tr.chosenAt), fmtMS(tr.killedAt.Sub(tr.chosenAt)))
 	}
-	fmt.Fprintf(out, "outcomes (timeout_seconds %d): victim chosen at %s; %d attempt(s) unfinished at the kill (LEASED %d, RUNNING %d); %d finished between the choice and the kill\n",
-		tr.timeoutSeconds, chosen, len(tr.outcomes), leased, running, len(tr.finishedBeforeKill))
+	fmt.Fprintf(out, "outcomes (timeout_seconds %d): victim chosen at %s; %d attempt(s) unfinished at the kill (%s); %d finished between the choice and the kill\n",
+		tr.timeoutSeconds, chosen, len(tr.outcomes), countsLine(states, heldOrder), len(tr.finishedBeforeKill))
+	fmt.Fprintf(out, "held when dead %d, outcomes %d: %s\n", tr.held, len(tr.outcomes), heldAgreement(tr))
 	for _, f := range tr.finishedBeforeKill {
 		fmt.Fprintf(out, "  finished before the kill: job %s attempt %d %s at %s, %s before the kill\n",
 			short(f.JobID), f.AttemptNumber, f.Status, stamp(f.FinishedAt), fmtMS(tr.killedAt.Sub(f.FinishedAt)))
@@ -470,10 +467,15 @@ func printOutcomes(out io.Writer, tr trialResult) {
 //     way (M8A's explanation);
 //   - "TIMED_OUT": at least one caught attempt ended TIMED_OUT, with or without
 //     dead-lettering (M8D3's);
+//   - "no victim": a miss that never chose a victim, because no worker held an
+//     attempt it could be aimed at; it caught nothing because nothing was aimed;
 //   - "other": anything else, named in the trial's own block.
 func noAbandoned(tr trialResult) string {
+	if tr.worker == "" {
+		return noVictim
+	}
 	for _, o := range tr.outcomes {
-		if o.Outcome() == readdb.OutcomeAbandoned {
+		if b := o.Outcome(); b == readdb.OutcomeAbandoned || b == readdb.OutcomeAbandonedDeadLetter {
 			return ""
 		}
 	}
@@ -495,9 +497,32 @@ func noAbandoned(tr trialResult) string {
 	return "other"
 }
 
+// noVictim is noAbandoned's category for a miss that chose no victim.
+const noVictim = "no victim"
+
+// heldOrder is the order the states at a kill are printed in.
+var heldOrder = []string{readdb.HeldLeased, readdb.HeldRunning, readdb.HeldCreatedAfterKill}
+
+// heldAgreement compares the attempts the victim's session held once it was dead
+// (readdb.HeldBySession, read after the process exited) with the attempts
+// KillOutcomes caught. Every attempt held when dead is unfinished at the kill, so
+// fewer outcomes than held attempts means the selection dropped one.
+func heldAgreement(tr trialResult) string {
+	switch {
+	case len(tr.outcomes) < tr.held:
+		return "MISMATCH: fewer outcomes than attempts held when dead"
+	case len(tr.outcomes) > tr.held:
+		return "more outcomes than held when dead (an attempt finished between the kill stamp and the process's exit)"
+	default:
+		return "agree"
+	}
+}
+
 // outcomeSummary is one condition's outcomes, with every denominator.
 type outcomeSummary struct {
 	trials, missed, withHeld int
+	withVictim               int
+	heldAgree, heldMismatch  int
 	held                     map[string]int            // by state at kill
 	final                    map[string]int            // by outcome bucket
 	byState                  map[string]map[string]int // state at kill -> outcome -> count
@@ -528,6 +553,14 @@ func summarizeOutcomes(trials []trialResult) outcomeSummary {
 			s.outcomeErrors++
 			continue
 		}
+		if tr.worker != "" {
+			s.withVictim++
+			if len(tr.outcomes) < tr.held {
+				s.heldMismatch++
+			} else {
+				s.heldAgree++
+			}
+		}
 		if len(tr.outcomes) > 0 {
 			s.withHeld++
 		}
@@ -535,7 +568,11 @@ func summarizeOutcomes(trials []trialResult) outcomeSummary {
 		if len(tr.finishedBeforeKill) > 0 {
 			s.trialsWithFinished++
 		}
-		if kind := noAbandoned(tr); kind != "" {
+		switch kind := noAbandoned(tr); kind {
+		case "":
+		case noVictim:
+			s.noAbandoned[kind]++
+		default:
 			s.noAbandonedTrials++
 			s.noAbandoned[kind]++
 		}
@@ -593,7 +630,7 @@ func countsLine(m map[string]int, order []string) string {
 	return strings.Join(parts, ", ")
 }
 
-var outcomeOrder = []string{readdb.OutcomeAbandoned, readdb.OutcomeTimedOut, readdb.OutcomeTimedOutDeadLetter,
+var outcomeOrder = []string{readdb.OutcomeAbandoned, readdb.OutcomeAbandonedDeadLetter, readdb.OutcomeTimedOut, readdb.OutcomeTimedOutDeadLetter,
 	readdb.OutcomeCanceled, readdb.OutcomeUnresolved, readdb.OutcomeOther}
 
 // spread renders count, min, median and max.
@@ -615,14 +652,19 @@ func printOutcomeSummary(out io.Writer, cond string, trials []trialResult) {
 		total += n
 	}
 	fmt.Fprintf(out, "=== outcomes: condition %s, %s ===\n", cond, conditionNames[cond])
-	fmt.Fprintf(out, "trials run %d (%d counted, %d missed and run again); trials with >=1 attempt unfinished at the kill: %d\n",
-		s.trials, s.trials-s.missed, s.missed, s.withHeld)
+	fmt.Fprintf(out, "trials run %d (%d counted, %d missed and run again); trials with a victim: %d; trials with >=1 attempt unfinished at the kill: %d\n",
+		s.trials, s.trials-s.missed, s.missed, s.withVictim, s.withHeld)
+	fmt.Fprintf(out, "held when dead vs outcomes: agree (outcomes >= held) in %d of %d trials with a victim", s.heldAgree, s.withVictim)
+	if s.heldMismatch > 0 {
+		fmt.Fprintf(out, "; MISMATCH in %d", s.heldMismatch)
+	}
+	fmt.Fprintln(out)
 	if s.outcomeErrors > 0 {
 		fmt.Fprintf(out, "OUTCOMES UNAVAILABLE in %d trial(s); they are left out of every figure below\n", s.outcomeErrors)
 	}
-	fmt.Fprintf(out, "attempts unfinished at the kill: %d (%s)\n", total, countsLine(s.held, []string{readdb.HeldLeased, readdb.HeldRunning}))
+	fmt.Fprintf(out, "attempts unfinished at the kill: %d (%s)\n", total, countsLine(s.held, heldOrder))
 	fmt.Fprintf(out, "final, of %d: %s\n", total, countsLine(s.final, outcomeOrder))
-	for _, state := range []string{readdb.HeldLeased, readdb.HeldRunning} {
+	for _, state := range heldOrder {
 		fmt.Fprintf(out, "  %s at the kill, of %d: %s\n", state, s.held[state], countsLine(s.byState[state], outcomeOrder))
 	}
 	fmt.Fprintf(out, "TIMED_OUT attempts taken by: %s\n", countsLine(s.takenBy, nil))
@@ -631,6 +673,12 @@ func printOutcomeSummary(out io.Writer, cond string, trials []trialResult) {
 	fmt.Fprintf(out, "claim->start (started_at - acquired_at), RUNNING at the kill: %s\n", spread(s.claimToStart))
 	fmt.Fprintf(out, "kill->replacement, ABANDONED (the recovery figure): %s\n", spread(s.abandonedToReplacement))
 	fmt.Fprintf(out, "kill->replacement, TIMED_OUT (its own figure, not a recovery): %s\n", spread(s.timedOutToReplacement))
-	fmt.Fprintf(out, "trials with no ABANDONED attempt: %d of %d (%s)\n\n", s.noAbandonedTrials, s.trials,
-		countsLine(s.noAbandoned, []string{"finished before the signal", "TIMED_OUT", "other"}))
+	fmt.Fprintf(out, "trials with no ABANDONED attempt: %d of %d with a victim (%s); misses with no victim: %d\n\n",
+		s.noAbandonedTrials, s.withVictim,
+		countsLine(map[string]int{
+			"finished before the signal": s.noAbandoned["finished before the signal"],
+			"TIMED_OUT":                  s.noAbandoned["TIMED_OUT"],
+			"other":                      s.noAbandoned["other"],
+		}, []string{"finished before the signal", "TIMED_OUT", "other"}),
+		s.noAbandoned[noVictim])
 }

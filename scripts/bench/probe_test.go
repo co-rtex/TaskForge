@@ -282,14 +282,14 @@ func TestNoAbandoned_SplitsKillsThatAbandonedNothing(t *testing.T) {
 	failed.Status = "FAILED"
 	finished := []readdb.Finished{{Status: "SUCCEEDED"}}
 
-	require.Empty(t, noAbandoned(trialResult{outcomes: []readdb.KillOutcome{timedOut, abandoned}}), "one ABANDONED is enough")
-	require.Equal(t, "TIMED_OUT", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{timedOut}}))
-	require.Equal(t, "TIMED_OUT", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{dlq}}), "dead-lettered on a timeout")
-	require.Equal(t, "finished before the signal", noAbandoned(trialResult{finishedBeforeKill: finished}))
-	require.Equal(t, "finished before the signal", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{succeeded}}),
+	require.Empty(t, noAbandoned(trialResult{worker: "w01", outcomes: []readdb.KillOutcome{timedOut, abandoned}}), "one ABANDONED is enough")
+	require.Equal(t, "TIMED_OUT", noAbandoned(trialResult{worker: "w01", outcomes: []readdb.KillOutcome{timedOut}}))
+	require.Equal(t, "TIMED_OUT", noAbandoned(trialResult{worker: "w01", outcomes: []readdb.KillOutcome{dlq}}), "dead-lettered on a timeout")
+	require.Equal(t, "finished before the signal", noAbandoned(trialResult{worker: "w01", finishedBeforeKill: finished}))
+	require.Equal(t, "finished before the signal", noAbandoned(trialResult{worker: "w01", outcomes: []readdb.KillOutcome{succeeded}}),
 		"a report committing as the signal was sent")
-	require.Equal(t, "other", noAbandoned(trialResult{outcomes: []readdb.KillOutcome{failed}, finishedBeforeKill: finished}))
-	require.Equal(t, "other", noAbandoned(trialResult{}), "nothing caught and nothing finished")
+	require.Equal(t, "other", noAbandoned(trialResult{worker: "w01", outcomes: []readdb.KillOutcome{failed}, finishedBeforeKill: finished}))
+	require.Equal(t, "other", noAbandoned(trialResult{worker: "w01"}), "a victim, but nothing caught and nothing finished")
 }
 
 func TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart(t *testing.T) {
@@ -298,9 +298,9 @@ func TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart(t *testing
 	timedOut := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(20*time.Millisecond), d(30020*time.Millisecond), d(31*time.Second), d(35*time.Second))
 	swept := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "RELEASED", 0, d(10*time.Millisecond), d(25010*time.Millisecond), d(26*time.Second), d(29*time.Second))
 	trials := []trialResult{
-		{killedAt: kill, outcomes: []readdb.KillOutcome{abandoned, timedOut}},
-		{killedAt: kill, outcomes: []readdb.KillOutcome{swept}},
-		{killedAt: kill, missed: true, finishedBeforeKill: []readdb.Finished{{Status: "SUCCEEDED"}}},
+		{worker: "w01", killedAt: kill, outcomes: []readdb.KillOutcome{abandoned, timedOut}},
+		{worker: "w01", killedAt: kill, outcomes: []readdb.KillOutcome{swept}},
+		{worker: "w01", killedAt: kill, missed: true, finishedBeforeKill: []readdb.Finished{{Status: "SUCCEEDED"}}},
 	}
 	s := summarizeOutcomes(trials)
 	require.Equal(t, 3, s.trials)
@@ -321,12 +321,12 @@ func TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart(t *testing
 	var out bytes.Buffer
 	printOutcomeSummary(&out, condRunning, trials)
 	text := out.String()
-	require.Contains(t, text, "trials run 3 (2 counted, 1 missed and run again); trials with >=1 attempt unfinished at the kill: 2")
-	require.Contains(t, text, "final, of 3: ABANDONED 1, TIMED_OUT 2, DEAD_LETTERED_ON_TIMEOUT 0, CANCELED 0, UNRESOLVED 0, OTHER 0")
+	require.Contains(t, text, "trials run 3 (2 counted, 1 missed and run again); trials with a victim: 3; trials with >=1 attempt unfinished at the kill: 2")
+	require.Contains(t, text, "final, of 3: ABANDONED 1, DEAD_LETTERED_ON_ABANDON 0, TIMED_OUT 2, DEAD_LETTERED_ON_TIMEOUT 0, CANCELED 0, UNRESOLVED 0, OTHER 0")
 	require.Contains(t, text, "precedence identity (TIMED_OUT exactly when released_at >= timeout_at): held in 3 of 3")
 	require.Contains(t, text, "kill->replacement, ABANDONED (the recovery figure): 1; min 32000 ms, median 32000 ms, max 32000 ms")
 	require.Contains(t, text, "kill->replacement, TIMED_OUT (its own figure, not a recovery): 2; min 28000 ms")
-	require.Contains(t, text, "trials with no ABANDONED attempt: 2 of 3 (finished before the signal 1, TIMED_OUT 1, other 0)")
+	require.Contains(t, text, "trials with no ABANDONED attempt: 2 of 3 with a victim (finished before the signal 1, TIMED_OUT 1, other 0); misses with no victim: 0")
 }
 
 func TestSummarizeOutcomes_AnUnreadableTrialIsCountedAndLeftOut(t *testing.T) {
@@ -362,12 +362,44 @@ func TestPrintOutcomes_NamesEachAttemptsPathAndFigures(t *testing.T) {
 	retry := o.FinishedAt.Add(900 * time.Millisecond)
 	o.RetryAt = &retry
 	var out bytes.Buffer
-	printOutcomes(&out, trialResult{killedAt: kill, chosenAt: kill.Add(-4 * time.Millisecond), timeoutSeconds: 30, outcomes: []readdb.KillOutcome{o}})
+	printOutcomes(&out, trialResult{killedAt: kill, chosenAt: kill.Add(-4 * time.Millisecond), timeoutSeconds: 30, held: 1, outcomes: []readdb.KillOutcome{o}})
 	text := out.String()
-	require.Contains(t, text, "outcomes (timeout_seconds 30): victim chosen at PostgreSQL 12:00:01.996 UTC, 4 ms before the kill; 1 attempt(s) unfinished at the kill (LEASED 0, RUNNING 1); 0 finished between the choice and the kill")
+	require.Contains(t, text, "held when dead 1, outcomes 1: agree\n")
+	require.Contains(t, text, "outcomes (timeout_seconds 30): victim chosen at PostgreSQL 12:00:01.996 UTC, 4 ms before the kill; 1 attempt(s) unfinished at the kill (LEASED 0, RUNNING 1, CREATED_AFTER_KILL 0); 0 finished between the choice and the kill")
 	require.Contains(t, text, "RUNNING at the kill -> TIMED_OUT (job now RETRY_WAIT); code timeout; lease EXPIRED, renewed 0x; claim->start 15 ms; timeout_at - expires_at 15 ms; resolved 1000 ms after expires_at by the expired-lease path; retry_at = finished + 900 ms; kill->replacement 33000 ms; precedence identity HOLDS")
+
+	out.Reset()
+	printOutcomes(&out, trialResult{killedAt: kill, held: 2, outcomes: []readdb.KillOutcome{o}})
+	require.Contains(t, out.String(), "held when dead 2, outcomes 1: MISMATCH: fewer outcomes than attempts held when dead\n")
+	s := summarizeOutcomes([]trialResult{{worker: "w01", killedAt: kill, held: 2, outcomes: []readdb.KillOutcome{o}},
+		{worker: "w02", killedAt: kill, held: 1, outcomes: []readdb.KillOutcome{o}}})
+	require.Equal(t, 1, s.heldMismatch)
+	require.Equal(t, 1, s.heldAgree)
 
 	out.Reset()
 	printOutcomes(&out, trialResult{outcomeErr: errors.New("boom")})
 	require.Equal(t, "outcomes: UNAVAILABLE: boom\n", out.String())
+}
+
+func TestNoAbandoned_AMissWithNoVictimIsItsOwnCategory(t *testing.T) {
+	// A miss that never chose a victim (no worker held a targetable attempt) caught
+	// nothing because nothing was aimed at: it is not "other" (review B3).
+	noVictim := trialResult{missed: true, missReason: "no worker held an attempt"}
+	require.Equal(t, "no victim", noAbandoned(noVictim))
+
+	// A victim that was chosen but whose kill caught nothing and saw nothing finish
+	// is still "other".
+	require.Equal(t, "other", noAbandoned(trialResult{worker: "w01"}))
+
+	kill := probeBase.Add(time.Second)
+	abandoned := outcome(readdb.HeldLeased, "ABANDONED", "QUEUED", "EXPIRED", 0, nil, nil, d(31*time.Second), d(33*time.Second))
+	trials := []trialResult{
+		{worker: "w01", killedAt: kill, outcomes: []readdb.KillOutcome{abandoned}},
+		noVictim,
+	}
+	var out bytes.Buffer
+	printOutcomeSummary(&out, condLoaded, trials)
+	text := out.String()
+	require.Contains(t, text, "trials run 2 (1 counted, 1 missed and run again); trials with a victim: 1; trials with >=1 attempt unfinished at the kill: 1")
+	require.Contains(t, text, "trials with no ABANDONED attempt: 0 of 1 with a victim (finished before the signal 0, TIMED_OUT 0, other 0); misses with no victim: 1")
 }

@@ -172,8 +172,10 @@ func TestKillOutcomes_EveryAttemptUnfinishedAtTheKillAndWhatBecameOfIt(t *testin
 		expires: kill.Add(30*time.Second - 60*ms), released: timep(kill, ms)})
 
 	// Not selected: finished exactly at the kill (finished, not unfinished), finished
-	// between the choice and the kill, finished just before the choice, created
-	// after the kill, and the other session's attempt.
+	// between the choice and the kill, finished just before the choice, and the
+	// other session's attempt. An attempt created after the kill stamp IS selected
+	// (review B2): the stamp is read before the signal, so the dying process can
+	// still have a claim committing, and that attempt is the kill's too.
 	finishedAtKill := newJob("SUCCEEDED")
 	seed.seededAttempt(seededAttempt{job: finishedAtKill, number: 1, worker: worker, session: killed, status: "SUCCEEDED",
 		created: kill.Add(-70 * ms), started: timep(kill, -65*ms), timeout: timep(kill, 30*time.Second),
@@ -202,10 +204,13 @@ func TestKillOutcomes_EveryAttemptUnfinishedAtTheKillAndWhatBecameOfIt(t *testin
 	for _, o := range outcomes {
 		byJob[o.JobID] = o
 	}
-	require.Len(t, outcomes, 6, "the six attempts unfinished at the kill, and nothing else")
-	for _, excluded := range []uuid.UUID{finishedAtKill, finishedAfterChoice, finishedBeforeChoice, createdAfterKill, otherJob} {
+	require.Len(t, outcomes, 7, "the six attempts unfinished at the kill, the one claimed after its stamp, and nothing else")
+	for _, excluded := range []uuid.UUID{finishedAtKill, finishedAfterChoice, finishedBeforeChoice, otherJob} {
 		require.NotContains(t, byJob, excluded)
 	}
+	require.Contains(t, byJob, createdAfterKill, "an attempt claimed after the kill stamp is still the kill's")
+	require.Equal(t, readdb.HeldCreatedAfterKill, byJob[createdAfterKill].StateAtKill,
+		"it was neither LEASED nor RUNNING at the stamp, so it has a label of its own")
 
 	leased := byJob[leasedJob]
 	require.Equal(t, readdb.HeldLeased, leased.StateAtKill)
@@ -250,11 +255,20 @@ func TestKillOutcomes_EveryAttemptUnfinishedAtTheKillAndWhatBecameOfIt(t *testin
 	require.Equal(t, readdb.OutcomeOther, inFlight.Outcome())
 	require.Equal(t, "SUCCEEDED", inFlight.Status)
 
-	// The same kill read for the other session catches only its own attempt.
+	// The same kill read for the other session catches only that session's own
+	// attempts: its one unfinished at the kill, and the two replacements it claimed
+	// after it (labelled so), never the killed session's.
 	others, err := readdb.KillOutcomes(ctx, testPool, benchScope, otherSession, kill)
 	require.NoError(t, err)
-	require.Len(t, others, 1)
-	require.Equal(t, otherJob, others[0].JobID)
+	states := map[uuid.UUID]string{}
+	for _, o := range others {
+		states[o.JobID] = o.StateAtKill
+	}
+	require.Equal(t, map[uuid.UUID]string{
+		otherJob:    readdb.HeldLeased,
+		leasedJob:   readdb.HeldCreatedAfterKill,
+		timedOutJob: readdb.HeldCreatedAfterKill,
+	}, states)
 
 	// Finished between the choice and the kill, both ends included: the one at the
 	// choice and the one at the kill, not the one a millisecond before the choice.

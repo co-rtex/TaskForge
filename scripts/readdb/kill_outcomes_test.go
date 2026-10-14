@@ -1,6 +1,7 @@
 package readdb
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,20 +12,32 @@ import (
 // tests/integration/kill_outcomes_test.go; these are the pure methods.
 
 func TestKillOutcome_OutcomeBuckets(t *testing.T) {
-	for _, c := range []struct{ status, job, want string }{
-		{"ABANDONED", "QUEUED", OutcomeAbandoned},
-		{"ABANDONED", "DEAD_LETTERED", OutcomeAbandoned},
-		{"TIMED_OUT", "RETRY_WAIT", OutcomeTimedOut},
-		{"TIMED_OUT", "QUEUED", OutcomeTimedOut},
-		{"TIMED_OUT", "SUCCEEDED", OutcomeTimedOut},
-		{"TIMED_OUT", "DEAD_LETTERED", OutcomeTimedOutDeadLetter},
-		{"CANCELED", "CANCELED", OutcomeCanceled},
-		{"LEASED", "LEASED", OutcomeUnresolved},
-		{"RUNNING", "RUNNING", OutcomeUnresolved},
-		{"SUCCEEDED", "SUCCEEDED", OutcomeOther},
-		{"FAILED", "RETRY_WAIT", OutcomeOther},
+	// The dead-letter buckets are chosen by the attempt's own DLQ entry (DLQReason,
+	// joined on dlq_entries.terminal_attempt_id), never by the job's status now: a
+	// job a LATER attempt dead-lettered says nothing about how this attempt ended.
+	exhausted := "ATTEMPTS_EXHAUSTED"
+	for _, c := range []struct {
+		status, job string
+		dlq         *string
+		want        string
+	}{
+		{"ABANDONED", "QUEUED", nil, OutcomeAbandoned},
+		{"ABANDONED", "DEAD_LETTERED", nil, OutcomeAbandoned}, // a later attempt dead-lettered the job
+		{"ABANDONED", "DEAD_LETTERED", &exhausted, OutcomeAbandonedDeadLetter},
+		{"TIMED_OUT", "RETRY_WAIT", nil, OutcomeTimedOut},
+		{"TIMED_OUT", "QUEUED", nil, OutcomeTimedOut},
+		{"TIMED_OUT", "SUCCEEDED", nil, OutcomeTimedOut},
+		{"TIMED_OUT", "DEAD_LETTERED", nil, OutcomeTimedOut}, // a later attempt dead-lettered the job
+		{"TIMED_OUT", "DEAD_LETTERED", &exhausted, OutcomeTimedOutDeadLetter},
+		{"CANCELED", "CANCELED", nil, OutcomeCanceled},
+		{"LEASED", "LEASED", nil, OutcomeUnresolved},
+		{"RUNNING", "RUNNING", nil, OutcomeUnresolved},
+		{"SUCCEEDED", "SUCCEEDED", nil, OutcomeOther},
+		{"FAILED", "RETRY_WAIT", nil, OutcomeOther},
 	} {
-		require.Equal(t, c.want, KillOutcome{Status: c.status, JobStatus: c.job}.Outcome(), "%s / job %s", c.status, c.job)
+		t.Run(fmt.Sprintf("%s, job %s, own DLQ entry %v", c.status, c.job, c.dlq != nil), func(t *testing.T) {
+			require.Equal(t, c.want, KillOutcome{Status: c.status, JobStatus: c.job, DLQReason: c.dlq}.Outcome())
+		})
 	}
 }
 

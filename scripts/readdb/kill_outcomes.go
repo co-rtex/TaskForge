@@ -19,17 +19,25 @@ import (
 const (
 	HeldLeased  = "LEASED"
 	HeldRunning = "RUNNING"
+	// HeldCreatedAfterKill is an attempt of the killed session claimed after the
+	// kill was stamped. The stamp is read just before the signal, so a claim the
+	// dying process had in flight can commit after it; that attempt was neither
+	// LEASED nor RUNNING at the stamp, but the kill is what stranded it.
+	HeldCreatedAfterKill = "CREATED_AFTER_KILL"
 )
 
 // The outcome buckets a held attempt is reported in. They are the probe's
-// categories, not statuses of the schema: a TIMED_OUT attempt whose job was
-// dead-lettered is its own bucket, because what follows it (no retry at all) is
-// not what follows a timeout with budget left (RETRY_WAIT, then a replacement).
+// categories, not statuses of the schema. An attempt that dead-lettered its job
+// is its own bucket, because what follows it (no retry at all) is not what follows
+// one with budget left (a replacement). Which attempt dead-lettered a job is the
+// one its DLQ entry names (dlq_entries.terminal_attempt_id), not any attempt of a
+// job that is DEAD_LETTERED now: a later attempt may have done that.
 const (
-	OutcomeAbandoned          = "ABANDONED"
-	OutcomeTimedOut           = "TIMED_OUT"
-	OutcomeTimedOutDeadLetter = "DEAD_LETTERED_ON_TIMEOUT"
-	OutcomeCanceled           = "CANCELED"
+	OutcomeAbandoned           = "ABANDONED"
+	OutcomeAbandonedDeadLetter = "DEAD_LETTERED_ON_ABANDON"
+	OutcomeTimedOut            = "TIMED_OUT"
+	OutcomeTimedOutDeadLetter  = "DEAD_LETTERED_ON_TIMEOUT"
+	OutcomeCanceled            = "CANCELED"
 	// OutcomeUnresolved is an attempt still LEASED or RUNNING when it was read.
 	OutcomeUnresolved = "UNRESOLVED"
 	// OutcomeOther is anything else (SUCCEEDED or FAILED: a report that was in
@@ -44,9 +52,10 @@ type KillOutcome struct {
 	AttemptID     uuid.UUID
 	AttemptNumber int
 
-	// StateAtKill is HeldRunning if the attempt's started_at is at or before the
-	// kill, and HeldLeased otherwise (never started, or started after the kill
-	// instant by a Start that was in flight when the worker died).
+	// StateAtKill is HeldCreatedAfterKill if the attempt was claimed after the
+	// kill instant, HeldRunning if its started_at is at or before the kill, and
+	// HeldLeased otherwise (never started, or started after the kill instant by a
+	// Start that was in flight when the worker died).
 	StateAtKill string
 
 	// The attempt as it is now.
@@ -79,13 +88,17 @@ type KillOutcome struct {
 	ReplacementClaimedAt *time.Time
 }
 
-// Outcome is the attempt's outcome bucket.
+// Outcome is the attempt's outcome bucket. The dead-letter buckets are chosen by
+// the attempt's own DLQ entry (DLQReason), never by the job's status now.
 func (o KillOutcome) Outcome() string {
 	switch o.Status {
 	case "ABANDONED":
+		if o.DLQReason != nil {
+			return OutcomeAbandonedDeadLetter
+		}
 		return OutcomeAbandoned
 	case "TIMED_OUT":
-		if o.JobStatus == "DEAD_LETTERED" {
+		if o.DLQReason != nil {
 			return OutcomeTimedOutDeadLetter
 		}
 		return OutcomeTimedOut
@@ -122,17 +135,21 @@ func (o KillOutcome) ToReplacement(kill time.Time) (time.Duration, bool) {
 }
 
 // KillOutcomes returns every attempt of the killed session that was not finished
-// at the kill instant: created at or before it, and either not finished or
-// finished after it. An attempt the session had already finished is not one the
-// kill affected and is not returned; see FinishedBetween for those.
+// at the kill instant: not finished, or finished after it. An attempt the session
+// had already finished is not one the kill affected and is not returned; see
+// FinishedBetween for those.
 //
-// Every instant is PostgreSQL's. created_at is the claim transaction's start, so
-// an attempt whose claim was committing as the kill was stamped can fall on either
-// side; that is the resolution of one statement, not a choice.
+// There is deliberately no bound on created_at. The kill instant is stamped just
+// before the signal, so a claim the dying process had in flight can commit after
+// the stamp; that attempt is the kill's too, and is labelled HeldCreatedAfterKill
+// rather than dropped (a dropped one would make the outcomes disagree with the
+// attempts the session held once it was dead). Every instant is PostgreSQL's.
 func KillOutcomes(ctx context.Context, q Querier, scope string, sessionID uuid.UUID, kill time.Time) ([]KillOutcome, error) {
 	rows, err := q.Query(ctx, `
 		SELECT a.job_id, a.id, a.attempt_number,
-		       CASE WHEN a.started_at IS NOT NULL AND a.started_at <= $3 THEN 'RUNNING' ELSE 'LEASED' END,
+		       CASE WHEN a.created_at > $3 THEN 'CREATED_AFTER_KILL'
+		            WHEN a.started_at IS NOT NULL AND a.started_at <= $3 THEN 'RUNNING'
+		            ELSE 'LEASED' END,
 		       a.status, a.failure_class, a.error_code,
 		       a.created_at, a.started_at, a.timeout_at, a.finished_at, a.retry_at,
 		       l.status, l.acquired_at, l.renewed_at, l.expires_at, l.released_at, l.renewal_version,
@@ -144,7 +161,6 @@ func KillOutcomes(ctx context.Context, q Querier, scope string, sessionID uuid.U
 		LEFT JOIN job_attempts rep
 		       ON rep.job_id = a.job_id AND rep.attempt_number = a.attempt_number + 1
 		WHERE a.scope = $1 AND a.worker_session_id = $2
-		  AND a.created_at <= $3
 		  AND (a.finished_at IS NULL OR a.finished_at > $3)
 		ORDER BY a.job_id, a.attempt_number`, scope, sessionID, kill)
 	if err != nil {
@@ -174,10 +190,11 @@ type Finished struct {
 	FinishedAt    time.Time
 }
 
-// FinishedBetween returns the session's attempts that finished in [from, to], both
-// ends included. Between a kill's choice of victim (from) and the kill (to) these
-// are the attempts the kill was aimed at but could no longer catch: M8A's
-// explanation of a kill that hit nothing.
+// FinishedBetween returns every attempt of the session that finished in [from,
+// to], both ends included, whether or not the kill was aimed at it. Between a
+// kill's choice of victim (from) and the kill (to) they include any attempt the
+// kill was aimed at but could no longer catch, which is M8A's explanation of a kill
+// that hit nothing; they are not limited to those.
 func FinishedBetween(ctx context.Context, q Querier, scope string, sessionID uuid.UUID, from, to time.Time) ([]Finished, error) {
 	rows, err := q.Query(ctx, `
 		SELECT job_id, attempt_number, status, finished_at

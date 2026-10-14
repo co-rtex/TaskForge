@@ -376,7 +376,10 @@ const frozenClockSchema = "m8d4_frozen_clock"
 func frozenClockStore(t *testing.T, at time.Time) *workers.Store {
 	t.Helper()
 	ctx := context.Background()
+	// A run interrupted before its cleanup leaves the schema behind; dropping it
+	// first keeps that from failing every later run.
 	for _, ddl := range []string{
+		`DROP SCHEMA IF EXISTS ` + frozenClockSchema + ` CASCADE`,
 		`CREATE SCHEMA ` + frozenClockSchema,
 		`CREATE TABLE ` + frozenClockSchema + `.frozen (at timestamptz NOT NULL)`,
 		`CREATE FUNCTION ` + frozenClockSchema + `.clock_timestamp() RETURNS timestamptz
@@ -460,6 +463,15 @@ func TestPrecedence_ADeadlineExactlyAtTheDecisionInstantIsDue(t *testing.T) {
 	})
 	t.Run("expired-lease path, timeout_at == serverNow: TIMED_OUT", func(t *testing.T) {
 		a, frozenStore := arrange(t, false, 0)
+		// expires_at == serverNow: the lease is no longer usable, so the timeout
+		// sweep, though the deadline is due, must leave the attempt to the lease
+		// path (internal/workers/timeout.go requires a usable lease).
+		swept, err := frozenStore.ReconcileDueTimeouts(context.Background(), 10)
+		require.NoError(t, err)
+		require.Zero(t, swept.TimedOutAttempts, "the timeout sweep skips an attempt whose lease expires at the decision instant")
+		require.Equal(t, 1, swept.Skipped, "it was a candidate and was skipped under the locks")
+		require.Equal(t, "RUNNING", readAttemptOutcome(t, a.fence.AttemptID).status)
+
 		stats, err := frozenStore.ReconcileExpiredLeases(context.Background(), 10)
 		require.NoError(t, err)
 		require.Equal(t, 1, stats.TimedOutAttempts)
@@ -541,4 +553,71 @@ func TestPrecedence_AThirdAttemptThatTimesOutDeadLetters(t *testing.T) {
 	require.Equal(t, "ATTEMPTS_EXHAUSTED", *o.DLQReason)
 	require.Nil(t, o.ReplacementClaimedAt, "nothing replaces a dead-lettered job")
 	require.Nil(t, o.RetryAt, "no retry was decided")
+}
+
+// TestPrecedence_AnEarlierTimeoutIsNotTheAttemptThatDeadLettered is the review's B1
+// fixture. Attempt 1 is killed RUNNING and times out (budget left: RETRY_WAIT);
+// attempt 2, after the retry, is killed and abandoned, which exhausts max_attempts 2
+// and dead-letters the job. Read at attempt 1's kill, attempt 1 is a plain timeout
+// even though its job is now DEAD_LETTERED: the DLQ entry names attempt 2. Read at
+// attempt 2's kill, attempt 2 is the one dead-lettered, on an abandonment.
+func TestPrecedence_AnEarlierTimeoutIsNotTheAttemptThatDeadLettered(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	store := controlStore()
+	session := registerWorker(t, store, workerRegistration("precedence-earlier-timeout", 1, nil, []string{"demo.echo"}))
+	jobID := createJobWithOptions(t, "precedence-earlier-timeout", "default", "demo.echo", 50, nil, 2, 30, nil)
+	claimAndStart := func() workers.Fence {
+		claim, err := store.Claim(ctx, testScope, claimRequest(session, "default"))
+		require.NoError(t, err)
+		require.Equal(t, workers.Claimed, claim.Disposition)
+		fence := assignmentFence(claim.Assignment)
+		startAttempt(t, store, fence)
+		return fence
+	}
+
+	first := claimAndStart()
+	placeAttempt(t, first, true, -2*time.Second, -2*time.Second+12*time.Millisecond)
+	firstKill := serverNow(t)
+	stats, err := store.ReconcileExpiredLeases(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.TimedOutAttempts)
+	require.Equal(t, 1, stats.RetryWaitingJobs)
+
+	makeRetryDue(t, jobID)
+	promoted, err := jobStore().PromoteDueJobs(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, promoted.PromotedJobs)
+	second := claimAndStart()
+	expireLease(t, second.LeaseID) // its deadline, start + 30 s, is not due: an abandonment
+	secondKill := serverNow(t)
+	stats, err = store.ReconcileExpiredLeases(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.DeadLetteredJobs)
+	require.Equal(t, []string{"TIMED_OUT", "ABANDONED"}, attemptHistory(t, jobID))
+	require.Equal(t, "DEAD_LETTERED", readJob(t, jobID).status)
+
+	byNumber := func(kill time.Time, number int) readdb.KillOutcome {
+		t.Helper()
+		outcomes, err := readdb.KillOutcomes(ctx, testPool, testScope, session.ID, kill)
+		require.NoError(t, err)
+		for _, o := range outcomes {
+			if o.AttemptNumber == number {
+				return o
+			}
+		}
+		require.FailNow(t, "attempt not reported", "attempt %d at kill %s", number, kill)
+		return readdb.KillOutcome{}
+	}
+
+	earlier := byNumber(firstKill, 1)
+	require.Equal(t, "DEAD_LETTERED", earlier.JobStatus, "the job as it is now")
+	require.Nil(t, earlier.DLQReason, "the DLQ entry names attempt 2, not this one")
+	require.Equal(t, readdb.OutcomeTimedOut, earlier.Outcome(),
+		"a timeout with budget left, whatever a later attempt did to the job")
+
+	last := byNumber(secondKill, 2)
+	require.NotNil(t, last.DLQReason)
+	require.Equal(t, "ATTEMPTS_EXHAUSTED", *last.DLQReason)
+	require.Equal(t, readdb.OutcomeAbandonedDeadLetter, last.Outcome(), "the abandonment that exhausted the budget")
 }
