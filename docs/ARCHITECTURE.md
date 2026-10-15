@@ -52,7 +52,11 @@ reads exactly those public routes with the operator's own key (see
 guard on every `/internal/v1` route, which keeps a web page — the dashboard's own
 origin included — from driving the unauthenticated key-administration and
 worker-control routes (see
-[ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)).
+[ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)); and
+listeners by surface, so `taskforge-api` can serve `/v1` and the worker-control
+routes on network addresses while credential administration, the dashboard and
+metrics stay on loopback (see §2a and
+[ADR-0026](adr/0026-listeners-by-surface.md)).
 
 ---
 
@@ -109,7 +113,7 @@ single outbox publisher · a single reconciler instance.
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations, every `/internal/v1` route behind a stateless browser-origin guard that refuses a request carrying `Sec-Fetch-Site` or `Origin`, or addressed to a non-loopback `Host`, with `403` `origin_refused` (not authentication; see [ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)); serve the embedded operator dashboard's static files under `/dashboard/`. | **Built** |
+| `taskforge-api` | Validate and durably accept immediate and delayed submissions; serve read, cancellation, and DLQ/replay APIs; serve internal worker control operations, every `/internal/v1` route behind a stateless browser-origin guard that refuses a request carrying `Sec-Fetch-Site` or `Origin`, or addressed to a `Host` its listener does not accept (loopback on admin, the `TASKFORGE_API_CONTROL_HOSTS` allowlist on control), with `403` `origin_refused` (not authentication; see [ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md) and [ADR-0026](adr/0026-listeners-by-surface.md)); serve the embedded operator dashboard's static files under `/dashboard/`. Up to three listeners, each serving its share of the one route table (§2a). | **Built** |
 | `taskforge-outbox` | Publish pending outbox events to the broker with retry and backoff. | **Built** |
 | `taskforge-migrate` | Apply schema migrations. | **Built** |
 | `taskforge-scheduler` | Promote due `PENDING` and `RETRY_WAIT` jobs; re-notify stranded queued work. Holds no broker connection. | **Built** |
@@ -118,7 +122,51 @@ single outbox publisher · a single reconciler instance.
 | `taskforge-cli` | Operator and developer command-line interface over the public API and the loopback-only credential-management routes. | **Built** |
 | Operator dashboard | Read-only browser client of the public `/v1` read routes, compiled into `taskforge-api`. No endpoint, credential, or query of its own; it presents the operator's API key exactly as the CLI does. | **Built** |
 
-Every component is safe to run with N replicas.
+Every component is safe to run with N replicas. Every long-running binary takes a
+`healthcheck` subcommand that GETs its own loopback `/healthz` and exits 0 or 1, for a
+container health check in an image with no shell
+([ADR-0026](adr/0026-listeners-by-surface.md) Q6).
+
+## 2a. Process topology and listeners by surface — [IMPLEMENTED]
+
+`taskforge-api` has up to three listeners. Which routes each serves is a column of
+the route table (`internal/api/routes.go`), checked at startup:
+
+| Listener | Variable | Binds | Serves | What protects it |
+| --- | --- | --- | --- | --- |
+| admin | `TASKFORGE_API_ADDR` | loopback only, always open | every route, as before M8C1: `/v1`, the worker-control routes, key and worker-key administration, `/dashboard/`, `/metrics`, the probes | loopback; the browser-origin guard with the loopback `Host` rule on `/internal` |
+| public | `TASKFORGE_API_PUBLIC_ADDR` | optional, any address | `/v1` and `/healthz`, `/readyz` | an API key per request (ADR-0013) |
+| control | `TASKFORGE_API_CONTROL_ADDR` | optional, any address | the eight worker-control routes and `/healthz`, `/readyz` | a worker key at registration, then the session and a revocation check (ADR-0014); the browser-origin guard with an exact-match `Host` allowlist, `TASKFORGE_API_CONTROL_HOSTS` |
+
+The process binds every configured listener before serving on any, and a failure of
+any one stops them all, so it is never half up. With the two optional addresses unset
+it is the single loopback listener it always was.
+
+**The deployable topology** (M8C2 will describe it in Terraform; `make topology-smoke`
+runs it with the real images):
+
+```
+ clients ──► load balancer ──► api:8090 (public)   ┐
+                                                    │  taskforge-api container
+ workers ─── private network ─► api:8091 (control) │  admin 127.0.0.1:8080,
+                                                    ┘  reachable only from inside
+ taskforge-worker containers: TASKFORGE_WORKER_API_URL=http://api:8091,
+                              TASKFORGE_WORKER_ALLOW_REMOTE_API=true
+ outbox, scheduler, reconciler: database and broker only; loopback health listeners
+```
+
+**Trust boundaries.** The admin listener's routes take no credential and are
+protected by loopback alone, so they never leave it; a startup check refuses a table
+that would put key administration, the dashboard or `/metrics` on a network
+listener, an `/internal` path on public, or a `/v1` path on control. The control
+listener is plain HTTP inside the private network: the session id that authorizes
+every worker-control call after registration travels in plaintext there, an accepted
+limitation with TLS and a per-call credential as the named follow-ups (ADR-0026). The
+outbox, scheduler and reconciler expose nothing off their host.
+
+**Bootstrap.** The first API key and worker key are minted on the admin listener,
+from inside the api's host or container, with `taskforge-cli` against loopback. There
+is no other path: no network listener serves key administration.
 
 ---
 
@@ -758,7 +806,7 @@ success from committing and terminal `CANCELED` is never left.
 | Broker duplicates a notification | Globally idempotent event-id consumption admits one claim; another session gets a safe duplicate outcome. |
 | Broker loses a notification | The scheduler re-notifies a stranded queued job once the bounded interval elapses, using a new event id on the job's current notification generation. Reachability is repaired; nothing was ever at risk of corruption. |
 | Publisher crashes mid-publish | Event republished after the claim timeout/visibility window lapses. Documented at-least-once window. |
-| Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). This holds even when the attempt's deadline is due by the time reconciliation reaches it, as long as the lease expired strictly before the deadline ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). |
+| Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). This holds even when the attempt's deadline is due by the time reconciliation reaches it, as long as the lease expired strictly before the deadline ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). A crash after a renewal whose deadline comes before the renewed expiry ends differently: the lease is still live when the deadline arrives, so the timeout sweep records the attempt `TIMED_OUT` against its persisted deadline and applies the retry policy, before the lease ever expires. |
 | Handler returns an error | The worker reports a fenced failure under a retained outcome identity. With budget remaining the job enters `RETRY_WAIT` with a persisted jittered delay; a permanent classification or an exhausted budget dead-letters it with exactly one DLQ entry. |
 | Handler outlives its execution budget | The worker cancels it locally at a conservative deadline and reports nothing; it renewed its lease until then, so the lease outlives the deadline. Reconciliation records `TIMED_OUT` against the persisted deadline, by the timeout sweep while the lease is live or on the expired-lease path when `expires_at >= timeout_at`, and applies the same retry policy. A handler that starves its own renewals until its lease lapses before the deadline is recorded `ABANDONED` instead, bounded by `max_attempts` ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). |
 | Handler ignores cancellation entirely | Go cannot terminate it. Reconciliation finalizes the cancellation once the lease lapses, and every fenced operation refuses whatever the handler eventually produces. |
@@ -825,8 +873,9 @@ four background services serve it on their existing health listener;
 `/healthz` and `/readyz` beside them, and both are already validated as
 loopback binds — `TASKFORGE_API_ADDR` no less than the other four (see
 `internal/config.Validate`), so this endpoint crosses no boundary the health
-probes do not already cross. **That equivalence must be revisited before this
-API ever sits behind a real load balancer**, which is post-V1 cloud work.
+probes do not already cross. The api's `/metrics` is served on its admin listener
+only: the startup check refuses a table that places it on the public or control
+listener (§2a), so a load balancer in front of those never exposes it.
 
 What is exposed:
 

@@ -101,6 +101,7 @@ make bench             # the recorded benchmark: throughput, then faults (clean 
 make bench-smoke       # the benchmark harness in miniature: ~1 min, records nothing
 make images            # build the dashboard, then the six service images as taskforge-<service>:dev
 make images-smoke      # build the images, then inspect and run them (needs `make up`)
+make topology-smoke    # run the api and worker as separate containers and check the listeners (needs `make up`)
 make scan              # govulncheck, gitleaks, pip-audit and npm audit; blocks on any unexcepted finding
 ```
 
@@ -136,6 +137,17 @@ smoke creates for it (`taskforge_imagesmoke_<pid>` on the same server, dropped o
 every way out, so the database role needs `CREATEDB`) and leave it at the embedded
 schema version; and the api image must serve the dashboard build it was built with.
 Nothing is pushed anywhere.
+
+`make topology-smoke` runs `go run ./scripts/topologysmoke` after `make images`: the
+api, outbox and worker images as separate containers on a Docker network of its own,
+the api with its public (`:8090`) and control (`:8091`) listeners on the network and
+its admin listener on its own loopback, the worker dialing `http://api:8091` with
+`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`, and a probe container beside them. It prints
+seven rows, each PASS or FAIL, and a total, and exits non-zero unless all seven pass. It
+mints its keys with `taskforge-cli` inside the api container against loopback, uses a
+database (`taskforge_topology_<pid>`) and a broker queue of its own, and removes every
+container, the network, the queue and the database on every way out. See
+[ADR-0026](docs/adr/0026-listeners-by-surface.md).
 
 `make scan` runs `go run ./scripts/scan`: govulncheck (reachable findings only, under
 the Go that `go.mod` declares), gitleaks over the full git history, pip-audit over
@@ -262,6 +274,11 @@ result, in the README or anywhere else.
   [ADR-0019](docs/adr/0019-demo-handlers-are-trusted-built-ins.md) records why the
   demonstration handlers are part of it.
 - Local services bind to loopback. Nothing is exposed publicly without authentication.
+  The one exception is `taskforge-api`'s optional public and control listeners, which
+  may bind a network address because everything they serve but the probes is
+  authenticated; its admin listener, which serves the unauthenticated key
+  administration, dashboard and `/metrics`, stays loopback
+  ([ADR-0026](docs/adr/0026-listeners-by-surface.md)).
 
 ## 11. Git rules
 
