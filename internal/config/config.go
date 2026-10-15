@@ -88,6 +88,21 @@ type Config struct {
 	ResultsAccessKeyID         string
 	ResultsSecretAccessKey     string
 
+	// AWSDefaultChain is TASKFORGE_AWS_DEFAULT_CHAIN: with it true, the broker
+	// and results clients get no endpoint override and no static credentials,
+	// so the AWS SDK resolves the endpoint from the region and the credentials
+	// from its default chain (a task role, in ECS). The six endpoint and key
+	// variables must then be absent, not merely empty, and both regions must be
+	// set. With it false or unset nothing changes. See
+	// docs/adr/0027-aws-native-configuration-and-the-cli-sidecar.md.
+	AWSDefaultChain bool
+	// What Load observed for the switch, kept for Validate: whether its value
+	// did not parse, the AWS variables that were present when they must not
+	// be, and the region variables that were absent or empty.
+	awsChainInvalid  bool
+	awsPresent       []string
+	awsRegionMissing []string
+
 	OutboxAddr              string
 	OutboxBatchSize         int
 	OutboxPollInterval      time.Duration
@@ -165,7 +180,104 @@ func Load() (Config, error) {
 		OTelExporter: env("TASKFORGE_OTEL_EXPORTER", telemetry.ExporterNone),
 		OTelEndpoint: env("TASKFORGE_OTEL_ENDPOINT", ""),
 	}
+	c.loadAWSDefaultChain()
 	return c, c.Validate()
+}
+
+// awsStaticVariables are the six settings that pin a client to a non-default
+// endpoint or to static credentials. With TASKFORGE_AWS_DEFAULT_CHAIN true each
+// must be absent from the environment.
+var awsStaticVariables = []string{
+	"TASKFORGE_BROKER_ENDPOINT",
+	"TASKFORGE_BROKER_ACCESS_KEY_ID",
+	"TASKFORGE_BROKER_SECRET_ACCESS_KEY",
+	"TASKFORGE_RESULTS_ENDPOINT",
+	"TASKFORGE_RESULTS_ACCESS_KEY_ID",
+	"TASKFORGE_RESULTS_SECRET_ACCESS_KEY",
+}
+
+// awsRegionVariables must be present and non-empty with the switch on: the SDK
+// derives the endpoint from the region, so a defaulted region would silently
+// pick one.
+var awsRegionVariables = []string{"TASKFORGE_BROKER_REGION", "TASKFORGE_RESULTS_REGION"}
+
+// loadAWSDefaultChain reads TASKFORGE_AWS_DEFAULT_CHAIN and, when it is true,
+// clears the broker and results endpoints and keys.
+//
+// Presence is read with os.LookupEnv, not env(): env() treats an empty value as
+// unset and returns the local default, which is exactly what hides a variable
+// a deployment set to "" by mistake. A variable that is present at all, empty
+// included, is a refusal, so the two ways of configuring a client can never
+// mix. The values are never kept or echoed. An empty switch is unset, as env()
+// reads every other variable.
+func (c *Config) loadAWSDefaultChain() {
+	raw, _ := os.LookupEnv("TASKFORGE_AWS_DEFAULT_CHAIN")
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	on, err := strconv.ParseBool(raw)
+	if err != nil {
+		c.awsChainInvalid = true
+		return
+	}
+	if !on {
+		return
+	}
+	c.AWSDefaultChain = true
+	for _, name := range awsStaticVariables {
+		if _, present := os.LookupEnv(name); present {
+			c.awsPresent = append(c.awsPresent, name)
+		}
+	}
+	for _, name := range awsRegionVariables {
+		if v, present := os.LookupEnv(name); !present || strings.TrimSpace(v) == "" {
+			c.awsRegionMissing = append(c.awsRegionMissing, name)
+		}
+	}
+	c.BrokerEndpoint, c.BrokerAccessKeyID, c.BrokerSecretAccessKey = "", "", ""
+	c.ResultsEndpoint, c.ResultsAccessKeyID, c.ResultsSecretAccessKey = "", "", ""
+}
+
+// awsProblems reports the switch's refusals. Each names the variable and never
+// its value.
+func (c Config) awsProblems() []string {
+	var problems []string
+	if c.awsChainInvalid {
+		problems = append(problems, "TASKFORGE_AWS_DEFAULT_CHAIN must be true or false")
+	}
+	if !c.AWSDefaultChain {
+		return problems
+	}
+	for _, name := range c.awsPresent {
+		problems = append(problems, name+" must not be set, even empty, when TASKFORGE_AWS_DEFAULT_CHAIN is true; "+
+			"the SDK resolves the endpoint from the region and the credentials from its default chain")
+	}
+	for _, name := range c.awsRegionMissing {
+		problems = append(problems, name+" must be set when TASKFORGE_AWS_DEFAULT_CHAIN is true")
+	}
+	// The resolution above makes these empty; a Config assembled another way
+	// must not carry a local endpoint or a static key into AWS mode either.
+	for name, v := range map[string]string{
+		"TASKFORGE_BROKER_ENDPOINT": c.BrokerEndpoint, "TASKFORGE_BROKER_ACCESS_KEY_ID": c.BrokerAccessKeyID,
+		"TASKFORGE_BROKER_SECRET_ACCESS_KEY": c.BrokerSecretAccessKey, "TASKFORGE_RESULTS_ENDPOINT": c.ResultsEndpoint,
+		"TASKFORGE_RESULTS_ACCESS_KEY_ID": c.ResultsAccessKeyID, "TASKFORGE_RESULTS_SECRET_ACCESS_KEY": c.ResultsSecretAccessKey,
+	} {
+		if v != "" && !contains(c.awsPresent, name) {
+			problems = append(problems, name+" must resolve to empty when TASKFORGE_AWS_DEFAULT_CHAIN is true")
+		}
+	}
+	sort.Strings(problems)
+	return problems
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate reports every invalid setting at once.
@@ -195,6 +307,7 @@ func (c Config) Validate() error {
 			"TASKFORGE_API_CONTROL_ADDR may bind to a network address")
 	}
 	problems = append(problems, c.listenerProblems()...)
+	problems = append(problems, c.awsProblems()...)
 	if strings.TrimSpace(c.OutboxAddr) != "" && !isLoopbackBind(c.OutboxAddr) {
 		problems = append(problems, "TASKFORGE_OUTBOX_ADDR must bind to a loopback address until authentication is implemented")
 	}
