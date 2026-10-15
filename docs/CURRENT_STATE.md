@@ -105,7 +105,7 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   and worker as separate containers, 7 of 7 rows passing
   ([ADR-0026](adr/0026-listeners-by-surface.md)). Defaults are byte-identical. See "M8C1"
   below.
-- **M8C2 — AWS-native configuration and the CLI sidecar:** complete; see PR #PRNUM.
+- **M8C2 — AWS-native configuration and the CLI sidecar:** complete; see PR #30.
   `TASKFORGE_AWS_DEFAULT_CHAIN=true` makes every binary use SQS and S3 through the region's
   default endpoints and the AWS SDK's default credential chain, refusing startup if any of
   the six endpoint or key variables is present at all and requiring both regions; a seventh

@@ -629,7 +629,7 @@ M8C2, then M8C3.**
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
 complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8D4 is
 complete; see PR #27. M8D5 is complete; see PR #28. M8C1 is complete; see PR #29. M8C2
-is complete; see PR #PRNUM. M8C3 is planned.
+is complete; see PR #30. M8C3 is planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -865,7 +865,7 @@ them; `make images-smoke` and `make topology-smoke` pass (7 of 7 rows);
 `docs/benchmarks/*`, `internal/api/testdata/route_behavior.golden`, `migrations/` and `api/`
 are byte-identical to `main`.
 **Depends on.** M8C1.
-**Status:** complete; see PR #PRNUM and [CURRENT_STATE.md](CURRENT_STATE.md).
+**Status:** complete; see PR #30 and [CURRENT_STATE.md](CURRENT_STATE.md).
 
 #### M8C3 — Deployment: Terraform, validated and not applied
 **Objective.** Make deployment credible without applying it.
