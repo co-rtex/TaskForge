@@ -142,8 +142,26 @@ func (p *probe) expect(row int, what, method, url, host string, headers map[stri
 	case resp.status != wantStatus || (wantCode != "" && resp.code != wantCode):
 		p.check(row, what, fmt.Sprintf("%s %s answered %d %q, want %d %q", method, url, resp.status, resp.code, wantStatus, wantCode), "")
 	default:
-		p.check(row, what, "", fmt.Sprintf("%s %s -> %d %s", method, url, resp.status, resp.code))
+		p.check(row, what, "", fmt.Sprintf("%s %s -> %d %s", method, p.label(url), resp.status, resp.code))
 	}
+}
+
+// label names a request by its listener and path ("public:8090 /v1/jobs") rather
+// than by URL, so a passing line reads by surface. A failing line keeps the URL.
+func (p *probe) label(url string) string {
+	for prefix, name := range map[string]string{
+		p.publicURL:  "public:" + port(p.publicURL),
+		p.controlURL: "control:" + port(p.controlURL),
+	} {
+		if strings.HasPrefix(url, prefix+"/") {
+			return name + " " + strings.TrimPrefix(url, prefix)
+		}
+	}
+	return url
+}
+
+func port(url string) string {
+	return url[strings.LastIndex(url, ":")+1:]
 }
 
 // --- row 1 ------------------------------------------------------------------------
