@@ -4713,6 +4713,12 @@ A pure suffix match (M3 as literally worded) admits `xapi` but not `api.evil`; t
   decide how the CLI reaches the task.
 - **The integration test binds a real non-loopback interface** (the first up, non-loopback,
   non-link-local IPv4), for a few seconds, and fails rather than skips where there is none.
+- **A gitleaks false positive is pinned as a fixture.** Commit `a3646890` quoted a probe
+  line containing `http://api:8090/internal/v1/claims`, which gitleaks' `generic-api-key`
+  rule reads as a key (the keyword `api`, the separator `:`, then
+  `8090/internal/v1/claims`). It is a URL path, not a credential. History is permanent, so
+  `.gitleaks.toml` carries a FIXTURE entry for that literal in this file, and the probe now
+  prints passing requests by listener and path, which the rule does not match.
 - **The smoke builds the probe and the CLI with the host's Go for the engine's
   architecture** and runs them in the Dockerfile's pinned builder image, so it pulls no
   image the repository does not already pin.

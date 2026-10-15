@@ -47,3 +47,15 @@ condition = "AND"
 targetRules = ["generic-api-key"]
 paths = ['''^internal/api/result_handlers_test\.go$''']
 regexes = ['''results/scope/job/attempt''']
+
+# Fixture: a URL path in docs/CURRENT_STATE.md, not a credential. M8C1's notes quote
+# "http://api:8090/internal/v1/claims" (the topology smoke's public listener and a route
+# it must not serve), and the generic-api-key rule reads "8090/internal/v1/claims" after
+# the keyword "api" and a ":" as a key. Commit a3646890 first quoted it; the file keeps
+# one quotation, where it explains this entry.
+[[allowlists]]
+description = "topology-smoke URL path quoted in CURRENT_STATE"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^docs/CURRENT_STATE\.md$''']
+regexes = ['''8090/internal/v1/claims''']
