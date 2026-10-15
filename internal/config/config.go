@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/co-rtex/TaskForge/internal/hostallow"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/loopback"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
@@ -27,7 +28,18 @@ import (
 type Config struct {
 	DatabaseURL string
 
+	// APIAddr is the admin listener: loopback only, and it serves every route,
+	// including credential administration, the dashboard and /metrics.
+	// APIPublicAddr and APIControlAddr are the two optional network listeners
+	// (docs/adr/0026-listeners-by-surface.md): public serves /v1 and the
+	// probes, control the worker-control routes and the probes. Empty means
+	// that listener is not opened. APIControlHosts is the exact-match Host
+	// allowlist the control listener's browser-origin guard checks in place of
+	// loopback; it is required with APIControlAddr and refused without it.
 	APIAddr           string
+	APIPublicAddr     string
+	APIControlAddr    string
+	APIControlHosts   []string
 	MaxRequestBytes   int64
 	APIRequestTimeout time.Duration
 	LeaseDuration     time.Duration
@@ -101,6 +113,9 @@ func Load() (Config, error) {
 	c := Config{
 		DatabaseURL:       env("TASKFORGE_DATABASE_URL", "postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable"),
 		APIAddr:           env("TASKFORGE_API_ADDR", "127.0.0.1:8080"),
+		APIPublicAddr:     env("TASKFORGE_API_PUBLIC_ADDR", ""),
+		APIControlAddr:    env("TASKFORGE_API_CONTROL_ADDR", ""),
+		APIControlHosts:   envList("TASKFORGE_API_CONTROL_HOSTS"),
 		MaxRequestBytes:   envInt64("TASKFORGE_MAX_REQUEST_BYTES", 256*1024),
 		APIRequestTimeout: envDuration("TASKFORGE_API_REQUEST_TIMEOUT", 25*time.Second),
 		LeaseDuration:     envDuration("TASKFORGE_LEASE_DURATION", 30*time.Second),
@@ -170,9 +185,16 @@ func (c Config) Validate() error {
 	req("TASKFORGE_OUTBOX_ADDR", c.OutboxAddr)
 	req("TASKFORGE_RECONCILER_ADDR", c.ReconcilerAddr)
 	req("TASKFORGE_SCHEDULER_ADDR", c.SchedulerAddr)
+	// The admin listener serves credential administration, the dashboard and
+	// /metrics with no credential (ADR-0013, ADR-0017), so it is loopback for
+	// good, not until something is built. A network address is what the two
+	// optional listeners are for.
 	if strings.TrimSpace(c.APIAddr) != "" && !isLoopbackBind(c.APIAddr) {
-		problems = append(problems, "TASKFORGE_API_ADDR must bind to a loopback address until authentication is implemented")
+		problems = append(problems, "TASKFORGE_API_ADDR must bind to a loopback address: it is the admin listener, "+
+			"which serves key administration, the dashboard and /metrics; only TASKFORGE_API_PUBLIC_ADDR and "+
+			"TASKFORGE_API_CONTROL_ADDR may bind to a network address")
 	}
+	problems = append(problems, c.listenerProblems()...)
 	if strings.TrimSpace(c.OutboxAddr) != "" && !isLoopbackBind(c.OutboxAddr) {
 		problems = append(problems, "TASKFORGE_OUTBOX_ADDR must bind to a loopback address until authentication is implemented")
 	}
@@ -333,6 +355,66 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// listenerProblems reports every invalid setting of the two optional API
+// listeners and the control listener's Host allowlist.
+//
+// Each optional address may be any host:port, including a wildcard, because
+// what it serves is authenticated: /v1 by an API key (ADR-0013), the control
+// routes by a worker key and then the session it registered (ADR-0014). The
+// probes beside them reveal nothing tenant-specific. See
+// docs/adr/0026-listeners-by-surface.md.
+func (c Config) listenerProblems() []string {
+	var problems []string
+	public := strings.TrimSpace(c.APIPublicAddr)
+	control := strings.TrimSpace(c.APIControlAddr)
+	if public != "" && !isBindAddress(public) {
+		problems = append(problems, "TASKFORGE_API_PUBLIC_ADDR must be a host:port listen address")
+	}
+	if control != "" && !isBindAddress(control) {
+		problems = append(problems, "TASKFORGE_API_CONTROL_ADDR must be a host:port listen address")
+	}
+
+	// The allowlist replaces loopback in the control listener's Host rule, so a
+	// control listener without one would have no Host rule at all, and a list
+	// with no listener would be configuration that does nothing, which is the
+	// kind of mistake that is only ever found by its absence.
+	switch {
+	case control != "" && len(c.APIControlHosts) == 0:
+		problems = append(problems,
+			"TASKFORGE_API_CONTROL_HOSTS must list the host names workers dial when TASKFORGE_API_CONTROL_ADDR is set")
+	case control == "" && len(c.APIControlHosts) > 0:
+		problems = append(problems,
+			"TASKFORGE_API_CONTROL_HOSTS is set but TASKFORGE_API_CONTROL_ADDR is not; the list applies only to the control listener")
+	}
+	if len(c.APIControlHosts) > 0 {
+		if _, err := hostallow.Parse(c.APIControlHosts); err != nil {
+			problems = append(problems, "TASKFORGE_API_CONTROL_HOSTS must hold only hostnames or IP addresses: "+err.Error())
+		}
+	}
+
+	// Two listeners on one address would fail to bind at startup anyway, but
+	// only after the first had already opened; refusing here names both.
+	listeners := []struct{ name, addr string }{
+		{"TASKFORGE_API_ADDR", strings.TrimSpace(c.APIAddr)},
+		{"TASKFORGE_API_PUBLIC_ADDR", public},
+		{"TASKFORGE_API_CONTROL_ADDR", control},
+	}
+	for i := range listeners {
+		for j := i + 1; j < len(listeners); j++ {
+			if addressesOverlap(listeners[i].addr, listeners[j].addr) {
+				problems = append(problems, fmt.Sprintf("%s and %s must not share an address", listeners[i].name, listeners[j].name))
+			}
+		}
+	}
+	return problems
+}
+
+// ControlHostAllowlist is the parsed TASKFORGE_API_CONTROL_HOSTS. It is an
+// error on any Config that Validate refused it in.
+func (c Config) ControlHostAllowlist() (hostallow.List, error) {
+	return hostallow.Parse(c.APIControlHosts)
+}
+
 // RetryPolicy renders the validated job retry settings as the shared policy the
 // control plane enforces. It is a method rather than four fields copied at each
 // call site so no process can accidentally build a different policy from the
@@ -357,17 +439,24 @@ type WorkerConfig struct {
 	// registration only; every subsequent control-plane call is authenticated
 	// by the session that registration created, not by presenting this value
 	// again.
-	WorkerAPIKey    string
-	HealthAddr      string
-	Name            string
-	Hostname        string
-	WorkerGroup     string
-	Queue           string
-	Concurrency     int
-	Capabilities    []string
-	PollWait        time.Duration
-	RequestTimeout  time.Duration
-	ShutdownTimeout time.Duration
+	WorkerAPIKey string
+	// AllowRemoteAPI is TASKFORGE_WORKER_ALLOW_REMOTE_API: the explicit opt-in
+	// that lets APIBaseURL name a host other than loopback, which a worker in
+	// its own container needs to reach the API's control listener. Without it
+	// the loopback rule stands exactly as before. See
+	// docs/adr/0026-listeners-by-surface.md.
+	AllowRemoteAPI    bool
+	allowRemoteAPIRaw string
+	HealthAddr        string
+	Name              string
+	Hostname          string
+	WorkerGroup       string
+	Queue             string
+	Concurrency       int
+	Capabilities      []string
+	PollWait          time.Duration
+	RequestTimeout    time.Duration
+	ShutdownTimeout   time.Duration
 }
 
 // LoadWorker reads and validates worker-process settings.
@@ -390,6 +479,12 @@ func LoadWorker() (WorkerConfig, error) {
 		RequestTimeout:  envDuration("TASKFORGE_WORKER_REQUEST_TIMEOUT", 10*time.Second),
 		ShutdownTimeout: envDuration("TASKFORGE_WORKER_SHUTDOWN_TIMEOUT", 15*time.Second),
 	}
+	c.allowRemoteAPIRaw = strings.TrimSpace(env("TASKFORGE_WORKER_ALLOW_REMOTE_API", ""))
+	if c.allowRemoteAPIRaw != "" {
+		// A value that is not a boolean stays false and is reported by
+		// Validate, rather than quietly read as "no".
+		c.AllowRemoteAPI, _ = strconv.ParseBool(c.allowRemoteAPIRaw)
+	}
 	return c, c.Validate()
 }
 
@@ -401,11 +496,18 @@ func (c WorkerConfig) Validate() error {
 	parsed, err := url.Parse(c.APIBaseURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		problems = append(problems, "TASKFORGE_WORKER_API_URL must be an absolute http(s) URL")
-	} else if !loopback.IsLoopbackHost(parsed.Hostname()) {
-		// Permanent, not a stand-in for authentication: the worker health
-		// endpoint and the API's own loopback bind (see Config.Validate) are
-		// deliberately never exposed off-host, worker key or not.
+	} else if !c.AllowRemoteAPI && !loopback.IsLoopbackHost(parsed.Hostname()) {
+		// The default stays loopback: a worker beside the API reaches its admin
+		// listener there. Dialing the control listener in another container is
+		// a deliberate deployment choice, so it takes an explicit opt-in rather
+		// than being inferred from the URL. An older binary has no opt-in and
+		// keeps refusing, by design.
 		problems = append(problems, "TASKFORGE_WORKER_API_URL must use a loopback host")
+	}
+	if c.allowRemoteAPIRaw != "" {
+		if _, err := strconv.ParseBool(c.allowRemoteAPIRaw); err != nil {
+			problems = append(problems, "TASKFORGE_WORKER_ALLOW_REMOTE_API must be true or false")
+		}
 	}
 	if strings.TrimSpace(c.WorkerAPIKey) == "" {
 		problems = append(problems, "TASKFORGE_WORKER_API_KEY must not be empty")
@@ -593,6 +695,67 @@ func envSet(key, def string) []string {
 	}
 	sort.Strings(values)
 	return values
+}
+
+// envList reads a comma-separated list, keeping every entry as written apart
+// from surrounding space, empty entries included, so Validate can refuse "a,,b"
+// rather than read it as "a,b". An unset or blank variable is no list at all.
+func envList(key string) []string {
+	raw := env(key, "")
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	entries := strings.Split(raw, ",")
+	for i := range entries {
+		entries[i] = strings.TrimSpace(entries[i])
+	}
+	return entries
+}
+
+// isBindAddress reports whether address is a host:port a listener can bind,
+// with any host (a wildcard included) and a numeric port.
+func isBindAddress(address string) bool {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 0 && n <= 65535
+}
+
+// addressesOverlap reports whether two listen addresses would contend for one
+// socket: the same port, and either the same host or a wildcard host on
+// either side. Port 0 asks the kernel for a free port and so never contends.
+// IP literals are compared in canonical form; names are compared as written,
+// because resolving them here would make validation depend on DNS.
+func addressesOverlap(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	hostA, portA, errA := net.SplitHostPort(a)
+	hostB, portB, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil || portA != portB || portA == "0" {
+		return false
+	}
+	if isWildcardHost(hostA) || isWildcardHost(hostB) {
+		return true
+	}
+	return canonicalHost(hostA) == canonicalHost(hostB)
+}
+
+func isWildcardHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+func canonicalHost(host string) string {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
 func isLoopbackBind(address string) bool {
