@@ -617,17 +617,19 @@ some killed workers' attempts end `TIMED_OUT` rather than `ABANDONED`, and the o
 added M8D4 to measure that before M8C. M8D4 ended in a decision memo; the owner chose its
 option (b) on 2026-10-14 and added M8D5 to implement it before M8C. On 2026-10-14 the
 owner also split M8C in two: M8C1 makes the binaries deployable as separate services
-(listeners by surface), and M8C2 is the Terraform, which would otherwise describe a
-configuration the binaries refuse. The original objective, deliverables, and acceptance
-sentence are preserved across them, not reduced.
+(listeners by surface), and the second was the Terraform, which would otherwise describe a
+configuration the binaries refuse. On 2026-10-15 the owner split again: M8C2 makes the
+binaries use AWS's default endpoints and credential chain and adds the CLI sidecar that
+bootstraps the first keys, and the Terraform entry is renamed M8C3. The original
+objective, deliverables, and acceptance sentence are preserved across them, not reduced.
 
 **Order: M8B, then M8D1, then M8D2, then M8D3, then M8D4, then M8D5, then M8C1, then
-M8C2.**
+M8C2, then M8C3.**
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
 complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8D4 is
 complete; see PR #27. M8D5 is complete; see PR #28. M8C1 is complete; see PR #29. M8C2
-is planned.
+is complete; see PR #PRNUM. M8C3 is planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -844,22 +846,67 @@ byte-identical to `main`.
 **Depends on.** M8B; follows M8D5.
 **Status:** complete; see PR #29 and [CURRENT_STATE.md](CURRENT_STATE.md).
 
-#### M8C2 — Deployment: Terraform, validated and not applied
+#### M8C2 — AWS-native configuration and the CLI sidecar
+**Objective.** Remove the two blockers between M8C1 and a credible deployment, as the
+owner decided on 2026-10-15: the binaries could not use the AWS SDK's default endpoint or
+credential chain (an empty value falls back to the local default), and there was no way to
+mint the first credentials in ECS (the admin listener is loopback-only; the api image has
+no CLI and no shell).
+**Deliverables.** `TASKFORGE_AWS_DEFAULT_CHAIN`, strictly parsed: with it true the broker
+and results endpoints and keys resolve to empty, startup refuses if any of the six endpoint
+or key variables is present (even empty), and both regions are required; off, nothing
+changes. One `OptionsFromConfig` per client package, used by the api, outbox and worker. A
+seventh image, `taskforge-cli`, with `taskforge-cli idle`, run as a sidecar in the api task
+and reached through ECS Exec; `make images` builds seven and the image smoke checks the
+seventh. `make topology-smoke` mints its keys through that sidecar. The ECS Exec findings,
+cited. [ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md).
+**Acceptance.** The config and client tests pass and the four mutations are shown failing
+them; `make images-smoke` and `make topology-smoke` pass (7 of 7 rows);
+`docs/benchmarks/*`, `internal/api/testdata/route_behavior.golden`, `migrations/` and `api/`
+are byte-identical to `main`.
+**Depends on.** M8C1.
+**Status:** complete; see PR #PRNUM and [CURRENT_STATE.md](CURRENT_STATE.md).
+
+#### M8C3 — Deployment: Terraform, validated and not applied
 **Objective.** Make deployment credible without applying it.
 **Deliverables.** Validated (not applied) Terraform for ALB, ECS services, RDS, SQS, S3,
-secrets and logs, running the topology M8C1 made possible: the api with its public
-listener behind the load balancer and its control listener reachable from the workers
-only, `TASKFORGE_API_CONTROL_HOSTS` holding the exact name workers dial, workers with
-`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`, each container's health check the binary's
-own `healthcheck` subcommand, and a runbook for minting the first keys on the admin
-listener from inside the api task (ADR-0026 records that the api image holds no CLI, so
-the runbook has to say how the CLI reaches the task).
+secrets and logs, running the topology M8C1 made possible with the configuration M8C2 made
+possible, and implementing the decisions ADR-0027 records:
+- every service with `TASKFORGE_AWS_DEFAULT_CHAIN=true`, both regions set, none of the six
+  endpoint or key variables present, and a task role per service;
+- the api task with the `taskforge-cli` sidecar (default command `idle`) and ECS Exec
+  enabled; **the sidecar's root filesystem writable** (ECS Exec does not support
+  `readonlyRootFilesystem`); ECS Exec logging set to `NONE` or verified, since the image has
+  no `script`, `cat` or `sh`; `ecs:ExecuteCommand` limited by IAM to the `cli` container;
+  and a runbook that mints the first keys with `aws ecs execute-command ... --container cli
+  --interactive --command "/taskforge-cli --api-url http://127.0.0.1:8080 api-keys create
+  ..."`, a command run without a shell, so one program and its arguments;
+- **Q4** Cloud Map private DNS: workers dial `api.taskforge.internal:8091` and
+  `TASKFORGE_API_CONTROL_HOSTS=api.taskforge.internal`; the control port accepts traffic
+  only from the worker security group, the public port only from the ALB's;
+- **Q5** an internet-facing ALB, HTTPS only, `acm_certificate_arn` a required variable,
+  HTTP redirected to HTTPS, `allowed_ingress_cidrs` defaulting to `[]`, the health check
+  the public `/healthz`;
+- **Q6** one NAT gateway, with its cost and single point of failure recorded and VPC
+  endpoints named as the alternative;
+- **Q7** `sslmode=require` in the database DSN, held in Secrets Manager (not `verify-full`:
+  the images carry no RDS CA); the password Terraform generates is in its state, so the
+  runbook requires an encrypted remote backend before any apply;
+- **Q8** one CI job: `terraform fmt -check`, `terraform init -backend=false`, `terraform
+  validate`, with a pinned Terraform version and the lock file committed, and no plan;
+- IAM for S3: the worker's `EnsureBucket` calls `CreateBucket` and readiness `HeadBucket`,
+  so its role needs `s3:CreateBucket` and `s3:ListBucket` on the bucket's ARN, with object
+  `s3:PutObject` and `s3:GetObject` on its contents, and the api `s3:GetObject`;
+- the SQS queue `taskforge-work-available`, standard, visibility timeout 30 s, delay 0 s,
+  receive wait 0 s, as `deploy/local/elasticmq.conf` has it (ADR-0024 depends on the 30 s);
+- each container's health check the binary's own `healthcheck` subcommand.
+The shipped timings stay as they are.
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8C1. **Needs its own handoff before any work starts**, and the
+**Depends on.** M8C2. **Needs its own handoff before any work starts**, and the
 infrastructure costs money if applied.
 **Status:** planned.
 
-**Open product decision, not part of M8C1's or M8C2's deliverables: the shipped default
+**Open product decision, not part of M8C1's, M8C2's or M8C3's deliverables: the shipped default
 timings.** The M8A benchmark missed the dispatch-latency and worker-failure-recovery
 targets on the shipped defaults (`TASKFORGE_OUTBOX_POLL_INTERVAL=1s`,
 `TASKFORGE_LEASE_DURATION=30s`) and met all five on a tuned, labelled profile
