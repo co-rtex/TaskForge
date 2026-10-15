@@ -25,11 +25,13 @@
 // queue of its own. The containers reach the infrastructure by joining the compose
 // project's own network, so the same code runs on Linux and on Docker Desktop.
 //
-// The first API key and worker key are minted the way M8C2's runbook will mint
-// them: on the admin listener, from inside the api container, with the CLI
-// against loopback. The api image holds no CLI (ADR-0021), so the smoke copies a
-// linux build of taskforge-cli into the running container with `docker cp` and
-// runs it there with `docker exec`.
+// The first API key and worker key are minted the way M8C3's runbook will mint
+// them (ADR-0027): a cli sidecar, the taskforge-cli image running its default
+// `idle`, shares the api container's network namespace (`--network
+// container:<api>`, as containers in one awsvpc ECS task share theirs), and
+// `docker exec` runs /taskforge-cli in it, with no shell, against the admin
+// listener on 127.0.0.1. That exec is what ECS Exec does into the sidecar. The
+// api image is untouched.
 package main
 
 import (
@@ -43,7 +45,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -153,7 +154,7 @@ func (s *smoke) setUp(ctx context.Context) error {
 	if s.builder, err = builderImage(string(dockerfile)); err != nil {
 		return err
 	}
-	for _, service := range []string{"api", "worker", "outbox", "migrate"} {
+	for _, service := range []string{"api", "worker", "outbox", "migrate", "cli"} {
 		if out, err := docker(ctx, "image", "inspect", "--format", "{{.Id}}", image(service)); err != nil || out.exit != 0 {
 			return fmt.Errorf("%s is not built; run `make images` first", image(service))
 		}
@@ -173,7 +174,7 @@ func (s *smoke) setUp(ctx context.Context) error {
 		return err
 	}
 	s.onCleanup(func() { _ = os.RemoveAll(s.workdir) })
-	if err := crossBuild(ctx, arch, s.workdir, "./cmd/taskforge-cli", "./scripts/topologysmoke/probe"); err != nil {
+	if err := crossBuild(ctx, arch, s.workdir, "./scripts/topologysmoke/probe"); err != nil {
 		return err
 	}
 
@@ -324,18 +325,27 @@ func (s *smoke) awaitHealthy(ctx context.Context, role string) error {
 	return fmt.Errorf("the %s container was not healthy within %s: %s", role, healthTimeout, truncate(last, 300))
 }
 
-// mintKeys is the bootstrap path: the CLI, inside the api container, against
-// the admin listener on that container's loopback.
+// sidecarNetwork is the network the cli sidecar runs on: the api container's
+// own namespace, so 127.0.0.1 inside the sidecar is the api's loopback and its
+// admin listener is reachable, and nothing else's is.
+func (s *smoke) sidecarNetwork() string { return "container:" + s.name("api") }
+
+// mintKeys is the bootstrap path: the cli sidecar, idling in the api's network
+// namespace, and `docker exec` of the CLI in it against the admin listener.
 func (s *smoke) mintKeys(ctx context.Context) (apiKey, workerKey string, err error) {
-	api := s.name("api")
-	if out, err := docker(ctx, "cp", filepath.Join(s.workdir, "taskforge-cli"), api+":/tmp/taskforge-cli"); err != nil || out.exit != 0 {
-		return "", "", fmt.Errorf("copy taskforge-cli into the api container: %v %s", err, out.stderr)
+	cli := s.name("cli")
+	out, err := docker(ctx, "run", "--detach", "--name", cli, "--network", s.sidecarNetwork(), image("cli"))
+	if err != nil || out.exit != 0 {
+		return "", "", fmt.Errorf("start the cli sidecar: %v %s", err, truncate(out.stderr, 300))
 	}
+	s.containers = append(s.containers, cli)
+	s.onCleanup(func() { _, _ = dockerCleanup("rm", "--force", cli) })
+
 	mint := func(kind string) (string, error) {
-		out, err := docker(ctx, "exec", "--env", "TASKFORGE_CLI_API_URL=http://"+adminAddr, api,
-			"/tmp/taskforge-cli", kind, "create", "--scope", scope, "--name", fmt.Sprintf("topology-%s-%d", kind, s.pid))
+		out, err := docker(ctx, "exec", cli,
+			"/taskforge-cli", "--api-url", "http://"+adminAddr, kind, "create", "--scope", scope, "--name", fmt.Sprintf("topology-%s-%d", kind, s.pid))
 		if err != nil || out.exit != 0 {
-			return "", fmt.Errorf("%s create inside the api container: exit %d %v %s", kind, out.exit, err, truncate(out.stderr, 300))
+			return "", fmt.Errorf("%s create in the cli sidecar: exit %d %v %s", kind, out.exit, err, truncate(out.stderr, 300))
 		}
 		var created struct {
 			Key string `json:"key"`
@@ -351,7 +361,8 @@ func (s *smoke) mintKeys(ctx context.Context) (apiKey, workerKey string, err err
 	if workerKey, err = mint("worker-keys"); err != nil {
 		return "", "", err
 	}
-	s.say("minted an API key and a worker key with taskforge-cli inside %s, against http://%s", api, adminAddr)
+	s.say("minted an API key and a worker key with taskforge-cli in the sidecar %s (network %s), against http://%s",
+		cli, s.sidecarNetwork(), adminAddr)
 	return apiKey, workerKey, nil
 }
 
