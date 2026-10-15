@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/co-rtex/TaskForge/internal/hostallow"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/results"
@@ -74,6 +75,10 @@ type Server struct {
 	// checkRouteBoundaries); nothing in production sets it, and it is unexported,
 	// so nothing outside this package can.
 	routeTableHook func([]route) []route
+	// controlHosts is the control listener's exact-match Host allowlist
+	// (TASKFORGE_API_CONTROL_HOSTS). Empty unless WithControlHosts set it, in
+	// which case only ListenerAdmin and ListenerPublic can be built.
+	controlHosts hostallow.List
 }
 
 // Results reads a job's recorded result. See internal/results.Store.
@@ -176,6 +181,15 @@ func (s *Server) WithMetrics(m *metrics.Metrics) *Server {
 	return s
 }
 
+// WithControlHosts sets the control listener's Host allowlist: the exact names
+// workers dial, which the browser-origin guard on that listener checks as its
+// rule 3 in place of loopback. It changes nothing on the admin or public
+// listener. See docs/adr/0026-listeners-by-surface.md.
+func (s *Server) WithControlHosts(hosts hostallow.List) *Server {
+	s.controlHosts = hosts
+	return s
+}
+
 // WithTracer overrides the tracer this server records spans with.
 //
 // Production never calls it: NewServer already takes the global delegating
@@ -193,12 +207,28 @@ func (s *Server) WithTracer(tracer trace.Tracer) *Server {
 // tracing sits just inside it so a span can carry that id and so the access log
 // can carry the trace id, and recovery sits inside both so a panic is logged
 // with both identities.
+//
+// It is the admin listener's handler, which serves every route: see
+// ListenerHandler.
 func (s *Server) Handler() http.Handler {
+	return s.ListenerHandler(ListenerAdmin)
+}
+
+// ListenerHandler returns the fully wrapped HTTP handler for one listener: the
+// routes whose table entry names it, their 405 fallbacks, and the "/" catch-all,
+// under the same middleware every listener shares. The same metrics, tracer and
+// logger serve all of them, and a route's metric label is its pattern whichever
+// listener it arrived on (docs/adr/0026-listeners-by-surface.md says why there is
+// no listener label).
+//
+// ListenerControl needs WithControlHosts first; building it without an allowlist
+// panics, because its guard would otherwise have no Host rule at all.
+func (s *Server) ListenerHandler(l Listener) http.Handler {
 	mux := http.NewServeMux()
 	// Every route is declared in routeTable (routes.go) and registered from it:
-	// the table is the one place a route, its wrappers, its feature group and its
-	// reason for being absent from the spec are read.
-	s.registerRoutes(mux)
+	// the table is the one place a route, its wrappers, its feature group, its
+	// listeners and its reason for being absent from the spec are read.
+	s.registerRoutes(mux, l)
 
 	// Innermost first. withSpanRoute must sit directly on the mux so it reads
 	// the pattern off the same *Request the mux wrote it to -- see its comment.
@@ -240,8 +270,8 @@ func (s *Server) Handler() http.Handler {
 // TestRoutes_InternalRoutesAreGuardedOutermost, and for every operation
 // api/openapi.yaml documents by
 // TestInternalGuard_RefusesBrowserRequestsOnEveryDocumentedOperation.
-func (s *Server) handleInternal(mux *http.ServeMux, pattern string, handler http.HandlerFunc) {
-	mux.HandleFunc(pattern, s.refuseBrowserOrigin(handler))
+func (s *Server) handleInternal(mux *http.ServeMux, pattern string, rule hostRule, handler http.HandlerFunc) {
+	mux.HandleFunc(pattern, s.refuseBrowserOrigin(rule, handler))
 }
 
 // JobResponse is the public representation of a job. It deliberately excludes
