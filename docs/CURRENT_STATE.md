@@ -4608,60 +4608,60 @@ mint them: a linux build of `taskforge-cli` is copied into the running api conta
 `docker cp` (the image holds no CLI) and run there with `docker exec` against
 `http://127.0.0.1:8080`. A probe container on the same network checks rows 1–6; row 7 is
 checked by `docker exec` and `docker run` from the host. The run on the final head
-(`make topology-smoke`, images labelled `c34426f`, on AC, 2026-10-15 02:44:51–02:44:59 UTC; the images had been built from the same tree earlier, so the build was cached):
+(`make topology-smoke`, on AC, 2026-10-15 02:46:57–02:47:07 UTC, after the probe was changed to name each request by listener and path rather than by URL, because gitleaks' `generic-api-key` rule matched a quoted URL; the service images were rebuilt from cache, their binaries unchanged since `c34426f`):
 
 ```
-topology-smoke: docker engine linux/arm64, compose network taskforge_default, pid 68562
-topology-smoke: migrated taskforge_topology_68562 with taskforge-migrate:dev
-topology-smoke: started taskforge-topology-api-68562
-topology-smoke: minted an API key and a worker key with taskforge-cli inside taskforge-topology-api-68562, against http://127.0.0.1:8080
-topology-smoke: started taskforge-topology-outbox-68562
-topology-smoke: started taskforge-topology-worker-68562
+topology-smoke: docker engine linux/arm64, compose network taskforge_default, pid 69031
+topology-smoke: migrated taskforge_topology_69031 with taskforge-migrate:dev
+topology-smoke: started taskforge-topology-api-69031
+topology-smoke: minted an API key and a worker key with taskforge-cli inside taskforge-topology-api-69031, against http://127.0.0.1:8080
+topology-smoke: started taskforge-topology-outbox-69031
+topology-smoke: started taskforge-topology-worker-69031
 === topology-smoke: checks ===
-  PASS  row 1  the worker registered through control:8091  GET public:8090/v1/workers lists topology-worker HEALTHY, id debbb46c-4f26-4db0-8e90-e439644d3650
-  PASS  row 1  a job submitted through public:8090 reaches SUCCEEDED  job 71d0fa34-02c6-4a0f-a4ef-9c1cf8dd1678 SUCCEEDED in one attempt by topology-worker
-  PASS  row 2  key administration is not served  GET http://api:8090/internal/v1/api-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8090/internal/v1/api-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8090/internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
-  PASS  row 2  key administration is not served  GET http://api:8090/internal/v1/worker-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8090/internal/v1/worker-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8090/internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
-  PASS  row 2  key administration is not served  GET http://api:8091/internal/v1/api-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8091/internal/v1/api-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8091/internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
-  PASS  row 2  key administration is not served  GET http://api:8091/internal/v1/worker-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8091/internal/v1/worker-keys -> 404 not_found
-  PASS  row 2  key administration is not served  POST http://api:8091/internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8090/dashboard/ -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8090/dashboard/index.html -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8090/metrics -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8090/ -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8091/dashboard/ -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8091/dashboard/index.html -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8091/metrics -> 404 not_found
-  PASS  row 3  the dashboard and /metrics are not served  GET http://api:8091/ -> 404 not_found
+  PASS  row 1  the worker registered through control:8091  GET public:8090/v1/workers lists topology-worker HEALTHY, id fd9a65c5-cafc-4f20-ad62-c0c03174a5f5
+  PASS  row 1  a job submitted through public:8090 reaches SUCCEEDED  job cf66a91d-1335-4ea2-8c56-33c9b7b30b05 SUCCEEDED in one attempt by topology-worker
+  PASS  row 2  key administration is not served  GET public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET control:8091 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET control:8091 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /dashboard/ -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /dashboard/index.html -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /metrics -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 / -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /dashboard/ -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /dashboard/index.html -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /metrics -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 / -> 404 not_found
   PASS  row 4  control:8091 admits the allowlisted Host  Host api -> 422 validation_failed (past the guard)
   PASS  row 4  control:8091 refuses a Host off the allowlist  403 origin_refused
   PASS  row 4  control:8091 refuses a loopback Host, which is not on the allowlist  403 origin_refused
   PASS  row 4  control:8091 refuses a near-miss Host  403 origin_refused
   PASS  row 4  control:8091 refuses the allowlisted Host with Origin  403 origin_refused
   PASS  row 4  control:8091 refuses the allowlisted Host with Sec-Fetch-Site  403 origin_refused
-  PASS  row 5  public:8090 serves /v1 (the positive control)  GET http://api:8090/v1/jobs -> 200
-  PASS  row 5  public:8090 serves no /internal route  PUT http://api:8090/internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111 -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111/heartbeat -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/claims -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/leases/11111111-1111-4111-8111-111111111111/renew -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/attempts/11111111-1111-4111-8111-111111111111/start -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/attempts/11111111-1111-4111-8111-111111111111/succeed -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/attempts/11111111-1111-4111-8111-111111111111/fail -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/attempts/11111111-1111-4111-8111-111111111111/cancel -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  GET http://api:8090/internal/v1/api-keys -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/api-keys -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  GET http://api:8090/internal/v1/worker-keys -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/worker-keys -> 404 not_found
-  PASS  row 5  public:8090 serves no /internal route  POST http://api:8090/internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
-  PASS  row 5  control:8091 serves no /v1 route  GET http://api:8091/v1/jobs -> 404 not_found
+  PASS  row 5  public:8090 serves /v1 (the positive control)  GET public:8090 /v1/jobs -> 200
+  PASS  row 5  public:8090 serves no /internal route  PUT public:8090 /internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111 -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111/heartbeat -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/claims -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/leases/11111111-1111-4111-8111-111111111111/renew -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/start -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/succeed -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/fail -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/cancel -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  GET public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  GET public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 5  control:8091 serves no /v1 route  GET control:8091 /v1/jobs -> 404 not_found
   PASS  row 6  the probe can reach the api container (the positive control)  TCP connect to api:8090 succeeded
   PASS  row 6  the admin listener cannot be reached from another container  TCP connect to api:8080 failed: dial tcp 172.19.0.2:8080: connect: connection refused
   PASS  row 6  no key listing is served on the admin port  GET failed: Get "http://api:8080/internal/v1/api-keys": dial tcp 172.19.0.2:8080: connect: connection refused
@@ -4679,7 +4679,7 @@ topology-smoke: started taskforge-topology-worker-68562
   PASS  row 6  the admin listener cannot be reached from the probe container  (3 checks)
   PASS  row 7  `healthcheck` exits 0 against a healthy container and 1 when its probe is down  (5 checks)
 === RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met) ===
-topology-smoke: dropped database taskforge_topology_68562
+topology-smoke: dropped database taskforge_topology_69031
 ```
 
 Nothing is left behind: no `taskforge-topology-*` container or network, no
@@ -5306,8 +5306,9 @@ Recorded as risks, not worked around silently.
 These gates ran locally on 2026-10-14 (US Central; 2026-10-15 UTC) under Go 1.27.2 (`go
 version` printed `go1.27.2 darwin/arm64`), the version `go.mod` names, against PostgreSQL
 16, ElasticMQ and the object store from `make up`. No other TaskForge process was running.
-The code and tests are as at `c34426f`; every later commit changes `docs/` and
-`.env.example` only. The timed gates ran on AC with the lid open and Low Power Mode off
+The code and tests are as at `c34426f`, except the topology probe's output format (one
+later commit under `scripts/topologysmoke/probe`); every other later commit changes
+`docs/`, `AGENTS.md` and `.env.example` only. The timed gates ran on AC with the lid open and Low Power Mode off
 (`pmset -g batt`: `Now drawing from 'AC Power'`, recorded before each). Every Docker build
 and run used a throwaway `DOCKER_CONFIG` with no credential store, because Docker
 Desktop's credential helper hung on this machine (`docker-credential-desktop get` did not
@@ -5325,7 +5326,7 @@ return); the global Docker configuration was not touched.
 | `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)`, 02:43:43–02:43:57 UTC |
 | `make bench-smoke` | PASS: `14 of 14 checks met`, 02:43:57–02:44:33 UTC |
 | `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, revision `c34426f`, 02:44:33–02:44:51 UTC |
-| `make topology-smoke` | PASS: `RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met)`, 02:44:51–02:44:59 UTC |
+| `make topology-smoke` | PASS: `RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met)`, 02:44:51–02:44:59 UTC, and again after the probe's output change, 02:46:57–02:47:07 UTC (the run quoted under "M8C1") |
 | `make scan` | run in a fresh full clone of the final head; the command and its result are in the pull request |
 | `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change |
 
