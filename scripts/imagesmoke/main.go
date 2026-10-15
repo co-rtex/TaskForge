@@ -1,4 +1,4 @@
-// Command imagesmoke checks the six service images that `make images` builds. It
+// Command imagesmoke checks the seven images that `make images` builds. It
 // is what turns the Dockerfile's claims into observations of the built image:
 //
 //   - every image runs as a non-root user, carries the source and revision labels,
@@ -117,6 +117,10 @@ func run(stdout, stderr io.Writer) int {
 		s.checkImage(ctx, svc.name)
 		s.checkRejection(ctx, svc.name, svc.env, svc.message)
 	}
+	// The seventh image, the cli sidecar (ADR-0027), has no configuration to
+	// reject; what it must do is idle until it is told to stop.
+	s.checkImage(ctx, "cli")
+	s.checkCLIIdles(ctx)
 	s.checkMigrate(ctx)
 	s.checkAPIDashboard(ctx)
 
@@ -212,6 +216,61 @@ func (s *smoke) checkRejection(ctx context.Context, service string, env map[stri
 		return
 	}
 	s.record(name, rejectionProblem(out.exit, out.combined(), message), fmt.Sprintf("exit %d: %s", out.exit, message))
+}
+
+// --- cli ------------------------------------------------------------------------
+
+// cliIdleWindow is how long the cli container must keep running with no signal,
+// and cliStopBound how soon after SIGTERM it must have exited. The bound is well
+// under `docker stop`'s own 10 s, after which Docker would SIGKILL it (exit 137).
+const (
+	cliIdleWindow = 3 * time.Second
+	cliStopBound  = 5 * time.Second
+)
+
+// checkCLIIdles runs the cli image with its default command (`idle`) and no
+// network at all, requires it to be running after the idle window, sends it
+// SIGTERM, and requires exit 0 within the bound.
+func (s *smoke) checkCLIIdles(ctx context.Context) {
+	const name = "cli: idles until SIGTERM, then exits 0"
+	container := fmt.Sprintf("taskforge-smoke-cli-%d", os.Getpid())
+	started, err := docker(ctx, "run", "--detach", "--network", "none", "--name", container, imageName("cli"))
+	if err != nil || started.exit != 0 {
+		s.record(name, fmt.Sprintf("could not start the cli image (exit %d): %v %s", started.exit, err, truncate(started.stderr, 300)), "")
+		return
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = docker(cleanup, "rm", "--force", container)
+	}()
+
+	time.Sleep(cliIdleWindow)
+	state, _ := docker(ctx, "inspect", "--format", "{{.State.Running}}", container)
+	if strings.TrimSpace(state.stdout) != "true" {
+		logs, _ := docker(ctx, "logs", container)
+		s.record(name, fmt.Sprintf("not running after %s with no signal: %s", cliIdleWindow, truncate(logs.combined(), 300)), "")
+		return
+	}
+	signalled := time.Now()
+	if out, err := docker(ctx, "kill", "--signal", "SIGTERM", container); err != nil || out.exit != 0 {
+		s.record(name, fmt.Sprintf("docker kill --signal SIGTERM: %v %s", err, out.stderr), "")
+		return
+	}
+	for time.Since(signalled) < cliStopBound {
+		state, _ = docker(ctx, "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", container)
+		if fields := strings.Fields(state.stdout); len(fields) == 2 && fields[0] == "false" {
+			elapsed := time.Since(signalled).Round(10 * time.Millisecond)
+			if fields[1] != "0" {
+				s.record(name, fmt.Sprintf("exited %s after SIGTERM, want 0", fields[1]), "")
+				return
+			}
+			s.record(name, "", fmt.Sprintf("running after %s idle; exit 0 %s after SIGTERM", cliIdleWindow, elapsed))
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	s.record(name, fmt.Sprintf("still running %s after SIGTERM", cliStopBound), "")
 }
 
 // --- migrate --------------------------------------------------------------------

@@ -88,13 +88,7 @@ func run() int {
 	}
 	defer pool.Close()
 
-	broker, err := sqsbroker.New(ctx, sqsbroker.Options{
-		Endpoint:        cfg.BrokerEndpoint,
-		Region:          cfg.BrokerRegion,
-		QueueName:       cfg.BrokerQueueName,
-		AccessKeyID:     cfg.BrokerAccessKeyID,
-		SecretAccessKey: cfg.BrokerSecretAccessKey,
-	})
+	broker, err := sqsbroker.New(ctx, sqsbroker.OptionsFromConfig(cfg))
 	if err != nil {
 		log.Error("connect to broker", slog.String("error", err.Error()))
 		return 1

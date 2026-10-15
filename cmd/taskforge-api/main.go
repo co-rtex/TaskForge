@@ -115,10 +115,7 @@ func run() int {
 	// object-located result on demand, so its boot must not depend on the
 	// object store being reachable -- the same posture it already has
 	// toward the broker, which it never touches directly at all.
-	objects, err := objectstore.New(ctx, objectstore.Options{
-		Endpoint: cfg.ResultsEndpoint, Region: cfg.ResultsRegion,
-		AccessKeyID: cfg.ResultsAccessKeyID, SecretAccessKey: cfg.ResultsSecretAccessKey,
-	})
+	objects, err := objectstore.New(ctx, objectstore.OptionsFromConfig(cfg))
 	if err != nil {
 		log.Error("configure result object store client", slog.String("error", err.Error()))
 		return 1

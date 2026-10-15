@@ -126,22 +126,22 @@ bench-smoke: build up migrate ## Smoke-test the benchmark harness: about a minut
 # the api embeds internal/dashboard/dist: a clean clone has only .gitkeep there,
 # and an api image built without the dashboard would serve a placeholder page.
 # See docs/adr/0021-container-images-and-supply-chain-scanning.md.
-IMAGE_SERVICES := api outbox scheduler reconciler worker migrate
+IMAGE_SERVICES := api outbox scheduler reconciler worker migrate cli
 IMAGE_REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
-images: dash-build ## Build the six service images as taskforge-<service>:dev (builds the dashboard first)
+images: dash-build ## Build the seven images as taskforge-<service>:dev (builds the dashboard first)
 	@set -e; for svc in $(IMAGE_SERVICES); do \
 		echo "==> taskforge-$$svc:dev"; \
 		$(DOCKER) build --target $$svc --build-arg REVISION=$(IMAGE_REVISION) --tag taskforge-$$svc:dev .; \
 	done
 	@$(DOCKER) image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' | \
-		awk 'NR==1 || /^taskforge-(api|outbox|scheduler|reconciler|worker|migrate):dev/'
+		awk 'NR==1 || /^taskforge-(api|outbox|scheduler|reconciler|worker|migrate|cli):dev/'
 
 # Inspects and runs the six images: non-root user, labels, only the service's own
 # binary, rejection of an invalid configuration, the migrate image against
 # PostgreSQL, and the api serving the real dashboard. It builds the images first and
 # needs the infrastructure up. See scripts/imagesmoke and ADR-0021.
-images-smoke: images up ## Check the six images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard
+images-smoke: images up ## Check the seven images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard, the cli idling
 	$(GO) run ./scripts/imagesmoke
 
 # Runs the api and the worker as separate containers, the topology M8C2 will

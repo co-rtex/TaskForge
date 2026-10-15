@@ -1,6 +1,11 @@
 # ADR-0021: Container images and supply-chain scanning: one Dockerfile, pinned bases, blocking scanners, two acceptance mechanisms
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded by
+  [ADR-0027](0027-aws-native-configuration-and-the-cli-sidecar.md). Its count of six final
+  targets and its "There is no CLI image" are replaced: there is a seventh target, `cli`,
+  holding `taskforge-cli` alone as the api task's bootstrap sidecar. Every rule here (one
+  binary per image, the pinned bases, the non-root user, exec-form entrypoints, the labels,
+  the smoke) applies to it unchanged, and the api image is unchanged.
 - **Date:** 2026-10-05
 
 ## Context

@@ -1,12 +1,15 @@
-# The service images: one builder stage, one runtime stage, and one final target
-# per service. `make images` builds all six as taskforge-<service>:dev; a single
+# The images: one builder stage, one runtime stage, and one final target per
+# image. `make images` builds all seven as taskforge-<service>:dev; a single
 # one is `docker build --target api .`. See
 # docs/adr/0021-container-images-and-supply-chain-scanning.md for why it is
 # shaped this way and what each rule below guards.
 #
 # Each image holds exactly one binary on a distroless static base, running as the
-# base's non-root user. There is no CLI image: taskforge-cli is a client a person
-# runs, not a service.
+# base's non-root user. The seventh, cli, is taskforge-cli run as a sidecar in the
+# api's ECS task: `taskforge-cli idle` keeps it running, and an operator mints the
+# first keys in it through ECS Exec against the admin listener on 127.0.0.1, which
+# it shares with the api (docs/adr/0027-aws-native-configuration-and-the-cli-sidecar.md).
+# The api image itself still holds only taskforge-api.
 #
 # The api embeds internal/dashboard/dist (go:embed). That directory is gitignored
 # apart from .gitkeep, so an api image is only the real dashboard if
@@ -32,13 +35,15 @@ COPY cmd ./cmd
 COPY internal ./internal
 COPY migrations ./migrations
 # Static (CGO_ENABLED=0: the final image has no libc to link against) and trimmed
-# (-trimpath: build paths do not leak into the binary). The six commands are named
-# rather than ./cmd/..., which would also build the CLI. -s -w drops the symbol
+# (-trimpath: build paths do not leak into the binary). The seven commands are
+# named rather than ./cmd/..., so a new command never enters an image by accident.
+# -s -w drops the symbol
 # table and DWARF; the module and VCS-free build info that `go version -m` and
 # govulncheck read are kept.
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/ \
     ./cmd/taskforge-api ./cmd/taskforge-outbox ./cmd/taskforge-scheduler \
-    ./cmd/taskforge-reconciler ./cmd/taskforge-worker ./cmd/taskforge-migrate
+    ./cmd/taskforge-reconciler ./cmd/taskforge-worker ./cmd/taskforge-migrate \
+    ./cmd/taskforge-cli
 
 # The base every target shares, so it is pinned once. Its default user is
 # `nonroot` (uid 65532); no target sets another.
@@ -70,3 +75,10 @@ ENTRYPOINT ["/taskforge-worker"]
 FROM runtime AS migrate
 COPY --from=builder /out/taskforge-migrate /taskforge-migrate
 ENTRYPOINT ["/taskforge-migrate"]
+
+# The CLI sidecar. Its default command idles until SIGTERM or SIGINT, so the
+# container stays up for ECS Exec; any other arguments run that CLI command.
+FROM runtime AS cli
+COPY --from=builder /out/taskforge-cli /taskforge-cli
+ENTRYPOINT ["/taskforge-cli"]
+CMD ["idle"]

@@ -1,7 +1,7 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8C1, including the Go 1.27.2
+planned. It records the implemented state through M8C2, including the Go 1.27.2
 toolchain bump that came between M8D3 and M8D4. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
@@ -12,10 +12,10 @@ the measured benchmarks, M8B, the supply chain (container images and scanning), 
 the route registry, M8D2, the verification-matrix drift check with the bench-smoke
 flake and three items from the M8A review, M8D3, the investigation of the 50.04 s
 recovery outlier, M8D4, killed attempts that end `TIMED_OUT`, M8D5, a lease that lapsed
-before the deadline is an abandonment, M8C1, listeners by surface, and M8C2, deployment
-(Terraform, validated and not applied), in the order M8B, M8D1, M8D2, M8D3, M8D4, M8D5,
-M8C1, M8C2; M8A, M8B, M8D1, M8D2, M8D3, M8D4, M8D5 and M8C1 are complete and M8C2 is
-planned.
+before the deadline is an abandonment, M8C1, listeners by surface, M8C2, AWS-native
+configuration and the CLI sidecar, and M8C3, deployment (Terraform, validated and not
+applied), in the order M8B, M8D1, M8D2, M8D3, M8D4, M8D5, M8C1, M8C2, M8C3; M8A, M8B,
+M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
 
 ## Milestone status
 
@@ -104,10 +104,19 @@ planned.
   long-running binary has a `healthcheck` subcommand; and `make topology-smoke` runs the api
   and worker as separate containers, 7 of 7 rows passing
   ([ADR-0026](adr/0026-listeners-by-surface.md)). Defaults are byte-identical. See "M8C1"
-  below. M8C2 (the Terraform) is planned.
+  below.
+- **M8C2 — AWS-native configuration and the CLI sidecar:** complete; see PR #30.
+  `TASKFORGE_AWS_DEFAULT_CHAIN=true` makes every binary use SQS and S3 through the region's
+  default endpoints and the AWS SDK's default credential chain, refusing startup if any of
+  the six endpoint or key variables is present at all and requiring both regions; a seventh
+  image, `taskforge-cli`, idles as a sidecar in the api task so the first keys can be minted
+  through ECS Exec on the shared loopback, which the AWS documentation and the agents' source
+  show needs no shell but a writable root filesystem
+  ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)). Defaults are
+  byte-identical. See "M8C2" below. M8C3 (the Terraform) is planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
-M7 into two, and M8 into nine, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
+M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
@@ -123,7 +132,8 @@ that are run from source and are not among the seven:
   (gitleaks has `.gitleaks.toml`). See "M8B" below.
 
 - `scripts/imagesmoke` is the program behind `make images-smoke`. It inspects and
-  runs the six service images. See "M8B" below.
+  runs the seven images: the six services (see "M8B" below) and the `taskforge-cli`
+  sidecar (see "M8C2" below).
 
 - `scripts/topologysmoke` is the program behind `make topology-smoke`. It runs the api,
   outbox and worker images as separate containers with the api's public and control
@@ -4603,7 +4613,7 @@ own, joined to the compose network for PostgreSQL, ElasticMQ and the object stor
 runs with `TASKFORGE_API_PUBLIC_ADDR=0.0.0.0:8090`, `TASKFORGE_API_CONTROL_ADDR=0.0.0.0:8091`,
 `TASKFORGE_API_CONTROL_HOSTS=api` and its admin listener on `127.0.0.1:8080` inside its
 container; the worker with `TASKFORGE_WORKER_API_URL=http://api:8091` and
-`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`. The keys are minted the way M8C2's runbook will
+`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`. The keys are minted the way the deployment runbook (now M8C3's) will
 mint them: a linux build of `taskforge-cli` is copied into the running api container with
 `docker cp` (the image holds no CLI) and run there with `docker exec` against
 `http://127.0.0.1:8080`. A probe container on the same network checks rows 1–6; row 7 is
@@ -4709,7 +4719,7 @@ A pure suffix match (M3 as literally worded) admits `xapi` but not `api.evil`; t
   credential are the named follow-ups (ADR-0026).
 - **The refusal message on the control listener still says "addressed to a loopback
   host"**: `api/openapi.yaml` documents one fixed message, and the contract was not changed.
-- **The api image holds no CLI.** The smoke copies one in; M8C2's ECS Exec runbook has to
+- **The api image holds no CLI.** The smoke copies one in; the ECS Exec runbook (now M8C3's, through M8C2's cli sidecar) has to
   decide how the CLI reaches the task.
 - **The integration test binds a real non-loopback interface** (the first up, non-loopback,
   non-link-local IPv4), for a few seconds, and fails rather than skips where there is none.
@@ -4722,6 +4732,230 @@ A pure suffix match (M3 as literally worded) admits `xapi` but not `api.evil`; t
 - **The smoke builds the probe and the CLI with the host's Go for the engine's
   architecture** and runs them in the Dockerfile's pinned builder image, so it pulls no
   image the repository does not already pin.
+
+---
+
+## M8C2 — AWS-native configuration and the CLI sidecar
+
+M8C2 follows M8C1 in the owner's order ([ROADMAP.md](ROADMAP.md)). The owner split it out
+of the deployment milestone on 2026-10-15, renamed the Terraform M8C3, and decided its
+questions: Q2 and Q3 are built here, Q4–Q8 are recorded for M8C3. The decisions, their
+alternatives and their limitations are in
+[ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md), which amends ADR-0021
+in its count of images only.
+
+**What changed:** `internal/config` (the switch, its refusals); `internal/queue/sqsbroker`
+and `internal/objectstore` (`OptionsFromConfig`, and in sqsbroker a `newClient` split out of
+`New` with no change in behavior); the api, outbox and worker mains (built from
+`OptionsFromConfig`); `internal/cli` (`idle`); the `cli` Dockerfile target; the Makefile's
+image list; `scripts/imagesmoke` (the seventh image); `scripts/topologysmoke` (minting
+through the sidecar); `tests/verification/images_test.go` (seven targets in place of "no
+CLI image"); unit tests; ADR-0027, ADR-0021's status, the ADR index, `docs/ARCHITECTURE.md`,
+`docs/ROADMAP.md`, `AGENTS.md`, `.env.example` and this file. No migration and no change
+under `api/`, `migrations/`, `docs/benchmarks/` or `internal/api/testdata/`; `env()`, the
+listeners, the guard and ADR-0026 are unchanged; `.github/workflows/ci.yml` is unchanged
+(its images job runs `make images`, which now builds the cli target, and the image and
+topology smokes).
+
+### Behavior
+
+**`TASKFORGE_AWS_DEFAULT_CHAIN`.** Parsed with `strconv.ParseBool`; any other value is
+refused (`TASKFORGE_AWS_DEFAULT_CHAIN must be true or false`); empty is unset. True:
+
+- the broker and results endpoints, access key ids and secret keys resolve to `""`;
+- each of `TASKFORGE_BROKER_ENDPOINT`, `TASKFORGE_BROKER_ACCESS_KEY_ID`,
+  `TASKFORGE_BROKER_SECRET_ACCESS_KEY`, `TASKFORGE_RESULTS_ENDPOINT`,
+  `TASKFORGE_RESULTS_ACCESS_KEY_ID` and `TASKFORGE_RESULTS_SECRET_ACCESS_KEY` that is present
+  in the environment, read with `os.LookupEnv` and so including an empty value, is refused
+  as `<NAME> must not be set, even empty, when TASKFORGE_AWS_DEFAULT_CHAIN is true; the SDK
+  resolves the endpoint from the region and the credentials from its default chain`, naming
+  the variable and never its value;
+- `TASKFORGE_BROKER_REGION` and `TASKFORGE_RESULTS_REGION` absent, empty or blank are
+  refused (`<NAME> must be set when TASKFORGE_AWS_DEFAULT_CHAIN is true`);
+- and, as a backstop, a Config that reaches validation with any of the six still non-empty
+  is refused (`<NAME> must resolve to empty ...`).
+
+False, `0`, empty or unset: the ten broker and results values are the literal defaults they
+were, and an empty static variable still falls back to its default
+(`TestAWSDefaultChain_OffIsByteIdentical`).
+
+**The clients.** `sqsbroker.New` and `objectstore.New` already skipped the endpoint override
+(and S3's path-style addressing) when `Endpoint` was `""`, and the static credentials
+provider when `AccessKeyID` was `""`; they needed no change. The binaries that build them
+now all map the configuration through `OptionsFromConfig`: taskforge-api (S3),
+taskforge-outbox (SQS), taskforge-worker (SQS and S3). `TestClient_AWSDefaultChainReachesTheClient`
+in each package loads the configuration with the switch on, builds the real client from it,
+and reads the client's own `Options()`: no `BaseEndpoint`, no `UsePathStyle` (S3), a
+credentials provider that is not a `StaticCredentialsProvider`, and the endpoint the SDK
+resolves for `eu-west-1` is `sqs.eu-west-1.amazonaws.com` and
+`taskforge-results.s3.eu-west-1.amazonaws.com` over https. It makes no network call: the
+SQS client comes from `newClient`, split out of `New` before its `GetQueueUrl`;
+`objectstore.New` makes none; no credential is retrieved; the SDK's shared files are
+`/dev/null` and IMDS is disabled. `TestClient_LocalDefaultsReachTheClient` is the control:
+with the switch unset the same path gives `http://127.0.0.1:9324` / `:4566` and a static
+provider.
+
+**`taskforge-cli idle` and the cli image.** `idle` blocks until SIGTERM or SIGINT (or its
+context ends) and exits 0; it resolves no address and makes no network call. The `cli`
+target holds `/taskforge-cli` alone on the pinned distroless `nonroot` base with the same
+labels, `ENTRYPOINT ["/taskforge-cli"]` and `CMD ["idle"]`. `make images` builds seven
+images.
+
+**The bootstrap.** `make topology-smoke` starts the cli image with its default command and
+`--network container:<api>`, so 127.0.0.1 in it is the api's loopback, and runs `docker
+exec <sidecar> /taskforge-cli --api-url http://127.0.0.1:8080 api-keys create ...` (and
+`worker-keys create`), with no shell. This replaces M8C1's `docker cp` into the api
+container. The api image is unchanged.
+
+### The ECS Exec findings, verified before the sidecar was built
+
+- **(a) A command can run in a container with no shell: yes.** The ECS container agent
+  writes the in-container SSM agent's configuration with `"ContainerMode": true`
+  ([amazon-ecs-agent `agent/engine/execcmd/manager_init_task.go` L44–L60, at
+  `fef29b5`](https://github.com/aws/amazon-ecs-agent/blob/fef29b5c38aefb4768cfc6c665b108338c5beb0d/agent/engine/execcmd/manager_init_task.go#L44-L60)),
+  and in container mode the SSM agent shlex-splits `--command` and execs
+  `commands[0]` with the rest as arguments, with no `sh`
+  ([amazon-ssm-agent `agent/session/shell/shell_unix.go` L76–L98, at
+  `e5da10f`](https://github.com/aws/amazon-ssm-agent/blob/e5da10f27a438dc1737865589f9ee1e92587145d/agent/session/shell/shell_unix.go#L76-L98)).
+  [Running commands using ECS Exec](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec-run.html)
+  requires `--interactive` and shows `--command` naming the program (its example is
+  `/bin/sh`); the agent binaries are bind-mounted in
+  ([ECS Exec, Architecture](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html#ecs-exec-architecture)).
+  So a command is one program and its arguments: no pipes or redirection; an empty
+  command would run `sh`, which the image lacks.
+- **(b) ECS Exec does not work with `readonlyRootFilesystem=true`.** The Considerations
+  say the SSM agent "requires that the container file system can be written to", so a
+  read-only root "isn't supported"
+  ([ECS Exec, Considerations](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html#ecs-exec-considerations)).
+  **The sidecar's root filesystem must be writable**; this is recorded for M8C3 and the
+  work continued.
+- From the same page: commands run as root whatever the container's user; the task needs
+  a role with the Session Manager permissions; and session logging needs `script` and `cat`
+  in the image ([ECS Exec, Logging](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html#ecs-exec-logging)),
+  which this image does not have.
+- **Not verified:** container mode on Fargate (its agent is not open source); whether the
+  api container may keep a read-only root with Exec enabled for the task; and what ECS Exec
+  logging set to `DEFAULT` does without `script`, `cat` and `sh`. M8C3 must confirm each on
+  a real task.
+
+### Evidence
+
+`make images-smoke`, the seventh image's checks (run on the final code, on AC):
+
+```
+imagesmoke: revision d9560f25ac97ff60c15d08a35ce2f2a035a13d3c, Docker Desktop networking
+  PASS  cli: the image exists                                           d22057d9e6a1, linux/arm64, 3.4 MB
+  PASS  cli: runs as a non-root user                                    USER "65532"
+  PASS  cli: exec-form entrypoint is its own binary                     [/taskforge-cli]
+  PASS  cli: carries the source and revision labels                     revision d9560f25ac97
+  PASS  cli: holds only its own binary, and no shell                    /taskforge-cli among 1444 paths
+  PASS  cli: idles until SIGTERM, then exits 0                          running after 3s idle; exit 0 140ms after SIGTERM
+=== RESULT: PASS (47 of 47 checks met) ===
+```
+
+`make topology-smoke`, minting through the sidecar (run on the final code, on AC):
+
+```
+topology-smoke: docker engine linux/arm64, compose network taskforge_default, pid 80837
+topology-smoke: migrated taskforge_topology_80837 with taskforge-migrate:dev
+topology-smoke: started taskforge-topology-api-80837
+topology-smoke: minted an API key and a worker key with taskforge-cli in the sidecar taskforge-topology-cli-80837 (network container:taskforge-topology-api-80837), against http://127.0.0.1:8080
+topology-smoke: started taskforge-topology-outbox-80837
+topology-smoke: started taskforge-topology-worker-80837
+=== topology-smoke: checks ===
+  PASS  row 1  the worker registered through control:8091  GET public:8090/v1/workers lists topology-worker HEALTHY, id 159dcea5-9916-4c21-a3b3-ecb0699d898a
+  PASS  row 1  a job submitted through public:8090 reaches SUCCEEDED  job 5b50cd9b-72ac-4f82-9775-d3de0f19e35d SUCCEEDED in one attempt by topology-worker
+  PASS  row 2  key administration is not served  GET public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET control:8091 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET control:8091 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /dashboard/ -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /dashboard/index.html -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /metrics -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 / -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /dashboard/ -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /dashboard/index.html -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /metrics -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 / -> 404 not_found
+  PASS  row 4  control:8091 admits the allowlisted Host  Host api -> 422 validation_failed (past the guard)
+  PASS  row 4  control:8091 refuses a Host off the allowlist  403 origin_refused
+  PASS  row 4  control:8091 refuses a loopback Host, which is not on the allowlist  403 origin_refused
+  PASS  row 4  control:8091 refuses a near-miss Host  403 origin_refused
+  PASS  row 4  control:8091 refuses the allowlisted Host with Origin  403 origin_refused
+  PASS  row 4  control:8091 refuses the allowlisted Host with Sec-Fetch-Site  403 origin_refused
+  PASS  row 5  public:8090 serves /v1 (the positive control)  GET public:8090 /v1/jobs -> 200
+  PASS  row 5  public:8090 serves no /internal route  PUT public:8090 /internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111 -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111/heartbeat -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/claims -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/leases/11111111-1111-4111-8111-111111111111/renew -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/start -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/succeed -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/fail -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/cancel -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  GET public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  GET public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 5  control:8091 serves no /v1 route  GET control:8091 /v1/jobs -> 404 not_found
+  PASS  row 6  the probe can reach the api container (the positive control)  TCP connect to api:8090 succeeded
+  PASS  row 6  the admin listener cannot be reached from another container  TCP connect to api:8080 failed: dial tcp 172.19.0.2:8080: connect: connection refused
+  PASS  row 6  no key listing is served on the admin port  GET failed: Get "http://api:8080/internal/v1/api-keys": dial tcp 172.19.0.2:8080: connect: connection refused
+  PASS  row 7  `healthcheck` exits 0 in the running api container  exit 0: taskforge-api healthcheck: healthy (127.0.0.1:8080/healthz answered 200)
+  PASS  row 7  `healthcheck` exits 0 in the running worker container  exit 0: taskforge-worker healthcheck: healthy (127.0.0.1:8082/healthz answered 200)
+  PASS  row 7  `healthcheck` exits 0 in the running outbox container  exit 0: taskforge-outbox healthcheck: healthy (127.0.0.1:8081/healthz answered 200)
+  PASS  row 7  `healthcheck` exits 1 in a api container whose probe is down  exit 1: taskforge-api healthcheck: unhealthy: GET http://127.0.0.1:8080/healthz: Get "http://127.0.0.1:8080/healthz": dial tcp 127.0.0.1:8080: conne...
+  PASS  row 7  `healthcheck` exits 1 in a worker container whose probe is down  exit 1: taskforge-worker healthcheck: unhealthy: GET http://127.0.0.1:8082/healthz: Get "http://127.0.0.1:8082/healthz": dial tcp 127.0.0.1:8082: co...
+=== topology-smoke: rows ===
+  PASS  row 1  the worker registers, and a job submitted through public:8090 with an API key reaches SUCCEEDED  (2 checks)
+  PASS  row 2  /internal/v1/api-keys and /internal/v1/worker-keys are 404 on 8090 and 8091  (12 checks)
+  PASS  row 3  /dashboard/ and /metrics are 404 on 8090 and 8091  (8 checks)
+  PASS  row 4  control:8091 answers 403 origin_refused to a Host off the allowlist, and to the allowlisted Host with Origin or Sec-Fetch-Site  (6 checks)
+  PASS  row 5  public:8090 serves no /internal route (and control:8091 no /v1 route)  (16 checks)
+  PASS  row 6  the admin listener cannot be reached from the probe container  (3 checks)
+  PASS  row 7  `healthcheck` exits 0 against a healthy container and 1 when its probe is down  (5 checks)
+=== RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met) ===
+topology-smoke: dropped database taskforge_topology_80837
+```
+
+Nothing is left behind: no `taskforge-topology-*` or `taskforge-smoke-cli-*` container or
+network, and no `taskforge_topology_*` database, after either run.
+
+### Mutations
+
+Each was applied alone, its failing output recorded, and reverted, with `git status
+--short` empty afterwards. The diffs and outputs are in the pull request description.
+
+| | Mutation | Fixture that catches it | Fails |
+| --- | --- | --- | --- |
+| M1 | the switch clears the keys but keeps both endpoints | `TestClient_AWSDefaultChainReachesTheClient` (both packages): the switch on, the endpoint variables absent | the client tests fail, first at `config.Load`, which the backstop refuses with `TASKFORGE_BROKER_ENDPOINT must resolve to empty ...`; and `TestAWSDefaultChain_ClearsEveryEndpointAndKey` |
+| M1b | M1 with the backstop also disabled, to show the client assertion itself catches it | the same | `no endpoint override ...; got "http://127.0.0.1:9324"` (sqsbroker) and `got "http://127.0.0.1:4566"` (objectstore) |
+| M2 | presence checked with `env(name, "") != ""` instead of `os.LookupEnv` | each static variable set to `""` with the switch on | `TestAWSDefaultChain_RefusesEachStaticVariableEvenEmpty`, the six `_empty` cases |
+| M3 | the region requirement removed | each region absent, `""` or blank with the switch on | `TestAWSDefaultChain_RequiresBothRegions`, all six cases |
+| M4 | the sidecar joins the compose network instead of `container:<api>` | `make topology-smoke`'s mint | `api-keys create in the cli sidecar: exit 8 ... transport_error ... connection refused` on 127.0.0.1:8080; `0 of 7 rows passed` |
+
+### Limitations
+
+- **The sidecar's root filesystem must be writable** for ECS Exec, and its commands run as
+  root. Who may exec into it (IAM `ecs:ExecuteCommand`, conditioned on the container name)
+  is the control.
+- **No ECS Exec session logging in this image**; the audit is CloudTrail's
+  `ExecuteCommand` event.
+- **The client tests read the SDK's resolved options, not a request on the wire.** They
+  prove no endpoint override and no static provider reach the clients and that the
+  regional endpoint resolves; that the default chain finds a task role is AWS's behavior
+  and is not exercised here.
+- **Recorded for M8C3, unbuilt here:** `sslmode=require` without server verification, and
+  the database password in Terraform state.
 
 ---
 
@@ -5306,6 +5540,31 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8C2 gates
+
+These gates ran locally on 2026-10-15 under Go 1.27.2 (`go version` printed `go1.27.2
+darwin/arm64`), against PostgreSQL 16, ElasticMQ and the object store from `make up`, with
+no other TaskForge process running. The code and tests are as at `d9560f2`; every later
+commit changes `docs/` only. The timed gates ran on AC, the lid open and Low Power Mode off
+(`pmset -g batt`: `Now drawing from 'AC Power'`; `lowpowermode 0`; `AppleClamshellState =
+No`, recorded before each). Docker Desktop's credential helper answered normally this time,
+so the global Docker configuration was used; nothing in it was changed.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 32 packages `ok`, including `tests/verification` (the matrix drift check, unchanged) |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  91.651s` |
+| `make test-race` | PASS: 33 packages `ok` under `-race`; `ok  …/tests/integration  97.322s`; no `DATA RACE` |
+| `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)`, 07:07:30–07:07:44 UTC |
+| `make bench-smoke` | PASS: `14 of 14 checks met`, 07:07:44–07:08:17 UTC |
+| `make images-smoke` | PASS: `RESULT: PASS (47 of 47 checks met)`, seven images, 07:08:17–07:08:36 UTC |
+| `make topology-smoke` | PASS: `RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met)`, keys minted through the cli sidecar, 07:08:36–07:08:55 UTC |
+| `make scan` | run in a fresh full clone of the final head; the command and its result are in the pull request |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change |
 
 ### M8C1 gates
 
@@ -6523,16 +6782,16 @@ two targets belong in its version.
 
 ## Next objective
 
-M8C1 is complete. The next milestone is M8C2: the Terraform for ALB, ECS services, RDS,
-SQS, S3, secrets and logs, validated and not applied (see [ROADMAP.md](ROADMAP.md)'s M8C2
-entry). M8C2 is not started and **needs its own handoff before any work starts**; its
-infrastructure costs money if applied. It inherits from M8C1 the topology to describe
-(public listener behind the load balancer, control listener reachable from the workers
-only, `TASKFORGE_API_CONTROL_HOSTS` holding the exact name workers dial, the
-`healthcheck` subcommand as each container's health check) and one open question: how
-`taskforge-cli` reaches the api task for the first-key bootstrap, since the api image holds
-no CLI and ECS Exec into it finds nothing to run. TLS on the control listener and a
-per-call worker credential are ADR-0026's named follow-ups. Every M7 scenario can also be
+M8C2 is complete. The next milestone is M8C3: the Terraform for ALB, ECS services, RDS,
+SQS, S3, secrets and logs, validated and not applied (see [ROADMAP.md](ROADMAP.md)'s M8C3
+entry, which carries ADR-0027's decisions Q4–Q8, the IAM note, the SQS attributes and the
+ECS Exec findings). M8C3 is not started and **needs its own handoff before any work
+starts**; its infrastructure costs money if applied. What it must confirm on a real task,
+because nothing local can: a shell-less ECS Exec on its launch type (verified in the open
+ECS agent's source, not on Fargate's), whether the api container may keep a read-only root
+with ECS Exec enabled for the task, and what ECS Exec logging does in an image with no
+`script`, `cat` or `sh`. TLS on the control listener, a per-call worker credential and
+`verify-full` against the RDS CA are named follow-ups. Every M7 scenario can also be
 watched from the dashboard.
 
 Open, and not any milestone's deliverable: whether the shipped lease and outbox

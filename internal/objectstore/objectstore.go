@@ -21,6 +21,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"github.com/co-rtex/TaskForge/internal/config"
 )
 
 // The SDK's own default HTTP client (awshttp.BuildableClient, below) leaves
@@ -46,6 +48,20 @@ const (
 	localRequestTimeout  = 3 * time.Second
 	remoteRequestTimeout = 30 * time.Second
 )
+
+// OptionsFromConfig is the one mapping from validated configuration to an
+// object-store client, so every binary that builds one (taskforge-api,
+// taskforge-worker) reads the same resolved values. With
+// TASKFORGE_AWS_DEFAULT_CHAIN true the endpoint and keys are "", which New
+// reads as "the SDK's defaults".
+func OptionsFromConfig(cfg config.Config) Options {
+	return Options{
+		Endpoint:        cfg.ResultsEndpoint,
+		Region:          cfg.ResultsRegion,
+		AccessKeyID:     cfg.ResultsAccessKeyID,
+		SecretAccessKey: cfg.ResultsSecretAccessKey,
+	}
+}
 
 // Options configures an object-store client.
 type Options struct {

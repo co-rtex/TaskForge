@@ -92,20 +92,13 @@ func run() int {
 		}
 	}()
 
-	broker, err := sqsbroker.New(ctx, sqsbroker.Options{
-		Endpoint: shared.BrokerEndpoint, Region: shared.BrokerRegion,
-		QueueName: shared.BrokerQueueName, AccessKeyID: shared.BrokerAccessKeyID,
-		SecretAccessKey: shared.BrokerSecretAccessKey,
-	})
+	broker, err := sqsbroker.New(ctx, sqsbroker.OptionsFromConfig(shared))
 	if err != nil {
 		log.Error("connect to broker", slog.String("error", err.Error()))
 		return 1
 	}
 
-	objects, err := objectstore.New(ctx, objectstore.Options{
-		Endpoint: shared.ResultsEndpoint, Region: shared.ResultsRegion,
-		AccessKeyID: shared.ResultsAccessKeyID, SecretAccessKey: shared.ResultsSecretAccessKey,
-	})
+	objects, err := objectstore.New(ctx, objectstore.OptionsFromConfig(shared))
 	if err != nil {
 		log.Error("configure result object store client", slog.String("error", err.Error()))
 		return 1

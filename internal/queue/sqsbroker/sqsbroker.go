@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/queue"
 )
 
@@ -26,6 +27,20 @@ type Options struct {
 	QueueName       string
 	AccessKeyID     string
 	SecretAccessKey string
+}
+
+// OptionsFromConfig is the one mapping from validated configuration to a broker
+// client, so every binary that builds one (taskforge-outbox, taskforge-worker)
+// reads the same resolved values. With TASKFORGE_AWS_DEFAULT_CHAIN true the
+// endpoint and keys are "", which New reads as "the SDK's defaults".
+func OptionsFromConfig(cfg config.Config) Options {
+	return Options{
+		Endpoint:        cfg.BrokerEndpoint,
+		Region:          cfg.BrokerRegion,
+		QueueName:       cfg.BrokerQueueName,
+		AccessKeyID:     cfg.BrokerAccessKeyID,
+		SecretAccessKey: cfg.BrokerSecretAccessKey,
+	}
 }
 
 // Broker is an SQS-compatible queue.Broker.
@@ -42,7 +57,22 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	if opts.QueueName == "" {
 		return nil, fmt.Errorf("queue name is required")
 	}
+	client, err := newClient(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 
+	out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(opts.QueueName)})
+	if err != nil {
+		return nil, fmt.Errorf("resolve queue url for %q: %w", opts.QueueName, err)
+	}
+	return &Broker{client: client, queueURL: aws.ToString(out.QueueUrl)}, nil
+}
+
+// newClient builds the SQS client New uses, and makes no network call. It is
+// split from New so a test can read the client's resolved options without the
+// GetQueueUrl round trip; New's behavior is unchanged.
+func newClient(ctx context.Context, opts Options) (*sqs.Client, error) {
 	loadOpts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(opts.Region)}
 	if opts.AccessKeyID != "" {
 		// ElasticMQ ignores credentials, but the SDK refuses to sign without
@@ -58,17 +88,11 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	client := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+	return sqs.NewFromConfig(cfg, func(o *sqs.Options) {
 		if opts.Endpoint != "" {
 			o.BaseEndpoint = aws.String(opts.Endpoint)
 		}
-	})
-
-	out, err := client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(opts.QueueName)})
-	if err != nil {
-		return nil, fmt.Errorf("resolve queue url for %q: %w", opts.QueueName, err)
-	}
-	return &Broker{client: client, queueURL: aws.ToString(out.QueueUrl)}, nil
+	}), nil
 }
 
 // QueueURL reports the resolved queue URL. Useful for logs and tests.

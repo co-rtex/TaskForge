@@ -748,3 +748,147 @@ func TestWorker_RemoteAPIURLNeedsTheOptIn(t *testing.T) {
 		require.False(t, c.AllowRemoteAPI)
 	})
 }
+
+// --- M8C2: TASKFORGE_AWS_DEFAULT_CHAIN (docs/adr/0027) ---------------------
+
+// unsetForTest removes a variable for the rest of the test and restores it
+// afterwards. t.Setenv cannot express "absent", only "set to a value".
+func unsetForTest(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv(name, "") // registers the restore
+	require.NoError(t, os.Unsetenv(name))
+}
+
+// awsMode puts the environment into a valid AWS default-chain configuration:
+// the switch on, both regions set, and none of the six static variables
+// present (whatever the developer's own environment holds).
+func awsMode(t *testing.T) {
+	t.Helper()
+	for _, name := range awsStaticVariables {
+		unsetForTest(t, name)
+	}
+	t.Setenv("TASKFORGE_AWS_DEFAULT_CHAIN", "true")
+	t.Setenv("TASKFORGE_BROKER_REGION", "eu-west-1")
+	t.Setenv("TASKFORGE_RESULTS_REGION", "eu-west-1")
+}
+
+// TestAWSDefaultChain_ClearsEveryEndpointAndKey is the switch's purpose: with it
+// on and both regions set, the broker and results endpoints and keys resolve to
+// "", which the two clients read as "use the SDK's defaults".
+func TestAWSDefaultChain_ClearsEveryEndpointAndKey(t *testing.T) {
+	awsMode(t)
+	c, err := Load()
+	require.NoError(t, err)
+	require.True(t, c.AWSDefaultChain)
+	for name, v := range map[string]string{
+		"broker endpoint": c.BrokerEndpoint, "broker key id": c.BrokerAccessKeyID, "broker secret": c.BrokerSecretAccessKey,
+		"results endpoint": c.ResultsEndpoint, "results key id": c.ResultsAccessKeyID, "results secret": c.ResultsSecretAccessKey,
+	} {
+		require.Emptyf(t, v, "%s must resolve to empty", name)
+	}
+	require.Equal(t, "eu-west-1", c.BrokerRegion)
+	require.Equal(t, "eu-west-1", c.ResultsRegion)
+	require.Equal(t, "taskforge-work-available", c.BrokerQueueName, "the queue and bucket names keep their meaning")
+	require.Equal(t, "taskforge-results", c.ResultsBucket)
+}
+
+// TestAWSDefaultChain_RefusesEachStaticVariableEvenEmpty proves presence, not
+// value, is the test: each of the six variables, set alone, is refused whether
+// it holds a value or the empty string, and the refusal names it and never
+// echoes what it held.
+func TestAWSDefaultChain_RefusesEachStaticVariableEvenEmpty(t *testing.T) {
+	for _, name := range awsStaticVariables {
+		for label, value := range map[string]string{"non-empty": "PLANTED-MARKER-NOT-A-REAL-VALUE", "empty": ""} {
+			t.Run(name+" "+label, func(t *testing.T) {
+				awsMode(t)
+				t.Setenv(name, value)
+				_, err := Load()
+				require.Error(t, err)
+				require.Contains(t, err.Error(), name+" must not be set, even empty, when TASKFORGE_AWS_DEFAULT_CHAIN is true")
+				require.NotContains(t, err.Error(), "PLANTED-MARKER")
+				for _, other := range awsStaticVariables {
+					if other != name {
+						require.NotContains(t, err.Error(), other+" must not be set", "only the present variable is named")
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestAWSDefaultChain_RequiresBothRegions proves a region that is absent or
+// empty is refused with the switch on, rather than defaulted to us-east-1.
+func TestAWSDefaultChain_RequiresBothRegions(t *testing.T) {
+	for _, name := range awsRegionVariables {
+		for label, set := range map[string]func(t *testing.T){
+			"absent": func(t *testing.T) { unsetForTest(t, name) },
+			"empty":  func(t *testing.T) { t.Setenv(name, "") },
+			"blank":  func(t *testing.T) { t.Setenv(name, "   ") },
+		} {
+			t.Run(name+" "+label, func(t *testing.T) {
+				awsMode(t)
+				set(t)
+				_, err := Load()
+				require.Error(t, err)
+				require.Contains(t, err.Error(), name+" must be set when TASKFORGE_AWS_DEFAULT_CHAIN is true")
+			})
+		}
+	}
+}
+
+// TestAWSDefaultChain_RefusesAnInvalidSwitch proves the switch is parsed
+// strictly: a value strconv.ParseBool rejects is refused, not read as false.
+func TestAWSDefaultChain_RefusesAnInvalidSwitch(t *testing.T) {
+	for _, value := range []string{"yes", "on", "enabled", "tru", "2"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("TASKFORGE_AWS_DEFAULT_CHAIN", value)
+			_, err := Load()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "TASKFORGE_AWS_DEFAULT_CHAIN must be true or false")
+		})
+	}
+}
+
+// TestAWSDefaultChain_OffIsByteIdentical proves the switch off, unset or empty
+// leaves every broker and results value at the literal default it had before
+// M8C2, and leaves a present static variable free to override, as env() always
+// let it.
+func TestAWSDefaultChain_OffIsByteIdentical(t *testing.T) {
+	want := map[string]string{
+		"BrokerEndpoint": "http://127.0.0.1:9324", "BrokerQueueName": "taskforge-work-available",
+		"BrokerRegion": "us-east-1", "BrokerAccessKeyID": "local", "BrokerSecretAccessKey": "local",
+		"ResultsEndpoint": "http://127.0.0.1:4566", "ResultsBucket": "taskforge-results",
+		"ResultsRegion": "us-east-1", "ResultsAccessKeyID": "local", "ResultsSecretAccessKey": "local",
+	}
+	for label, set := range map[string]func(t *testing.T){
+		"unset": func(t *testing.T) { unsetForTest(t, "TASKFORGE_AWS_DEFAULT_CHAIN") },
+		"empty": func(t *testing.T) { t.Setenv("TASKFORGE_AWS_DEFAULT_CHAIN", "") },
+		"false": func(t *testing.T) { t.Setenv("TASKFORGE_AWS_DEFAULT_CHAIN", "false") },
+		"0":     func(t *testing.T) { t.Setenv("TASKFORGE_AWS_DEFAULT_CHAIN", "0") },
+	} {
+		t.Run(label, func(t *testing.T) {
+			for _, name := range append(append([]string{}, awsStaticVariables...), awsRegionVariables...) {
+				unsetForTest(t, name)
+			}
+			unsetForTest(t, "TASKFORGE_BROKER_QUEUE_NAME")
+			unsetForTest(t, "TASKFORGE_RESULTS_BUCKET")
+			set(t)
+			c, err := Load()
+			require.NoError(t, err)
+			require.False(t, c.AWSDefaultChain)
+			require.Equal(t, want, map[string]string{
+				"BrokerEndpoint": c.BrokerEndpoint, "BrokerQueueName": c.BrokerQueueName,
+				"BrokerRegion": c.BrokerRegion, "BrokerAccessKeyID": c.BrokerAccessKeyID, "BrokerSecretAccessKey": c.BrokerSecretAccessKey,
+				"ResultsEndpoint": c.ResultsEndpoint, "ResultsBucket": c.ResultsBucket,
+				"ResultsRegion": c.ResultsRegion, "ResultsAccessKeyID": c.ResultsAccessKeyID, "ResultsSecretAccessKey": c.ResultsSecretAccessKey,
+			})
+
+			// And an empty static variable still falls back to its default, as
+			// env() has always read it: nothing about the off path changed.
+			t.Setenv("TASKFORGE_BROKER_ENDPOINT", "")
+			c, err = Load()
+			require.NoError(t, err)
+			require.Equal(t, "http://127.0.0.1:9324", c.BrokerEndpoint)
+		})
+	}
+}

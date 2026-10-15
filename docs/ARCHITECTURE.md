@@ -56,7 +56,9 @@ worker-control routes (see
 listeners by surface, so `taskforge-api` can serve `/v1` and the worker-control
 routes on network addresses while credential administration, the dashboard and
 metrics stay on loopback (see §2a and
-[ADR-0026](adr/0026-listeners-by-surface.md)).
+[ADR-0026](adr/0026-listeners-by-surface.md)); and an AWS-native configuration mode
+and a CLI sidecar image for the first-key bootstrap (see §2a and
+[ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)).
 
 ---
 
@@ -165,8 +167,24 @@ limitation with TLS and a per-call credential as the named follow-ups (ADR-0026)
 outbox, scheduler and reconciler expose nothing off their host.
 
 **Bootstrap.** The first API key and worker key are minted on the admin listener,
-from inside the api's host or container, with `taskforge-cli` against loopback. There
-is no other path: no network listener serves key administration.
+from inside the api's network namespace, with `taskforge-cli` against loopback. There
+is no other path: no network listener serves key administration. In a deployment that
+namespace is shared by the api task's `cli` sidecar: the `taskforge-cli` image, whose
+default command `taskforge-cli idle` keeps it running, reached through ECS Exec, which
+runs `/taskforge-cli --api-url http://127.0.0.1:8080 api-keys create ...` in it with no
+shell. The sidecar's root filesystem must be writable for ECS Exec, and the api image is
+unchanged ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)).
+`make topology-smoke` mints its keys the same way, with the sidecar on `--network
+container:<api>`.
+
+**AWS-native mode.** With `TASKFORGE_AWS_DEFAULT_CHAIN=true` the broker and results
+endpoints and keys resolve to empty, so the SQS and S3 clients use the region's default
+endpoint and the AWS SDK's default credential chain (in ECS, the task role). Startup
+refuses if any of the six endpoint or key variables is present at all, even empty, and
+both region variables are required. Unset, every service talks to ElasticMQ and
+LocalStack on their local defaults exactly as before. Every binary that builds one of
+these clients (api, outbox, worker) maps the configuration through one
+`OptionsFromConfig` per client package (ADR-0027).
 
 ---
 

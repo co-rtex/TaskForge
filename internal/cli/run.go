@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/google/uuid"
 )
@@ -47,6 +49,9 @@ Resources and verbs:
   worker-keys create --scope --name
   worker-keys list   [--limit]
   worker-keys revoke <key_id>
+  idle               block until SIGTERM or SIGINT, then exit 0; makes no
+                     network call. Keeps a sidecar container running so an
+                     operator can exec into it (docs/adr/0027).
 
 A success response is written as JSON to stdout. A failure writes a JSON
 error object to stderr and prints nothing to stdout; the process exit code
@@ -103,6 +108,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	rest := globalFlags.Args()
+	if len(rest) == 1 && rest[0] == "idle" {
+		return idle(ctx)
+	}
 	if len(rest) < 2 {
 		fmt.Fprint(stderr, usageText)
 		return ExitUsageError
@@ -127,6 +135,20 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	client := NewClient(baseURL, key)
 
 	return cmd(ctx, client, rest, stdout, stderr)
+}
+
+// idle is `taskforge-cli idle`: it blocks until the process receives SIGTERM or
+// SIGINT, or ctx ends, and then returns ExitSuccess. It resolves no API address
+// and makes no network call. It exists so the cli image can run as a sidecar in
+// the api's ECS task, sharing its network namespace, with nothing to do until an
+// operator runs `taskforge-cli api-keys create ...` in it through ECS Exec
+// against the admin listener on 127.0.0.1 (docs/adr/0027). A stop is the
+// expected way out, so it is success, not an error.
+func idle(ctx context.Context) int {
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	<-ctx.Done()
+	return ExitSuccess
 }
 
 // apiErrorEnvelope is the minimal shape this CLI needs to read out of an

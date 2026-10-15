@@ -34,7 +34,7 @@ evidence matter more than feature count.
 | Python tooling | `ruff format` (authoritative), `ruff check`, `mypy --strict` |
 | Operator dashboard | React + TypeScript built by Vite, embedded into `taskforge-api` with `go:embed`; Node runs **only** inside the digest-pinned image in `dashboard/Dockerfile` |
 | Dashboard tooling | Biome (`biome ci`, authoritative formatter and linter), `tsc --noEmit`, Vitest |
-| Container images | One root `Dockerfile`: a digest-pinned `golang` builder and a digest-pinned `distroless/static-debian12:nonroot` base, six targets, no CLI image |
+| Container images | One root `Dockerfile`: a digest-pinned `golang` builder and a digest-pinned `distroless/static-debian12:nonroot` base, seven targets, one binary each: the six services and the `taskforge-cli` bootstrap sidecar (the api image holds no CLI) |
 | Supply-chain scanning | `scripts/scan` driving govulncheck, gitleaks (pinned container), pip-audit and npm audit (in the dashboard's pinned Node). Dated risk acceptance for the three dependency scanners lives in `security/scan-exceptions.yaml`; a gitleaks finding is accepted only in `.gitleaks.toml` |
 
 Required to build and run: Git, Go, Docker, Docker Compose, GNU Make.
@@ -99,7 +99,7 @@ make demo              # success demonstration: succeed, retry, dead-letter
 make demo-failure      # failure demonstration: a killed and a frozen worker
 make bench             # the recorded benchmark: throughput, then faults (clean tree, ~16 min)
 make bench-smoke       # the benchmark harness in miniature: ~1 min, records nothing
-make images            # build the dashboard, then the six service images as taskforge-<service>:dev
+make images            # build the dashboard, then the seven images as taskforge-<service>:dev
 make images-smoke      # build the images, then inspect and run them (needs `make up`)
 make topology-smoke    # run the api and worker as separate containers and check the listeners (needs `make up`)
 make scan              # govulncheck, gitleaks, pip-audit and npm audit; blocks on any unexcepted finding
@@ -127,6 +127,11 @@ never records numbers. The definitions are in
 
 `go run ./scripts/bench recovery-probe` is M8D3's non-recording investigation tool, extended by M8D4 (no Make target, `--record` refused with any other flag). Conditions A, B and C run by default (the planned 10/20/10 trials take about 50 minutes); `--conditions D` (a RUNNING kill, never renewed) and `--conditions E` (a kill after every held attempt was renewed) run 10 trials each by default, about 7 and 9 minutes as measured in M8D4 (A, B and C together took 47). `--timeout-seconds N` replaces every condition's `timeout_seconds`. Every trial prints what became of each attempt its kill caught (`readdb.KillOutcomes`).
 
+`make images` builds seven images: the six services and `taskforge-cli`, the api task's
+bootstrap sidecar, whose default command `taskforge-cli idle` blocks until SIGTERM or
+SIGINT and exits 0 with no network call, so an operator can run the CLI in it through ECS
+Exec against the admin listener on its shared loopback
+([ADR-0027](docs/adr/0027-aws-native-configuration-and-the-cli-sidecar.md)).
 `make images` builds `internal/dashboard/dist` first (the api embeds it; a clean
 clone has only a placeholder) and then one image per service from the root
 `Dockerfile`, each labelled with the commit. `make images-smoke` runs
@@ -144,7 +149,8 @@ the api with its public (`:8090`) and control (`:8091`) listeners on the network
 its admin listener on its own loopback, the worker dialing `http://api:8091` with
 `TASKFORGE_WORKER_ALLOW_REMOTE_API=true`, and a probe container beside them. It prints
 seven rows, each PASS or FAIL, and a total, and exits non-zero unless all seven pass. It
-mints its keys with `taskforge-cli` inside the api container against loopback, uses a
+mints its keys through a cli sidecar on `--network container:<api>`, with `docker exec`
+of `taskforge-cli` against loopback, uses a
 database (`taskforge_topology_<pid>`) and a broker queue of its own, and removes every
 container, the network, the queue and the database on every way out. See
 [ADR-0026](docs/adr/0026-listeners-by-surface.md).
@@ -188,6 +194,12 @@ dashboard has not been built. Rebuild the binary after `make dash-build` to
 embed the real one.
 
 Targets are added only when the behavior behind them actually works.
+
+`TASKFORGE_AWS_DEFAULT_CHAIN=true` switches every binary to AWS's own endpoints and the
+SDK's default credential chain for SQS and S3: the six `TASKFORGE_{BROKER,RESULTS}_ENDPOINT`,
+`_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` variables must then be absent (even empty is
+refused) and both `_REGION` variables set. Unset, the local defaults apply as before
+([ADR-0027](docs/adr/0027-aws-native-configuration-and-the-cli-sidecar.md)).
 
 ## 5. Coding conventions
 
