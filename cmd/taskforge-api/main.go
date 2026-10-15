@@ -4,7 +4,13 @@
 // internal worker-control surface authenticates registration with a separate
 // database-backed worker key -- see docs/adr/0014-worker-control-authentication.md.
 // The key-management routes for both credential types are unauthenticated
-// operator plumbing, so the process still binds to loopback only.
+// operator plumbing, so they are served only on the admin listener, which binds
+// to loopback. Two optional listeners serve the authenticated surfaces on
+// network addresses: public (/v1 and the probes) and control (the worker-control
+// routes and the probes) -- see docs/adr/0026-listeners-by-surface.md.
+//
+// `taskforge-api healthcheck` GETs the admin listener's /healthz and exits 0 or 1,
+// for a container health check in an image with no shell.
 //
 // It also serves the operator dashboard's embedded static assets under
 // /dashboard/, same-origin with the API the dashboard reads -- see
@@ -13,9 +19,7 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +30,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/dashboard"
 	"github.com/co-rtex/TaskForge/internal/database"
+	"github.com/co-rtex/TaskForge/internal/healthcheck"
 	"github.com/co-rtex/TaskForge/internal/jobs"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/metrics"
@@ -37,7 +42,19 @@ import (
 )
 
 func main() {
+	if healthcheck.Requested(os.Args) {
+		os.Exit(runHealthcheck())
+	}
 	os.Exit(run())
+}
+
+// runHealthcheck probes the admin listener, which every configuration opens.
+func runHealthcheck() int {
+	if err := config.LoadDotEnv(".env"); err != nil {
+		return healthcheck.Run(context.Background(), "taskforge-api", "", err, os.Stdout, os.Stderr)
+	}
+	cfg, err := config.Load()
+	return healthcheck.Run(context.Background(), "taskforge-api", cfg.APIAddr, err, os.Stdout, os.Stderr)
 }
 
 func run() int {
@@ -144,41 +161,30 @@ func run() int {
 		WithResults(results.NewStore(pool), objects).
 		WithDashboard(dashboardAssets)
 
-	httpServer := &http.Server{
-		Addr:    cfg.APIAddr,
-		Handler: server.Handler(),
-		// Bounded timeouts stop a slow or stalled client from holding a
-		// connection, and a goroutine, indefinitely.
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	errCh := make(chan error, 1)
-	go func() {
-		log.Info("api listening",
-			slog.String("addr", cfg.APIAddr),
-			slog.Int64("max_request_bytes", cfg.MaxRequestBytes),
-			slog.String("dashboard_path", api.DashboardPath),
-			slog.Bool("dashboard_built", dashboardBuilt))
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+	// One http.Server per configured listener, each serving its own share of
+	// the one route table. The control listener's Host rule is the allowlist,
+	// which Load has already validated.
+	plan := planListeners(cfg)
+	if cfg.APIControlAddr != "" {
+		hosts, err := cfg.ControlHostAllowlist()
+		if err != nil {
+			log.Error("configuration invalid", slog.String("error", err.Error()))
+			return 1
 		}
-	}()
-
-	select {
-	case err := <-errCh:
-		log.Error("http server failed", slog.String("error", err.Error()))
-		return 1
-	case <-ctx.Done():
-		log.Info("shutdown signal received")
+		server.WithControlHosts(hosts)
 	}
+	servers := make([]namedServer, 0, len(plan))
+	for _, p := range plan {
+		servers = append(servers, namedServer{p.listener.String(), newHTTPServer(p.addr, server.ListenerHandler(p.listener))})
+	}
+	log.Info("api starting",
+		slog.Int("listeners", len(servers)),
+		slog.Int64("max_request_bytes", cfg.MaxRequestBytes),
+		slog.String("dashboard_path", api.DashboardPath),
+		slog.Bool("dashboard_built", dashboardBuilt))
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Error("graceful shutdown failed", slog.String("error", err.Error()))
+	if err := serveAll(ctx, log, servers, 15*time.Second); err != nil {
+		log.Error("api stopped with an error", slog.String("error", err.Error()))
 		return 1
 	}
 	log.Info("api stopped")

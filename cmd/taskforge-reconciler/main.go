@@ -19,6 +19,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/database"
+	"github.com/co-rtex/TaskForge/internal/healthcheck"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/reconciler"
@@ -27,7 +28,21 @@ import (
 )
 
 func main() {
+	if healthcheck.Requested(os.Args) {
+		os.Exit(runHealthcheck())
+	}
 	os.Exit(run())
+}
+
+// runHealthcheck is `taskforge-reconciler healthcheck`: it GETs this process's own
+// loopback /healthz (TASKFORGE_RECONCILER_ADDR) and exits 0 or 1, for a
+// container health check in an image with no shell. See internal/healthcheck.
+func runHealthcheck() int {
+	if err := config.LoadDotEnv(".env"); err != nil {
+		return healthcheck.Run(context.Background(), "taskforge-reconciler", "", err, os.Stdout, os.Stderr)
+	}
+	cfg, err := config.Load()
+	return healthcheck.Run(context.Background(), "taskforge-reconciler", cfg.ReconcilerAddr, err, os.Stdout, os.Stderr)
 }
 
 func run() int {
