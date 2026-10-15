@@ -130,7 +130,6 @@ var (
 		"PUT /internal/v1/worker-sessions/{worker_session_id}",
 	}
 	wantAdminRoutes = []string{
-		"GET /",
 		"GET /dashboard/",
 		"GET /healthz",
 		"GET /internal/v1/api-keys",
@@ -173,10 +172,8 @@ func TestListeners_EachServesExactlyItsRoutes(t *testing.T) {
 	bed := newListenerBed(t, nil)
 	enabled := bed.server.enabledRoutes()
 
-	// "GET /" is not a table route: it is the admin list's reminder that the
-	// bare root has a route there ("GET /{$}"). It is dropped before comparing.
 	want := map[Listener][]string{
-		ListenerAdmin:   withoutBareRoot(wantAdminRoutes),
+		ListenerAdmin:   wantAdminRoutes,
 		ListenerPublic:  wantPublicRoutes,
 		ListenerControl: wantControlRoutes,
 	}
@@ -202,16 +199,6 @@ func TestListeners_EachServesExactlyItsRoutes(t *testing.T) {
 			require.Equalf(t, CodeNotFound, errorCodeOf(rec), label)
 		}
 	}
-}
-
-func withoutBareRoot(patterns []string) []string {
-	var out []string
-	for _, p := range patterns {
-		if p != "GET /" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func contains(list []string, want string) bool {

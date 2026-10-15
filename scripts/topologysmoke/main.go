@@ -120,12 +120,15 @@ func run(stdout, stderr io.Writer) int {
 		}
 	}()
 	if err := s.setUp(ctx); err != nil {
+		// A topology that cannot be brought up fails every row: none of them was
+		// shown to hold. The report still prints, so the failure is the same shape
+		// as any other.
 		fmt.Fprintf(stderr, "topology-smoke: %v\n", err)
-		s.dumpLogs()
-		return exitFailed
+		s.record(0, "the topology came up", err.Error(), "")
+	} else {
+		s.runProbe(ctx)
+		s.checkHealthcheck(ctx)
 	}
-	s.runProbe(ctx)
-	s.checkHealthcheck(ctx)
 	code := s.report(ctx)
 	if code != exitPassed {
 		s.dumpLogs()
@@ -478,7 +481,7 @@ func (s *smoke) report(ctx context.Context) int {
 		fmt.Fprintf(s.out, "  %s  row %d  %s  (%d checks)\n", verdict, row, rowTitles[row], rowSeen[row])
 	}
 	if rowSeen[0] > 0 {
-		fmt.Fprintf(s.out, "  FAIL  the probe itself did not run cleanly\n")
+		fmt.Fprintf(s.out, "  FAIL  the topology or the probe did not run cleanly, so no row holds\n")
 	}
 	if passedRows != totalRows || failedChecks > 0 {
 		fmt.Fprintf(s.out, "=== RESULT: FAIL (%d of %d rows passed; %d of %d checks failed) ===\n",
