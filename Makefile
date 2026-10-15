@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure bench bench-smoke images images-smoke scan \
+        demo demo-failure bench bench-smoke images images-smoke topology-smoke scan \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -143,6 +143,16 @@ images: dash-build ## Build the six service images as taskforge-<service>:dev (b
 # needs the infrastructure up. See scripts/imagesmoke and ADR-0021.
 images-smoke: images up ## Check the six images: non-root, labels, config rejection, migrate against PostgreSQL, the api's real dashboard
 	$(GO) run ./scripts/imagesmoke
+
+# Runs the api and the worker as separate containers, the topology M8C2 will
+# deploy: the api with its public (8090) and control (8091) listeners on the
+# network and its admin listener on its own loopback, the worker dialing
+# http://api:8091 with the remote-API opt-in, and a probe container beside them.
+# Seven rows, each PASS or FAIL, and a total. It creates its own network,
+# containers, database (taskforge_topology_<pid>) and broker queue, and removes all
+# of them on every way out. See scripts/topologysmoke and ADR-0026.
+topology-smoke: images up ## Run the api and worker as separate containers and check the listeners by surface
+	$(GO) run ./scripts/topologysmoke
 
 # The four supply-chain scanners, through one driver: govulncheck (reachable
 # vulnerabilities in the Go code), gitleaks (secrets in the full git history),
