@@ -120,7 +120,9 @@ func TestBinaryProblems(t *testing.T) {
 	require.Empty(t, binaryProblems(append([]string{"taskforge-api"}, base...), "api"))
 	require.NotEmpty(t, binaryProblems(base, "api"), "its own binary is missing")
 	require.NotEmpty(t, binaryProblems(append([]string{"taskforge-api", "taskforge-worker"}, base...), "api"), "another service's binary")
-	require.NotEmpty(t, binaryProblems(append([]string{"taskforge-api", "taskforge-cli"}, base...), "api"), "there is no CLI image")
+	require.NotEmpty(t, binaryProblems(append([]string{"taskforge-api", "taskforge-cli"}, base...), "api"), "the api image holds no CLI")
+	require.Empty(t, binaryProblems(append([]string{"taskforge-cli"}, base...), "cli"), "the cli image holds the CLI alone")
+	require.NotEmpty(t, binaryProblems(append([]string{"taskforge-cli", "taskforge-api"}, base...), "cli"), "and no service binary")
 	require.NotEmpty(t, binaryProblems(append([]string{"taskforge-api", "app/taskforge-outbox"}, base...), "api"), "a binary under another path")
 	require.NotEmpty(t, binaryProblems(append([]string{"taskforge-api", "bin/sh"}, base...), "api"), "a shell")
 }

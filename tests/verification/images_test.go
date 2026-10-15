@@ -24,9 +24,10 @@ const (
 	makefilePath     = "Makefile"
 )
 
-// imageServices are the six services that get an image, in the order the ADR lists
-// them. There is deliberately no CLI image.
-var imageServices = []string{"api", "outbox", "scheduler", "reconciler", "worker", "migrate"}
+// imageServices are the seven images, in the order the ADRs list them: the six
+// services of ADR-0021 and the cli sidecar of ADR-0027. Each holds exactly one
+// binary; the api image still holds no CLI.
+var imageServices = []string{"api", "outbox", "scheduler", "reconciler", "worker", "migrate", "cli"}
 
 func readRepoFile(t *testing.T, rel string) string {
 	t.Helper()
@@ -153,7 +154,7 @@ func TestDockerfile_EachBaseImageIsPinnedInExactlyOnePlace(t *testing.T) {
 	}
 }
 
-func TestDockerfile_HasExactlyOneTargetPerServiceAndNoCLIImage(t *testing.T) {
+func TestDockerfile_HasExactlyOneTargetPerImage(t *testing.T) {
 	stages := parseDockerfile(t, readRepoFile(t, dockerfilePath))
 
 	var targets []string
@@ -162,8 +163,7 @@ func TestDockerfile_HasExactlyOneTargetPerServiceAndNoCLIImage(t *testing.T) {
 			targets = append(targets, s.name)
 		}
 	}
-	require.ElementsMatch(t, imageServices, targets, "one final target per service, and nothing else")
-	require.NotContains(t, targets, "cli")
+	require.ElementsMatch(t, imageServices, targets, "one final target per image, and nothing else")
 }
 
 func TestDockerfile_EachTargetCarriesOnlyItsOwnBinaryAndRunsIt(t *testing.T) {
@@ -189,6 +189,18 @@ func TestDockerfile_EachTargetCarriesOnlyItsOwnBinaryAndRunsIt(t *testing.T) {
 		require.Containsf(t, copies[0], "/out/taskforge-"+svc, "target %s copies its own binary", svc)
 		require.NotContainsf(t, copies[0], "dist", "target %s", svc)
 
+		var cmds []string
+		for _, ins := range s.instructions {
+			if strings.HasPrefix(strings.ToUpper(ins), "CMD") {
+				cmds = append(cmds, ins)
+			}
+		}
+		if svc == "cli" {
+			require.Equal(t, []string{`CMD ["idle"]`}, cmds, "the cli sidecar idles by default, so the container stays up for ECS Exec")
+		} else {
+			require.Emptyf(t, cmds, "target %s takes no default arguments", svc)
+		}
+
 		require.Lenf(t, entrypoints, 1, "target %s", svc)
 		require.Equalf(t, `ENTRYPOINT ["/taskforge-`+svc+`"]`, entrypoints[0], "target %s uses the exec form, with no shell to put in the way", svc)
 	}
@@ -211,8 +223,7 @@ func TestDockerfile_BuildsStaticAndTrimmed(t *testing.T) {
 		for _, svc := range imageServices {
 			require.Contains(t, ins, "./cmd/taskforge-"+svc)
 		}
-		require.NotContains(t, ins, "./cmd/taskforge-cli", "there is no CLI image")
-		require.NotContains(t, ins, "./cmd/...", "name the six commands; ./cmd/... would add the CLI")
+		require.NotContains(t, ins, "./cmd/...", "name the seven commands; ./cmd/... would add any new one")
 	}
 }
 
@@ -257,7 +268,7 @@ func TestDockerignore_IsAnAllowlistOfWhatTheGoBuildNeeds(t *testing.T) {
 	// gitignored apart from .gitkeep, so Docker's ignore file is the only thing
 	// that decides whether the built dashboard enters the build context.
 	require.ElementsMatch(t, []string{"go.mod", "go.sum", "cmd", "internal", "migrations"}, allowed,
-		"exactly what the six binaries import: nothing else may enter the build context")
+		"exactly what the seven binaries import: nothing else may enter the build context")
 
 	require.Contains(t, rules, "**/*_test.go", "test files are not part of an image's build")
 	for _, forbidden := range []string{".git", ".env", "dashboard", "sdk", "docs", "node_modules"} {
