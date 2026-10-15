@@ -146,6 +146,79 @@ func (s *Server) groupEnabled(g group) bool {
 	return false
 }
 
+// Listener is one of taskforge-api's listeners. Each serves the routes whose
+// table entry names it, and nothing else. See
+// docs/adr/0026-listeners-by-surface.md.
+type Listener int
+
+const (
+	// ListenerAdmin is TASKFORGE_API_ADDR: loopback only, always open, and it
+	// serves every route the server has, exactly as the single listener did
+	// before M8C1. Key administration, the dashboard and /metrics are here and
+	// nowhere else.
+	ListenerAdmin Listener = iota + 1
+	// ListenerPublic is TASKFORGE_API_PUBLIC_ADDR: optional, any address. The
+	// /v1 surface and the two probes.
+	ListenerPublic
+	// ListenerControl is TASKFORGE_API_CONTROL_ADDR: optional, any address. The
+	// eight worker-control routes and the two probes, behind the browser-origin
+	// guard with an exact-match Host allowlist in place of loopback.
+	ListenerControl
+)
+
+func (l Listener) String() string {
+	switch l {
+	case ListenerAdmin:
+		return "admin"
+	case ListenerPublic:
+		return "public"
+	case ListenerControl:
+		return "control"
+	}
+	return fmt.Sprintf("listener(%d)", int(l))
+}
+
+// listenerSet is the listeners a route is served on. The zero value means the
+// admin listener alone: an entry that forgot its column is served where every
+// route was served before M8C1, on loopback, and on no network listener. That is
+// the fail-closed direction, since the admin listener is the one that protects
+// unauthenticated routes. TestRoutes_EveryEntryNamesItsListeners holds that the
+// real table never relies on it.
+type listenerSet uint8
+
+func (l Listener) bit() listenerSet { return listenerSet(1) << uint(l) }
+
+// effective is the set the zero value stands for, and every other set as it is.
+func (ls listenerSet) effective() listenerSet {
+	if ls == 0 {
+		return ListenerAdmin.bit()
+	}
+	return ls
+}
+
+func (ls listenerSet) has(l Listener) bool { return ls.effective()&l.bit() != 0 }
+
+func (ls listenerSet) String() string {
+	ls = ls.effective()
+	var names []string
+	for _, l := range []Listener{ListenerAdmin, ListenerPublic, ListenerControl} {
+		if ls.has(l) {
+			names = append(names, l.String())
+		}
+	}
+	return strings.Join(names, "+")
+}
+
+// The four columns the table uses. Admin is in every one: the admin listener
+// serves everything it served before the network listeners existed, which is
+// what keeps the default configuration byte-identical.
+var (
+	adminOnly       = ListenerAdmin.bit()
+	adminAndPublic  = ListenerAdmin.bit() | ListenerPublic.bit()
+	adminAndControl = ListenerAdmin.bit() | ListenerControl.bit()
+	everyListener   = ListenerAdmin.bit() | ListenerPublic.bit() | ListenerControl.bit()
+)
+
 // route is one registered method and path, and everything that decides how it
 // is registered and what it is held to.
 type route struct {
@@ -160,7 +233,10 @@ type route struct {
 	surface surface
 	chain   chain
 	group   group
-	handler http.HandlerFunc
+	// listeners is where the route is served. checkListenerPlacement holds
+	// what may be where, by group and by path.
+	listeners listenerSet
+	handler   http.HandlerFunc
 
 	// noFallback marks a path that has NO method-less 405 fallback. Every other
 	// path gets one, derived from the methods the table holds for it. A path
@@ -206,34 +282,34 @@ func (s *Server) routeTable() []route {
 
 	table := []route{
 		// --- Public surface. ---------------------------------------------------
-		{method: http.MethodPost, path: "/v1/jobs", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleSubmitJob},
-		{method: http.MethodGet, path: "/v1/jobs", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleListJobs},
-		{method: http.MethodGet, path: "/v1/jobs/{job_id}", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleGetJob},
-		{method: http.MethodGet, path: "/v1/jobs/{job_id}/attempts", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleListJobAttempts},
-		{method: http.MethodGet, path: "/v1/jobs/{job_id}/result", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleGetJobResult},
-		{method: http.MethodPost, path: "/v1/jobs/{job_id}/cancel", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleCancelJob},
+		{method: http.MethodPost, path: "/v1/jobs", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleSubmitJob},
+		{method: http.MethodGet, path: "/v1/jobs", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleListJobs},
+		{method: http.MethodGet, path: "/v1/jobs/{job_id}", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleGetJob},
+		{method: http.MethodGet, path: "/v1/jobs/{job_id}/attempts", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleListJobAttempts},
+		{method: http.MethodGet, path: "/v1/jobs/{job_id}/result", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleGetJobResult},
+		{method: http.MethodPost, path: "/v1/jobs/{job_id}/cancel", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleCancelJob},
 		// Operator retry IS DLQ replay: same service, same idempotency namespace.
 		// Two routes exist because operators reach for both names, not because
 		// there are two operations.
-		{method: http.MethodPost, path: "/v1/jobs/{job_id}/retry", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleReplayJob},
-		{method: http.MethodGet, path: "/v1/dlq", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleListDLQ},
-		{method: http.MethodPost, path: "/v1/dlq/{job_id}/replay", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleReplayJob},
+		{method: http.MethodPost, path: "/v1/jobs/{job_id}/retry", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleReplayJob},
+		{method: http.MethodGet, path: "/v1/dlq", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleListDLQ},
+		{method: http.MethodPost, path: "/v1/dlq/{job_id}/replay", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleReplayJob},
 		// The operator read surface (M6A). PROJECT_SPEC.md section 4 items 4 and 7
 		// name these; the dashboard, the CLI, and the SDK are all consumers of
 		// exactly these four routes and nothing else.
-		{method: http.MethodGet, path: "/v1/workers", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleListWorkers},
-		{method: http.MethodGet, path: "/v1/queues", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, handler: s.handleListQueues},
+		{method: http.MethodGet, path: "/v1/workers", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleListWorkers},
+		{method: http.MethodGet, path: "/v1/queues", surface: surfacePublic, chain: chainAPIKey, group: groupAlways, listeners: adminAndPublic, handler: s.handleListQueues},
 
 		// --- Health probes. ----------------------------------------------------
 		// Unauthenticated. They reveal nothing tenant-specific, and a liveness
 		// probe that needed a credential would report a healthy process as dead
 		// the moment that credential was revoked.
-		{method: http.MethodGet, path: "/healthz", surface: surfaceProbe, chain: chainNone, group: groupAlways, handler: s.handleLiveness},
-		{method: http.MethodGet, path: "/readyz", surface: surfaceProbe, chain: chainNone, group: groupAlways, handler: s.handleReadiness},
+		{method: http.MethodGet, path: "/healthz", surface: surfaceProbe, chain: chainNone, group: groupAlways, listeners: everyListener, handler: s.handleLiveness},
+		{method: http.MethodGet, path: "/readyz", surface: surfaceProbe, chain: chainNone, group: groupAlways, listeners: everyListener, handler: s.handleReadiness},
 
 		// --- Registered, and deliberately not in api/openapi.yaml. --------------
 		{
-			method: http.MethodGet, path: "/metrics", surface: surfaceUnlisted, chain: chainNone, group: groupMetrics,
+			method: http.MethodGet, path: "/metrics", surface: surfaceUnlisted, chain: chainNone, group: groupMetrics, listeners: adminOnly,
 			handler: metricsHandler,
 			// Unauthenticated, like the probes beside it, on this same
 			// already-loopback-bound listener. See WithMetrics.
@@ -244,7 +320,7 @@ func (s *Server) routeTable() []route {
 			noFallback: true,
 		},
 		{
-			method: http.MethodGet, path: DashboardPath, surface: surfaceUnlisted, chain: chainNone, group: groupDashboard,
+			method: http.MethodGet, path: DashboardPath, surface: surfaceUnlisted, chain: chainNone, group: groupDashboard, listeners: adminOnly,
 			handler: s.handleDashboard,
 			// Static files and nothing else: the dashboard reads only the /v1
 			// routes above, with the operator's own key, like any other client.
@@ -254,7 +330,7 @@ func (s *Server) routeTable() []route {
 			// This path DOES get a derived 405 fallback, as it always had.
 		},
 		{
-			method: http.MethodGet, path: "/{$}", surface: surfaceUnlisted, chain: chainNone, group: groupDashboard,
+			method: http.MethodGet, path: "/{$}", surface: surfaceUnlisted, chain: chainNone, group: groupDashboard, listeners: adminOnly,
 			handler: s.handleDashboardRoot,
 			// {$} matches the bare root only. Every other unrouted path still falls
 			// through to the catch-all.
@@ -265,28 +341,28 @@ func (s *Server) routeTable() []route {
 		},
 
 		// --- Internal surface: API-key management (ADR-0013). -------------------
-		{method: http.MethodPost, path: "/internal/v1/api-keys", surface: surfaceInternal, chain: chainGuard, group: groupKeys, handler: s.handleCreateAPIKey},
-		{method: http.MethodGet, path: "/internal/v1/api-keys", surface: surfaceInternal, chain: chainGuard, group: groupKeys, handler: s.handleListAPIKeys},
-		{method: http.MethodPost, path: "/internal/v1/api-keys/{key_id}/revoke", surface: surfaceInternal, chain: chainGuard, group: groupKeys, handler: s.handleRevokeAPIKey},
+		{method: http.MethodPost, path: "/internal/v1/api-keys", surface: surfaceInternal, chain: chainGuard, group: groupKeys, listeners: adminOnly, handler: s.handleCreateAPIKey},
+		{method: http.MethodGet, path: "/internal/v1/api-keys", surface: surfaceInternal, chain: chainGuard, group: groupKeys, listeners: adminOnly, handler: s.handleListAPIKeys},
+		{method: http.MethodPost, path: "/internal/v1/api-keys/{key_id}/revoke", surface: surfaceInternal, chain: chainGuard, group: groupKeys, listeners: adminOnly, handler: s.handleRevokeAPIKey},
 
 		// --- Internal surface: worker-key management (ADR-0014). ----------------
-		{method: http.MethodPost, path: "/internal/v1/worker-keys", surface: surfaceInternal, chain: chainGuard, group: groupWorkerKeys, handler: s.handleCreateWorkerKey},
-		{method: http.MethodGet, path: "/internal/v1/worker-keys", surface: surfaceInternal, chain: chainGuard, group: groupWorkerKeys, handler: s.handleListWorkerKeys},
-		{method: http.MethodPost, path: "/internal/v1/worker-keys/{key_id}/revoke", surface: surfaceInternal, chain: chainGuard, group: groupWorkerKeys, handler: s.handleRevokeWorkerKey},
+		{method: http.MethodPost, path: "/internal/v1/worker-keys", surface: surfaceInternal, chain: chainGuard, group: groupWorkerKeys, listeners: adminOnly, handler: s.handleCreateWorkerKey},
+		{method: http.MethodGet, path: "/internal/v1/worker-keys", surface: surfaceInternal, chain: chainGuard, group: groupWorkerKeys, listeners: adminOnly, handler: s.handleListWorkerKeys},
+		{method: http.MethodPost, path: "/internal/v1/worker-keys/{key_id}/revoke", surface: surfaceInternal, chain: chainGuard, group: groupWorkerKeys, listeners: adminOnly, handler: s.handleRevokeWorkerKey},
 
 		// --- Internal surface: worker control. ---------------------------------
 		// Registration alone is wrapped in requireWorkerKey: every other
 		// worker-control route below resolves its scope from the session identity
 		// the request already carries rather than a fresh credential. See
 		// requireWorkerKey's doc comment for why that asymmetry is deliberate.
-		{method: http.MethodPut, path: "/internal/v1/worker-sessions/{worker_session_id}", surface: surfaceInternal, chain: chainGuardWorkerKey, group: groupControl, handler: s.handleRegisterWorkerSession},
-		{method: http.MethodPost, path: "/internal/v1/worker-sessions/{worker_session_id}/heartbeat", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleHeartbeat},
-		{method: http.MethodPost, path: "/internal/v1/claims", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleClaim},
-		{method: http.MethodPost, path: "/internal/v1/leases/{lease_id}/renew", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleRenewLease},
-		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/start", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleStartAttempt},
-		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/succeed", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleSucceedAttempt},
-		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/fail", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleFailAttempt},
-		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/cancel", surface: surfaceInternal, chain: chainGuard, group: groupControl, handler: s.handleCancelAttempt},
+		{method: http.MethodPut, path: "/internal/v1/worker-sessions/{worker_session_id}", surface: surfaceInternal, chain: chainGuardWorkerKey, group: groupControl, listeners: adminAndControl, handler: s.handleRegisterWorkerSession},
+		{method: http.MethodPost, path: "/internal/v1/worker-sessions/{worker_session_id}/heartbeat", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleHeartbeat},
+		{method: http.MethodPost, path: "/internal/v1/claims", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleClaim},
+		{method: http.MethodPost, path: "/internal/v1/leases/{lease_id}/renew", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleRenewLease},
+		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/start", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleStartAttempt},
+		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/succeed", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleSucceedAttempt},
+		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/fail", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleFailAttempt},
+		{method: http.MethodPost, path: "/internal/v1/attempts/{attempt_id}/cancel", surface: surfaceInternal, chain: chainGuard, group: groupControl, listeners: adminAndControl, handler: s.handleCancelAttempt},
 	}
 	if s.routeTableHook != nil {
 		table = s.routeTableHook(table)
@@ -304,6 +380,17 @@ func (s *Server) enabledRoutes() []route {
 		}
 	}
 	return enabled
+}
+
+// routesOn is the routes a listener serves: those whose column names it.
+func routesOn(routes []route, l Listener) []route {
+	var on []route
+	for _, rt := range routes {
+		if rt.listeners.has(l) {
+			on = append(on, rt)
+		}
+	}
+	return on
 }
 
 // fallback is a method-less pattern that answers every method the table does not
@@ -467,24 +554,98 @@ func firstSegmentIsWildcard(path string) bool {
 	return strings.HasPrefix(first, "{")
 }
 
-// registerRoutes registers every enabled route, then every derived fallback,
-// then the "/" catch-all. It is the only code that iterates the table.
+// checkListenerPlacement reports every route the table places on a listener it
+// must never be served on. It returns nil when none is, and otherwise one error
+// naming every offender.
 //
-// Before it registers anything it checks every enabled route and every derived
-// fallback against checkRouteBoundaries and panics on a breach: a table that would
-// register an unguarded /internal route, or an unauthenticated /v1 one, is a server
-// that never starts, not one that serves it. The check changes no response.
-func (s *Server) registerRoutes(mux *http.ServeMux) {
+// The rules, from docs/adr/0026-listeners-by-surface.md:
+//
+//   - credential administration (groupKeys, groupWorkerKeys), the dashboard
+//     (groupDashboard, and its paths whatever group an entry declares) and
+//     /metrics (groupMetrics, and the path) are admin-only: they are
+//     unauthenticated by design and loopback is what protects them;
+//   - nothing under /internal/ is on the public listener, which has no
+//     browser-origin guard;
+//   - nothing under /v1/ is on the control listener, whose Host allowlist is
+//     the workers' name for the API, not the clients'.
+//
+// Like checkRouteBoundaries it reads paths as well as declarations, because a
+// declaration can be wrong, and it is a pure function so a test can hand it a
+// synthetic table without building a server.
+func checkListenerPlacement(routes []route) error {
+	var breaches []error
+	for _, rt := range routes {
+		if rt.listeners.effective()&^ListenerAdmin.bit() == 0 {
+			continue // admin only: anything may be there
+		}
+		if adminOnlyRoute(rt) {
+			breaches = append(breaches, fmt.Errorf(
+				"route %q (group %s) is on the %s listener; key administration, the dashboard and /metrics are served on the admin listener only",
+				rt.pattern(), rt.group, rt.listeners))
+		}
+		if rt.listeners.has(ListenerPublic) && strings.HasPrefix(rt.path, internalPathPrefix) {
+			breaches = append(breaches, fmt.Errorf(
+				"route %q is under %s and on the public listener; no /internal route is served there",
+				rt.pattern(), internalPathPrefix))
+		}
+		if rt.listeners.has(ListenerControl) && strings.HasPrefix(rt.path, publicPathPrefix) {
+			breaches = append(breaches, fmt.Errorf(
+				"route %q is under %s and on the control listener; no /v1 route is served there",
+				rt.pattern(), publicPathPrefix))
+		}
+	}
+	return errors.Join(breaches...)
+}
+
+// adminOnlyRoute reports whether a route is one of those the admin listener
+// alone may serve, by its group or by its path.
+func adminOnlyRoute(rt route) bool {
+	switch rt.group {
+	case groupKeys, groupWorkerKeys, groupDashboard, groupMetrics:
+		return true
+	}
+	switch {
+	case rt.path == "/metrics", rt.path == "/{$}", strings.HasPrefix(rt.path, DashboardPath):
+		return true
+	case strings.HasPrefix(rt.path, "/internal/v1/api-keys"), strings.HasPrefix(rt.path, "/internal/v1/worker-keys"):
+		return true
+	}
+	return false
+}
+
+// registerRoutes registers every enabled route the listener serves, then every
+// fallback derived from those routes, then the "/" catch-all. It is the only
+// code that iterates the table.
+//
+// Before it registers anything it checks the WHOLE enabled table, whichever
+// listener it is building, against checkListenerPlacement and
+// checkRouteBoundaries, and panics on a breach: a table that would put key
+// administration on a network listener, or register an unguarded /internal route
+// or an unauthenticated /v1 one, is a server that never starts, not one that
+// serves it. Checking the whole table rather than the listener's share means the
+// admin listener, which every process opens, refuses a table whose network
+// placement is wrong even when no network listener is configured. The checks
+// change no response.
+//
+// The fallbacks are derived from the listener's own routes, so a path a
+// listener does not serve has no fallback there either and answers the
+// catch-all's 404, as an unrouted path does. On the admin listener, which
+// serves every route, that is the derivation it always had.
+func (s *Server) registerRoutes(mux *http.ServeMux, l Listener) {
 	enabled := s.enabledRoutes()
-	fallbacks := fallbacksFor(enabled)
-	if err := checkRouteBoundaries(enabled, fallbacks); err != nil {
+	if err := checkListenerPlacement(enabled); err != nil {
+		panic(fmt.Sprintf("api: the route table places a route on the wrong listener: %v", err))
+	}
+	if err := checkRouteBoundaries(enabled, fallbacksFor(enabled)); err != nil {
 		panic(fmt.Sprintf("api: the route table breaks a boundary rule: %v", err))
 	}
-	for _, rt := range enabled {
-		s.register(mux, rt.pattern(), rt.chain, rt.handler)
+	rule := s.hostRuleFor(l)
+	served := routesOn(enabled, l)
+	for _, rt := range served {
+		s.register(mux, rt.pattern(), rt.chain, rule, rt.handler)
 	}
-	for _, fb := range fallbacks {
-		s.register(mux, fb.path, fb.chain, s.methodNotAllowed(fb.methods...))
+	for _, fb := range fallbacksFor(served) {
+		s.register(mux, fb.path, fb.chain, rule, s.methodNotAllowed(fb.methods...))
 	}
 	// The one registration that is not in the table: it answers every path
 	// nothing else matched with the structured 404, and so exists on every
@@ -493,17 +654,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 }
 
 // register applies a chain to a handler and registers it. It is the only place
-// a chain is turned into wrappers.
-func (s *Server) register(mux *http.ServeMux, pattern string, c chain, handler http.HandlerFunc) {
+// a chain is turned into wrappers. rule is the listener's Host rule, which the
+// browser-origin guard on a guarded chain checks as its rule 3.
+func (s *Server) register(mux *http.ServeMux, pattern string, c chain, rule hostRule, handler http.HandlerFunc) {
 	switch c {
 	case chainNone:
 		mux.HandleFunc(pattern, handler)
 	case chainAPIKey:
 		mux.HandleFunc(pattern, s.requireAPIKey(handler))
 	case chainGuard:
-		s.handleInternal(mux, pattern, handler)
+		s.handleInternal(mux, pattern, rule, handler)
 	case chainGuardWorkerKey:
-		s.handleInternal(mux, pattern, s.requireWorkerKey(handler))
+		s.handleInternal(mux, pattern, rule, s.requireWorkerKey(handler))
 	default:
 		panic(fmt.Sprintf("api: route %q has no wrapper chain; set one in routeTable", pattern))
 	}

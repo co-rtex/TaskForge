@@ -536,6 +536,21 @@ jobs:
           TASKFORGE_RESULTS_ENDPOINT: http://127.0.0.1:4566
         run: go run ./scripts/imagesmoke
 
+      - name: Topology smoke (make topology-smoke)
+        # The api and the worker as separate containers, the topology M8C2 will
+        # deploy: public and control listeners on the network, the admin listener on
+        # the api container's own loopback, and a probe container beside them
+        # (ADR-0026). `make topology-smoke` is not used for the same reason as the
+        # step above: it depends on `images` and `up`, which this job has done. The
+        # containers reach the compose services over the compose network, so the
+        # loopback endpoints below are only where the smoke itself creates and
+        # drops its own database and broker queue.
+        env:
+          TASKFORGE_DATABASE_URL: postgres://taskforge:taskforge@127.0.0.1:5442/taskforge?sslmode=disable
+          TASKFORGE_BROKER_ENDPOINT: http://127.0.0.1:9324
+          TASKFORGE_RESULTS_ENDPOINT: http://127.0.0.1:4566
+        run: go run ./scripts/topologysmoke
+
       - name: Collect failure diagnostics
         if: failure()
         continue-on-error: true

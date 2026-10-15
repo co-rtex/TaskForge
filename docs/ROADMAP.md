@@ -615,15 +615,19 @@ When M8D2 began the owner split it again: the 50.04 s recovery-outlier investiga
 moved to M8D3, which needs an experiment and not a documentation change. M8D3 found that
 some killed workers' attempts end `TIMED_OUT` rather than `ABANDONED`, and the owner
 added M8D4 to measure that before M8C. M8D4 ended in a decision memo; the owner chose its
-option (b) on 2026-10-14 and added M8D5 to implement it before M8C. The original
-objective, deliverables, and acceptance sentence are preserved across them, not
-reduced.
+option (b) on 2026-10-14 and added M8D5 to implement it before M8C. On 2026-10-14 the
+owner also split M8C in two: M8C1 makes the binaries deployable as separate services
+(listeners by surface), and M8C2 is the Terraform, which would otherwise describe a
+configuration the binaries refuse. The original objective, deliverables, and acceptance
+sentence are preserved across them, not reduced.
 
-**Order: M8B, then M8D1, then M8D2, then M8D3, then M8D4, then M8D5, then M8C.** M8C keeps its name.
+**Order: M8B, then M8D1, then M8D2, then M8D3, then M8D4, then M8D5, then M8C1, then
+M8C2.**
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
 complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8D4 is
-complete; see PR #27. M8D5 is complete; see PR #28. M8C is planned.
+complete; see PR #27. M8D5 is complete; see PR #28. M8C1 is complete; see PR #29. M8C2
+is planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -817,24 +821,45 @@ sweep, against predictions written before the series, or the difference is repor
 **Depends on.** M8D4.
 **Status:** complete; see PR #28 and [CURRENT_STATE.md](CURRENT_STATE.md).
 
-#### M8C — Deployment
+#### M8C1 — Listeners by surface: a deployable process topology
+**Objective.** Make the binaries deployable as separate services: `taskforge-api` serves
+`/v1` and the worker-control routes on network addresses while credential administration,
+the dashboard and metrics stay on loopback, and a worker registers and runs jobs against
+an API in another container, all decided in the one route table and pinned by tests,
+with defaults byte-identical. It carries the three decisions M8C named, as the owner
+decided them on 2026-10-14: the non-loopback bind together with ADR-0018's Host rule,
+protection of `/internal`, and the demonstration-handler gate (none).
+**Deliverables.** `TASKFORGE_API_PUBLIC_ADDR`, `TASKFORGE_API_CONTROL_ADDR` and
+`TASKFORGE_API_CONTROL_HOSTS` with their refusals; a listener column in the route table,
+one mux per listener, and a startup check against forbidden placements; the
+browser-origin guard's rule 3 per listener (an exact-match allowlist on control); one
+`http.Server` per listener that is never half up; `TASKFORGE_WORKER_ALLOW_REMOTE_API`; a
+`healthcheck` subcommand on each long-running binary; `make topology-smoke` in CI's
+container-images job; and [ADR-0026](adr/0026-listeners-by-surface.md), amending
+ADR-0018's rule 3.
+**Acceptance.** `make topology-smoke` passes all seven rows locally and in CI; the unit
+and integration tests pass and the five mutations are shown failing them;
+`internal/api/testdata/route_behavior.golden`, `docs/benchmarks/*` and the migrations are
+byte-identical to `main`.
+**Depends on.** M8B; follows M8D5.
+**Status:** complete; see PR #29 and [CURRENT_STATE.md](CURRENT_STATE.md).
+
+#### M8C2 — Deployment: Terraform, validated and not applied
 **Objective.** Make deployment credible without applying it.
-**Deliverables.** Validated (not applied) Terraform for ALB, ECS services, RDS,
-SQS, S3, secrets and logs, together with the three decisions that deployment
-forces: the non-loopback bind, which
-[ADR-0018](adr/0018-browser-origin-guard-on-the-internal-surface.md)'s shared
-loopback predicate ties to the `Host` rule and which must be revisited with it;
-protection of `/internal`, which ADR-0018 deliberately did not provide; and
-whether the demonstration handlers are gated in a deployed worker
-([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
-a gate open).
+**Deliverables.** Validated (not applied) Terraform for ALB, ECS services, RDS, SQS, S3,
+secrets and logs, running the topology M8C1 made possible: the api with its public
+listener behind the load balancer and its control listener reachable from the workers
+only, `TASKFORGE_API_CONTROL_HOSTS` holding the exact name workers dial, workers with
+`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`, each container's health check the binary's
+own `healthcheck` subcommand, and a runbook for minting the first keys on the admin
+listener from inside the api task (ADR-0026 records that the api image holds no CLI, so
+the runbook has to say how the CLI reaches the task).
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8B; follows M8D5 in the owner's order (M8B, M8D1, M8D2, M8D3, M8D4, M8D5, M8C). **Needs its
-own owner decision before any work starts:** the bind, `/internal` and the handler
-gate are trust-boundary decisions, and the infrastructure costs money.
+**Depends on.** M8C1. **Needs its own handoff before any work starts**, and the
+infrastructure costs money if applied.
 **Status:** planned.
 
-**Open product decision, not part of M8C's deliverables: the shipped default
+**Open product decision, not part of M8C1's or M8C2's deliverables: the shipped default
 timings.** The M8A benchmark missed the dispatch-latency and worker-failure-recovery
 targets on the shipped defaults (`TASKFORGE_OUTBOX_POLL_INTERVAL=1s`,
 `TASKFORGE_LEASE_DURATION=30s`) and met all five on a tuned, labelled profile

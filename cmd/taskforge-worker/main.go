@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/co-rtex/TaskForge/internal/config"
+	"github.com/co-rtex/TaskForge/internal/healthcheck"
 	"github.com/co-rtex/TaskForge/internal/metrics"
 	"github.com/co-rtex/TaskForge/internal/objectstore"
 	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
@@ -25,7 +26,23 @@ import (
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
-func main() { os.Exit(run()) }
+func main() {
+	if healthcheck.Requested(os.Args) {
+		os.Exit(runHealthcheck())
+	}
+	os.Exit(run())
+}
+
+// runHealthcheck is `taskforge-worker healthcheck`: it GETs this process's own
+// loopback /healthz (TASKFORGE_WORKER_ADDR) and exits 0 or 1, for a container
+// health check in an image with no shell. See internal/healthcheck.
+func runHealthcheck() int {
+	if err := config.LoadDotEnv(".env"); err != nil {
+		return healthcheck.Run(context.Background(), "taskforge-worker", "", err, os.Stdout, os.Stderr)
+	}
+	cfg, err := config.LoadWorker()
+	return healthcheck.Run(context.Background(), "taskforge-worker", cfg.HealthAddr, err, os.Stdout, os.Stderr)
+}
 
 func run() int {
 	if err := config.LoadDotEnv(".env"); err != nil {

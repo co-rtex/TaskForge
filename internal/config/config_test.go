@@ -556,3 +556,195 @@ func TestValidate_AgreesWithTheRetryPolicyItBuilds(t *testing.T) {
 		})
 	}
 }
+
+// --- M8C1: listeners by surface (docs/adr/0026-listeners-by-surface.md) -------
+
+// TestListeners_DefaultsOpenOnlyTheAdminListener proves the two new listeners
+// are off unless asked for: with every new variable unset there is one
+// listener, on the loopback address it always had, and no allowlist.
+func TestListeners_DefaultsOpenOnlyTheAdminListener(t *testing.T) {
+	c, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, "127.0.0.1:8080", c.APIAddr)
+	require.Empty(t, c.APIPublicAddr)
+	require.Empty(t, c.APIControlAddr)
+	require.Empty(t, c.APIControlHosts)
+}
+
+// TestListeners_AcceptTheTopologyTheyExistFor proves the deployable
+// configuration loads: an admin listener on loopback, public and control on
+// any address, and the allowlist read and canonicalized from its variable.
+func TestListeners_AcceptTheTopologyTheyExistFor(t *testing.T) {
+	t.Setenv("TASKFORGE_API_ADDR", "127.0.0.1:8080")
+	t.Setenv("TASKFORGE_API_PUBLIC_ADDR", "0.0.0.0:8090")
+	t.Setenv("TASKFORGE_API_CONTROL_ADDR", "0.0.0.0:8091")
+	t.Setenv("TASKFORGE_API_CONTROL_HOSTS", " api , API., taskforge-control.internal,10.0.4.9,[2001:db8::9]")
+
+	c, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, "0.0.0.0:8090", c.APIPublicAddr)
+	require.Equal(t, "0.0.0.0:8091", c.APIControlAddr)
+	list, err := c.ControlHostAllowlist()
+	require.NoError(t, err)
+	require.Equal(t, []string{"api", "taskforge-control.internal", "10.0.4.9", "2001:db8::9"}, list.Names())
+
+	for name, mutate := range map[string]func(*Config){
+		"public alone":                  func(c *Config) { c.APIControlAddr, c.APIControlHosts = "", nil },
+		"control alone":                 func(c *Config) { c.APIPublicAddr = "" },
+		"an IPv6 wildcard":              func(c *Config) { c.APIPublicAddr = "[::]:8090" },
+		"a specific interface":          func(c *Config) { c.APIControlAddr = "10.0.4.9:8091" },
+		"loopback for the network ones": func(c *Config) { c.APIPublicAddr, c.APIControlAddr = "127.0.0.1:8090", "127.0.0.1:8091" },
+		// Port 0 is a kernel-chosen port, so two of them never contend.
+		"two kernel-chosen ports": func(c *Config) { c.APIPublicAddr, c.APIControlAddr = "0.0.0.0:0", "0.0.0.0:0" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := c
+			mutate(&changed)
+			require.NoError(t, changed.Validate())
+		})
+	}
+}
+
+// TestListeners_RefuseEachInvalidCombination proves every refusal in scope:
+// the admin listener off loopback (unchanged), a control listener with no
+// allowlist, an allowlist with no control listener, an entry that is not a
+// hostname or an address, a listener address that does not parse, and any two
+// listeners on one address.
+func TestListeners_RefuseEachInvalidCombination(t *testing.T) {
+	valid := baseConfig()
+	valid.APIPublicAddr = "0.0.0.0:8090"
+	valid.APIControlAddr = "0.0.0.0:8091"
+	valid.APIControlHosts = []string{"api"}
+	require.NoError(t, valid.Validate())
+
+	for name, tc := range map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"admin on a wildcard": {func(c *Config) { c.APIAddr = "0.0.0.0:8080" },
+			"TASKFORGE_API_ADDR must bind to a loopback address: it is the admin listener"},
+		"admin on a network interface": {func(c *Config) { c.APIAddr = "10.0.4.9:8080" },
+			"TASKFORGE_API_ADDR must bind to a loopback address"},
+		"control with no allowlist": {func(c *Config) { c.APIControlHosts = nil },
+			"TASKFORGE_API_CONTROL_HOSTS must list the host names workers dial"},
+		"control with an allowlist of one empty entry": {func(c *Config) { c.APIControlHosts = []string{""} },
+			"an entry is empty"},
+		"an allowlist without control": {func(c *Config) { c.APIControlAddr = "" },
+			"TASKFORGE_API_CONTROL_HOSTS is set but TASKFORGE_API_CONTROL_ADDR is not"},
+		"an entry with a port": {func(c *Config) { c.APIControlHosts = []string{"api:8091"} },
+			"TASKFORGE_API_CONTROL_HOSTS must hold only hostnames or IP addresses"},
+		"a wildcard entry": {func(c *Config) { c.APIControlHosts = []string{"*.internal"} },
+			"TASKFORGE_API_CONTROL_HOSTS must hold only hostnames or IP addresses"},
+		"a URL entry": {func(c *Config) { c.APIControlHosts = []string{"api", "http://api"} },
+			"TASKFORGE_API_CONTROL_HOSTS must hold only hostnames or IP addresses"},
+		"an empty entry between commas": {func(c *Config) { c.APIControlHosts = []string{"api", "", "worker"} },
+			"an entry is empty"},
+		"a public address with no port": {func(c *Config) { c.APIPublicAddr = "0.0.0.0" },
+			"TASKFORGE_API_PUBLIC_ADDR must be a host:port listen address"},
+		"a control address with a bad port": {func(c *Config) { c.APIControlAddr = "0.0.0.0:http" },
+			"TASKFORGE_API_CONTROL_ADDR must be a host:port listen address"},
+		"public and control on one address": {func(c *Config) { c.APIControlAddr = "0.0.0.0:8090" },
+			"TASKFORGE_API_PUBLIC_ADDR and TASKFORGE_API_CONTROL_ADDR must not share an address"},
+		"public on the admin address": {func(c *Config) { c.APIPublicAddr = "127.0.0.1:8080" },
+			"TASKFORGE_API_ADDR and TASKFORGE_API_PUBLIC_ADDR must not share an address"},
+		"a wildcard over the admin port": {func(c *Config) { c.APIPublicAddr = "0.0.0.0:8080" },
+			"TASKFORGE_API_ADDR and TASKFORGE_API_PUBLIC_ADDR must not share an address"},
+		"an IPv6 wildcard over the control port": {func(c *Config) { c.APIPublicAddr = "[::]:8091" },
+			"TASKFORGE_API_PUBLIC_ADDR and TASKFORGE_API_CONTROL_ADDR must not share an address"},
+		"control on the admin address spelled differently": {func(c *Config) {
+			c.APIAddr = "[::1]:8080"
+			c.APIControlAddr = "[0:0:0:0:0:0:0:1]:8080"
+		}, "TASKFORGE_API_ADDR and TASKFORGE_API_CONTROL_ADDR must not share an address"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := valid
+			c.APIControlHosts = append([]string(nil), valid.APIControlHosts...)
+			tc.mutate(&c)
+			err := c.Validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// TestListeners_EmptyAllowlistVariableIsNoList proves a blank
+// TASKFORGE_API_CONTROL_HOSTS is read as no list, so it is refused beside a
+// control address rather than parsed into one empty entry that happens to be
+// refused for a different reason.
+func TestListeners_EmptyAllowlistVariableIsNoList(t *testing.T) {
+	t.Setenv("TASKFORGE_API_CONTROL_ADDR", "0.0.0.0:8091")
+	t.Setenv("TASKFORGE_API_CONTROL_HOSTS", "   ")
+	_, err := Load()
+	require.ErrorContains(t, err, "TASKFORGE_API_CONTROL_HOSTS must list the host names workers dial")
+
+	t.Setenv("TASKFORGE_API_CONTROL_HOSTS", "api,")
+	_, err = Load()
+	require.ErrorContains(t, err, "an entry is empty")
+}
+
+// TestListeners_BackgroundBindMessagesAreUnchanged proves the reword touched
+// only the admin listener: the outbox, reconciler and scheduler are still
+// loopback "until authentication is implemented", which is still true of them.
+func TestListeners_BackgroundBindMessagesAreUnchanged(t *testing.T) {
+	c := baseConfig()
+	c.OutboxAddr = "0.0.0.0:8081"
+	c.ReconcilerAddr = "0.0.0.0:8083"
+	c.SchedulerAddr = "0.0.0.0:8084"
+	err := c.Validate()
+	require.Error(t, err)
+	for _, name := range []string{"TASKFORGE_OUTBOX_ADDR", "TASKFORGE_RECONCILER_ADDR", "TASKFORGE_SCHEDULER_ADDR"} {
+		require.Contains(t, err.Error(), name+" must bind to a loopback address until authentication is implemented")
+	}
+}
+
+// TestWorker_RemoteAPIURLNeedsTheOptIn is Q5: a non-loopback
+// TASKFORGE_WORKER_API_URL is refused with the message it always had, and
+// accepted only with TASKFORGE_WORKER_ALLOW_REMOTE_API=true. The opt-in widens
+// nothing else: the worker's own health address stays loopback.
+func TestWorker_RemoteAPIURLNeedsTheOptIn(t *testing.T) {
+	setTestWorkerAPIKey(t)
+	t.Setenv("TASKFORGE_WORKER_API_URL", "http://api:8091")
+
+	t.Run("without the opt-in", func(t *testing.T) {
+		_, err := LoadWorker()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "TASKFORGE_WORKER_API_URL must use a loopback host")
+	})
+	t.Run("with the opt-in false", func(t *testing.T) {
+		t.Setenv("TASKFORGE_WORKER_ALLOW_REMOTE_API", "false")
+		_, err := LoadWorker()
+		require.ErrorContains(t, err, "TASKFORGE_WORKER_API_URL must use a loopback host")
+	})
+	t.Run("with the opt-in", func(t *testing.T) {
+		t.Setenv("TASKFORGE_WORKER_ALLOW_REMOTE_API", "true")
+		c, err := LoadWorker()
+		require.NoError(t, err)
+		require.True(t, c.AllowRemoteAPI)
+		require.Equal(t, "http://api:8091", c.APIBaseURL)
+	})
+	t.Run("the opt-in does not open the worker's own health address", func(t *testing.T) {
+		t.Setenv("TASKFORGE_WORKER_ALLOW_REMOTE_API", "true")
+		t.Setenv("TASKFORGE_WORKER_ADDR", "0.0.0.0:8082")
+		_, err := LoadWorker()
+		require.ErrorContains(t, err, "TASKFORGE_WORKER_ADDR must bind to a loopback address")
+	})
+	t.Run("the opt-in does not accept a URL that is not one", func(t *testing.T) {
+		t.Setenv("TASKFORGE_WORKER_ALLOW_REMOTE_API", "true")
+		t.Setenv("TASKFORGE_WORKER_API_URL", "api:8091")
+		_, err := LoadWorker()
+		require.ErrorContains(t, err, "TASKFORGE_WORKER_API_URL must be an absolute http(s) URL")
+	})
+	t.Run("a value that is not a boolean is refused, not read as no", func(t *testing.T) {
+		t.Setenv("TASKFORGE_WORKER_ALLOW_REMOTE_API", "yes please")
+		_, err := LoadWorker()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "TASKFORGE_WORKER_ALLOW_REMOTE_API must be true or false")
+		require.Contains(t, err.Error(), "TASKFORGE_WORKER_API_URL must use a loopback host")
+	})
+	t.Run("a loopback URL needs no opt-in, as before", func(t *testing.T) {
+		t.Setenv("TASKFORGE_WORKER_API_URL", "http://127.0.0.1:8080")
+		c, err := LoadWorker()
+		require.NoError(t, err)
+		require.False(t, c.AllowRemoteAPI)
+	})
+}

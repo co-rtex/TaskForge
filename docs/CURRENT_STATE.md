@@ -1,7 +1,7 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8D5, including the Go 1.27.2
+planned. It records the implemented state through M8C1, including the Go 1.27.2
 toolchain bump that came between M8D3 and M8D4. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
@@ -12,8 +12,9 @@ the measured benchmarks, M8B, the supply chain (container images and scanning), 
 the route registry, M8D2, the verification-matrix drift check with the bench-smoke
 flake and three items from the M8A review, M8D3, the investigation of the 50.04 s
 recovery outlier, M8D4, killed attempts that end `TIMED_OUT`, M8D5, a lease that lapsed
-before the deadline is an abandonment, and M8C, deployment, in the order M8B, M8D1, M8D2,
-M8D3, M8D4, M8D5, M8C; M8A, M8B, M8D1, M8D2, M8D3, M8D4 and M8D5 are complete and M8C is
+before the deadline is an abandonment, M8C1, listeners by surface, and M8C2, deployment
+(Terraform, validated and not applied), in the order M8B, M8D1, M8D2, M8D3, M8D4, M8D5,
+M8C1, M8C2; M8A, M8B, M8D1, M8D2, M8D3, M8D4, M8D5 and M8C1 are complete and M8C2 is
 planned.
 
 ## Milestone status
@@ -95,10 +96,18 @@ planned.
   the time the reconciler reaches it; the tie is a timeout
   ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). One
   predicate changed; the report paths, the API and the records did not. See "M8D5" below.
-  M8C (deployment) is planned.
+- **M8C1 — listeners by surface:** complete; see PR #29. `taskforge-api` can serve `/v1`
+  (public listener) and the worker-control routes (control listener) on network addresses
+  while key administration, the dashboard and `/metrics` stay on its loopback admin
+  listener, decided per route in the one table and checked at startup; the control
+  listener's Host rule is an exact-match allowlist; a worker opts in to a remote API; every
+  long-running binary has a `healthcheck` subcommand; and `make topology-smoke` runs the api
+  and worker as separate containers, 7 of 7 rows passing
+  ([ADR-0026](adr/0026-listeners-by-surface.md)). Defaults are byte-identical. See "M8C1"
+  below. M8C2 (the Terraform) is planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
-M7 into two, and M8 into eight, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
+M7 into two, and M8 into nine, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
@@ -115,6 +124,10 @@ that are run from source and are not among the seven:
 
 - `scripts/imagesmoke` is the program behind `make images-smoke`. It inspects and
   runs the six service images. See "M8B" below.
+
+- `scripts/topologysmoke` is the program behind `make topology-smoke`. It runs the api,
+  outbox and worker images as separate containers with the api's public and control
+  listeners on a Docker network, and a probe container beside them. See "M8C1" below.
 
 - `scripts/bench` is the program behind `make bench` and `make bench-smoke`. It
   starts the same stack `scripts/demo` does, offers load over HTTP, kills workers
@@ -159,8 +172,12 @@ that are run from source and are not among the seven:
   those credentials. `taskforge-api` never depends on the result object store
   being reachable at boot; only a request that needs an object-located result
   does. Every `/internal/v1` route also refuses a request that carries
-  `Sec-Fetch-Site` or `Origin`, or is addressed to a non-loopback `Host`, with
-  `403` `origin_refused` — see "M6E" below; that is not authentication. It also
+  `Sec-Fetch-Site` or `Origin`, or is addressed to a `Host` its listener does not
+  accept (loopback on the admin listener, `TASKFORGE_API_CONTROL_HOSTS` on the control
+  listener), with `403` `origin_refused` — see "M6E" and "M8C1" below; that is not
+  authentication. It has up to three listeners: the loopback admin listener, which
+  serves everything, and the optional public (`/v1`, probes) and control
+  (worker-control, probes) listeners on any address — see "M8C1" below. It also
   serves the read-only operator dashboard, compiled into the
   binary, same-origin under `/dashboard/` — see "M6D — operator dashboard"
   below. A binary built before `make dash-build` serves a page saying the
@@ -4488,6 +4505,226 @@ lease lapsed strictly before a deadline that is due when the reconciler arrives 
 during a rolling deploy each attempt gets exactly one outcome, under whichever version won
 the lock.
 
+## M8C1 — listeners by surface
+
+M8C1 follows M8D5 in the owner's order ([ROADMAP.md](ROADMAP.md)). The owner split M8C
+into M8C1 (this: make the binaries deployable as separate services) and M8C2 (the
+Terraform), and decided its questions on 2026-10-14. The decisions, their alternatives and
+their limitations are in [ADR-0026](adr/0026-listeners-by-surface.md), which amends
+ADR-0018's rule 3.
+
+**What changed:** `internal/config` (three API variables, the worker's opt-in, the bind
+messages); a new `internal/hostallow` (the one exact-match allowlist parser); the route
+table's listener column, one mux per listener and a startup check (`internal/api/routes.go`,
+`server.go`); the guard's per-listener rule 3 (`internal/api/origin_guard.go`); one
+`http.Server` per listener in `cmd/taskforge-api` (`listeners.go`); a `healthcheck`
+subcommand on the five long-running binaries, through a new `internal/healthcheck`;
+`scripts/topologysmoke` and `make topology-smoke`; one step in CI's `images` job; unit and
+integration tests; ADR-0026, ADR-0018's status, the ADR index, `docs/ARCHITECTURE.md`,
+`docs/ROADMAP.md`, `AGENTS.md`, `.env.example` and this file. No migration, no change under
+`api/` (the OpenAPI document), `migrations/`, `docs/benchmarks/` or
+`internal/api/testdata/`; the route-behavior golden is byte-identical and was not
+regenerated. The outbox, reconciler and scheduler bind rules, the demonstration handlers,
+`/v1` authentication and ADR-0013/0014 are unchanged.
+
+### Behavior
+
+**Three listeners.** `TASKFORGE_API_ADDR` is the admin listener: required, loopback only,
+and it serves every route it served before. `TASKFORGE_API_PUBLIC_ADDR` (optional, any
+address) serves the `/v1` routes and the probes. `TASKFORGE_API_CONTROL_ADDR` (optional,
+any address) serves the eight worker-control routes and the probes, and requires
+`TASKFORGE_API_CONTROL_HOSTS`. With both optional addresses unset exactly one listener
+opens (`TestPlanListeners_DefaultsOpenExactlyOne`) and the golden is unchanged. Each
+listener's exact route set, as `TestListeners_EachServesExactlyItsRoutes` pins it against
+literal lists:
+
+- **admin (30 patterns):** `GET /{$}`, `GET /dashboard/`, `GET /healthz`, `GET /readyz`,
+  `GET /metrics`, the eleven `/v1` routes, the three API-key and three worker-key
+  administration routes, and the eight worker-control routes.
+- **public (13):** `GET /healthz`, `GET /readyz`, `GET /v1/dlq`, `GET /v1/jobs`,
+  `GET /v1/jobs/{job_id}`, `GET /v1/jobs/{job_id}/attempts`, `GET /v1/jobs/{job_id}/result`,
+  `GET /v1/queues`, `GET /v1/workers`, `POST /v1/dlq/{job_id}/replay`, `POST /v1/jobs`,
+  `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry`.
+- **control (10):** `GET /healthz`, `GET /readyz`,
+  `PUT /internal/v1/worker-sessions/{worker_session_id}`,
+  `POST /internal/v1/worker-sessions/{worker_session_id}/heartbeat`,
+  `POST /internal/v1/claims`, `POST /internal/v1/leases/{lease_id}/renew`, and
+  `POST /internal/v1/attempts/{attempt_id}/start|succeed|fail|cancel`.
+
+Every other path answers the catch-all's `404 not_found` on a listener that does not
+serve it, and each listener's `405` fallbacks are derived from its own routes
+(`TestListeners_FallbacksFollowTheirRoutes`).
+
+**The startup check.** `checkListenerPlacement` refuses a table that puts a `groupKeys`,
+`groupWorkerKeys`, `groupDashboard` or `groupMetrics` route, or a route whose path is the
+dashboard's, `/metrics` or a key-administration path, on a network listener; an
+`/internal/` path on public; or a `/v1/` path on control. It runs on the whole table when
+any listener is built, the admin one included, and the server panics at startup on a
+breach (`TestListeners_HandlerRefusesAForbiddenPlacement`).
+
+**Configuration refusals** (`internal/config`): a control address with no or an empty
+allowlist; an allowlist without a control address; an entry that is not a hostname or an
+IP address (a port, a scheme, a wildcard, an underscore, an empty entry); an address that
+is not `host:port`; any two listeners on one address (the same port with the same host, or
+a wildcard host on either side); and an admin address off loopback, unchanged, now worded
+`TASKFORGE_API_ADDR must bind to a loopback address: it is the admin listener, which
+serves key administration, the dashboard and /metrics; only TASKFORGE_API_PUBLIC_ADDR and
+TASKFORGE_API_CONTROL_ADDR may bind to a network address`. The outbox, reconciler and
+scheduler keep "until authentication is implemented".
+
+**The control listener's guard.** Rules 1 and 2 (`Sec-Fetch-Site`, then `Origin`) run first,
+unchanged; rule 3 checks the `Host` against the allowlist: exact, case-insensitive, one
+trailing dot normalized, port optional, IPv6 brackets handled, fail closed on a Host that
+does not parse. Loopback is refused on control unless listed. The refusal is the same
+`403 origin_refused` with the same fixed message as on admin. The admin listener's guard is
+unchanged; every ADR-0018 test passes unmodified.
+
+**The worker.** A non-loopback `TASKFORGE_WORKER_API_URL` is accepted only with
+`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`; without it, the message is unchanged. A
+non-boolean value is refused.
+
+**`healthcheck`.** `taskforge-api healthcheck` (and `-outbox`, `-scheduler`,
+`-reconciler`, `-worker`) GETs its own loopback `/healthz` and exits 0 for a `200`, 1
+otherwise. All four background binaries already served `/healthz` on their loopback health
+address, so nothing was added for them; the api's targets the admin listener.
+
+**The process.** `taskforge-api` binds every configured listener before serving on any; a
+bind failure closes the ones already bound and exits 1 naming the listener and address
+(`TestServeAll_OneListenerFailingToBindStopsThemAll`); a listener that stops takes the
+others down; shutdown drains all of them concurrently within the existing 15 s grace
+(`TestServeAll_ShutdownDrainsEveryListener`). Its startup log is now one `api starting`
+line (listener count, request limit, dashboard state) and one `api listening` line per
+listener, where it was one `api listening` line.
+
+### Evidence: `make topology-smoke`
+
+The api, outbox and worker images as separate containers on a Docker network of the smoke's
+own, joined to the compose network for PostgreSQL, ElasticMQ and the object store. The api
+runs with `TASKFORGE_API_PUBLIC_ADDR=0.0.0.0:8090`, `TASKFORGE_API_CONTROL_ADDR=0.0.0.0:8091`,
+`TASKFORGE_API_CONTROL_HOSTS=api` and its admin listener on `127.0.0.1:8080` inside its
+container; the worker with `TASKFORGE_WORKER_API_URL=http://api:8091` and
+`TASKFORGE_WORKER_ALLOW_REMOTE_API=true`. The keys are minted the way M8C2's runbook will
+mint them: a linux build of `taskforge-cli` is copied into the running api container with
+`docker cp` (the image holds no CLI) and run there with `docker exec` against
+`http://127.0.0.1:8080`. A probe container on the same network checks rows 1–6; row 7 is
+checked by `docker exec` and `docker run` from the host. The run on the final head
+(`make topology-smoke`, on AC, 2026-10-15 02:46:57–02:47:07 UTC, after the probe was changed to name each request by listener and path rather than by URL, because gitleaks' `generic-api-key` rule matched a quoted URL; the service images were rebuilt from cache, their binaries unchanged since `c34426f`):
+
+```
+topology-smoke: docker engine linux/arm64, compose network taskforge_default, pid 69031
+topology-smoke: migrated taskforge_topology_69031 with taskforge-migrate:dev
+topology-smoke: started taskforge-topology-api-69031
+topology-smoke: minted an API key and a worker key with taskforge-cli inside taskforge-topology-api-69031, against http://127.0.0.1:8080
+topology-smoke: started taskforge-topology-outbox-69031
+topology-smoke: started taskforge-topology-worker-69031
+=== topology-smoke: checks ===
+  PASS  row 1  the worker registered through control:8091  GET public:8090/v1/workers lists topology-worker HEALTHY, id fd9a65c5-cafc-4f20-ad62-c0c03174a5f5
+  PASS  row 1  a job submitted through public:8090 reaches SUCCEEDED  job cf66a91d-1335-4ea2-8c56-33c9b7b30b05 SUCCEEDED in one attempt by topology-worker
+  PASS  row 2  key administration is not served  GET public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST public:8090 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET control:8091 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/api-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 2  key administration is not served  GET control:8091 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 2  key administration is not served  POST control:8091 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /dashboard/ -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /dashboard/index.html -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 /metrics -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET public:8090 / -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /dashboard/ -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /dashboard/index.html -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 /metrics -> 404 not_found
+  PASS  row 3  the dashboard and /metrics are not served  GET control:8091 / -> 404 not_found
+  PASS  row 4  control:8091 admits the allowlisted Host  Host api -> 422 validation_failed (past the guard)
+  PASS  row 4  control:8091 refuses a Host off the allowlist  403 origin_refused
+  PASS  row 4  control:8091 refuses a loopback Host, which is not on the allowlist  403 origin_refused
+  PASS  row 4  control:8091 refuses a near-miss Host  403 origin_refused
+  PASS  row 4  control:8091 refuses the allowlisted Host with Origin  403 origin_refused
+  PASS  row 4  control:8091 refuses the allowlisted Host with Sec-Fetch-Site  403 origin_refused
+  PASS  row 5  public:8090 serves /v1 (the positive control)  GET public:8090 /v1/jobs -> 200
+  PASS  row 5  public:8090 serves no /internal route  PUT public:8090 /internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111 -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-sessions/11111111-1111-4111-8111-111111111111/heartbeat -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/claims -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/leases/11111111-1111-4111-8111-111111111111/renew -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/start -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/succeed -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/fail -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/attempts/11111111-1111-4111-8111-111111111111/cancel -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  GET public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/api-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/api-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  GET public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-keys -> 404 not_found
+  PASS  row 5  public:8090 serves no /internal route  POST public:8090 /internal/v1/worker-keys/11111111-1111-4111-8111-111111111111/revoke -> 404 not_found
+  PASS  row 5  control:8091 serves no /v1 route  GET control:8091 /v1/jobs -> 404 not_found
+  PASS  row 6  the probe can reach the api container (the positive control)  TCP connect to api:8090 succeeded
+  PASS  row 6  the admin listener cannot be reached from another container  TCP connect to api:8080 failed: dial tcp 172.19.0.2:8080: connect: connection refused
+  PASS  row 6  no key listing is served on the admin port  GET failed: Get "http://api:8080/internal/v1/api-keys": dial tcp 172.19.0.2:8080: connect: connection refused
+  PASS  row 7  `healthcheck` exits 0 in the running api container  exit 0: taskforge-api healthcheck: healthy (127.0.0.1:8080/healthz answered 200)
+  PASS  row 7  `healthcheck` exits 0 in the running worker container  exit 0: taskforge-worker healthcheck: healthy (127.0.0.1:8082/healthz answered 200)
+  PASS  row 7  `healthcheck` exits 0 in the running outbox container  exit 0: taskforge-outbox healthcheck: healthy (127.0.0.1:8081/healthz answered 200)
+  PASS  row 7  `healthcheck` exits 1 in a api container whose probe is down  exit 1: taskforge-api healthcheck: unhealthy: GET http://127.0.0.1:8080/healthz: Get "http://127.0.0.1:8080/healthz": dial tcp 127.0.0.1:8080: conne...
+  PASS  row 7  `healthcheck` exits 1 in a worker container whose probe is down  exit 1: taskforge-worker healthcheck: unhealthy: GET http://127.0.0.1:8082/healthz: Get "http://127.0.0.1:8082/healthz": dial tcp 127.0.0.1:8082: co...
+=== topology-smoke: rows ===
+  PASS  row 1  the worker registers, and a job submitted through public:8090 with an API key reaches SUCCEEDED  (2 checks)
+  PASS  row 2  /internal/v1/api-keys and /internal/v1/worker-keys are 404 on 8090 and 8091  (12 checks)
+  PASS  row 3  /dashboard/ and /metrics are 404 on 8090 and 8091  (8 checks)
+  PASS  row 4  control:8091 answers 403 origin_refused to a Host off the allowlist, and to the allowlisted Host with Origin or Sec-Fetch-Site  (6 checks)
+  PASS  row 5  public:8090 serves no /internal route (and control:8091 no /v1 route)  (16 checks)
+  PASS  row 6  the admin listener cannot be reached from the probe container  (3 checks)
+  PASS  row 7  `healthcheck` exits 0 against a healthy container and 1 when its probe is down  (5 checks)
+=== RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met) ===
+topology-smoke: dropped database taskforge_topology_69031
+```
+
+Nothing is left behind: no `taskforge-topology-*` container or network, no
+`taskforge_topology_*` database and no topology queue after the run.
+
+### Mutations
+
+Each was applied alone, its failing output recorded, and reverted, with `git status --short
+internal` empty afterwards. The diffs, the outputs and the smoke logs are in the pull
+request description.
+
+| | Mutation | Fixture that makes it behave differently | Fails |
+| --- | --- | --- | --- |
+| M1 | the two `/internal/v1/api-keys` entries on `adminAndControl` | the real table (`routeTableOf`), and the smoke's api container | `TestListeners_EachServesExactlyItsRoutes` panics with `route "POST /internal/v1/api-keys" (group keys) is on the admin+control listener; key administration, the dashboard and /metrics are served on the admin listener only`; the smoke: the api container panics with that message at startup and exits, so the topology never comes up and all seven rows fail (`0 of 7 rows passed`), row 2 among them. With the startup check also disabled (M1b, to show row 2 is not vacuous), the api starts and row 2 alone fails: `GET http://api:8091/internal/v1/api-keys answered 200 "", want 404 "not_found"` and `POST ... answered 400 "malformed_json"` (`6 of 7 rows passed; 2 of 52 checks failed`) |
+| M2 | control's rule 3 is `hostIsLoopback` | Host `api`, `api:8091`, `API`, `api.` (accepted cases) and `127.0.0.1`, `localhost` (refused cases) | `TestControlGuard_AcceptsTheAllowlistedHostInEveryForm` (5 of 5), `TestControlGuard_RefusesEveryHostOffTheAllowlist` (the loopback cases), `TestListeners_FallbacksFollowTheirRoutes`; the smoke: row 1 (`no HEALTHY worker named topology-worker in GET /v1/workers within 90s`: the worker's registration with Host `api:8091` is refused and it exits), row 4 (`Host api answered 403 "origin_refused"`; `a loopback Host ... answered 422 "validation_failed"`) and row 7 (the worker container has exited) |
+| M3 | `Allows` matches by `strings.HasSuffix`, then by `strings.HasPrefix` | `xapi`, `evil.api` (suffix); `api.evil`, `api.example`, `apix` (prefix) | suffix: `TestControlGuard_RefusesEveryHostOffTheAllowlist/"xapi"`, `/"xapi:8091"`, `/"evil.api"`, `TestAllows_IsAnExactMatch`; prefix: `.../"api.evil"`, `/"api.evil:8091"`, `/"api.example"`, `/"apix"`, `TestAllows_IsAnExactMatch` |
+| M4 | the empty-allowlist refusal removed | `APIControlAddr` set, `APIControlHosts` nil; `TASKFORGE_API_CONTROL_HOSTS="   "` | `TestListeners_RefuseEachInvalidCombination/control_with_no_allowlist`, `TestListeners_EmptyAllowlistVariableIsNoList` |
+| M5 | the worker's loopback check never fires | `TASKFORGE_WORKER_API_URL=http://api:8091` without the opt-in | `TestWorker_RemoteAPIURLNeedsTheOptIn/without_the_opt-in`, `/with_the_opt-in_false`, `/a_value_that_is_not_a_boolean_...` |
+
+A pure suffix match (M3 as literally worded) admits `xapi` but not `api.evil`; the
+`api.evil` case needs the prefix variant, so both were run.
+
+### Limitations
+
+- **The session id is a bearer token in plaintext inside the network**, and the worker key
+  crosses it once per registration. TLS on the control listener and a per-call worker
+  credential are the named follow-ups (ADR-0026).
+- **The refusal message on the control listener still says "addressed to a loopback
+  host"**: `api/openapi.yaml` documents one fixed message, and the contract was not changed.
+- **The api image holds no CLI.** The smoke copies one in; M8C2's ECS Exec runbook has to
+  decide how the CLI reaches the task.
+- **The integration test binds a real non-loopback interface** (the first up, non-loopback,
+  non-link-local IPv4), for a few seconds, and fails rather than skips where there is none.
+- **A gitleaks false positive is pinned as a fixture.** Commit `a3646890` quoted a probe
+  line containing `http://api:8090/internal/v1/claims`, which gitleaks' `generic-api-key`
+  rule reads as a key (the keyword `api`, the separator `:`, then
+  `8090/internal/v1/claims`). It is a URL path, not a credential. History is permanent, so
+  `.gitleaks.toml` carries a FIXTURE entry for that literal in this file, and the probe now
+  prints passing requests by listener and path, which the rule does not match.
+- **The smoke builds the probe and the CLI with the host's Go for the engine's
+  architecture** and runs them in the Dockerfile's pinned builder image, so it pulls no
+  image the repository does not already pin.
+
+---
+
 ## Verification
 
 ### M5A gates
@@ -5069,6 +5306,35 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8C1 gates
+
+These gates ran locally on 2026-10-14 (US Central; 2026-10-15 UTC) under Go 1.27.2 (`go
+version` printed `go1.27.2 darwin/arm64`), the version `go.mod` names, against PostgreSQL
+16, ElasticMQ and the object store from `make up`. No other TaskForge process was running.
+The code and tests are as at `c34426f`, except the topology probe's output format (one
+later commit under `scripts/topologysmoke/probe`); every other later commit changes
+`docs/`, `AGENTS.md` and `.env.example` only. The timed gates ran on AC with the lid open and Low Power Mode off
+(`pmset -g batt`: `Now drawing from 'AC Power'`, recorded before each). Every Docker build
+and run used a throwaway `DOCKER_CONFIG` with no credential store, because Docker
+Desktop's credential helper hung on this machine (`docker-credential-desktop get` did not
+return); the global Docker configuration was not touched.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 30 packages `ok`, including `tests/verification` (the matrix drift check, unchanged) |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  93.844s` |
+| `make test-race` | PASS: 31 packages `ok` under `-race`; `ok  …/tests/integration  101.917s`; no `DATA RACE` |
+| `go test -count=10` over every `TestListeners_*`, `TestListenerPlacement_*`, `TestControlGuard_*`, `TestGuard_RulesOneAndTwo*`, `TestInternalGuard_*`, `TestRoutes_*` and `TestRouteBehavior_*` in `internal/api`, and every test in `internal/hostallow` | PASS: 330 of 330 top-level runs in `internal/api` (33 tests × 10) and 40 of 40 in `internal/hostallow`, 0 failures |
+| `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)`, 02:43:43–02:43:57 UTC |
+| `make bench-smoke` | PASS: `14 of 14 checks met`, 02:43:57–02:44:33 UTC |
+| `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, revision `c34426f`, 02:44:33–02:44:51 UTC |
+| `make topology-smoke` | PASS: `RESULT: PASS (7 of 7 rows passed; 52 of 52 checks met)`, 02:44:51–02:44:59 UTC, and again after the probe's output change, 02:46:57–02:47:07 UTC (the run quoted under "M8C1") |
+| `make scan` | run in a fresh full clone of the final head; the command and its result are in the pull request |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change |
 
 ### M8D5 gates
 
@@ -6124,6 +6390,11 @@ full history, sets up Go and Python 3.13, and runs `make scan`. Neither pushes
 anything or logs in to a registry, and every new action is pinned by commit SHA.
 `tests/verification/ci_supply_chain_test.go` holds those rules.
 
+M8C1 adds one step to the `images` job, after the image smoke: `go run
+./scripts/topologysmoke`, with the same `TASKFORGE_*` endpoints, which it uses only to
+create and drop its own database and broker queue; its containers reach the compose
+services over the compose network. No job was added.
+
 The failure path — diagnostic capture and artifact upload — has still not been
 exercised by a real hosted failure; the `images` job adds a diagnostics step of the
 same shape, equally unexercised.
@@ -6252,13 +6523,17 @@ two targets belong in its version.
 
 ## Next objective
 
-M8D5 is complete. The next milestone is M8C: deployment (see
-[ROADMAP.md](ROADMAP.md)'s M8C entry). M8C is not started. M8C **needs its own owner
-decisions before any work starts**: the non-loopback bind, which M6E's note says has to be
-revisited together with the Host rule; protection of `/internal`; and the decision
-ADR-0019 leaves, whether to gate the demonstration handlers in a deployed worker. M8C's
-infrastructure also costs money. Every M7 scenario can also be watched from the
-dashboard.
+M8C1 is complete. The next milestone is M8C2: the Terraform for ALB, ECS services, RDS,
+SQS, S3, secrets and logs, validated and not applied (see [ROADMAP.md](ROADMAP.md)'s M8C2
+entry). M8C2 is not started and **needs its own handoff before any work starts**; its
+infrastructure costs money if applied. It inherits from M8C1 the topology to describe
+(public listener behind the load balancer, control listener reachable from the workers
+only, `TASKFORGE_API_CONTROL_HOSTS` holding the exact name workers dial, the
+`healthcheck` subcommand as each container's health check) and one open question: how
+`taskforge-cli` reaches the api task for the first-key bootstrap, since the api image holds
+no CLI and ECS Exec into it finds nothing to run. TLS on the control listener and a
+per-call worker credential are ADR-0026's named follow-ups. Every M7 scenario can also be
+watched from the dashboard.
 
 Open, and not any milestone's deliverable: whether the shipped lease and outbox
 interval should change is a question the two M8A records answer only as numbers, not

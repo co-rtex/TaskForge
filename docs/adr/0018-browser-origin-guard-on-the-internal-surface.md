@@ -1,7 +1,11 @@
 # ADR-0018: Browser-origin guard on the internal surface
 
 - **Status:** Accepted, partially superseded by
-  [ADR-0022](0022-the-route-table-is-the-single-source-of-routes.md). Two sentences
+  [ADR-0022](0022-the-route-table-is-the-single-source-of-routes.md) and by
+  [ADR-0026](0026-listeners-by-surface.md). ADR-0026 replaces rule 3 and Q3 below: the
+  `Host` rule is per listener, loopback on the admin listener exactly as written here and
+  an exact-match allowlist (`TASKFORGE_API_CONTROL_HOSTS`) on the control listener; rules
+  1 and 2, their order and everything else stand. From ADR-0022: two sentences
   of its "Registration: per route, inside the mux" section are replaced: the ones
   saying fail-closed coverage comes from two tests, one of which reads `server.go`
   for `/internal` patterns registered around `handleInternal`. That test no longer
