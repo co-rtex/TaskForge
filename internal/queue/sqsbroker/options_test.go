@@ -63,7 +63,7 @@ func TestClient_AWSDefaultChainReachesTheClient(t *testing.T) {
 	t.Setenv("TASKFORGE_RESULTS_REGION", "eu-west-1")
 
 	o := clientFromEnvironment(t)
-	require.Nil(t, o.BaseEndpoint, "no endpoint override: the SDK resolves it from the region")
+	require.Nilf(t, o.BaseEndpoint, "no endpoint override: the SDK resolves it from the region; got %q", aws.ToString(o.BaseEndpoint))
 	require.Equal(t, "eu-west-1", o.Region)
 	require.NotNil(t, o.Credentials, "the SDK's default chain")
 	require.False(t, aws.IsCredentialsProvider(o.Credentials, credentials.StaticCredentialsProvider{}),
