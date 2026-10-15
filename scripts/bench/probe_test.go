@@ -237,7 +237,15 @@ var probeBase = time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
 
 func d(v time.Duration) *time.Duration { return &v }
 
-func TestPrecedenceIdentity_TimedOutExactlyWhenResolvedAtOrAfterTheDeadline(t *testing.T) {
+// renewedPast is o with its lease renewed once and expiring at the given offset
+// from probeBase: a lease that can outlive the deadline.
+func renewedPast(o readdb.KillOutcome, expires time.Duration) readdb.KillOutcome {
+	o.RenewalVersion = 1
+	o.LeaseExpiresAt = probeBase.Add(expires)
+	return o
+}
+
+func TestPrecedenceIdentity_TimedOutExactlyWhenResolvedAtOrAfterTheDeadlineAndTheLeaseOutlivedIt(t *testing.T) {
 	// A killed RUNNING attempt never renewed: expires at acquired + 30 s, deadline at
 	// started + 30 s, 12 ms later. A pass inside those 12 ms abandons it.
 	abandoned := outcome(readdb.HeldRunning, "ABANDONED", "QUEUED", "EXPIRED", 0, d(12*time.Millisecond), d(30012*time.Millisecond), d(30005*time.Millisecond), d(31*time.Second))
@@ -245,20 +253,52 @@ func TestPrecedenceIdentity_TimedOutExactlyWhenResolvedAtOrAfterTheDeadline(t *t
 	require.True(t, applies)
 	require.True(t, holds, "resolved 7 ms before the deadline: ABANDONED")
 
-	timedOut := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(12*time.Millisecond), d(30012*time.Millisecond), d(31*time.Second), d(34*time.Second))
+	// M8D5: a pass AFTER the deadline abandons it too, because the lease lapsed
+	// first (ADR-0025). The same instants recorded as TIMED_OUT, the old rule's
+	// outcome, fail the identity.
+	lapsedFirst := outcome(readdb.HeldRunning, "ABANDONED", "QUEUED", "EXPIRED", 0, d(12*time.Millisecond), d(30012*time.Millisecond), d(31*time.Second), d(31*time.Second))
+	applies, holds = precedenceIdentity(lapsedFirst)
+	require.True(t, applies)
+	require.True(t, holds, "lapsed 12 ms before a deadline resolved 988 ms late: ABANDONED")
+	oldRule := lapsedFirst
+	oldRule.Status, oldRule.JobStatus = "TIMED_OUT", "RETRY_WAIT"
+	_, holds = precedenceIdentity(oldRule)
+	require.False(t, holds, "TIMED_OUT for a lease that lapsed before the deadline is the rule M8D5 replaced")
+
+	// A lease renewed past the deadline, lapsed after it, resolved after both.
+	timedOut := renewedPast(outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(12*time.Millisecond), d(30012*time.Millisecond), d(31*time.Second), d(34*time.Second)), 30500*time.Millisecond)
 	applies, holds = precedenceIdentity(timedOut)
 	require.True(t, applies)
 	require.True(t, holds)
+	abandonedAnyway := timedOut
+	abandonedAnyway.Status = "ABANDONED"
+	_, holds = precedenceIdentity(abandonedAnyway)
+	require.False(t, holds, "ABANDONED for a lease that outlived a due deadline contradicts the precedence")
 
+	// The tie: expires_at == timeout_at is TIMED_OUT.
+	tie := timedOut
+	tie.LeaseExpiresAt = *tie.TimeoutAt
+	_, holds = precedenceIdentity(tie)
+	require.True(t, holds, "expires_at == timeout_at, resolved after: TIMED_OUT")
+	tieAbandoned := tie
+	tieAbandoned.Status = "ABANDONED"
+	_, holds = precedenceIdentity(tieAbandoned)
+	require.False(t, holds, "ABANDONED at the tie contradicts the precedence")
+	justBefore := tie
+	justBefore.LeaseExpiresAt = tie.TimeoutAt.Add(-time.Microsecond)
+	_, holds = precedenceIdentity(justBefore)
+	require.False(t, holds, "one microsecond before the deadline is an abandonment, not a timeout")
+
+	// The timeout sweep: resolved exactly at the deadline with the lease live.
 	exact := timedOut
+	exact.LeaseStatus = "RELEASED"
 	exact.LeaseReleasedAt = exact.TimeoutAt
 	_, holds = precedenceIdentity(exact)
 	require.True(t, holds, "resolved exactly at the deadline is due: TIMED_OUT")
-
-	wrong := abandoned
-	wrong.LeaseReleasedAt = wrong.TimeoutAt
+	wrong := exact
+	wrong.Status = "ABANDONED"
 	_, holds = precedenceIdentity(wrong)
-	require.False(t, holds, "ABANDONED at the deadline would contradict the precedence")
+	require.False(t, holds, "ABANDONED at the deadline with a live lease would contradict the precedence")
 
 	leased := outcome(readdb.HeldLeased, "ABANDONED", "QUEUED", "EXPIRED", 0, nil, nil, d(31*time.Second), d(32*time.Second))
 	_, holds = precedenceIdentity(leased)
@@ -295,7 +335,7 @@ func TestNoAbandoned_SplitsKillsThatAbandonedNothing(t *testing.T) {
 func TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart(t *testing.T) {
 	kill := probeBase.Add(time.Second)
 	abandoned := outcome(readdb.HeldLeased, "ABANDONED", "QUEUED", "EXPIRED", 0, nil, nil, d(31*time.Second), d(33*time.Second))
-	timedOut := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(20*time.Millisecond), d(30020*time.Millisecond), d(31*time.Second), d(35*time.Second))
+	timedOut := renewedPast(outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(20*time.Millisecond), d(30020*time.Millisecond), d(31*time.Second), d(35*time.Second)), 30500*time.Millisecond)
 	swept := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "RELEASED", 0, d(10*time.Millisecond), d(25010*time.Millisecond), d(26*time.Second), d(29*time.Second))
 	trials := []trialResult{
 		{worker: "w01", killedAt: kill, outcomes: []readdb.KillOutcome{abandoned, timedOut}},
@@ -323,7 +363,7 @@ func TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart(t *testing
 	text := out.String()
 	require.Contains(t, text, "trials run 3 (2 counted, 1 missed and run again); trials with a victim: 3; trials with >=1 attempt unfinished at the kill: 2")
 	require.Contains(t, text, "final, of 3: ABANDONED 1, DEAD_LETTERED_ON_ABANDON 0, TIMED_OUT 2, DEAD_LETTERED_ON_TIMEOUT 0, CANCELED 0, UNRESOLVED 0, OTHER 0")
-	require.Contains(t, text, "precedence identity (TIMED_OUT exactly when released_at >= timeout_at): held in 3 of 3")
+	require.Contains(t, text, "precedence identity (TIMED_OUT exactly when released_at >= timeout_at and expires_at >= timeout_at): held in 3 of 3")
 	require.Contains(t, text, "kill->replacement, ABANDONED (the recovery figure): 1; min 32000 ms, median 32000 ms, max 32000 ms")
 	require.Contains(t, text, "kill->replacement, TIMED_OUT (its own figure, not a recovery): 2; min 28000 ms")
 	require.Contains(t, text, "trials with no ABANDONED attempt: 2 of 3 with a victim (finished before the signal 1, TIMED_OUT 1, other 0); misses with no victim: 0")
@@ -356,7 +396,7 @@ func TestOutcomesSettled_WaitsForEveryHeldAttemptToBeReplacedOrFinished(t *testi
 
 func TestPrintOutcomes_NamesEachAttemptsPathAndFigures(t *testing.T) {
 	kill := probeBase.Add(2 * time.Second)
-	o := outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(15*time.Millisecond), d(30015*time.Millisecond), d(31*time.Second), d(35*time.Second))
+	o := renewedPast(outcome(readdb.HeldRunning, "TIMED_OUT", "RETRY_WAIT", "EXPIRED", 0, d(15*time.Millisecond), d(30015*time.Millisecond), d(31*time.Second), d(35*time.Second)), 30500*time.Millisecond)
 	code := "timeout"
 	o.ErrorCode = &code
 	retry := o.FinishedAt.Add(900 * time.Millisecond)
@@ -366,7 +406,7 @@ func TestPrintOutcomes_NamesEachAttemptsPathAndFigures(t *testing.T) {
 	text := out.String()
 	require.Contains(t, text, "held when dead 1, outcomes 1: agree\n")
 	require.Contains(t, text, "outcomes (timeout_seconds 30): victim chosen at PostgreSQL 12:00:01.996 UTC, 4 ms before the kill; 1 attempt(s) unfinished at the kill (LEASED 0, RUNNING 1, CREATED_AFTER_KILL 0); 0 finished between the choice and the kill")
-	require.Contains(t, text, "RUNNING at the kill -> TIMED_OUT (job now RETRY_WAIT); code timeout; lease EXPIRED, renewed 0x; claim->start 15 ms; timeout_at - expires_at 15 ms; resolved 1000 ms after expires_at by the expired-lease path; retry_at = finished + 900 ms; kill->replacement 33000 ms; precedence identity HOLDS")
+	require.Contains(t, text, "RUNNING at the kill -> TIMED_OUT (job now RETRY_WAIT); code timeout; lease EXPIRED, renewed 1x; claim->start 15 ms; timeout_at - expires_at -485 ms; resolved 500 ms after expires_at by the expired-lease path; retry_at = finished + 900 ms; kill->replacement 33000 ms; precedence identity HOLDS")
 
 	out.Reset()
 	printOutcomes(&out, trialResult{killedAt: kill, held: 2, outcomes: []readdb.KillOutcome{o}})

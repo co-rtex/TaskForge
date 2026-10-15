@@ -113,9 +113,11 @@ func (o KillOutcome) Outcome() string {
 
 // ClaimToStart is started_at minus the lease's acquired_at: how long the attempt
 // was LEASED before its Start committed. For an attempt never renewed it is also
-// timeout_at minus expires_at whenever timeout_seconds equals the lease, which is
-// the window in which a reconciler pass abandons it rather than times it out. The
-// second result is false for an attempt that never started.
+// timeout_at minus expires_at whenever timeout_seconds equals the lease. Before
+// M8D5 that was the window in which a reconciler pass abandoned it rather than
+// timed it out; since ADR-0025 a lease that lapsed that much before the deadline
+// is abandoned whenever the pass comes. The second result is false for an attempt
+// that never started.
 func (o KillOutcome) ClaimToStart() (time.Duration, bool) {
 	if o.StartedAt == nil {
 		return 0, false
@@ -135,7 +137,9 @@ func (o KillOutcome) ToReplacement(kill time.Time) (time.Duration, bool) {
 }
 
 // KillOutcomes returns every attempt of the killed session that was not finished
-// at the kill instant: not finished, or finished after it. An attempt the session
+// at the kill instant: not finished, or finished after it. It assumes the session
+// is dead from the kill on: a live session's later reports, renewals and claims
+// would be read as the kill's outcomes. An attempt the session
 // had already finished is not one the kill affected and is not returned; see
 // FinishedBetween for those.
 //

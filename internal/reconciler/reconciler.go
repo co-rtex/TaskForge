@@ -106,10 +106,13 @@ func (r Result) Changed() bool {
 //     this before the expired-lease scan means an attempt that timed out and
 //     whose lease has not yet lapsed is recorded as TIMED_OUT rather than
 //     waiting for the lease to expire first.
-//  3. Expired leases last, applying the same precedence internally for the case
-//     where a lease lapsed around a deadline that had already passed:
-//     CANCEL_REQUESTED finalizes cancellation, a due deadline finalizes a
-//     timeout, and only otherwise does ADR-0009's abandonment path run.
+//  3. Expired leases last, with a precedence of their own: CANCEL_REQUESTED
+//     finalizes cancellation; a due deadline finalizes a timeout only when the
+//     lease did not lapse before it (expires_at at or after timeout_at); and
+//     otherwise ADR-0009's abandonment path runs, including for a lease that
+//     lapsed strictly before a deadline that is due by now (ADR-0025). The
+//     verdict reads stored instants only, so it does not depend on how late
+//     this pass arrives.
 //
 // A session can stop heartbeating while its lease is still valid, and a lease
 // can expire while its session is perfectly healthy — the worker leaves a lease

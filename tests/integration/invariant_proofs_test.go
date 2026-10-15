@@ -115,8 +115,8 @@ func TestInvariant_TerminalJobsStayTerminalUnderEveryMutator(t *testing.T) {
 			    last_notification_at = clock_timestamp() - interval '2 hours'
 			WHERE id = $1`, fence.JobID)
 		require.NoError(t, err)
-		expireAttemptDeadline(t, fence.AttemptID)
-		expireLease(t, fence.LeaseID)
+		// Both past, from one reading; their order is moot for a terminal job's lease.
+		placeDeadlineAndExpiry(t, fence, -time.Minute, -time.Minute)
 		before[status] = durableSnapshot(t, fence.JobID)
 	}
 

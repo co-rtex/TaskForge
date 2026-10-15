@@ -222,17 +222,29 @@ func (s *Store) reconcileExpiredLease(ctx context.Context, leaseID uuid.UUID, st
 		return nil
 	}
 
-	// Precedence, and the order matters.
+	// Precedence, and the order matters (ADR-0010 item 2 as amended by ADR-0025).
 	//
 	// 1. CANCEL_REQUESTED first. Cancellation already won durably; the only thing
 	//    left is to finalize it, and calling that an abandonment would both lose
 	//    the operator's decision and wrongly consume attempt budget.
-	// 2. A due persisted deadline next. A lease that lapsed around a deadline
-	//    that had already passed is a TIMEOUT, not an abandonment. Getting this
-	//    wrong is not cosmetic: ABANDONED would requeue with no backoff and
-	//    record no failure detail, so a genuinely timing-out job would loop
-	//    through its whole budget at full speed.
-	// 3. Otherwise M3's abandonment path, unchanged (ADR-0009).
+	// 2. A TIMEOUT only when the deadline is due AND the lease did not lapse
+	//    before it: expires_at at or after timeout_at. That is a worker whose
+	//    authority outlived its budget, which a renewing worker shows by renewing
+	//    up to the deadline, and ABANDONED for it would requeue with no backoff and
+	//    no failure detail, so a genuinely timing-out job would loop through its
+	//    budget at full speed. The tie expires_at == timeout_at is a timeout.
+	// 3. Otherwise ADR-0009's abandonment path, unchanged, and that includes a
+	//    lease that lapsed STRICTLY before the deadline even when the deadline is
+	//    due by the time this pass reaches it. The worker lost authority while its
+	//    budget still had time left, so it was interrupted, not judged; how late
+	//    the reconciler arrived must not decide that (M8D4 measured exactly that).
+	//
+	// Rule 2 depends only on the two stored instants, so every reconciler, however
+	// late, reaches the same verdict. The post-lock sample is already at or after
+	// expires_at here, so expires_at >= timeout_at makes the deadline due by
+	// itself. And neither instant can move any more: expires_at changes only by a
+	// renewal, which needs a usable lease, and timeout_at only by Start, which
+	// needs one too.
 	switch {
 	case state.jobStatus == "CANCEL_REQUESTED":
 		// No outcome identity: nobody requested this, and reconciliation's
@@ -251,7 +263,7 @@ func (s *Store) reconcileExpiredLease(ctx context.Context, leaseID uuid.UUID, st
 		stats.Skipped++
 		return nil
 
-	case state.timedOut():
+	case state.timedOutBeforeLapse():
 		if err := s.finalizeTimeout(ctx, tx, state, fence, stats); err != nil {
 			return err
 		}
@@ -313,4 +325,17 @@ func collectIDs(rows pgx.Rows) ([]uuid.UUID, error) {
 		return nil, fmt.Errorf("iterate reconciliation candidates: %w", err)
 	}
 	return ids, nil
+}
+
+// timedOutBeforeLapse reports whether an attempt whose lease has lapsed is a
+// timeout rather than an abandonment: its persisted deadline is due (timedOut)
+// and the lease did not lapse before it, expires_at at or after timeout_at. A
+// lease that expired strictly before the deadline is an abandonment; the tie is
+// a timeout.
+//
+// Only the expired-lease path asks this. Every other caller of timedOut wants
+// the deadline alone, whatever the lease did: renewal, Succeed and Fail refuse a
+// due deadline, and the timeout sweep only ever sees a usable lease. ADR-0025.
+func (s fenceState) timedOutBeforeLapse() bool {
+	return s.timeoutAt != nil && !s.expiresAt.Before(*s.timeoutAt) && s.timedOut()
 }

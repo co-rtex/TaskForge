@@ -336,11 +336,13 @@ func TestTimeout_ExpiredLeaseScanRecognizesAnAlreadyDueDeadline(t *testing.T) {
 		workerRegistration("timeout-vs-abandon", 1, nil, []string{"demo.echo"}))
 	fence, _ := claimedRunningWithTimeout(t, store, session, "timeout-vs-abandon", 3, 60)
 
-	// Both are true at once: the deadline passed AND the lease lapsed. This is
-	// what a worker that stalled past its budget and then stopped renewing
-	// actually leaves behind.
-	expireAttemptDeadline(t, fence.AttemptID)
-	expireLease(t, fence.LeaseID)
+	// Both are true at once: the deadline passed AND the lease lapsed, the lease
+	// half a minute AFTER the deadline. This is what a worker that stalled past its
+	// budget, renewing up to the deadline, and then stopped renewing actually
+	// leaves behind. Since M8D5 the order is what makes it a timeout (ADR-0025): a
+	// lease that lapsed before the deadline would be an abandonment, which
+	// TestPrecedence_AKilledAttemptsOutcome case (a) pins.
+	placeDeadlineAndExpiry(t, fence, -time.Minute, -30*time.Second)
 
 	// Only the expired-lease scan runs, so the precedence must live inside it.
 	stats, err := store.ReconcileExpiredLeases(ctx, 10)

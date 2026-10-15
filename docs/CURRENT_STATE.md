@@ -1,7 +1,7 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8D4, including the Go 1.27.2
+planned. It records the implemented state through M8D5, including the Go 1.27.2
 toolchain bump that came between M8D3 and M8D4. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
@@ -11,9 +11,10 @@ M7B, the demonstration targets, and is complete with both. M8 is split into M8A,
 the measured benchmarks, M8B, the supply chain (container images and scanning), M8D1,
 the route registry, M8D2, the verification-matrix drift check with the bench-smoke
 flake and three items from the M8A review, M8D3, the investigation of the 50.04 s
-recovery outlier, M8D4, killed attempts that end `TIMED_OUT`, and M8C, deployment, in
-the order M8B, M8D1, M8D2, M8D3, M8D4, M8C; M8A, M8B, M8D1, M8D2, M8D3 and M8D4 are
-complete and M8C is planned.
+recovery outlier, M8D4, killed attempts that end `TIMED_OUT`, M8D5, a lease that lapsed
+before the deadline is an abandonment, and M8C, deployment, in the order M8B, M8D1, M8D2,
+M8D3, M8D4, M8D5, M8C; M8A, M8B, M8D1, M8D2, M8D3, M8D4 and M8D5 are complete and M8C is
+planned.
 
 ## Milestone status
 
@@ -86,11 +87,18 @@ complete and M8C is planned.
   class is set by the reconciler's 2 s phase against a claim→start window of 27–225 ms. The
   precedence is pinned by deterministic tests (four mutations shown), a worker-path analysis
   is recorded, and a decision memo recommends option (b) without deciding it. No production
-  code changed.
-  See "M8D4" below. M8C (deployment) is planned.
+  code changed. The owner chose option (b) on 2026-10-14; M8D5 implements it.
+  See "M8D4" below.
+- **M8D5 — a lease that lapsed before the deadline is an abandonment:** complete; see
+  PR #28. On the expired-lease path, after cancellation, a `RUNNING` attempt whose lease
+  expired strictly before its deadline is now `ABANDONED` even when the deadline is due by
+  the time the reconciler reaches it; the tie is a timeout
+  ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). One
+  predicate changed; the report paths, the API and the records did not. See "M8D5" below.
+  M8C (deployment) is planned.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
-M7 into two, and M8 into six, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
+M7 into two, and M8 into eight, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
 name in the original roadmap — were split into M5D and M5E: independently
 testable systems in two different language toolchains, the same reasoning
 that split the original undivided M5 into M5A–M5D.
@@ -477,7 +485,11 @@ Everything recorded for M1, M2, and M3 still holds. What M4 adds:
 ### Terminal-outcome precedence
 
 Under the authority locks, against one post-lock `clock_timestamp()` sample:
-cancellation first, then a due persisted deadline, then ADR-0009's abandonment.
+cancellation first, then a due persisted deadline, then ADR-0009's abandonment. Since
+M8D5, on the expired-lease path the middle rule applies only when the lease did not lapse
+before the deadline (`expires_at >= timeout_at`, the tie a timeout); a lease that expired
+strictly before its deadline is an abandonment, however late the reconciler arrives
+([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)).
 
 The middle rule is load-bearing rather than cosmetic. Recording a genuine
 timeout as `ABANDONED` would requeue it immediately with no backoff and no
@@ -2624,6 +2636,10 @@ numbers can be trusted.
   headline run. **The headline run's own split cannot be recovered:** its database is gone,
   and its JSON records `attempts_held_when_chosen` and `abandoned_attempts` per kill but no
   final status. See "M8D4".
+  *Amended by M8D5:* the second hypothesis describes the rule before ADR-0025. Since M8D5
+  a killed, never-renewed `RUNNING` attempt whose lease lapsed before its deadline ends
+  `ABANDONED` and is counted by `Recoveries`. The recorded runs predate that rule and are
+  unchanged; future recorded runs will count these kills as recoveries.
 - **Dispatch latency leans slightly in the system's favor by definition.** It reads
   `job_attempts.created_at`, the start of the claim transaction. The supplementary
   lease-issuance figure is 583.3 ms median and 973.1 ms p95 on the headline run,
@@ -3719,7 +3735,10 @@ beside its output.
   timed out instead. That is a gap in the benchmark's recovery measurement, not in M8D3's
   scope, and it is not fixed here. **M8D4 measured it** (see "M8D4" below): the probe now
   reports what became of every attempt a kill caught, and both hypotheses for the headline
-  run's misses are tested there.
+  run's misses are tested there. *Amended by M8D5:* those `TIMED_OUT` outcomes are what the
+  rule before ADR-0025 recorded. Since M8D5 a lease that lapsed before its deadline is
+  `ABANDONED` whenever the reconciler reaches it, so a future run counts such a kill as a
+  recovery; the recorded runs, and this section's figures, predate the rule.
 - **The probe ran against databases of its own**, `taskforge_m8d3_probe` and
   `taskforge_m8d3_probe2`, created on the local server and left in place, because the
   integration tests leave non-terminal rows in the shared database that the trial's
@@ -4164,6 +4183,11 @@ deadline is further away than the lease.
 
 ### Decision memo (recommends; decides nothing)
 
+**Decided after M8D4:** the owner chose option **(b)** on 2026-10-14, with the tie a
+timeout, the report paths unchanged, and no recorded run. M8D5 implements it; see "M8D5"
+below and [ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md).
+The memo below is left as written.
+
 The three options for a killed worker's `RUNNING` attempt whose lease lapsed before its
 deadline:
 
@@ -4286,6 +4310,183 @@ M8D4's scope. Nothing here is decided, and no ADR is written.
 
 None. The probe's default conditions are still A, B and C. The new flags and conditions are
 additive, and the probe is still never recorded.
+
+## M8D5 — a lease that lapsed before the deadline is an abandonment
+
+M8D5 follows M8D4 in the owner's order ([ROADMAP.md](ROADMAP.md)). It implements option
+(b) of M8D4's decision memo, which the owner chose on 2026-10-14. The tie is a timeout (Q1),
+the report paths are unchanged (Q2), and there is no recorded run (Q3). The decision and its
+consequences are in
+[ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md), which
+amends ADR-0010's precedence item 2.
+
+**What changed:** one predicate and two comments under `internal/`
+(`internal/workers/reconcile.go` and `internal/reconciler/reconciler.go`), the recovery
+probe's precedence identity and its unit test (`scripts/bench`), two doc comments in
+`scripts/readdb`, integration tests, ADR-0025, ADR-0010's status and item 2, the ADR index,
+`docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and this file. Nothing changed under `cmd/`,
+`migrations/`, `api/` or `.github/`, and `internal/worker` (the worker process) is untouched.
+There is no OpenAPI change. `docs/benchmarks/*` and
+`internal/api/testdata/route_behavior.golden` are byte-identical to `main`.
+
+### Behavior
+
+On the expired-lease path, after cancellation, the reconciler records a `RUNNING` attempt
+`TIMED_OUT` only when its deadline is due **and** its lease did not lapse before it:
+`fenceState.timedOutBeforeLapse`, `timeout_at` set, `expires_at >= timeout_at`, and
+`timedOut()`. Otherwise the attempt goes through ADR-0009's abandonment path: `ABANDONED`,
+an immediate requeue with zero delay and a fresh `work.available` event, or dead-lettered
+`ATTEMPTS_EXHAUSTED` when it was the last attempt. That includes a lease that expired
+strictly before a deadline that is due by the time the pass arrives. `expires_at ==
+timeout_at` is `TIMED_OUT`.
+
+Unchanged:
+
+- a deadline found while the lease is live, which the timeout sweep takes (lease
+  `RELEASED`);
+- a lease that expired at or after the deadline;
+- a `LEASED` attempt, which has no deadline and is abandoned;
+- cancellation, which still comes first.
+
+The other `timedOut()` callers are unchanged: renewal (`heartbeat.go:222`), `Succeed`
+(`store.go:653`), `Fail` (`outcome.go:103`) and the timeout sweep (`timeout.go:97`). So
+`Succeed` and `Fail` still answer `attempt_timed_out` once the deadline is due and record
+nothing, even for an attempt the reconciler then records `ABANDONED` (Q2).
+
+On this path the post-lock sample is at or after `expires_at`, and neither instant can move
+once the lease has lapsed. So the verdict is the same from any replica at any time
+(ADR-0025, "Why the rule depends only on stored instants").
+
+**The probe's precedence identity** is now `TIMED_OUT ⇔ released_at ≥ timeout_at AND
+expires_at ≥ timeout_at`. It was updated, with unit cases for the tie, one microsecond
+before it, and an old-rule outcome that now fails, before either series ran.
+`readdb.KillOutcomes` now says it assumes a dead session. `ClaimToStart`'s comment no longer
+calls its window the abandonment window.
+
+**Tests.** `placeAttempt` (`tests/integration/precedence_test.go`) now computes both
+instants from **one** `clock_timestamp()` reading, writes them as parameters, and reads them
+back. It asserts that `timeout_at − expires_at` is exactly the case's value. A new helper,
+`placeDeadlineAndExpiry`, does the same for the timeout, cancellation and invariant tests.
+No test now depends on the microseconds between two clock reads.
+
+| Test | Placement | Expects |
+| --- | --- | --- |
+| T1: `TestPrecedence_AKilledAttemptsOutcome` (a) | `expires_at` = now − 2 s, `timeout_at` 12 ms later (still past) | `ABANDONED`, `QUEUED`, zero delay, one `work.available`; budget of one: `DEAD_LETTERED` `ATTEMPTS_EXHAUSTED` (was `TIMED_OUT`) |
+| T2: (a′), new | `timeout_at` = now − 2 s − 12 ms, `expires_at` = now − 2 s | `TIMED_OUT`, lease `EXPIRED`, `RETRY_WAIT` with backoff; budget of one: dead-lettered |
+| T3: `TestPrecedence_ADeadlineExactlyAtTheDecisionInstantIsDue`, two new subtests | frozen clock; `timeout_at` = frozen − 1 s; `expires_at` = `timeout_at` − 1 µs, or equal | `ABANDONED` (zero delay) against `TIMED_OUT` (backoff), both decided at the frozen instant |
+| T4: case (c), `TestPrecedence_TheTimeoutSweepRunsFirstInAPass` | (c) unchanged; the sweep-order test's lapse now puts `expires_at` at the placed `timeout_at` + 500 ms, from the same reading | unchanged: pass |
+| T5: (g), and (g′) new | (g): `expires_at` now − 2 s, `timeout_at` now − 1 s; (g′): `timeout_at` now − 2 s, `expires_at` now − 1 s | `CANCELED`, no budget used, no retry, no event |
+| T6: `TestPrecedence_AHealthyWorkerThatKeepsLosingItsLeaseExhaustsItsBudget`, new | `HEALTHY` session (fresh heartbeat, `StaleSessions` 0 each round); each round `expires_at` 12 ms before a due `timeout_at` | every round `ABANDONED` with zero delay; after 3 rounds `DEAD_LETTERED` `ATTEMPTS_EXHAUSTED`, history `ABANDONED ×3`, nothing left to claim |
+| T7: (h), new | renewed once, healthy session; `timeout_at` now − 20 s, `expires_at` now − 1 s (`timeout_at` + 19 s) | `TIMED_OUT`, lease `EXPIRED`, `RETRY_WAIT` with backoff |
+| T8: `TestPrecedence_AThirdAttemptThatTimesOutDeadLetters` | now two subtests: the third attempt renewed with `expires_at` 1 s after `timeout_at`, or never renewed with `expires_at` 12 ms before it, both past | `DEAD_LETTERED_ON_TIMEOUT` against `DEAD_LETTERED_ON_ABANDON` (new), read back by `KillOutcomes` |
+| T8: `TestPrecedence_AnEarlierTimeoutIsNotTheAttemptThatDeadLettered` | attempt 1 renewed, `expires_at` now − 2 s, `timeout_at` now − 3 s (was 12 ms the other way) | unchanged: attempt 1 `TIMED_OUT`, attempt 2 `ABANDONED` and dead-lettered |
+
+**T9, every existing test that set both instants:**
+
+| Test | Before | After | Expects |
+| --- | --- | --- | --- |
+| `placeAttempt` callers (every `TestPrecedence_*` above) | `timeout_at` and `expires_at` from two `clock_timestamp()` calls in two statements | both from one reading, read back and asserted | as in the table above |
+| `TestTimeout_ExpiredLeaseScanRecognizesAnAlreadyDueDeadline` | `expireAttemptDeadline` then `expireLease`: both "now − 1 min" from two reads, so `expires_at` fell microseconds after `timeout_at` by call order alone | `timeout_at` now − 1 min, `expires_at` now − 30 s, one reading | `TIMED_OUT`, `RETRY_WAIT`, lease `EXPIRED` (unchanged) |
+| `TestCancel_TakesPrecedenceOverADueTimeout` | the same two helpers | `timeout_at` now − 1 min, `expires_at` now − 30 s, one reading: without the cancellation, a timeout | `CANCELED` (unchanged) |
+| `TestInvariant_TerminalJobsStayTerminalUnderEveryMutator` | the same two helpers | both now − 1 min, one reading; the order is moot (no terminal job's lease is `ACTIVE`) | nothing changes (unchanged) |
+| `TestPrecedence_ADeadlineExactlyAtTheDecisionInstantIsDue` | already one frozen reading | `arrange` takes the `expires_at` offset explicitly | unchanged plus T3 |
+| `TestInvariant_ReleasingCapacityNeverAdmitsPastTheLimit` | reviewed, not changed | each release path sets one instant; the other is Start's `timeout_seconds` 300 | unchanged |
+
+Concurrency is still pinned by `TestReconcile_ConcurrentReconcilersProduceOneRepair` and
+`TestTimeout_ConcurrentReconcilersProduceOneOutcome`. They are not duplicated, and they pass,
+also at `-count=10`.
+
+### Evidence
+
+**Mutations.** Each was applied, shown by its diff, run against the precedence, timeout and
+cancellation tests, and reverted, with a clean `git status` after each. The diffs and
+outputs are under the session's scratch directory.
+
+| Mutation | Diff | Failed | Said |
+| --- | --- | --- | --- |
+| M1: restore `case state.timedOut()` | the switch case | T1 (a) under both budgets; T3's −1 µs subtest; T6; T8's dead-letter-on-abandon subtest | `timeouts recorded` expected 0, actual 1 |
+| M2: the tie `ABANDONED` (`expiresAt.After`) | the predicate | T3's tie subtest and case (e)'s lease-path subtest (`expires_at == timeout_at == serverNow`) | `TimedOutAttempts` expected 1, actual 0 |
+| M3a: `renewed_at + lease` instead of `expires_at` | the case, plus two temporary `fenceState` fields read in `lockAuthorityRows` | T2 (a′) under both budgets; T3's −1 µs subtest. **T7 passed**: its renewal instant plus the 2 min test lease is after its deadline, as `expires_at` is | `TimedOutAttempts` expected 1, actual 0 |
+| M3b: `acquired_at + lease` | as M3a | T7 (h) and T2 (a′) under both budgets; T3's −1 µs; T8's timeout subtest; `TestPrecedence_AnEarlierTimeout…` | expected 1, actual 0 |
+| M3c: `acquired_at` | as M3a | T7, T2, both T3 lease-path ties, T8's timeout subtest, `TestPrecedence_AnEarlierTimeout…`, `TestTimeout_ExpiredLeaseScanRecognizesAnAlreadyDueDeadline` | expected 1, actual 0 |
+| M4: the new case moved above `CANCEL_REQUESTED` | the case block | (g′) under both budgets and `TestCancel_TakesPrecedenceOverADueTimeout`. **T5 (g) passed** | `state transition conflict: job changed during outcome` |
+
+**Two findings from the mutations.** M3: T3 catches both derived-expiry variants and T7
+catches the `acquired_at` ones, so every variant fails at least one of T3 and T7, as the
+specification asked. **M4 does not fail T5.** T5's lease lapsed *before* the deadline, so
+the moved predicate is false there and cancellation still decides. Moving the case can only
+change an attempt whose lease outlived its deadline. (g′) and the re-placed
+`TestCancel_TakesPrecedenceOverADueTimeout` are those attempts, and they fail.
+
+**The series.** Two series ran hands-off, chained, on 2026-10-14:
+
+- one probe binary built at the PR head **`2a9adc5`** (sha256
+  `b245c4c59ef02b64a397300de5e13ad0ff3c2d10ee499ac13f462e5ebaaf1ed4`), with `bin/` built from
+  the same commit;
+- each series on a fresh database of its own (`taskforge_m8d5_d`, `taskforge_m8d5_e`, left
+  in place);
+- `pmset` recorded before each: AC, Low Power Mode 0, lid open;
+- a power guard polling every 5 s that never fired;
+- nothing else running, and no sleep (`pmset -g log`: the last sleep was at 18:48 UTC,
+  before the series).
+
+The predictions were posted in PR #28's description at 19:52:08 UTC, before the series
+started at 19:52:35. No dry run or untimed check of the probe was made at this head.
+
+| Series | Window (UTC) | stdout sha256 | report sha256 |
+| --- | --- | --- | --- |
+| `--conditions D --trials-d 10` (`timeout_seconds` 30) | 19:52:35–19:59:28 | `298be4398605b0d74ccabfd3cd5da7c676b71b40d0a6ff8289bff7969dd6b182` | `baa1a79210864dfb16142965d7bf59749f7956088333ce8eaf4236f8206058de` |
+| `--conditions E --trials-e 10` (`timeout_seconds` 25, renewed) | 19:59:28–20:08:03 | `1ed9768a6966f330b2a1867e3e5e1163763916f84916e6bc7dfa3104c3ab74c5` | `80c878e93f6adefa83619a6f3e1d27928f3db1267103a1c86ebbd7814886e2b4` |
+
+| | D | E |
+| --- | --- | --- |
+| Trials run / with a victim / missed | 10 / 10 / 0 | 10 / 10 / 0 |
+| Held when dead against outcomes | agree in 10 of 10 | agree in 10 of 10 |
+| Attempts unfinished at the kill (LEASED / RUNNING / created after) | 40 (0 / 40 / 0) | 40 (0 / 40 / 0) |
+| Outcomes | **`ABANDONED` 40**; `TIMED_OUT` 0; DLQ, `CANCELED`, `UNRESOLVED`, `OTHER` 0 | `ABANDONED` 0; **`TIMED_OUT` 40**; the rest 0 |
+| Taken by | the expired-lease path: lease `EXPIRED` 40, renewed 0×, retry delay 0 ms | the timeout sweep, lease live: `RELEASED` 40, renewed 1×, backoff 0.80–1.20 s |
+| Precedence identity (new rule) | held in 40 of 40 | held in 40 of 40 |
+| Claim→start (min / median / max) | 23 / 49 / 68 ms | 43 / 55 / 81 ms |
+| `timeout_at − expires_at` | 23–68 ms | −15.06 to −15.01 s |
+| Resolved after `expires_at` | 1.14–2.03 s: **every one after its deadline** | 14.10–14.17 s *before* it |
+| Kill→replacement | **40 in the recovery figure: 30.95 / 31.96 / 32.03 s** | 40 as their own figure: 18.82 / 18.86 / 18.89 s |
+
+Every one of D's 40 was resolved 1.14–2.03 s after its lease expired, past a deadline 23–68
+ms after expiry. Under the rule before ADR-0025 each would have been `TIMED_OUT`, as all 40
+were in M8D4's D. Defect check, against each series' database after it ended: 80 jobs, all
+`SUCCEEDED`; no job with two `SUCCEEDED` attempts; no `ACTIVE` lease; the DLQ is empty.
+
+**Predictions against results.**
+
+| Prediction (posted first) | Result | Verdict |
+| --- | --- | --- |
+| D: 40/40 `ABANDONED`, on the expired-lease path, about 32 s kill→replacement, counted in the recovery figure | 40/40 `ABANDONED`, lease `EXPIRED`, zero delay, 30.95–32.03 s (median 31.96 s), all 40 in the recovery figure | **confirmed** |
+| E: 40/40 `TIMED_OUT`, by the timeout sweep with the lease `RELEASED`, unchanged | 40/40, lease `RELEASED`, 18.82–18.89 s | **confirmed** |
+
+### Limitations
+
+- **The self-starvation path is pinned, not measured.** T6 shows it ends at `max_attempts`
+  with a healthy session. No series exercised a handler that starves its own renewals, and
+  its frequency is unknown (ADR-0025).
+- **A worker can be told `attempt_timed_out` for an attempt recorded `ABANDONED`** (Q2),
+  because `Succeed` and `Fail` were deliberately left unchanged.
+- **The recorded runs predate the rule.** `docs/benchmarks/*` is byte-identical, and the
+  `TIMED_OUT` kills that M8A, M8D3 and M8D4 report describe the rule before it. Future
+  recorded runs will count these kills as recoveries, so recovery figures before and after
+  are not directly comparable.
+- **The series is one machine, two conditions and a handful of jobs on an idle fleet,** as
+  in M8D4. A, B, C and D-300 were deliberately not run.
+- **The databases `taskforge_m8d5_d` and `taskforge_m8d5_e` were left on the local server.**
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
+  own CI result; the pull request's checks are the record.
+
+### Breaking change
+
+None in the API or the schema. A behavior change in classification only: an attempt whose
+lease lapsed strictly before a deadline that is due when the reconciler arrives is now
+`ABANDONED` (immediate requeue) rather than `TIMED_OUT` (backoff). Nothing needs migrating;
+during a rolling deploy each attempt gets exactly one outcome, under whichever version won
+the lock.
 
 ## Verification
 
@@ -4868,6 +5069,29 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8D5 gates
+
+These gates ran locally on 2026-10-14 under Go 1.27.2 (`go version` printed `go1.27.2
+darwin/arm64`), the version `go.mod` names, against PostgreSQL 16, ElasticMQ and the object
+store from `make up`. No other TaskForge process was running. The code and tests are as at
+`2a9adc5`; every later commit changes `docs/` only. The timed gates ran after both probe
+series had ended, on AC with no sleep, with `pmset` recorded before each.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 27 packages `ok`, including `tests/verification` (the matrix drift check). New: `TestPrecedenceIdentity_TimedOutExactlyWhenResolvedAtOrAfterTheDeadlineAndTheLeaseOutlivedIt` (replaces the old-rule test); changed fixtures: `TestSummarizeOutcomes_KeepsEveryDenominatorAndTheTwoFiguresApart`, `TestPrintOutcomes_NamesEachAttemptsPathAndFigures` |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  93.946s` |
+| `make test-race` | PASS: 28 packages `ok` under `-race`; `ok  …/tests/integration  86.280s`; no `DATA RACE` |
+| `go test -tags=integration -count=10` over every `TestPrecedence_*`, `TestTimeout_ExpiredLeaseScanRecognizesAnAlreadyDueDeadline`, `TestCancel_TakesPrecedenceOverADueTimeout`, `TestInvariant_TerminalJobsStayTerminalUnderEveryMutator` and the two concurrent-reconciler tests | PASS: 110 of 110 top-level runs (11 tests × 10), 0 failures |
+| `make demo` | PASS: `RESULT: PASS (21 of 21 expectations met)`, on AC, 20:08:35–20:09:01 UTC |
+| `make bench-smoke` | PASS: `14 of 14 checks met`, on AC, 20:09:01–20:09:35 UTC |
+| `make images-smoke` | PASS: `RESULT: PASS (41 of 41 checks met)`, on AC, 20:09:36–20:14:43 UTC |
+| `make scan` | PASS in a fresh full clone of the final head; the run is in the pull request |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change |
 
 ### M8D4 gates
 
@@ -6028,12 +6252,9 @@ two targets belong in its version.
 
 ## Next objective
 
-M8D4 is complete, and its decision memo (see "M8D4" above) leaves the next step to the
-owner. If the owner chooses to change the reconciler's precedence for killed attempts, that
-change is its own bounded milestone, specified then; M8D4 recommends but decides nothing.
-After that decision, or without one, the next milestone is M8C: deployment (see
+M8D5 is complete. The next milestone is M8C: deployment (see
 [ROADMAP.md](ROADMAP.md)'s M8C entry). M8C is not started. M8C **needs its own owner
-decision before any work starts**: the non-loopback bind, which M6E's note says has to be
+decisions before any work starts**: the non-loopback bind, which M6E's note says has to be
 revisited together with the Host rule; protection of `/internal`; and the decision
 ADR-0019 leaves, whether to gate the demonstration handlers in a deployed worker. M8C's
 infrastructure also costs money. Every M7 scenario can also be watched from the

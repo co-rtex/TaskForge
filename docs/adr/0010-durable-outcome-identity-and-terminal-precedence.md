@@ -1,6 +1,12 @@
 # ADR-0010: Durable outcome identity and terminal-outcome precedence
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded by
+  [ADR-0025](0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md). Item 2
+  of "Precedence is fixed and stated" is replaced on the expired-lease path: there, a
+  due deadline is a timeout only when the lease did not lapse before it
+  (`expires_at` at or after `timeout_at`), and a lease that expired strictly before its
+  deadline is an abandonment even when the deadline is due when the reconciler reaches
+  it. Item 2 still governs the due-timeout scan, and every other section stands.
 - **Date:** 2026-09-01
 
 ## Context
@@ -186,10 +192,13 @@ Under the authority locks, against one post-lock `clock_timestamp()` sample:
 1. **Cancellation**, if the job is `CANCEL_REQUESTED`. It already won durably;
    the only thing left is to finalize it. It never retries, never dead-letters,
    and never consumes attempt budget.
-2. **Timeout**, if the attempt's persisted `timeout_at` has passed. This holds
-   whether the timeout was found by the dedicated due-timeout scan or by the
-   expired-lease scan, so a lease that lapsed around a deadline that had already
-   passed is a timeout, not an abandonment.
+2. **Timeout**, if the attempt's persisted `timeout_at` is due (at or before the
+   post-lock sample). This holds whether the timeout was found by the dedicated
+   due-timeout scan or by the expired-lease scan, so a lease that lapsed around a
+   deadline that had already passed is a timeout, not an abandonment. *(On the
+   expired-lease path this item is replaced by
+   [ADR-0025](0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md): a
+   lease that expired strictly before the deadline is an abandonment.)*
 3. **Abandonment**, otherwise — M3's path, unchanged
    ([ADR-0009](0009-abandoned-attempts-consume-the-attempt-budget.md)).
 

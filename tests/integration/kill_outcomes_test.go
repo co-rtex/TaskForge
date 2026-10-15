@@ -122,7 +122,10 @@ func TestKillOutcomes_EveryAttemptUnfinishedAtTheKillAndWhatBecameOfIt(t *testin
 	replace(leasedJob, 2, kill.Add(33*time.Second))
 
 	// 2. RUNNING at the kill, never renewed, reached after its deadline: TIMED_OUT on
-	//    the expired-lease path, RETRY_WAIT, replaced later.
+	//    the expired-lease path, RETRY_WAIT, replaced later. Rows 2 and 3 are what
+	//    the rule before M8D5 recorded; ADR-0025 would now abandon these instants
+	//    (the lease lapsed first). KillOutcomes classifies what was recorded,
+	//    whichever rule recorded it.
 	timedOutJob := newJob("RUNNING")
 	seed.seededAttempt(seededAttempt{job: timedOutJob, number: 1, worker: worker, session: killed, status: "TIMED_OUT",
 		created: kill.Add(-30 * ms), started: timep(kill, -18*ms), timeout: timep(kill, 30*time.Second-18*ms),

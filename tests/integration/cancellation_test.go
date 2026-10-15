@@ -411,8 +411,8 @@ func TestCancel_TakesPrecedenceOverADueTimeout(t *testing.T) {
 
 	_, err := jobStore().RequestCancel(ctx, testScope, fence.JobID)
 	require.NoError(t, err)
-	expireAttemptDeadline(t, fence.AttemptID)
-	expireLease(t, fence.LeaseID)
+	// Lapsed 30 s after the deadline: without the cancellation, a timeout (ADR-0025).
+	placeDeadlineAndExpiry(t, fence, -time.Minute, -30*time.Second)
 
 	// The dedicated timeout scan must not touch it either: it filters on a
 	// RUNNING job, and this one is CANCEL_REQUESTED.

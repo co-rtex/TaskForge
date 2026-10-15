@@ -614,15 +614,16 @@ when M8D began: M8D1 is the route registry and nothing else, and M8D2 is the res
 When M8D2 began the owner split it again: the 50.04 s recovery-outlier investigation
 moved to M8D3, which needs an experiment and not a documentation change. M8D3 found that
 some killed workers' attempts end `TIMED_OUT` rather than `ABANDONED`, and the owner
-added M8D4 to measure that before M8C. The original
+added M8D4 to measure that before M8C. M8D4 ended in a decision memo; the owner chose its
+option (b) on 2026-10-14 and added M8D5 to implement it before M8C. The original
 objective, deliverables, and acceptance sentence are preserved across them, not
 reduced.
 
-**Order: M8B, then M8D1, then M8D2, then M8D3, then M8D4, then M8C.** M8C keeps its name.
+**Order: M8B, then M8D1, then M8D2, then M8D3, then M8D4, then M8D5, then M8C.** M8C keeps its name.
 
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
 complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8D4 is
-complete; see PR #27. M8C is planned.
+complete; see PR #27. M8D5 is complete; see PR #28. M8C is planned.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -790,8 +791,31 @@ deterministic tests, with the mutations shown failing them; the worker-path anal
 citations; and the decision memo.
 **Depends on.** M8D3.
 **Status:** complete; see PR #27 and [CURRENT_STATE.md](CURRENT_STATE.md) for the
-evidence, the worker-path analysis and the decision memo. Any change to the precedence is
-the owner's decision and a separate, later milestone if one is chosen.
+evidence, the worker-path analysis and the decision memo. The owner chose option (b) on
+2026-10-14; M8D5 implements it.
+
+#### M8D5 — A lease that lapsed before the deadline is an abandonment
+**Objective.** Implement M8D4's option (b), as the owner decided on 2026-10-14: on the
+expired-lease path, after cancellation, a `RUNNING` attempt whose lease expired strictly
+before its persisted `timeout_at` goes through ADR-0009's abandonment path, even when the
+deadline is due by the time the reconciler reaches it, so its outcome depends on two stored
+instants rather than on the reconciler's phase. `expires_at == timeout_at` stays a timeout.
+Nothing else changes: not a deadline found while the lease is live, a lease that expired at
+or after the deadline, a `LEASED` attempt, cancellation, the report paths, the API, the
+worker or the migrations.
+**Deliverables.** The predicate change in `internal/workers/reconcile.go` and the
+`RunOnce` comment; [ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md),
+amending ADR-0010's precedence item 2; integration tests that place both instants from one
+clock reading, including the tie, a healthy worker's cooperative deadline and the
+self-starvation bound, with every existing test that set both instants re-placed; the
+mutations shown failing them; the recovery probe's precedence identity updated to the new
+rule; and a timed D and E series with predictions posted first. No recorded run.
+**Acceptance.** The deterministic tests pass and the four mutations are shown failing
+them; D's killed `RUNNING` attempts end `ABANDONED` and E's stay `TIMED_OUT` by the timeout
+sweep, against predictions written before the series, or the difference is reported;
+`docs/benchmarks/*`, migrations, `api/` and the route golden are byte-identical to `main`.
+**Depends on.** M8D4.
+**Status:** complete; see PR #28 and [CURRENT_STATE.md](CURRENT_STATE.md).
 
 #### M8C — Deployment
 **Objective.** Make deployment credible without applying it.
@@ -805,7 +829,7 @@ whether the demonstration handlers are gated in a deployed worker
 ([ADR-0019](adr/0019-demo-handlers-are-trusted-built-ins.md) ships them and leaves
 a gate open).
 **Acceptance.** `terraform validate` passes without applying.
-**Depends on.** M8B; follows M8D4 in the owner's order (M8B, M8D1, M8D2, M8D3, M8D4, M8C). **Needs its
+**Depends on.** M8B; follows M8D5 in the owner's order (M8B, M8D1, M8D2, M8D3, M8D4, M8D5, M8C). **Needs its
 own owner decision before any work starts:** the bind, `/internal` and the handler
 gate are trust-boundary decisions, and the infrastructure costs money.
 **Status:** planned.
