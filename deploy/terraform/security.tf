@@ -2,9 +2,11 @@
 #
 #   ALB      443 and 80 in from var.allowed_ingress_cidrs (none by default); out to api:8090
 #   api      8090 in from the ALB only; 8091 in from the workers only
-#   tasks    out 443 (AWS APIs and ECR, through the NAT) and 5432 to the database only
-#   worker   out 8091 to the api only (on top of tasks)
-#   rds      5432 in from the tasks only
+#   tasks    out 443 (AWS APIs and ECR, through the NAT) and 5432 to the database only;
+#            every task but the worker's
+#   worker   out 443 and 8091 to the api only: the worker never opens the database, so
+#            it has no path to 5432
+#   rds      5432 in from the tasks group only
 #
 # DNS to the VPC's resolver is not filtered by security groups, so no rule names it.
 
@@ -28,7 +30,7 @@ resource "aws_security_group" "tasks" {
 
 resource "aws_security_group" "worker" {
   name        = "${var.name}-worker"
-  description = "TaskForge worker tasks: egress to the api's control listener"
+  description = "TaskForge worker tasks: egress to AWS APIs and the api's control listener only"
   vpc_id      = aws_vpc.this.id
 }
 
@@ -98,6 +100,15 @@ resource "aws_vpc_security_group_egress_rule" "tasks_postgres" {
   ip_protocol                  = "tcp"
   from_port                    = 5432
   to_port                      = 5432
+}
+
+resource "aws_vpc_security_group_egress_rule" "worker_https" {
+  security_group_id = aws_security_group.worker.id
+  description       = "AWS APIs (SQS, S3, Secrets Manager, ECR, CloudWatch Logs) through the NAT gateway"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
 }
 
 resource "aws_vpc_security_group_egress_rule" "worker_to_control" {

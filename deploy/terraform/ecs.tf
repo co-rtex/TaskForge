@@ -6,7 +6,10 @@
 # "${aws_region}" and "${results_bucket}". Nothing else is substituted.
 #
 # Secrets reach the containers with valueFrom, never as plain environment: the database
-# URL for every binary that opens the database, and the worker key for the worker.
+# URL for every binary that opens the database (every one but the worker, which reaches
+# PostgreSQL only through the api's control listener), and the worker key for the worker.
+# tests/verification/terraform_env_test.go derives which binaries open the database from
+# their imports and holds this map to it.
 
 resource "aws_ecs_cluster" "this" {
   name = var.name
@@ -40,7 +43,7 @@ locals {
     outbox     = local.database_secret
     reconciler = local.database_secret
     scheduler  = local.database_secret
-    worker     = concat(local.database_secret, [{ name = "TASKFORGE_WORKER_API_KEY", valueFrom = aws_secretsmanager_secret.worker_key.arn }])
+    worker     = [{ name = "TASKFORGE_WORKER_API_KEY", valueFrom = aws_secretsmanager_secret.worker_key.arn }]
     migrate    = local.database_secret
   }
 
@@ -87,14 +90,15 @@ locals {
   # The api task: the api, and the cli sidecar that shares its network namespace so an
   # operator can mint the first keys on its loopback admin listener through ECS Exec
   # (ADR-0027). The api's read-only root beside ECS Exec on the task is UNVERIFIED
-  # (ADR-0028 Q1); RUNBOOK.md gives the fallback. The cli's root is writable because ECS
-  # Exec requires it.
+  # (ADR-0028 Q1); RUNBOOK.md's fallback is var.api_readonly_root_filesystem = false, which
+  # changes the api container only. The cli's root is writable because ECS Exec requires
+  # it.
   api_containers = [
     {
       name                   = "api"
       image                  = local.image["api"]
       essential              = true
-      readonlyRootFilesystem = true
+      readonlyRootFilesystem = var.api_readonly_root_filesystem
       environment            = local.environment["api"]
       secrets                = local.secrets["api"]
       logConfiguration       = local.log_configuration["api"]
@@ -159,7 +163,7 @@ locals {
     outbox     = [aws_security_group.tasks.id]
     reconciler = [aws_security_group.tasks.id]
     scheduler  = [aws_security_group.tasks.id]
-    worker     = [aws_security_group.tasks.id, aws_security_group.worker.id]
+    worker     = [aws_security_group.worker.id]
   }
 }
 

@@ -314,6 +314,37 @@ func TestTerraformEnv_MigrateCarriesOnlyWhatMigrateReads(t *testing.T) {
 	require.Equal(t, sortedSet(want), sortedSet(got))
 }
 
+// TestTerraformEnv_OnlyBinariesThatOpenTheDatabaseGetItsURL derives, from each main's
+// imports, which binaries open PostgreSQL (they import internal/database), and holds
+// ecs.tf's secrets map to it: those get the database URL secret, and the others (the
+// worker, which reaches the database only through the api) do not, so a compromised
+// worker task holds no database credential.
+func TestTerraformEnv_OnlyBinariesThatOpenTheDatabaseGetItsURL(t *testing.T) {
+	block := regexp.MustCompile(`(?ms)^\s*secrets = \{\n(.*?)^\s*\}`).FindStringSubmatch(readRepoFile(t, terraformECSPath))
+	require.NotNil(t, block, "ecs.tf must declare local.secrets")
+	lines := map[string]string{}
+	for _, line := range strings.Split(block[1], "\n") {
+		if name, rest, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
+			lines[strings.TrimSpace(name)] = rest
+		}
+	}
+	for _, svc := range deployedServices {
+		opens := false
+		for _, imp := range parseSource(t, "cmd/taskforge-"+svc+"/main.go").Imports {
+			path, _ := strconv.Unquote(imp.Path.Value)
+			if strings.HasSuffix(path, "/internal/database") {
+				opens = true
+			}
+		}
+		line, ok := lines[svc]
+		require.Truef(t, ok, "ecs.tf's secrets map has no entry for %s", svc)
+		require.Equalf(t, opens, strings.Contains(line, "database_secret"),
+			"%s: gets the database URL secret = %v, but opens the database = %v", svc, strings.Contains(line, "database_secret"), opens)
+		require.Equalf(t, svc == "worker", strings.Contains(line, "TASKFORGE_WORKER_API_KEY"),
+			"%s: only the worker gets the worker key", svc)
+	}
+}
+
 // TestTerraformEnv_ECSSubstitutesExactlyThePlaceholders proves ecs.tf replaces the two
 // placeholders the files may use and no others, so a value can never reach a container
 // with an unsubstituted ${...} in it, and that both secrets are wired by valueFrom.

@@ -69,6 +69,12 @@ variable "secret_recovery_window_days" {
   default     = 7
 }
 
+variable "api_readonly_root_filesystem" {
+  description = "Whether the api container's root filesystem is read-only. True is UNVERIFIED with ECS Exec enabled on the task (ADR-0028 Q1); RUNBOOK.md sets it false, for the api container only, if the task refuses to start."
+  type        = bool
+  default     = true
+}
+
 # --- Desired counts: all zero until the runbook raises them in order. ----------
 
 variable "api_desired_count" {
