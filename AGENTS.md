@@ -64,7 +64,11 @@ scripts/               Developer scripts. scripts/demo is the Go program behind
                        Go would then keep tests/integration out).
 tests/integration/     Tests requiring real PostgreSQL and/or a real broker.
 tests/verification/    Infrastructure-free checks over the repository's own
-                       documentation: the verification-matrix drift check.
+                       documentation and configuration: the verification-matrix
+                       drift check, the image definitions, and the Terraform
+                       environment's consistency with internal/config.
+deploy/terraform/      The AWS deployment, one root module, validated and never
+                       applied; see its RUNBOOK.md and ADR-0028.
 sdk/python/            The Python SDK. Its own toolchain; see ADR-0016.
 dashboard/             The operator dashboard's frontend source. Its own
                        toolchain, containerized; see ADR-0017.
@@ -102,6 +106,7 @@ make bench-smoke       # the benchmark harness in miniature: ~1 min, records not
 make images            # build the dashboard, then the seven images as taskforge-<service>:dev
 make images-smoke      # build the images, then inspect and run them (needs `make up`)
 make topology-smoke    # run the api and worker as separate containers and check the listeners (needs `make up`)
+make tf-validate       # deploy/terraform: fmt -check, init -backend=false, validate (no credentials; never plans or applies)
 make scan              # govulncheck, gitleaks, pip-audit and npm audit; blocks on any unexcepted finding
 ```
 
@@ -200,6 +205,17 @@ SDK's default credential chain for SQS and S3: the six `TASKFORGE_{BROKER,RESULT
 `_ACCESS_KEY_ID` and `_SECRET_ACCESS_KEY` variables must then be absent (even empty is
 refused) and both `_REGION` variables set. Unset, the local defaults apply as before
 ([ADR-0027](docs/adr/0027-aws-native-configuration-and-the-cli-sidecar.md)).
+
+`make tf-validate` checks `deploy/terraform/` with Terraform 1.16.4: a local `terraform`
+of exactly that version, or the pinned image by digest when none is installed (any other
+local version is refused). It needs no AWS credentials, makes no AWS call, and never plans
+or applies. **Any `TASKFORGE_*` variable a deployed service needs goes in that service's
+`deploy/terraform/env/<service>.json`**, never inline in a `.tf` file; secrets go in
+`ecs.tf`'s `valueFrom` map instead. `tests/verification/terraform_env_test.go` derives what
+each binary reads from `internal/config` and fails on a name the binary does not read, a
+missing or forbidden AWS-mode setting, a secret in plain environment, or a non-empty
+default for `allowed_ingress_cidrs`. See
+[ADR-0028](docs/adr/0028-deployment-shape-on-aws.md) and `deploy/terraform/RUNBOOK.md`.
 
 ## 5. Coding conventions
 
