@@ -1,0 +1,12 @@
+{
+  "TASKFORGE_API_ADDR": "127.0.0.1:8080",
+  "TASKFORGE_API_CONTROL_ADDR": "0.0.0.0:8091",
+  "TASKFORGE_API_CONTROL_HOSTS": "api.taskforge.internal",
+  "TASKFORGE_API_PUBLIC_ADDR": "0.0.0.0:8090",
+  "TASKFORGE_AWS_DEFAULT_CHAIN": "true",
+  "TASKFORGE_BROKER_QUEUE_NAME": "taskforge-work-available",
+  "TASKFORGE_BROKER_REGION": "${aws_region}",
+  "TASKFORGE_LOG_LEVEL": "info",
+  "TASKFORGE_RESULTS_BUCKET": "${results_bucket}",
+  "TASKFORGE_RESULTS_REGION": "${aws_region}"
+}
