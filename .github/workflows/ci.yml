@@ -516,7 +516,7 @@ jobs:
       - name: Start local infrastructure
         run: make up
 
-      - name: Build the dashboard and the six images
+      - name: Build the dashboard and the seven images
         # `make images` builds the dashboard first (the api embeds
         # internal/dashboard/dist; without it the api image would serve a
         # placeholder), then one image per service, labelled with this commit.
@@ -576,6 +576,47 @@ jobs:
       - name: Tear down local infrastructure
         if: always()
         run: docker compose down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # Terraform (deploy/terraform). Checked only: fmt -check, init with no backend,
+  # validate. It never plans or applies, holds no AWS credentials, and makes no AWS
+  # call; init downloads the pinned providers and verifies them against the
+  # committed lock file, read-only. The version is pinned here and in
+  # deploy/terraform/versions.tf (required_version), and the action by commit SHA.
+  # `make tf-validate` runs the same three commands. See docs/adr/0028.
+  # ---------------------------------------------------------------------------
+  terraform:
+    name: Terraform (fmt, init without a backend, validate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: deploy/terraform
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.4
+          # The wrapper rewrites stdout and exit codes for later steps; plain output
+          # and plain exit codes are what this job judges.
+          terraform_wrapper: false
+
+      - name: Report the resolved toolchain
+        run: terraform version
+
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init without a backend
+        run: terraform init -backend=false -input=false -lockfile=readonly -no-color
+
+      - name: Validate
+        run: terraform validate -no-color
 
   # ---------------------------------------------------------------------------
   # Supply-chain scan. Its own job, for three reasons. It needs the full git
