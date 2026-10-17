@@ -114,7 +114,7 @@ complete, and with M8C3 **M8 is complete**.
   show needs no shell but a writable root filesystem
   ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)). Defaults are
   byte-identical. See "M8C2" below.
-- **M8C3 — deployment: Terraform, validated and not applied:** complete; see PR #PRNUM.
+- **M8C3 — deployment: Terraform, validated and not applied:** complete; see PR #31.
   `deploy/terraform/` describes the M8C1/M8C2 topology on AWS (VPC with one NAT gateway, an
   HTTPS-only ALB closed by default, Cloud Map, ECS on Fargate with the cli sidecar, RDS, SQS,
   S3, Secrets Manager, least-privilege IAM, ECR) and passes `terraform fmt -check`, `init
