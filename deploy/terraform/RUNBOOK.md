@@ -125,15 +125,23 @@ event records who ran it.
 
 ### 2.6 Put the worker key
 
-Write the worker key's value to a file outside the repository, with mode 600, then:
+Write the worker key's value to a file outside the repository, mode 600, **with no
+trailing newline**:
 
 ```bash
+umask 077
+printf '%s' '<the worker key>' > <path-to-file>
 aws secretsmanager put-secret-value --secret-id "$(terraform output -raw worker_key_secret_arn)" \
   --secret-string "file://<path-to-file>"
 ```
 
-Then delete the file. Reading from a file keeps the key out of shell history and the
-process list.
+Then delete the file. Reading from a file keeps the key out of the process list.
+
+The newline matters. `TASKFORGE_WORKER_API_KEY` is read as written: `env()` returns the
+value untrimmed (`internal/config/config.go:742`) and the check at `:625` trims only to
+test for emptiness. A trailing newline (what `echo` or most editors add) would reach the
+worker's `Authorization: Bearer` header. Go's HTTP client refuses a header value that
+contains a newline, so every registration fails, and the worker never starts work.
 
 ### 2.7 Start the background services
 
@@ -153,12 +161,23 @@ Run one of each. More than one is safe for each:
   (`internal/jobs/schedule.go:227–290`), so a second replica finds the stamp and skips. No
   test runs re-notification on concurrent replicas, though, so start with 1.
 
-### 2.8 Start the workers
+### 2.8 Start the worker
 
 ```bash
 terraform apply -var api_desired_count=1 -var outbox_desired_count=1 \
-  -var reconciler_desired_count=1 -var scheduler_desired_count=1 -var worker_desired_count=<n>
+  -var reconciler_desired_count=1 -var scheduler_desired_count=1 -var worker_desired_count=1
 ```
+
+`worker_desired_count` is **0 or 1**, and a validation refuses anything else. Every worker
+task runs the same task definition, so every one registers as the one logical worker
+`TASKFORGE_WORKER_NAME` names (`ecs-worker`). The `workers` table is UNIQUE on
+`(scope, name)` (`migrations/0002_workers_sessions_and_claims.sql:55`), and registering
+makes the new boot's session current and the previous one `OFFLINE`
+(`internal/workers/store.go:53–106`). A second task would fence the first, whose runner
+returns `ErrSessionLost` (`internal/worker/runner.go:373`) and exits; ECS restarts it, and
+it fences the other in turn, forever. One worker task runs up to
+`TASKFORGE_WORKER_CONCURRENCY` jobs at once (4 by default). Per-task worker identity, which
+would lift the cap, is a code follow-up (ADR-0028).
 
 Keep these values in `terraform.tfvars` from now on, so a later plain `terraform apply`
 does not scale anything back to 0.
@@ -184,9 +203,18 @@ Every other container keeps a read-only root. Record the outcome in ADR-0028.
 2. Run the migrations first (2.3), with the new migrate image: set `image_tag` and apply
    with the services' current counts, then run the migrate task. The services then roll
    onto the same `image_tag`.
-3. The api and the workers are compatible across one version during the roll: listeners and
-   AWS mode are configuration only (ADR-0026, ADR-0027), and there is no wire change between
-   them in this configuration.
+3. **The worker deploys stop-then-start.** Its service runs at
+   `deployment_minimum_healthy_percent = 0` and `deployment_maximum_percent = 100`, so ECS
+   stops the old task before it starts the new one, instead of its default of starting the
+   new one first (which would fence the old one's in-flight attempts; see 2.8). The old
+   task gets SIGTERM and drains, within its 45 s `stopTimeout`. A release therefore has a
+   gap, up to one task start long, in which no worker claims. Jobs submitted meanwhile wait
+   `QUEUED`, and nothing is lost.
+4. **Compatibility is a precondition each release must meet**, not something this
+   configuration provides. While the services roll, an old api can serve a new worker and a
+   new api an old worker, so a release may only ship if the api and the worker of adjacent
+   versions work with each other. Configuration-only changes, such as the listeners and AWS
+   mode (ADR-0026, ADR-0027), meet it; a change to the control protocol needs its own plan.
 
 ## 5. Known failure modes
 
@@ -196,13 +224,16 @@ Every other container keeps a read-only root. Record the outcome in ADR-0028.
 - **Before the migrations run, readiness still passes.** `/readyz` only pings the database
   (`internal/database/database.go:42–47`), so it does not detect a missing schema. Requests
   that need the schema fail with a sanitized 500. That is why 2.3 comes before 2.4.
-- **A worker outside `us-east-1` creating its bucket: unverified.** At startup the worker
-  calls `CreateBucket` on the existing results bucket with no `LocationConstraint`
-  (`internal/objectstore/objectstore.go:148`), and tolerates only "already owned by you" or
-  "already exists". In `us-east-1` that call succeeds against your own bucket. Elsewhere,
-  whether S3 answers "already owned" or `IllegalLocationConstraintException` (which stops
-  the worker from starting) has not been checked. If the workers fail with that error, the
-  fix is in code, not here; `us-east-1` avoids the question.
+- **The region is enforced as `us-east-1`.** A validation on `aws_region` refuses any other
+  value until a code fix lifts it. At startup the worker calls `CreateBucket` on the
+  existing results bucket with no `LocationConstraint`
+  (`internal/objectstore/objectstore.go:148`), and tolerates only `BucketAlreadyOwnedByYou`
+  and `BucketAlreadyExists`. In `us-east-1`, S3 documents that re-creating a bucket you own
+  "returns 200 OK and resets the bucket access control lists"
+  ([CreateBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html));
+  ACLs are disabled here (`BucketOwnerEnforced`). Outside `us-east-1`, whether that call
+  answers `BucketAlreadyOwnedByYou` or `IllegalLocationConstraintException` remains
+  **unverified**.
 - **ECS Exec on Fargate is verified from the open-source EC2 agent's behavior, not
   Fargate's** (ADR-0027). If 2.5 fails with an error about a shell, record it in ADR-0028.
 
@@ -218,4 +249,7 @@ Deletion protection and the required final snapshot are deliberate. To destroy:
    snapshot of that name already exists; delete or rename the old one first. The snapshot
    is kept, and keeps costing storage, until you delete it.
 5. The two secrets enter their recovery window (`secret_recovery_window_days`, default
-   7). The state bucket is yours to delete last.
+   7). **Re-applying within that window fails**: the secret names `<name>/database-url` and
+   `<name>/worker-key` are still taken by the deleted secrets. Wait the window out, restore
+   them (`aws secretsmanager restore-secret`), or use a different `name`. The state bucket is
+   yours to delete last.
