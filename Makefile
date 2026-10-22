@@ -33,7 +33,7 @@ DASH_TOOLS     := taskforge-dashboard-tools
 
 .PHONY: help bootstrap up down logs migrate fmt lint build \
         test test-unit test-integration test-race clean \
-        demo demo-failure bench bench-smoke images images-smoke topology-smoke scan \
+        demo demo-failure bench bench-smoke images images-smoke topology-smoke tf-validate scan \
         sdk-venv sdk-fmt sdk-lint sdk-test \
         dash-fmt dash-lint dash-test dash-build
 
@@ -153,6 +153,35 @@ images-smoke: images up ## Check the seven images: non-root, labels, config reje
 # of them on every way out. See scripts/topologysmoke and ADR-0026.
 topology-smoke: images up ## Run the api and worker as separate containers and check the listeners by surface
 	$(GO) run ./scripts/topologysmoke
+
+# Terraform (deploy/terraform), checked and never planned or applied: fmt -check,
+# init with no backend (it downloads the pinned providers and verifies them against
+# the committed .terraform.lock.hcl, read-only), and validate. It needs no AWS
+# credentials and makes no AWS call. A local terraform of exactly TF_VERSION is used
+# if there is one; with none it runs the pinned image by digest, inside the
+# container's own filesystem, so no provider is written to the host. Any other local
+# version is refused rather than silently used. CI's Terraform job does the same.
+# See docs/adr/0028-deployment-shape-on-aws.md.
+TF_VERSION := 1.16.4
+TF_IMAGE   := hashicorp/terraform:1.16.4@sha256:985cdc6c1d9b0a65b83377f666efd2f740b47f02ac55be1ced3d18f7d3b0e829
+TF_DIR     := deploy/terraform
+TF_CHECKS  := terraform fmt -check -recursive -diff && \
+              terraform init -backend=false -input=false -lockfile=readonly -no-color && \
+              terraform validate -no-color
+
+tf-validate: ## Check the Terraform: fmt -check, init -backend=false, validate (no credentials; never plans or applies)
+	@if command -v terraform >/dev/null 2>&1; then \
+		have=$$(terraform version -json | sed -n 's/.*"terraform_version": *"\([^"]*\)".*/\1/p'); \
+		if [ "$$have" != "$(TF_VERSION)" ]; then \
+			echo "terraform $$have is installed; deploy/terraform pins $(TF_VERSION). Install $(TF_VERSION) or remove it from PATH to use the pinned image."; exit 1; \
+		fi; \
+		echo "==> local terraform $$have"; \
+		cd $(TF_DIR) && $(TF_CHECKS); \
+	else \
+		echo "==> no local terraform; running $(TF_IMAGE)"; \
+		$(DOCKER) run --rm --volume "$(CURDIR)/$(TF_DIR):/src:ro" --entrypoint sh $(TF_IMAGE) \
+			-c 'cp -R /src /work && cd /work && $(TF_CHECKS)'; \
+	fi
 
 # The four supply-chain scanners, through one driver: govulncheck (reachable
 # vulnerabilities in the Go code), gitleaks (secrets in the full git history),

@@ -1,0 +1,11 @@
+{
+  "TASKFORGE_AWS_DEFAULT_CHAIN": "true",
+  "TASKFORGE_BROKER_QUEUE_NAME": "taskforge-work-available",
+  "TASKFORGE_BROKER_REGION": "${aws_region}",
+  "TASKFORGE_LOG_LEVEL": "info",
+  "TASKFORGE_RESULTS_BUCKET": "${results_bucket}",
+  "TASKFORGE_RESULTS_REGION": "${aws_region}",
+  "TASKFORGE_WORKER_ALLOW_REMOTE_API": "true",
+  "TASKFORGE_WORKER_API_URL": "http://api.taskforge.internal:8091",
+  "TASKFORGE_WORKER_NAME": "ecs-worker"
+}

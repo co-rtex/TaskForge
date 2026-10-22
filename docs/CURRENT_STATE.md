@@ -1,7 +1,7 @@
 # Current State
 
 This document is the source of truth for what is runnable now and what remains
-planned. It records the implemented state through M8C2, including the Go 1.27.2
+planned. It records the implemented state through M8C3, including the Go 1.27.2
 toolchain bump that came between M8D3 and M8D4. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
@@ -14,8 +14,8 @@ flake and three items from the M8A review, M8D3, the investigation of the 50.04 
 recovery outlier, M8D4, killed attempts that end `TIMED_OUT`, M8D5, a lease that lapsed
 before the deadline is an abandonment, M8C1, listeners by surface, M8C2, AWS-native
 configuration and the CLI sidecar, and M8C3, deployment (Terraform, validated and not
-applied), in the order M8B, M8D1, M8D2, M8D3, M8D4, M8D5, M8C1, M8C2, M8C3; M8A, M8B,
-M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
+applied), in the order M8B, M8D1, M8D2, M8D3, M8D4, M8D5, M8C1, M8C2, M8C3; all of them are
+complete, and with M8C3 **M8 is complete**.
 
 ## Milestone status
 
@@ -113,7 +113,15 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   through ECS Exec on the shared loopback, which the AWS documentation and the agents' source
   show needs no shell but a writable root filesystem
   ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)). Defaults are
-  byte-identical. See "M8C2" below. M8C3 (the Terraform) is planned.
+  byte-identical. See "M8C2" below.
+- **M8C3 — deployment: Terraform, validated and not applied:** complete; see PR #31.
+  `deploy/terraform/` describes the M8C1/M8C2 topology on AWS (VPC with one NAT gateway, an
+  HTTPS-only ALB closed by default, Cloud Map, ECS on Fargate with the cli sidecar, RDS, SQS,
+  S3, Secrets Manager, least-privilege IAM, ECR) and passes `terraform fmt -check`, `init
+  -backend=false` and `validate` locally and in a new CI job; it has never been planned or
+  applied. A test holds every service's environment to what `internal/config` reads
+  ([ADR-0028](adr/0028-deployment-shape-on-aws.md)). No service code or image changed.
+  See "M8C3" below. With it, **M8 is complete.**
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -4959,6 +4967,189 @@ Each was applied alone, its failing output recorded, and reverted, with `git sta
 
 ---
 
+## M8C3 — deployment: Terraform, validated and not applied
+
+M8C3 follows M8C2 and is the last M8 milestone. It implements the decisions ADR-0027 recorded
+for it and the owner's Q1–Q6 of 2026-10-15, which
+[ADR-0028](adr/0028-deployment-shape-on-aws.md) records; the operator's order of operations
+is [`deploy/terraform/RUNBOOK.md`](../deploy/terraform/RUNBOOK.md). **It was never planned
+or applied, and applying it costs money.**
+
+**What changed:** `deploy/terraform/` (one root module: `versions.tf`, `providers.tf`,
+`variables.tf`, `network.tf`, `security.tf`, `alb.tf`, `discovery.tf`, `data.tf`,
+`secrets.tf`, `registry.tf`, `logs.tf`, `iam.tf`, `ecs.tf`, `outputs.tf`, the six
+`env/*.json`, `.terraform.lock.hcl`, `terraform.tfvars.example`, `.gitignore`, `RUNBOOK.md`);
+`tests/verification/terraform_env_test.go`; `make tf-validate`; one CI job, "Terraform (fmt,
+init without a backend, validate)", and the images job's step name ("seven images"); ADR-0028,
+the ADR index, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `AGENTS.md` and this file. **No
+change** under `cmd/`, `internal/`, `migrations/`, `api/`, `docs/benchmarks/`,
+`internal/api/testdata/` or the `Dockerfile`, so `make demo`, `make bench-smoke`, `make
+images-smoke` and `make topology-smoke` were not rerun: nothing they exercise changed (the
+scope proof is under "M8C3 gates").
+
+### Behavior
+
+- **Network:** two AZs, public and private subnets, one NAT gateway in the first public
+  subnet.
+- **Security groups:** ALB 443/80 from `allowed_ingress_cidrs` (default `[]`, closed) and out
+  to the api on 8090 only; api 8090 from the ALB only, 8091 from the workers only; the api,
+  outbox, reconciler, scheduler and migrate tasks out 443 and 5432 to RDS; the worker out 443
+  and 8091 to the api, and **no path to RDS**; RDS 5432 from the task group only.
+- **ALB:** HTTPS on 443 with `ssl_policy` defaulting to `ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09`
+  (AWS's recommendation), 80 redirecting to 443, ip targets on 8090, health check `/healthz`.
+- **Cloud Map:** the private namespace `taskforge.internal` and the service `api`, which the
+  api ECS service registers into.
+- **ECS:** the cluster's ECS Exec logging is `NONE`. Task definitions for the api (with the
+  `cli` sidecar: `essential = false`, `command = ["idle"]`, writable root, no health check),
+  outbox, reconciler, scheduler, worker and migrate. Every other container has a read-only
+  root (the api's through `api_readonly_root_filesystem`, default `true`, the Q1 fallback), an
+  exec-form health check of its own binary's `healthcheck` (migrate none), its own awslogs
+  group, its environment from `env/<service>.json`, and its secrets by `valueFrom`: the
+  database URL for every binary that opens the database (not the worker), the worker key for
+  the worker. Services have `desired_count` variables defaulting to 0, private subnets, no
+  public IP, `runtime_platform` from `cpu_architecture`, and ECS Exec on the api service only.
+- **The worker service** (fix round, finding B1): its own `aws_ecs_service.worker`, apart from
+  the outbox, reconciler and scheduler, with `deployment_minimum_healthy_percent = 0` and
+  `deployment_maximum_percent = 100`, so a deployment stops the old task before starting the
+  new one; its container's `stopTimeout` is 45 s. `worker_desired_count` has a validation
+  admitting only 0 and 1. Every worker task registers as the one logical worker `ecs-worker`
+  (`workers` is `UNIQUE (scope, name)`, `migrations/0002_workers_sessions_and_claims.sql:55`;
+  `Store.Register` marks the previous current session `OFFLINE`,
+  `internal/workers/store.go:53–106`; the fenced runner exits with `ErrSessionLost`,
+  `internal/worker/runner.go:373`), so a second task, or a start-before-stop deployment,
+  would fence the running one. ADR-0028 "One worker identity" records it.
+- **The region** (finding N1): `aws_region` has a validation requiring `us-east-1`, because
+  the worker's `CreateBucket` sends no `LocationConstraint`
+  (`internal/objectstore/objectstore.go:148`), and outside `us-east-1` S3's answer to it is
+  unverified. The code fix lifts it.
+- **Stores:** RDS (`db.t4g.micro`, PostgreSQL 16, single-AZ, encrypted, private, deletion
+  protection, final snapshot required, 7-day backups); the queue `taskforge-work-available`
+  (visibility 30 s, delay 0, receive wait 0, SSE-SQS); the results bucket (public access
+  blocked, SSE-S3, `BucketOwnerEnforced`).
+- **Secrets:** the database URL with `sslmode=require`, from `random_password` and the RDS
+  endpoint; the worker key secret created with no version.
+- **IAM:** one execution role (ECR pull, the log groups, exactly the two secrets), one task
+  role per service granting exactly its call sites (reconciler and scheduler none; migrate has
+  no task role), and an operator policy allowing `ecs:ExecuteCommand` only into the `cli`
+  container, output and attached to no one. The action-to-call-site table is in ADR-0028.
+- **ECR:** seven repositories, immutable tags, scan on push; `image_tag` has no default.
+- **Versions:** Terraform 1.16.4, `hashicorp/aws` 6.66.0, `hashicorp/random` 3.9.1, pinned
+  exactly with their release pages cited in ADR-0028, and the lock file committed.
+
+**The scheduler with more than one replica** is safe, from the repository: promotion is
+tested on four concurrent replicas (`TestScheduler_ConcurrentReplicasPromoteEachTransitionOnce`,
+`tests/integration/scheduler_test.go:246`), and re-notification revalidates under the queue
+and job row locks (`internal/jobs/schedule.go:227–290`). Re-notification has no concurrent
+test, so the runbook starts the scheduler at 1.
+
+**A correction to the handoff:** the api's readiness does **not** fail before the migrations
+run. `/readyz` is a connection ping (`internal/database/database.go:42–47`); requests that
+need the schema fail with a sanitized 500 instead. The runbook runs the migrations first.
+
+### Evidence
+
+`make tf-validate` (no local terraform, so the pinned image by digest, in the container's own
+filesystem): `terraform fmt -check -recursive -diff` printed nothing, then `Terraform has been
+successfully initialized!` (providers from the lock file, `-lockfile=readonly`), then `Success!
+The configuration is valid.`, exit 0, no warning.
+
+The consistency test (`go test -v -run TestTerraform ./tests/verification`):
+
+```
+--- PASS: TestTerraformEnv_EveryFileIsADeployedService (0.00s)
+--- PASS: TestTerraformEnv_EveryVariableIsOneTheBinaryReads (0.00s)
+--- PASS: TestTerraformEnv_AWSModeEverywhereItIsNeeded (0.00s)
+--- PASS: TestTerraformEnv_TheAPIsListeners (0.00s)
+--- PASS: TestTerraformEnv_TheWorkerDialsTheControlListener (0.00s)
+--- PASS: TestTerraformEnv_MigrateCarriesOnlyWhatMigrateReads (0.00s)
+--- PASS: TestTerraformEnv_OnlyBinariesThatOpenTheDatabaseGetItsURL (0.00s)
+--- PASS: TestTerraformEnv_ECSSubstitutesExactlyThePlaceholders (0.00s)
+--- PASS: TestTerraformVars_IngressIsClosedByDefault (0.00s)
+--- PASS: TestTerraformVars_WorkerCountIsAtMostOne (0.00s)
+--- PASS: TestTerraformVars_RegionIsUSEast1 (0.00s)
+--- PASS: TestTerraformECS_WorkerStopsBeforeItStarts (0.00s)
+--- PASS: TestTerraformECS_WorkerHasNoPathToTheDatabase (0.00s)
+ok  	github.com/co-rtex/TaskForge/tests/verification	0.522s
+```
+
+The four checks the fix round added read the canonical `.tf` text the same way:
+`TestTerraformVars_WorkerCountIsAtMostOne` (one validation, condition exactly
+`contains([0, 1], var.worker_desired_count)`), `TestTerraformVars_RegionIsUSEast1` (one
+validation, condition exactly `var.aws_region == "us-east-1"`),
+`TestTerraformECS_WorkerStopsBeforeItStarts` (0 % and 100 %, `stopTimeout = 45` and above
+the 15 s drain, the worker not in the background `for_each`), and
+`TestTerraformECS_WorkerHasNoPathToTheDatabase` (the worker's groups are exactly
+`[aws_security_group.worker.id]`, and its only two egress rules reach neither 5432 nor the
+database's group).
+
+The worker's stop timeout: it drains for up to `TASKFORGE_WORKER_SHUTDOWN_TIMEOUT`, 15 s
+(`internal/config/config.go:593`), then gives its health server a fresh 15 s
+(`cmd/taskforge-worker/main.go:177–180`); ECS sends SIGTERM, then SIGKILL after the
+container's `stopTimeout`, 30 s by default on Fargate, at most 120 s
+([task definition parameters](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html#container_definition_timeout),
+[StopTask](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_StopTask.html)), so
+the worker sets 45 s.
+
+How it derives what a binary reads: it parses `internal/config/config.go` with `go/ast` and
+collects every `"TASKFORGE_..."` literal passed to `env`, `envInt`, `envInt64`, `envFloat`,
+`envDuration`, `envSet`, `envList` or `os.LookupEnv`, split into `LoadWorker`'s and the rest;
+the AWS-client binaries and the database-opening binaries from each `cmd/taskforge-*/main.go`'s
+imports; and migrate's needs from its `cfg.<Field>` selectors mapped through `Load`'s literal.
+The ingress default is read from `variables.tf`'s block, which `terraform fmt -check` keeps
+canonical.
+
+### Mutations
+
+Each was applied alone, its failing output recorded, and reverted, with nothing left in
+`deploy/terraform` or `tests/` afterwards.
+
+| | Mutation | Fixture | Fails |
+| --- | --- | --- | --- |
+| M1 | `TASKFORGE_BROKER_ENDPOINT` added to `env/outbox.json` | the six static AWS variables | `TestTerraformEnv_EveryVariableIsOneTheBinaryReads/outbox`: `outbox.json must not set TASKFORGE_BROKER_ENDPOINT: with TASKFORGE_AWS_DEFAULT_CHAIN it refuses startup` |
+| M2 | `TASKFORGE_API_CONTROL_HOSTS` misspelled `..._HOST` in `env/api.json` | the variables derived from `config.go` | `.../api`: `api.json sets TASKFORGE_API_CONTROL_HOST, which taskforge-api never reads`; and `TestTerraformEnv_TheAPIsListeners` |
+| M3 | `TASKFORGE_WORKER_ALLOW_REMOTE_API` dropped from `env/worker.json` | the worker's pinned opt-in | `TestTerraformEnv_TheWorkerDialsTheControlListener` |
+| M4 | `ssl_policy = var.tls_policy`, an undeclared variable, in `alb.tf` | `terraform validate` | `Error: Reference to undeclared input variable ... on alb.tf line 35`; `make tf-validate` exit 2 |
+| M5 | `allowed_ingress_cidrs` defaults to `["0.0.0.0/0"]` | the default read from `variables.tf` | `TestTerraformVars_IngressIsClosedByDefault`: `allowed_ingress_cidrs must default to [] (closed)` |
+
+A sixth check, run while fixing a security-review finding: giving the worker the database URL
+secret again fails `TestTerraformEnv_OnlyBinariesThatOpenTheDatabaseGetItsURL` (`worker: gets
+the database URL secret = true, but opens the database = false`).
+
+The fix round's mutations, each applied to a committed file, its failing output recorded, and
+the file restored from a copy, with `git status --short` empty after each:
+
+| | Mutation | Fixture | Fails |
+| --- | --- | --- | --- |
+| M6 | `worker_desired_count`'s condition admits `[0, 1, 2]` | its pinned condition line | `TestTerraformVars_WorkerCountIsAtMostOne` (`Not equal`) |
+| M7 | `deployment_minimum_healthy_percent = 0` removed from the worker service | the worker service block | `TestTerraformECS_WorkerStopsBeforeItStarts` (`Not equal`) |
+| M8 | `deployment_maximum_percent = 200` | the same | `TestTerraformECS_WorkerStopsBeforeItStarts` (`Not equal`) |
+| M9 | `aws_security_group.tasks.id` added to the worker's groups | `local.service_security_groups["worker"]` | `TestTerraformECS_WorkerHasNoPathToTheDatabase` (`Not equal`) |
+| M10 | an egress rule on the worker group to the database on 5432 | the worker group's egress rules | `TestTerraformECS_WorkerHasNoPathToTheDatabase`: `egress rule "worker_postgres" on the worker group reaches 5432` |
+| M11 | `aws_region`'s condition loosened to `startswith(var.aws_region, "us-")` | its pinned condition line | `TestTerraformVars_RegionIsUSEast1` (`Not equal`) |
+| M11b | `aws_region`'s validation removed | the validation count | `TestTerraformVars_RegionIsUSEast1`: `aws_region must have exactly one validation` |
+| M12 | the worker's `stopTimeout = 10` | the pinned stop timeout | `TestTerraformECS_WorkerStopsBeforeItStarts`: `the worker container's stopTimeout` |
+
+### Limitations
+
+- **Never planned or applied.** `validate` checks the configuration against the provider
+  schemas, not against AWS.
+- **Never verified:** Fargate's ECS Exec agent; the api's read-only root beside ECS Exec on its
+  task (Q1, with the fallback); a task role actually resolved by the SDK's default chain; and
+  the worker's `CreateBucket` with no `LocationConstraint` against its existing bucket outside
+  `us-east-1` (`internal/objectstore/objectstore.go:148`), which may answer
+  `IllegalLocationConstraintException` instead of the tolerated "already owned", a code
+  question outside this milestone.
+- **One worker at a time**: one task running up to `TASKFORGE_WORKER_CONCURRENCY` jobs (4 by
+  default), and a claim gap, up to one task start long, on every worker deployment (jobs wait
+  `QUEUED`, none is lost). Per-task worker identity is the code follow-up that lifts it.
+- **`us-east-1` only**, until the worker's `CreateBucket` sends a `LocationConstraint`.
+- **Cost-shaped:** one NAT gateway, single-AZ RDS.
+- **The control listener is plain HTTP in the VPC** (ADR-0026), **`sslmode=require` does not
+  verify the server**, **Terraform state holds the database password**, and **every
+  database-opening binary uses the master user**.
+
+---
+
 ## Verification
 
 ### M5A gates
@@ -5540,6 +5731,38 @@ Recorded as risks, not worked around silently.
   milestone adds a consumer and touches no Go, and a comment-only Go edit here
   would cross that boundary for no behavioral gain. `errors.py`'s equivalent
   comment states 23 and 12 correctly.
+
+### M8C3 gates
+
+These gates ran locally on 2026-10-17 under Go 1.27.2 (`go version` printed `go1.27.2
+darwin/arm64`), against PostgreSQL 16, ElasticMQ and the object store from `make up` (freshly
+restarted, so `make migrate` applied all 18 migrations first), with no other TaskForge process
+running. The code is as at `cf8a397` plus the lock-file commit; later commits change docs only.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 32 packages `ok`, including `tests/verification` with the nine `TestTerraform*` checks |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  86.253s` |
+| `make test-race` | PASS: 33 packages `ok` under `-race`; `ok  …/tests/integration  89.449s`; no `DATA RACE` |
+| `make tf-validate` | PASS: no local terraform, so the pinned image; fmt clean, `Terraform has been successfully initialized!`, `Success! The configuration is valid.` |
+| `make scan` | PASS on `523f17c` (2026-10-17), in a fresh full clone: govulncheck, gitleaks (full history), pip-audit and npm-audit, no findings |
+| `make demo`, `make bench-smoke`, `make images-smoke`, `make topology-smoke` | NOT RUN, deliberately: no service code or image changed. `git diff 92cada2 HEAD -- cmd internal migrations api docs/benchmarks internal/api/testdata Dockerfile` is 0 lines |
+
+The fix round's gates, on 2026-10-21 (code as at `c078cdd`; later commits are docs only):
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 32 packages `ok`, including the thirteen `TestTerraform*` checks |
+| `make tf-validate` | PASS: the pinned image; fmt clean, `Terraform has been successfully initialized!`, `Success! The configuration is valid.`, exit 0 |
+| `make scan`, a fresh full clone of `2c272bb` | **FAIL**, on one finding unrelated to this pull request: `GO-2026-6809 stdlib crypto/x509.Certificate.Verify@v1.27.2, called from internal/worker/client.go:540 (Ping) ... (fixed in v1.27.3) -- not excepted`, under a vulnerability database modified 2026-10-21. gitleaks, pip-audit and npm-audit: no findings. `main` at `92cada2` has the same finding (govulncheck v1.8.0 on a clone of it). It is fixed by moving `go.mod` and the Dockerfile's builder to Go 1.27.3, which is outside this round's scope (the Dockerfile is frozen), so it is not fixed here |
+| `make test-integration`, `make test-race`, `make demo`, `make bench-smoke`, `make images-smoke`, `make topology-smoke` | NOT RUN: `git diff 523f17c HEAD -- cmd internal migrations api docs/benchmarks Dockerfile sdk dashboard` is 0 lines; CI runs the first two |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change |
 
 ### M8C2 gates
 
@@ -6782,23 +7005,30 @@ two targets belong in its version.
 
 ## Next objective
 
-M8C2 is complete. The next milestone is M8C3: the Terraform for ALB, ECS services, RDS,
-SQS, S3, secrets and logs, validated and not applied (see [ROADMAP.md](ROADMAP.md)'s M8C3
-entry, which carries ADR-0027's decisions Q4–Q8, the IAM note, the SQS attributes and the
-ECS Exec findings). M8C3 is not started and **needs its own handoff before any work
-starts**; its infrastructure costs money if applied. What it must confirm on a real task,
-because nothing local can: a shell-less ECS Exec on its launch type (verified in the open
-ECS agent's source, not on Fargate's), whether the api container may keep a read-only root
-with ECS Exec enabled for the task, and what ECS Exec logging does in an image with no
-`script`, `cat` or `sh`. TLS on the control listener, a per-call worker credential and
-`verify-full` against the RDS CA are named follow-ups. Every M7 scenario can also be
-watched from the dashboard.
+**M8 is complete.** It was the last milestone of V1 as [ROADMAP.md](ROADMAP.md) lays it out,
+and what comes next is the owner's decision: nothing is started. Applying `deploy/terraform/`
+is not a milestone of its own yet; it costs money, needs AWS credentials, and its first run
+would settle the items ADR-0028 records as never verified.
 
-Open, and not any milestone's deliverable: whether the shipped lease and outbox
-interval should change is a question the two M8A records answer only as numbers, not
-as a decision, and changing the defaults would require re-measuring.
+Open, and not any milestone's deliverable:
 
-Smaller items available to whoever wants them, none blocking M8:
+- **The shipped timings.** Whether the shipped lease and outbox interval should change is a
+  question the two M8A records answer only as numbers, not as a decision, and changing the
+  defaults would require re-measuring.
+- **The 403 wording.** The guard's refusal says "addressed to a loopback host" on the control
+  listener too (ADR-0026), because `api/openapi.yaml` documents one fixed message.
+- **The integration test that needs a non-loopback interface.**
+  `TestControlListener_AWorkerOnANonLoopbackAddressRunsAJob` fails, rather than skips, on a
+  machine with no up, non-loopback IPv4 interface (M8C1).
+- **The scan driver prints one trace per advisory ID** (M8B), so a finding reachable in two
+  places shows one of them.
+- The follow-ups ADR-0026, ADR-0027 and ADR-0028 name: TLS on the control listener, a per-call
+  worker credential, `verify-full` against the RDS CA, per-service database roles, the
+  worker's `CreateBucket` outside `us-east-1` (which would lift the region validation), and
+  **per-task worker identity** (for example the worker's name derived from its ECS task ID
+  when `TASKFORGE_WORKER_NAME` is unset), which would lift the one-worker cap.
+
+Smaller items available to whoever wants them:
 
 - `queue_wait_duration_seconds` and `end_to_end_duration_seconds`, which M6C
   deliberately did not build. See its section above for exactly what each would

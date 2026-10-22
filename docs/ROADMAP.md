@@ -629,7 +629,7 @@ M8C2, then M8C3.**
 **Status:** M8A is complete; see PR #21. M8B is complete; see PR #22. M8D1 is
 complete; see PR #23. M8D2 is complete; see PR #24. M8D3 is complete; see PR #25. M8D4 is
 complete; see PR #27. M8D5 is complete; see PR #28. M8C1 is complete; see PR #29. M8C2
-is complete; see PR #30. M8C3 is planned.
+is complete; see PR #30. M8C3 is complete; see PR #31. With it, **M8 is complete**.
 
 #### M8A — Load generator and measured benchmarks
 **Objective.** Measure reality: replace PROJECT_SPEC §7's unmeasured targets with
@@ -904,7 +904,9 @@ The shipped timings stay as they are.
 **Acceptance.** `terraform validate` passes without applying.
 **Depends on.** M8C2. **Needs its own handoff before any work starts**, and the
 infrastructure costs money if applied.
-**Status:** planned.
+**Status:** complete; see PR #31 and [CURRENT_STATE.md](CURRENT_STATE.md). The
+configuration is in `deploy/terraform/` with its [runbook](../deploy/terraform/RUNBOOK.md)
+and [ADR-0028](adr/0028-deployment-shape-on-aws.md); it was never planned or applied.
 
 **Open product decision, not part of M8C1's, M8C2's or M8C3's deliverables: the shipped default
 timings.** The M8A benchmark missed the dispatch-latency and worker-failure-recovery
