@@ -5748,8 +5748,20 @@ running. The code is as at `cf8a397` plus the lock-file commit; later commits ch
 | `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  86.253s` |
 | `make test-race` | PASS: 33 packages `ok` under `-race`; `ok  …/tests/integration  89.449s`; no `DATA RACE` |
 | `make tf-validate` | PASS: no local terraform, so the pinned image; fmt clean, `Terraform has been successfully initialized!`, `Success! The configuration is valid.` |
-| `make scan` | run in a fresh full clone of the final head; the command and its result are in the pull request |
+| `make scan` | PASS on `523f17c` (2026-10-17), in a fresh full clone: govulncheck, gitleaks (full history), pip-audit and npm-audit, no findings |
 | `make demo`, `make bench-smoke`, `make images-smoke`, `make topology-smoke` | NOT RUN, deliberately: no service code or image changed. `git diff 92cada2 HEAD -- cmd internal migrations api docs/benchmarks internal/api/testdata Dockerfile` is 0 lines |
+
+The fix round's gates, on 2026-10-21 (code as at `c078cdd`; later commits are docs only):
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no Go file changed |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries |
+| `make test-unit` | PASS: 32 packages `ok`, including the thirteen `TestTerraform*` checks |
+| `make tf-validate` | PASS: the pinned image; fmt clean, `Terraform has been successfully initialized!`, `Success! The configuration is valid.`, exit 0 |
+| `make scan`, a fresh full clone of `2c272bb` | **FAIL**, on one finding unrelated to this pull request: `GO-2026-6809 stdlib crypto/x509.Certificate.Verify@v1.27.2, called from internal/worker/client.go:540 (Ping) ... (fixed in v1.27.3) -- not excepted`, under a vulnerability database modified 2026-10-21. gitleaks, pip-audit and npm-audit: no findings. `main` at `92cada2` has the same finding (govulncheck v1.8.0 on a clone of it). It is fixed by moving `go.mod` and the Dockerfile's builder to Go 1.27.3, which is outside this round's scope (the Dockerfile is frozen), so it is not fixed here |
+| `make test-integration`, `make test-race`, `make demo`, `make bench-smoke`, `make images-smoke`, `make topology-smoke` | NOT RUN: `git diff 523f17c HEAD -- cmd internal migrations api docs/benchmarks Dockerfile sdk dashboard` is 0 lines; CI runs the first two |
 | `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change |
 
 ### M8C2 gates
