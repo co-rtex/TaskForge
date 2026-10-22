@@ -10,7 +10,10 @@ output "cluster_name" {
 
 output "service_names" {
   description = "The ECS services, by binary."
-  value       = merge({ api = aws_ecs_service.api.name }, { for k, s in aws_ecs_service.background : k => s.name })
+  value = merge(
+    { api = aws_ecs_service.api.name, worker = aws_ecs_service.worker.name },
+    { for k, s in aws_ecs_service.background : k => s.name },
+  )
 }
 
 output "task_definition_families" {

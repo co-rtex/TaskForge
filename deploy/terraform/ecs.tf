@@ -84,6 +84,10 @@ locals {
         logConfiguration       = local.log_configuration[svc]
       },
       svc == "migrate" ? {} : { healthCheck = local.health_check[svc] },
+      # The worker drains for up to TASKFORGE_WORKER_SHUTDOWN_TIMEOUT (15 s) and then
+      # shuts its health server down within a fresh 15 s (cmd/taskforge-worker/main.go:
+      # 177-180); Fargate's default stop timeout is 30 s, so it is set with room to spare.
+      svc == "worker" ? { stopTimeout = 45 } : {},
     )]
   }
 
@@ -196,7 +200,7 @@ resource "aws_ecs_service" "api" {
 }
 
 resource "aws_ecs_service" "background" {
-  for_each               = toset(["outbox", "reconciler", "scheduler", "worker"])
+  for_each               = toset(["outbox", "reconciler", "scheduler"])
   name                   = "${var.name}-${each.key}"
   cluster                = aws_ecs_cluster.this.id
   task_definition        = aws_ecs_task_definition.this[each.key].arn
@@ -207,6 +211,30 @@ resource "aws_ecs_service" "background" {
   network_configuration {
     subnets          = aws_subnet.private[*].id
     security_groups  = local.service_security_groups[each.key]
+    assign_public_ip = false
+  }
+}
+
+# The worker, on its own. Every worker task registers as the one logical worker
+# TASKFORGE_WORKER_NAME names (env/worker.json), and a new boot fences the previous one
+# (ADR-0028 "One worker identity"), so there is never more than one task
+# (var.worker_desired_count is 0 or 1) and a deployment stops the old task before it starts
+# the new one, instead of ECS's default of starting the new one first. The old task gets
+# SIGTERM and drains within its stop timeout; the gap until the new one registers leaves
+# jobs QUEUED, and loses none.
+resource "aws_ecs_service" "worker" {
+  name                               = "${var.name}-worker"
+  cluster                            = aws_ecs_cluster.this.id
+  task_definition                    = aws_ecs_task_definition.this["worker"].arn
+  desired_count                      = local.desired_count["worker"]
+  launch_type                        = "FARGATE"
+  enable_execute_command             = false
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
+
+  network_configuration {
+    subnets          = aws_subnet.private[*].id
+    security_groups  = local.service_security_groups["worker"]
     assign_public_ip = false
   }
 }

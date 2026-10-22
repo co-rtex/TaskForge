@@ -3,8 +3,13 @@
 # zero tasks (RUNBOOK.md brings them up in order).
 
 variable "aws_region" {
-  description = "The AWS region to deploy into. Also the region the services' SQS and S3 clients resolve their endpoints from (TASKFORGE_BROKER_REGION, TASKFORGE_RESULTS_REGION)."
+  description = "The AWS region to deploy into, and the region the services' SQS and S3 clients resolve their endpoints from (TASKFORGE_BROKER_REGION, TASKFORGE_RESULTS_REGION). Only us-east-1 is accepted until the worker's CreateBucket sends a LocationConstraint (ADR-0028)."
   type        = string
+
+  validation {
+    condition     = var.aws_region == "us-east-1"
+    error_message = "aws_region must be us-east-1: the worker calls CreateBucket on the results bucket at startup with no LocationConstraint (internal/objectstore/objectstore.go:148), and outside us-east-1 whether S3 answers \"already owned\" or IllegalLocationConstraintException is unverified. The code fix that sends a LocationConstraint lifts this (ADR-0028)."
+  }
 }
 
 variable "name" {
@@ -102,9 +107,14 @@ variable "scheduler_desired_count" {
 }
 
 variable "worker_desired_count" {
-  description = "Number of worker tasks."
+  description = "Number of worker tasks: 0 or 1. Every worker task registers as the one logical worker TASKFORGE_WORKER_NAME names, so a second task fences the first (ADR-0028)."
   type        = number
   default     = 0
+
+  validation {
+    condition     = contains([0, 1], var.worker_desired_count)
+    error_message = "worker_desired_count must be 0 or 1: every worker task shares one TASKFORGE_WORKER_NAME, so a second task registers as the same logical worker and fences the first (ADR-0028). Per-task worker identity is a code follow-up."
+  }
 }
 
 # --- Task sizes. -------------------------------------------------------------------
