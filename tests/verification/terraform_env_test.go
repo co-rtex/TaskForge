@@ -375,3 +375,117 @@ func TestTerraformVars_IngressIsClosedByDefault(t *testing.T) {
 	require.Equal(t, "[]", strings.TrimSpace(defaults[0][1]),
 		"allowed_ingress_cidrs must default to [] (closed): an operator who sets nothing exposes nothing")
 }
+
+// --- The worker's deployment shape (ADR-0028 "One worker identity") ---------------------
+//
+// Every worker task registers as the one logical worker TASKFORGE_WORKER_NAME names, and a
+// new boot fences the previous one, so the worker runs at most one task and deploys
+// stop-then-start. The checks below read the .tf files as text; `terraform fmt -check`
+// keeps them canonical, so a block is found by its header and its closing brace at
+// column 0.
+
+const terraformSecurityPath = "deploy/terraform/security.tf"
+
+// hclBlock returns the body of the top-level block whose header line is exactly header
+// (for example `variable "aws_region" {`), up to its closing brace at column 0.
+func hclBlock(t *testing.T, text, header string) string {
+	t.Helper()
+	m := regexp.MustCompile(`(?ms)^` + regexp.QuoteMeta(header) + `\n(.*?)^\}`).FindStringSubmatch(text)
+	require.NotNilf(t, m, "no block %q", header)
+	return m[1]
+}
+
+// attribute returns the trimmed value of every `name = value` line in body, after
+// collapsing fmt's alignment spaces.
+func attribute(body, name string) []string {
+	var values []string
+	for _, m := range regexp.MustCompile(`(?m)^\s*`+regexp.QuoteMeta(name)+`\s*=\s*(.*?)\s*$`).FindAllStringSubmatch(body, -1) {
+		values = append(values, m[1])
+	}
+	return values
+}
+
+// TestTerraformVars_WorkerCountIsAtMostOne pins worker_desired_count's one validation to
+// admitting exactly 0 and 1: a second worker task would register as the same logical
+// worker and fence the first.
+func TestTerraformVars_WorkerCountIsAtMostOne(t *testing.T) {
+	block := hclBlock(t, readRepoFile(t, terraformVarsPath), `variable "worker_desired_count" {`)
+	require.Len(t, regexp.MustCompile(`(?m)^\s*validation \{$`).FindAllString(block, -1), 1,
+		"worker_desired_count must have exactly one validation")
+	require.Equal(t, []string{"contains([0, 1], var.worker_desired_count)"}, attribute(block, "condition"))
+	require.Equal(t, []string{"0"}, attribute(block, "default"))
+}
+
+// TestTerraformVars_RegionIsUSEast1 pins aws_region's validation to us-east-1, until the
+// worker's CreateBucket sends a LocationConstraint.
+func TestTerraformVars_RegionIsUSEast1(t *testing.T) {
+	block := hclBlock(t, readRepoFile(t, terraformVarsPath), `variable "aws_region" {`)
+	require.Len(t, regexp.MustCompile(`(?m)^\s*validation \{$`).FindAllString(block, -1), 1,
+		"aws_region must have exactly one validation")
+	require.Equal(t, []string{`var.aws_region == "us-east-1"`}, attribute(block, "condition"))
+}
+
+// TestTerraformECS_WorkerStopsBeforeItStarts proves the worker service deploys
+// stop-then-start (0 % minimum healthy, 100 % maximum), so a new boot never fences a
+// running one mid-attempt, and that its container's stop timeout leaves room for its
+// shutdown: up to 15 s of drain (TASKFORGE_WORKER_SHUTDOWN_TIMEOUT's default) and then a
+// fresh 15 s for its health server.
+func TestTerraformECS_WorkerStopsBeforeItStarts(t *testing.T) {
+	ecs := readRepoFile(t, terraformECSPath)
+	block := hclBlock(t, ecs, `resource "aws_ecs_service" "worker" {`)
+	require.Equal(t, []string{"0"}, attribute(block, "deployment_minimum_healthy_percent"))
+	require.Equal(t, []string{"100"}, attribute(block, "deployment_maximum_percent"))
+	require.Equal(t, []string{`local.desired_count["worker"]`}, attribute(block, "desired_count"))
+
+	background := hclBlock(t, ecs, `resource "aws_ecs_service" "background" {`)
+	require.Equal(t, []string{`toset(["outbox", "reconciler", "scheduler"])`}, attribute(background, "for_each"),
+		"the worker must not also be a background service with ECS's default rolling deploy")
+
+	m := regexp.MustCompile(`svc == "worker" \? \{ stopTimeout = (\d+) \} : \{\}`).FindStringSubmatch(ecs)
+	require.NotNil(t, m, "the worker container must set stopTimeout")
+	stop, err := strconv.Atoi(m[1])
+	require.NoError(t, err)
+	require.Equal(t, 45, stop, "the worker container's stopTimeout")
+	require.Greater(t, stop, 15, "stopTimeout must exceed the worker's 15 s shutdown drain")
+}
+
+// TestTerraformECS_WorkerHasNoPathToTheDatabase proves the worker, which never opens the
+// database, is in the worker security group alone, and that no egress rule on that group
+// reaches 5432 or the database's group.
+func TestTerraformECS_WorkerHasNoPathToTheDatabase(t *testing.T) {
+	ecs := readRepoFile(t, terraformECSPath)
+	service := hclBlock(t, ecs, `resource "aws_ecs_service" "worker" {`)
+	require.Equal(t, []string{`local.service_security_groups["worker"]`}, attribute(service, "security_groups"))
+
+	groups := regexp.MustCompile(`(?ms)^\s*service_security_groups = \{\n(.*?)^\s*\}`).FindStringSubmatch(ecs)
+	require.NotNil(t, groups, "ecs.tf must declare local.service_security_groups")
+	require.Equal(t, []string{"[aws_security_group.worker.id]"}, attribute(groups[1], "worker"))
+
+	security := readRepoFile(t, terraformSecurityPath)
+	rules := regexp.MustCompile(`(?ms)^resource "aws_vpc_security_group_egress_rule" "([^"]+)" \{\n(.*?)^\}`).FindAllStringSubmatch(security, -1)
+	require.NotEmpty(t, rules)
+	var workerRules int
+	for _, rule := range rules {
+		if !contains(attribute(rule[2], "security_group_id"), "aws_security_group.worker.id") {
+			continue
+		}
+		workerRules++
+		for _, port := range append(attribute(rule[2], "from_port"), attribute(rule[2], "to_port")...) {
+			require.NotEqualf(t, "5432", port, "egress rule %q on the worker group reaches 5432", rule[1])
+		}
+		require.NotContainsf(t, attribute(rule[2], "referenced_security_group_id"), "aws_security_group.rds.id",
+			"egress rule %q on the worker group reaches the database", rule[1])
+		require.NotContainsf(t, attribute(rule[2], "ip_protocol"), `"-1"`,
+			"egress rule %q on the worker group allows every port", rule[1])
+	}
+	require.Equal(t, 2, workerRules, "the worker group has exactly its two egress rules: 443 and 8091 to the api")
+}
+
+func contains(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
