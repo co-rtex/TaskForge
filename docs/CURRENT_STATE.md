@@ -5008,6 +5008,20 @@ scope proof is under "M8C3 gates").
   database URL for every binary that opens the database (not the worker), the worker key for
   the worker. Services have `desired_count` variables defaulting to 0, private subnets, no
   public IP, `runtime_platform` from `cpu_architecture`, and ECS Exec on the api service only.
+- **The worker service** (fix round, finding B1): its own `aws_ecs_service.worker`, apart from
+  the outbox, reconciler and scheduler, with `deployment_minimum_healthy_percent = 0` and
+  `deployment_maximum_percent = 100`, so a deployment stops the old task before starting the
+  new one; its container's `stopTimeout` is 45 s. `worker_desired_count` has a validation
+  admitting only 0 and 1. Every worker task registers as the one logical worker `ecs-worker`
+  (`workers` is `UNIQUE (scope, name)`, `migrations/0002_workers_sessions_and_claims.sql:55`;
+  `Store.Register` marks the previous current session `OFFLINE`,
+  `internal/workers/store.go:53–106`; the fenced runner exits with `ErrSessionLost`,
+  `internal/worker/runner.go:373`), so a second task, or a start-before-stop deployment,
+  would fence the running one. ADR-0028 "One worker identity" records it.
+- **The region** (finding N1): `aws_region` has a validation requiring `us-east-1`, because
+  the worker's `CreateBucket` sends no `LocationConstraint`
+  (`internal/objectstore/objectstore.go:148`), and outside `us-east-1` S3's answer to it is
+  unverified. The code fix lifts it.
 - **Stores:** RDS (`db.t4g.micro`, PostgreSQL 16, single-AZ, encrypted, private, deletion
   protection, final snapshot required, 7-day backups); the queue `taskforge-work-available`
   (visibility 30 s, delay 0, receive wait 0, SSE-SQS); the results bucket (public access
@@ -5051,8 +5065,30 @@ The consistency test (`go test -v -run TestTerraform ./tests/verification`):
 --- PASS: TestTerraformEnv_OnlyBinariesThatOpenTheDatabaseGetItsURL (0.00s)
 --- PASS: TestTerraformEnv_ECSSubstitutesExactlyThePlaceholders (0.00s)
 --- PASS: TestTerraformVars_IngressIsClosedByDefault (0.00s)
-ok  	github.com/co-rtex/TaskForge/tests/verification	0.312s
+--- PASS: TestTerraformVars_WorkerCountIsAtMostOne (0.00s)
+--- PASS: TestTerraformVars_RegionIsUSEast1 (0.00s)
+--- PASS: TestTerraformECS_WorkerStopsBeforeItStarts (0.00s)
+--- PASS: TestTerraformECS_WorkerHasNoPathToTheDatabase (0.00s)
+ok  	github.com/co-rtex/TaskForge/tests/verification	0.522s
 ```
+
+The four checks the fix round added read the canonical `.tf` text the same way:
+`TestTerraformVars_WorkerCountIsAtMostOne` (one validation, condition exactly
+`contains([0, 1], var.worker_desired_count)`), `TestTerraformVars_RegionIsUSEast1` (one
+validation, condition exactly `var.aws_region == "us-east-1"`),
+`TestTerraformECS_WorkerStopsBeforeItStarts` (0 % and 100 %, `stopTimeout = 45` and above
+the 15 s drain, the worker not in the background `for_each`), and
+`TestTerraformECS_WorkerHasNoPathToTheDatabase` (the worker's groups are exactly
+`[aws_security_group.worker.id]`, and its only two egress rules reach neither 5432 nor the
+database's group).
+
+The worker's stop timeout: it drains for up to `TASKFORGE_WORKER_SHUTDOWN_TIMEOUT`, 15 s
+(`internal/config/config.go:593`), then gives its health server a fresh 15 s
+(`cmd/taskforge-worker/main.go:177–180`); ECS sends SIGTERM, then SIGKILL after the
+container's `stopTimeout`, 30 s by default on Fargate, at most 120 s
+([task definition parameters](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html#container_definition_timeout),
+[StopTask](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_StopTask.html)), so
+the worker sets 45 s.
 
 How it derives what a binary reads: it parses `internal/config/config.go` with `go/ast` and
 collects every `"TASKFORGE_..."` literal passed to `env`, `envInt`, `envInt64`, `envFloat`,
@@ -5079,6 +5115,20 @@ A sixth check, run while fixing a security-review finding: giving the worker the
 secret again fails `TestTerraformEnv_OnlyBinariesThatOpenTheDatabaseGetItsURL` (`worker: gets
 the database URL secret = true, but opens the database = false`).
 
+The fix round's mutations, each applied to a committed file, its failing output recorded, and
+the file restored from a copy, with `git status --short` empty after each:
+
+| | Mutation | Fixture | Fails |
+| --- | --- | --- | --- |
+| M6 | `worker_desired_count`'s condition admits `[0, 1, 2]` | its pinned condition line | `TestTerraformVars_WorkerCountIsAtMostOne` (`Not equal`) |
+| M7 | `deployment_minimum_healthy_percent = 0` removed from the worker service | the worker service block | `TestTerraformECS_WorkerStopsBeforeItStarts` (`Not equal`) |
+| M8 | `deployment_maximum_percent = 200` | the same | `TestTerraformECS_WorkerStopsBeforeItStarts` (`Not equal`) |
+| M9 | `aws_security_group.tasks.id` added to the worker's groups | `local.service_security_groups["worker"]` | `TestTerraformECS_WorkerHasNoPathToTheDatabase` (`Not equal`) |
+| M10 | an egress rule on the worker group to the database on 5432 | the worker group's egress rules | `TestTerraformECS_WorkerHasNoPathToTheDatabase`: `egress rule "worker_postgres" on the worker group reaches 5432` |
+| M11 | `aws_region`'s condition loosened to `startswith(var.aws_region, "us-")` | its pinned condition line | `TestTerraformVars_RegionIsUSEast1` (`Not equal`) |
+| M11b | `aws_region`'s validation removed | the validation count | `TestTerraformVars_RegionIsUSEast1`: `aws_region must have exactly one validation` |
+| M12 | the worker's `stopTimeout = 10` | the pinned stop timeout | `TestTerraformECS_WorkerStopsBeforeItStarts`: `the worker container's stopTimeout` |
+
 ### Limitations
 
 - **Never planned or applied.** `validate` checks the configuration against the provider
@@ -5089,6 +5139,10 @@ the database URL secret = true, but opens the database = false`).
   `us-east-1` (`internal/objectstore/objectstore.go:148`), which may answer
   `IllegalLocationConstraintException` instead of the tolerated "already owned", a code
   question outside this milestone.
+- **One worker at a time**: one task running up to `TASKFORGE_WORKER_CONCURRENCY` jobs (4 by
+  default), and a claim gap, up to one task start long, on every worker deployment (jobs wait
+  `QUEUED`, none is lost). Per-task worker identity is the code follow-up that lifts it.
+- **`us-east-1` only**, until the worker's `CreateBucket` sends a `LocationConstraint`.
 - **Cost-shaped:** one NAT gateway, single-AZ RDS.
 - **The control listener is plain HTTP in the VPC** (ADR-0026), **`sslmode=require` does not
   verify the server**, **Terraform state holds the database password**, and **every
@@ -6957,8 +7011,10 @@ Open, and not any milestone's deliverable:
 - **The scan driver prints one trace per advisory ID** (M8B), so a finding reachable in two
   places shows one of them.
 - The follow-ups ADR-0026, ADR-0027 and ADR-0028 name: TLS on the control listener, a per-call
-  worker credential, `verify-full` against the RDS CA, per-service database roles, and the
-  worker's `CreateBucket` outside `us-east-1`.
+  worker credential, `verify-full` against the RDS CA, per-service database roles, the
+  worker's `CreateBucket` outside `us-east-1` (which would lift the region validation), and
+  **per-task worker identity** (for example the worker's name derived from its ECS task ID
+  when `TASKFORGE_WORKER_NAME` is unset), which would lift the one-worker cap.
 
 Smaller items available to whoever wants them:
 

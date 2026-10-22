@@ -58,7 +58,7 @@ code, with no new Go dependency:
 Each ECS service's `desired_count` is a variable defaulting to 0. RUNBOOK.md's order: push
 the images, run the migrate task (`aws ecs run-task`), the api to 1, mint the keys through
 the cli sidecar, put the worker key secret's value, the outbox, reconciler and scheduler to
-1, then the workers. **The scheduler is safe with more than one replica**: promotion is
+1, then the worker (one task; see "One worker identity"). **The scheduler is safe with more than one replica**: promotion is
 tested with four concurrent replicas on separate connections
 (`TestScheduler_ConcurrentReplicasPromoteEachTransitionOnce`,
 `tests/integration/scheduler_test.go:246`), and re-notification locks the queue and the job
@@ -105,6 +105,61 @@ backups, each a variable. SQS uses SSE-SQS and S3 uses SSE-S3, so no role needs 
 permission. The results bucket blocks all public access and enforces bucket-owner
 ownership.
 
+### One worker identity: at most one worker task, stopped before its replacement starts
+
+*Implemented in the fix round for PR #31 (review finding B1), Terraform only, as the owner
+decided.*
+
+**The mechanism.** Every worker task runs the one task definition, so every one registers
+as the logical worker `TASKFORGE_WORKER_NAME` names (`ecs-worker`, `env/worker.json`). The
+`workers` table is `UNIQUE (scope, name)`
+(`migrations/0002_workers_sessions_and_claims.sql:55`), and `Store.Register` makes the new
+boot's session current and marks the previous current session `OFFLINE` in the same
+transaction (`internal/workers/store.go:53–106`). The fenced runner then gets
+`ErrSessionLost` (`internal/worker/runner.go:373`) and the process exits. Two tasks would
+therefore fence each other forever: each restart registers and fences the other. With one
+task and ECS's default rolling deploy (minimum 100 % healthy, maximum 200 %), the new task
+starts while the old one runs and fences its in-flight attempts, which then wait for lease
+expiry instead of draining.
+
+**The cap.** `worker_desired_count` has a validation admitting exactly 0 and 1
+(`contains([0, 1], var.worker_desired_count)`). One task runs up to
+`TASKFORGE_WORKER_CONCURRENCY` jobs at once (4 by default).
+
+**Stop-before-start.** The worker is its own `aws_ecs_service`, apart from the outbox,
+reconciler and scheduler, with `deployment_minimum_healthy_percent = 0` and
+`deployment_maximum_percent = 100`: ECS stops the old task (SIGTERM, then the worker's
+drain) before it starts the new one.
+
+**The stop timeout.** The worker drains for up to `TASKFORGE_WORKER_SHUTDOWN_TIMEOUT`, 15 s
+by default (`internal/config/config.go:593`; `internal/worker/runner.go:127–128`), then
+shuts its health server down within a fresh 15 s (`cmd/taskforge-worker/main.go:177–180`).
+ECS sends the stop signal (SIGTERM by default) and then `SIGKILL` after the container's
+`stopTimeout`, which defaults to 30 s on Fargate (platform 1.3.0 or later) and may be at
+most 120 s ([task definition parameters, container
+timeouts](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html#container_definition_timeout);
+[StopTask](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_StopTask.html)).
+30 s would leave no margin over the worst case, so the worker container sets `stopTimeout =
+45`.
+
+**Enforced by tests** (`tests/verification/terraform_env_test.go`):
+`TestTerraformVars_WorkerCountIsAtMostOne`, `TestTerraformECS_WorkerStopsBeforeItStarts`
+(the two deployment percentages, the 45 s stop timeout, and the worker not also in the
+background `for_each`), and `TestTerraformECS_WorkerHasNoPathToTheDatabase`.
+
+### The region is us-east-1
+
+*Implemented in the same fix round (review finding N1).* `aws_region` has a validation
+requiring `us-east-1`. The worker calls `CreateBucket` on the existing results bucket at
+startup with no `LocationConstraint` (`internal/objectstore/objectstore.go:148`) and
+tolerates only `BucketAlreadyOwnedByYou` and `BucketAlreadyExists`. In `us-east-1`, S3
+documents that re-creating a bucket you own "returns 200 OK and resets the bucket access
+control lists" ([CreateBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html));
+ACLs are disabled here (`BucketOwnerEnforced`). Outside `us-east-1`, whether S3 answers that
+call with `BucketAlreadyOwnedByYou` or `IllegalLocationConstraintException` is
+**unverified**. The code fix that sends a `LocationConstraint` lifts the validation.
+`TestTerraformVars_RegionIsUSEast1` pins it.
+
 ### IAM, from the call sites
 
 The execution role (ECS itself) pulls from the seven repositories (`ecr:GetAuthorizationToken`
@@ -141,8 +196,9 @@ Two AZs, public and private subnets, one NAT gateway (ADR-0027 Q6). Security gro
 the ALB takes 443 and 80 from `allowed_ingress_cidrs` (none by default) and sends only to
 the api on 8090; the api takes 8090 from the ALB only and 8091 from the workers only; the
 api, outbox, reconciler, scheduler and migrate tasks send 443 out and 5432 to the database;
-the worker sends 443 out and 8091 to the api, **and has no path to the database**, because
-it never opens it; the database takes 5432 from the first group only.
+the worker is in the worker group alone, which sends 443 out and 8091 to the api, **and has
+no path to the database**, because it never opens it
+(`TestTerraformECS_WorkerHasNoPathToTheDatabase` pins both); the database takes 5432 from the first group only.
 
 ## Failure and upgrade cases
 
@@ -155,8 +211,16 @@ it never opens it; the database takes 5432 from the first group only.
   first for that reason.
 - **If ECS Exec refuses the task because the api's root is read-only**, apply the Q1
   fallback.
-- **Rolling deploys:** the migrations run before the services update. The api and the
-  workers are compatible across one version (configuration only, ADR-0026).
+- **Rolling deploys:** the migrations run before the services update. **Compatibility across
+  one version is a precondition each release must meet**, not a property of this
+  configuration: while the services roll, an old api may serve a new worker and the
+  reverse. Configuration-only changes (the listeners, AWS mode; ADR-0026, ADR-0027) meet it.
+- **The worker's deployment gap.** Because the worker deploys stop-then-start ("One worker identity"), a
+  release has a gap, up to one task start long, in which no worker claims. Jobs wait
+  `QUEUED`; none is lost.
+- **The worker's stop timeout** is 45 s, above its worst-case shutdown of 15 s of drain plus
+  15 s of health-server shutdown, where Fargate's default of 30 s would leave no margin
+  ("One worker identity").
 - **Teardown** needs deletion protection turned off first; the final snapshot is taken and
   kept, and fails if one of that name exists. The bucket and the repositories must be
   emptied first. RUNBOOK.md §6.
@@ -173,6 +237,13 @@ it never opens it; the database takes 5432 from the first group only.
   and requires its single `default` line to be `[]`. A `validation` block was rejected as
   the proof: it constrains values passed in, not the value an operator gets by passing
   nothing.
+- **Per-index worker services** (worker-0, worker-1, ..., each with its own task definition
+  and `TASKFORGE_WORKER_NAME`). It would allow more than one worker today, but it multiplies
+  services, task definitions and env files by the count, and makes scaling an edit to the
+  configuration. Rejected for this milestone's scope.
+- **Per-task worker identity in code**, for example deriving the worker's name from the ECS
+  task ID when `TASKFORGE_WORKER_NAME` is unset. It would lift the cap with one service.
+  It is the named follow-up; this milestone changes no code.
 - **VPC endpoints instead of the NAT gateway**, and **multi-AZ RDS.** Both cost more from
   the first hour; both are one variable or resource away.
 
@@ -183,10 +254,12 @@ it never opens it; the database takes 5432 from the first group only.
   action AWS names differently than the provider accepts).
 - **Never verified:** Fargate's ECS Exec agent (ADR-0027 verified the EC2 agent's source);
   the api's read-only root beside ECS Exec on its task (Q1); a task role actually being
-  resolved by the SDK's default chain in a running task; and whether the worker's
-  `CreateBucket` with no `LocationConstraint` against its existing bucket outside
-  `us-east-1` answers "already owned" (tolerated) or `IllegalLocationConstraintException`
-  (the worker refuses to start). The last is a code question, outside this milestone.
+  resolved by the SDK's default chain in a running task; and what S3 answers the worker's
+  `CreateBucket` outside `us-east-1` ("The region is us-east-1", which is why it is enforced).
+- **One worker at a time** ("One worker identity"): one task, up to `TASKFORGE_WORKER_CONCURRENCY` jobs, and a
+  claim gap on every worker deployment. Per-task worker identity is the code follow-up that
+  lifts it.
+- **`us-east-1` only** ("The region is us-east-1"), until the worker's `CreateBucket` sends a `LocationConstraint`.
 - **Cost-shaped choices:** one NAT gateway (a single AZ of egress, and its hourly and
   per-GB charge), single-AZ RDS (no standby).
 - **The control listener is plain HTTP inside the VPC** (ADR-0026's accepted limitation):

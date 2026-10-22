@@ -213,8 +213,11 @@ or applies. **Any `TASKFORGE_*` variable a deployed service needs goes in that s
 `deploy/terraform/env/<service>.json`**, never inline in a `.tf` file; secrets go in
 `ecs.tf`'s `valueFrom` map instead. `tests/verification/terraform_env_test.go` derives what
 each binary reads from `internal/config` and fails on a name the binary does not read, a
-missing or forbidden AWS-mode setting, a secret in plain environment, or a non-empty
-default for `allowed_ingress_cidrs`. See
+missing or forbidden AWS-mode setting, a secret in plain environment, a non-empty
+default for `allowed_ingress_cidrs`, a `worker_desired_count` that may exceed 1, an
+`aws_region` not pinned to `us-east-1`, a worker service that does not deploy
+stop-then-start (0 % / 100 %, a 45 s `stopTimeout`), or a worker with a path to the
+database. See
 [ADR-0028](docs/adr/0028-deployment-shape-on-aws.md) and `deploy/terraform/RUNBOOK.md`.
 
 ## 5. Coding conventions
