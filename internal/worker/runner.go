@@ -550,6 +550,20 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	cause := context.Cause(handlerCtx)
 	canceled := r.attempts.wasCanceled(fence.AttemptID)
 	cancelHandler(nil)
+
+	// A handler that returned a result has not finished until that result is
+	// stored, and storing a large one is network I/O of no fixed length. It runs
+	// here, while renewal still holds the lease and inside the same execution
+	// window the handler had, so an upload that outlasts one lease window cannot
+	// cost the attempt a success that already happened: the lease would lapse,
+	// the attempt would be abandoned, and the abandonment would consume budget.
+	// Losing authority, or reaching the attempt's deadline, cancels the upload.
+	var result *workers.ResultRef
+	resultReady := false
+	if handlerErr == nil && !canceled && !errors.Is(cause, errUserCanceled) &&
+		!errors.Is(cause, errAttemptTimedOut) && !errors.Is(cause, errAuthorityLost) {
+		result, resultReady = r.prepareResult(executionCtx, fence, assignment.Scope, handlerResult)
+	}
 	cancelExecution()
 	// Stopping the renewal loop before reporting the outcome is what serializes
 	// renewal against a terminal report from this process: exactly one of them is
@@ -557,6 +571,10 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	// reconciliation.
 	authorityLost, fatalErr := renewal.Stop()
 	cancelLease(errAuthorityLost)
+	// Read again now that renewal has stopped: a cancellation that arrived while
+	// the result was uploading must still be acknowledged cooperatively rather
+	// than left for the lease to lapse.
+	canceled = canceled || r.attempts.wasCanceled(fence.AttemptID)
 	if fatalErr != nil {
 		// This whole process boot lost its session. Report it as fatal so intake
 		// stops and readiness drops, not just this one attempt.
@@ -603,8 +621,7 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 		return nil
 	}
 
-	result, ok := r.prepareResult(ctx, fence, assignment.Scope, handlerResult)
-	if !ok {
+	if !resultReady {
 		// Already logged inside prepareResult. Succeed must never be called
 		// with a large result this process could not actually upload: doing
 		// so would report success for a result nothing can ever retrieve.

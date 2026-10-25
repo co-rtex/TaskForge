@@ -664,3 +664,166 @@ func TestRenewal_ALateSuccessCannotRestoreExpiredLocalAuthority(t *testing.T) {
 	require.False(t, succeeded.Load(),
 		"a renewal confirmed after the deadline it was racing must not authorize success")
 }
+
+// uploadingRunner is renewingRunner with an object store and a threshold low
+// enough that any handler result is uploaded rather than stored inline.
+func uploadingRunner(control ControlPlane, registry *Registry, objects ObjectStore) *Runner {
+	runner := renewingRunner(control, &fakeBroker{}, registry, RunnerConfig{
+		ResultInlineThresholdBytes: 8, ResultsBucket: "taskforge-results",
+	})
+	runner.objects = objects
+	return runner
+}
+
+// largeResultHandler returns at once with a result well over uploadingRunner's
+// threshold, so all the time this attempt spends is spent uploading.
+func largeResultHandler() Handler {
+	return HandlerFunc(func(context.Context, Execution) (json.RawMessage, error) {
+		return json.RawMessage(`{"result":"comfortably larger than eight bytes"}`), nil
+	})
+}
+
+// TestRenewal_ContinuesWhileALargeResultUploads is the upload half of what M3
+// promised the handler: the attempt still holds its lease while it stores the
+// result it produced. An upload that outlived an unrenewed lease would lose a
+// success that already happened, and since an abandonment consumes the attempt
+// budget, a job whose every attempt succeeds could end up dead-lettered.
+//
+// The upload blocks until three renewals have committed after the handler
+// returned. That is a barrier: if renewal stopped when the handler returned, no
+// renewal would ever arrive, the upload would fail on its own safety timeout,
+// and Succeed would never be called.
+func TestRenewal_ContinuesWhileALargeResultUploads(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+	assignment.LeaseRemaining = 40 * time.Millisecond
+	assignment.ExecutionDeadline = time.Now().Add(40 * time.Millisecond)
+
+	var handlerReturned atomic.Bool
+	renewedAfterHandler := make(chan struct{}, 16)
+	var succeededWith *workers.ResultRef
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		renew: func(_ context.Context, req workers.RenewalRequest) (workers.RenewalResult, error) {
+			if handlerReturned.Load() {
+				select {
+				case renewedAfterHandler <- struct{}{}:
+				default:
+				}
+			}
+			return workers.RenewalResult{
+				LeaseID: req.Fence.LeaseID, RenewalVersion: req.ExpectedVersion + 1,
+				ExpiresAt: time.Now().Add(40 * time.Millisecond), Remaining: 40 * time.Millisecond,
+			}, nil
+		},
+		succeed: func(_ context.Context, _ workers.Fence, result *workers.ResultRef) error {
+			succeededWith = result
+			return nil
+		},
+	}
+	objects := &fakeObjectStore{put: func(ctx context.Context, _, _ string, _ []byte, _ string) error {
+		handlerReturned.Store(true)
+		for seen := 0; seen < 3; {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+				return errors.New("no lease renewal while the result was uploading")
+			case <-renewedAfterHandler:
+				seen++
+			}
+		}
+		return nil
+	}}
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", largeResultHandler()))
+
+	require.NoError(t, uploadingRunner(control, registry, objects).processMessage(context.Background(), session,
+		queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")}))
+	require.Equal(t, 1, objects.calls, "the upload must not be retried after it succeeded")
+	require.NotNil(t, succeededWith,
+		"an upload that outlasted the claim's lease window must still report a fenced success")
+	require.Equal(t, "taskforge-results", succeededWith.Bucket)
+}
+
+// TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess is the other side:
+// renewing through the upload does not make the upload independent of the
+// lease. A definitive renewal rejection cancels it, and nothing is reported.
+func TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+	var uploadCanceled, succeeded atomic.Bool
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		renew: func(context.Context, workers.RenewalRequest) (workers.RenewalResult, error) {
+			return workers.RenewalResult{}, workers.ErrLeaseExpired
+		},
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
+			succeeded.Store(true)
+			return nil
+		},
+	}
+	objects := &fakeObjectStore{put: func(ctx context.Context, _, _ string, _ []byte, _ string) error {
+		select {
+		case <-ctx.Done():
+			uploadCanceled.Store(true)
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+			return errors.New("the upload outlived the lease it was running under")
+		}
+	}}
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", largeResultHandler()))
+
+	require.NoError(t, uploadingRunner(control, registry, objects).processMessage(context.Background(), session,
+		queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")}))
+	require.True(t, uploadCanceled.Load(), "losing lease authority must cancel the upload")
+	require.False(t, succeeded.Load(), "a result stored after authority was lost must not be reported")
+}
+
+// TestRenewal_CancellationDuringTheUploadIsAcknowledged keeps cancellation's
+// precedence over success intact for the time the upload adds. Cancellation
+// that durably won makes Succeed a state conflict, so a worker that reported
+// success anyway would leave the job in CANCEL_REQUESTED until its lease lapsed,
+// with a cooperative worker right there.
+func TestRenewal_CancellationDuringTheUploadIsAcknowledged(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+	var acknowledged, succeeded atomic.Bool
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		cancelAck: func(_ context.Context, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+			acknowledged.Store(true)
+			return workers.OutcomeResult{
+				JobID: ack.Fence.JobID, JobStatus: "CANCELED", AttemptStatus: workers.AttemptCanceled,
+			}, nil
+		},
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
+			succeeded.Store(true)
+			return nil
+		},
+	}
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", largeResultHandler()))
+	objects := &fakeObjectStore{}
+	runner := uploadingRunner(control, registry, objects)
+	objects.put = func(context.Context, string, string, []byte, string) error {
+		// What the heartbeat loop does when a directive arrives mid-upload.
+		runner.deliverCancellations([]workers.CancellationDirective{{
+			JobID: assignment.JobID, AttemptID: assignment.AttemptID, LeaseID: assignment.LeaseID,
+		}})
+		return nil
+	}
+
+	require.NoError(t, runner.processMessage(context.Background(), session,
+		queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")}))
+	require.Equal(t, 1, objects.calls)
+	require.True(t, acknowledged.Load(), "a cancellation delivered during the upload must be acknowledged")
+	require.False(t, succeeded.Load(), "cancellation outranks the success it interrupted")
+}
