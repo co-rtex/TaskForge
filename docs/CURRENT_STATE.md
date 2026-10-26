@@ -119,7 +119,8 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   lease while it uploads a large result. Before, renewal stopped when the handler returned,
   so an upload that outlasted the lease's remaining window cost the attempt a success that
   had already happened, and a job whose every attempt succeeded could dead-letter. The
-  audit also records, for the owner, a limitation it does not fix: a worker of another
+  outbox now drains a backlog within one poll interval instead of one batch per interval.
+  The audit also records, for the owner, a limitation it does not fix: a worker of another
   scope deletes a notification it cannot use, and an unclaimable job's notifications
   accumulate without bound. See "Correctness audit after M8C2" below.
 
@@ -4972,8 +4973,8 @@ Each was applied alone, its failing output recorded, and reverted, with `git sta
 Maintenance after M8C2, not a milestone, like the Go 1.27.2 toolchain bump: a review of the
 claim, fenced-transition, reconciliation, scheduling, outbox and worker-runtime paths
 against [ARCHITECTURE.md](ARCHITECTURE.md)'s invariants. It fixes one defect, in the worker
-runtime, and records one limitation that needs an owner decision, because every sound fix
-for it amends [ADR-0011](adr/0011-notification-generations-and-bounded-renotification.md)
+runtime; changes the outbox loop so a backlog drains within one interval; and records one
+limitation that needs an owner decision, because every sound fix for it amends [ADR-0011](adr/0011-notification-generations-and-bounded-renotification.md)
 or the data model. Nothing under `api/`, `migrations/`, `docs/benchmarks/` or
 `internal/api/testdata/` changed, and no ADR did.
 
@@ -5120,12 +5121,61 @@ cancellation; scheduler promotion and re-notification (generation-fenced); the o
 keys, the loser's rollback leaves no orphan); and the API's request ids, body cap, request
 timeout and server timeouts. Every write that moves a job out of `LEASED`, `RUNNING` or
 `CANCEL_REQUESTED` ends its lease in the same transaction, so the reconcilers' skipped
-candidates cannot hold a scan slot for long. Smaller observations, none changed: the
-outbox publishes at most one batch per poll interval, so a backlog drains at
-`TASKFORGE_OUTBOX_BATCH_SIZE` per `TASKFORGE_OUTBOX_POLL_INTERVAL` (50 a second by default);
-a reconciliation or scheduling pass stops at its first failing candidate and retries on the
-next tick; and result retrieval reads the whole object into memory, with no size cap on
-results.
+candidates cannot hold a scan slot for long. Smaller observations, none changed: a
+reconciliation or scheduling pass stops at its first failing candidate and retries on the
+next tick; result retrieval reads the whole object into memory, with no size cap on
+results; and an event whose publish failed is retried on its own backoff, which reaches
+`TASKFORGE_OUTBOX_BACKOFF_MAX` (5 minutes by default, ±20 % jitter) at the tenth failure on
+the default base and multiplier, so after a
+broker outage of that length a job can wait up to that long once the broker is back, and
+re-notification cannot step in while the event is still `PENDING`.
+
+### Changed: the outbox drains a backlog within one interval
+
+**What was wrong.** `Publisher.Run` ran one pass per tick, so however much was due, it
+delivered at most `TASKFORGE_OUTBOX_BATCH_SIZE` events per `TASKFORGE_OUTBOX_POLL_INTERVAL`:
+50 a second on the defaults. A backlog left by a broker outage, or a burst of submissions,
+drained at that rate while new work queued behind it; at the 1,000 jobs a minute the
+benchmark offers, a ten-minute outage's 10,000 events take about five minutes to clear.
+
+**The change** (`internal/outbox/publisher.go`). After a pass that claimed a full batch and
+delivered every event in it, the loop runs the next pass at once; a short batch, a failed
+event or a pass error ends the drain until the next tick. Neither recorded benchmark is
+affected: both offer about 17 jobs a second, so a pass never claims a full batch of 50.
+[ARCHITECTURE.md](ARCHITECTURE.md) §7 states the rule.
+
+**Measured**, as a mechanism probe and not a recorded benchmark: 1,000 jobs submitted
+through `jobs.Store.Submit` in one scope, then `outbox.Publisher.Run` with the shipped
+publisher settings (batch 50, poll 1 s, claim timeout 30 s, backoff 1 s to 5 min) against a
+broker queue of its own on the local ElasticMQ, timed from `Run` starting until no event is
+`PENDING`, polled every 25 ms. On an Apple M3 with 8 GB, **on battery** (Low Power Mode
+off), so the figures are indicative only:
+
+| | Runs | Drain time |
+| --- | --- | --- |
+| Before (`main`) | 3 | 20.09 s, 20.08 s, 20.08 s: 20 passes, one per tick |
+| After | 13 | 12 runs from 1.93 s to 2.31 s (median 2.04 s), each with no event published more than once and no failed publish; **one run of 14.32 s, unexplained** |
+
+The 14.32 s run was the first after the change, and the counters that would show a failed
+publish were added only after it; it did not recur in the twelve runs that followed. A
+drain ends at a failed publish or a pass error, and the next tick is a second away, so about
+twelve such stops would account for it, but nothing recorded shows that.
+
+**Tests and mutations** (`tests/integration/outbox_drain_test.go`, a file of its own so the
+lines [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md) cites in `outbox_test.go` stay where
+they are): `TestOutbox_RunLoopPublishesABacklogOfSeveralBatchesInOneTick` (30 events,
+batches of 10, a 3 s poll, a broker queue of its own: all published before the second tick)
+fails on `main`'s loop (`condition never became true within 5.5s`), and
+`TestOutbox_RunLoopDoesNotDrainWhileTheBrokerIsDown` (a broker that fails every publish at
+once: one batch of attempts per tick) fails with the failure condition removed from the
+drain (`expected: 10, actual: 30`). Two corrections were made on the way, and are recorded
+because each changed what the tests prove. A first version of the second test failed
+through the flaky proxy, and did not catch that mutation: the SDK's retries made each failed
+publish slow enough to hide the loop. And one run of the `TestOutbox_` group, the first
+after the tests moved to their own file, reported `FAIL` without the failing test being
+captured; three reruns were clean. The first test then used the shared broker queue and
+counted exactly 30 deliveries, which a delivery left in flight by another test would break,
+and had 1.5 s of margin after the first tick; it now has a queue of its own and 2.5 s.
 
 ---
 
