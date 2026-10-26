@@ -185,18 +185,36 @@ func (p *Publisher) Run(ctx context.Context) error {
 			p.log.Info("outbox publisher stopped")
 			return nil
 		case <-ticker.C:
-			stats, err := p.RunOnce(ctx)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				p.log.Error("outbox pass failed", slog.String("error", err.Error()))
-				continue
-			}
-			if stats.Published > 0 || stats.Failed > 0 || stats.AlreadyPublished > 0 {
-				p.log.Info("outbox pass complete",
-					slog.Int("claimed", stats.Claimed),
-					slog.Int("published", stats.Published),
-					slog.Int("failed", stats.Failed),
-					slog.Int("already_published", stats.AlreadyPublished))
-			}
+			p.drain(ctx)
+		}
+	}
+}
+
+// drain runs passes back to back for as long as each one claimed a full batch
+// and delivered every event in it.
+//
+// One pass per tick would cap delivery at BatchSize per PollInterval however
+// much is due, so a backlog left by a broker outage or a burst of submissions
+// would drain at that rate while new work queued behind it. A full batch is the
+// sign that more is due now; a short one means the backlog is gone. A failed
+// event ends the drain, so a broker that is down costs one batch of attempts per
+// tick, not a tight loop over the whole backlog.
+func (p *Publisher) drain(ctx context.Context) {
+	for {
+		stats, err := p.RunOnce(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			p.log.Error("outbox pass failed", slog.String("error", err.Error()))
+			return
+		}
+		if stats.Published > 0 || stats.Failed > 0 || stats.AlreadyPublished > 0 {
+			p.log.Info("outbox pass complete",
+				slog.Int("claimed", stats.Claimed),
+				slog.Int("published", stats.Published),
+				slog.Int("failed", stats.Failed),
+				slog.Int("already_published", stats.AlreadyPublished))
+		}
+		if err != nil || ctx.Err() != nil || stats.Claimed < p.cfg.BatchSize || stats.Failed > 0 {
+			return
 		}
 	}
 }
