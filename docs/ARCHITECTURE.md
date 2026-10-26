@@ -455,6 +455,12 @@ Publisher loop:
    network I/O.
 3. Mark the event published in a second transaction.
 
+The loop runs a pass on every poll interval, and a pass that claimed a full batch and
+delivered all of it is followed at once by another, so a backlog drains at the rate the
+broker accepts rather than one batch per interval. A short batch ends the drain, and so does
+any event that failed, so a broker outage costs one batch of attempts per interval rather
+than a tight loop. A job submitted to an idle outbox still waits for the next interval.
+
 **The publish-before-mark window is a real at-least-once window.** A crash between
 step 2 and step 3 causes the event to be published again after the claim timeout's
 visibility window lapses. This is expected and harmless: notifications are advisory,

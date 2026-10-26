@@ -2,8 +2,8 @@
 
 This document is the source of truth for what is runnable now and what remains
 planned. It records the implemented state through M8C2, including the Go 1.27.2
-toolchain bump that came between M8D3 and M8D4 and the Go 1.27.3 bump after M8C2. Each
-milestone's line
+toolchain bump that came between M8D3 and M8D4, the Go 1.27.3 bump after M8C2, and the
+correctness audit that followed it. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -118,6 +118,14 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
 - **Go 1.27.3 toolchain (maintenance after M8C2, not a milestone):** see PR #32. `go.mod`
   and the image builder move to Go 1.27.3 for GO-2026-6809, and `make scan` passes again.
   No behavior changed. See "Go 1.27.3 toolchain" below.
+- **Correctness audit (maintenance after M8C2, not a milestone):** see PR #33. A worker now renews its
+  lease while it uploads a large result. Before, renewal stopped when the handler returned,
+  so an upload that outlasted the lease's remaining window cost the attempt a success that
+  had already happened, and a job whose every attempt succeeded could dead-letter. The
+  outbox now drains a backlog within one poll interval instead of one batch per interval.
+  The audit also records two open defects it does not fix, which need an owner decision:
+  a worker of another scope deletes a notification it cannot use, and an unclaimable job's
+  notifications accumulate without bound. See "Correctness audit after M8C2" below.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -5032,6 +5040,278 @@ none of these gates is a timed benchmark run.
 
 ---
 
+## Correctness audit after M8C2
+
+Maintenance after M8C2, not a milestone, like the Go 1.27.2 toolchain bump: a review of the
+claim, fenced-transition, reconciliation, scheduling, outbox and worker-runtime paths
+against [ARCHITECTURE.md](ARCHITECTURE.md)'s invariants. It fixes one defect, in the worker
+runtime; changes the outbox loop so a backlog drains within one interval; and records one
+limitation that needs an owner decision, because every sound fix for it amends [ADR-0011](adr/0011-notification-generations-and-bounded-renotification.md)
+or the data model. Nothing under `api/`, `migrations/`, `docs/benchmarks/` or
+`internal/api/testdata/` changed, and no ADR did.
+
+### Fixed: an upload that outlived the lease cost a success that had happened
+
+**What was wrong.** `Runner.processMessage` stopped the renewal loop as soon as the handler
+returned, and only then classified the result and, for one at or above
+`TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES`, uploaded it to the object store with retries.
+Nothing renewed the lease during the upload. With the shipped timings (30 s lease, renewal
+every 10 s, a 1 s margin) the lease had 20–30 s left when the handler returned, so an upload
+slower than about 20 s, with no result-size cap and a 30 s per-request timeout against AWS
+plus the SDK's own retries, lost the lease: `Succeed` was refused, the reconciler abandoned
+the attempt, and, because an abandonment consumes the attempt budget
+([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)), a job whose handler
+succeeded every time could end `DEAD_LETTERED`.
+
+**Reproduced before the fix**, by
+`TestResults_AnUploadLongerThanTheLeaseStillSucceedsOnTheFirstAttempt`
+(`tests/integration/result_upload_lease_test.go`) with the runner from `main`: the real
+control plane, reconciler and object store, a 4 s lease, and an upload delayed 6 s. The job
+never reached `SUCCEEDED` (`condition never became true within 30s`), and the database held:
+
+```
+attempt | attempt status | lease status | renewal_version | error_code
+      1 | ABANDONED      | EXPIRED      |               0 | attempt_abandoned
+      2 | ABANDONED      | EXPIRED      |               0 | attempt_abandoned
+      3 | ABANDONED      | EXPIRED      |               0 | attempt_abandoned
+job: DEAD_LETTERED, max_attempts 3, dlq reason ATTEMPTS_EXHAUSTED; results rows: 0
+```
+
+**The change** (`internal/worker/runner.go`). The result is prepared before renewal stops,
+on the attempt's execution context, which is a child of the lease-authority context and
+carries the attempt's local deadline. Renewal keeps the lease alive through the upload; a
+definitive renewal rejection, or the local deadline, cancels the upload. Renewal still stops
+before `Succeed`, so renewal and a terminal report from this process are still never in
+flight together. With the fix the same test passes in about 6 s: one attempt, `SUCCEEDED`,
+its lease `COMPLETED` with `renewal_version` 2 or more, and an `object` results row of the
+handler's size.
+
+**Two departures from the old behavior, both consequences of the change, listed here
+rather than left implicit:**
+
+- The upload now runs inside the attempt's **local** deadline, which is up to 1 s before the
+  server's `timeout_at` (`executionBudget`'s margin). An upload that would have finished in
+  that last second, and been reported just before `timeout_at`, is now cancelled and left to
+  the timeout sweep. The handler itself already obeys the same deadline.
+- **Cancellation is read again after renewal stops.** A directive that arrives while the
+  result uploads (or between the handler returning and renewal stopping) is acknowledged
+  cooperatively. Before, the worker went on to report a success or failure that the server
+  refuses once cancellation has won, and the job waited for its lease to lapse and the
+  reconciler's fallback. The terminal outcome is `CANCELED` either way; it now comes from
+  the worker, with the lease `RELEASED` rather than `EXPIRED`, as ADR-0010's precedence
+  intends. The directive also stops an upload in progress: once the handler has returned,
+  the attempt's registry entry is bound to the upload's context (a review of the first
+  version found it ran on until the next renewal noticed the cancellation, up to one renewal
+  interval).
+
+**Tests and mutations.** Four unit tests in `internal/worker/renewal_test.go` use barriers,
+not sleeps: `TestRenewal_ContinuesWhileALargeResultUploads` (the upload returns only after
+three renewals committed after the handler returned),
+`TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess`,
+`TestRenewal_CancellationDuringTheUploadIsAcknowledged` and
+`TestRenewal_CancellationStopsAnUploadInProgress` (renewal keeps succeeding, so only the
+directive can end the upload). Each mutation was applied alone and reverted:
+
+| Mutation | Fails |
+| --- | --- |
+| the runner from `main` (upload after renewal stops) | `TestRenewal_ContinuesWhileALargeResultUploads` (`an upload that outlasted the claim's lease window must still report a fenced success`), `TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` (`losing lease authority must cancel the upload`), and the integration test above |
+| renewal kept running, but the upload given the unbound completion context | `TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` |
+| the cancellation re-read removed | `TestRenewal_CancellationDuringTheUploadIsAcknowledged` |
+| the registry not bound to the upload | `TestRenewal_CancellationStopsAnUploadInProgress` (`a cancellation directive must stop the upload in progress`) |
+
+M8D4's worker-path analysis ("Worker-path analysis (for option (b))", above) cites
+`runner.go` lines as they stood on its branch; its rows for a success whose report or upload
+fails now describe the old order. Its conclusion is unchanged: renewal still stops before
+any report, and the upload is bounded by the attempt's deadline, so a live worker still
+cannot hold a lease past `timeout_at` and ADR-0025's reasoning stands.
+
+### Open issue, unresolved: notification reachability across scopes and for unclaimable jobs
+
+Both halves come from one gap. A claim decides whether a notification is safe to delete
+relative to the **claiming worker**, while bounded re-notification assumes a published
+notification is either consumed or lost, never held live by workers that decline it.
+Neither can lose a job or corrupt state; both cost reachability, and the second costs load.
+
+1. **A worker of another scope deletes a notification it cannot use.** Every scope's
+   notifications go to one broker queue (`TASKFORGE_BROKER_QUEUE_NAME`), and since
+   [ADR-0014](adr/0014-worker-control-authentication.md) each scope runs its own workers.
+   `Claim` selects and answers only within the worker's scope, so a worker of scope B that
+   receives scope A's notification gets `QUEUE_EMPTY` when B has nothing due, which is
+   safe to acknowledge, and deletes it; when B does have work, it claims B's job under A's
+   event id. Either way A's job is left with no notification until re-notification
+   (`TASKFORGE_SCHEDULER_RENOTIFY_AFTER`, 60 s), whose replacement can meet the same fate.
+   [ADR-0003](adr/0003-pull-based-claim-with-broker-notification.md)'s rule 5 ("only after
+   the claim succeeds or the control plane confirms no eligible job remains") holds per
+   scope, not per notification. `make demo`, `make bench` and the topology smoke each use a
+   broker queue of their own, which is why none of them shows it.
+2. **An unclaimable job's notifications accumulate.** `NO_ELIGIBLE_JOB` is never
+   acknowledged, so the notification of a job no running worker can take (a capability or
+   job type no worker has; submission checks only their format) stays live and is
+   redelivered every visibility timeout. Re-notification sees the job still `QUEUED` with
+   no `PENDING` event, because the live one was published, and adds another every
+   interval. Nothing deletes any of them while the job waits. On the shipped defaults that
+   is arithmetic, not a measurement: one more live message a minute per stuck job, each
+   claimed and declined every 30 s, so about 1,440 messages and 48 wasted claim
+   transactions a second per stuck job after a day. Any API key can create such a job. The
+   local queue has no retention or redrive setting, and the Terraform under review in
+   PR #31 sets neither, so on SQS only its default 4-day retention bounds it.
+
+**Pinned, not fixed**, in `tests/integration/notification_reachability_test.go`, each on a
+broker queue of its own with the real API, publisher, scheduler and workers. Both are named
+`TestOpenDefect_*`: what they assert is the wrong behavior observed today, not a
+requirement, and each failure message says so. When the defects are fixed they must be
+inverted, not deleted.
+
+- `TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification`: a scope-B worker deletes
+  the only notification; a healthy scope-A worker then sits beside a `QUEUED` job with no
+  broker message, no pending event and no attempt.
+- `TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate`: a `gpu` job beside a cpu-only
+  worker, with re-notification every 300 ms. Live messages on the queue, every 1.5 s:
+  `[5 10 15 19]`, from 19 outbox events.
+
+**Why it is not fixed here.** Claims are fungible within a scope: one notification may
+claim a different job, so no rule that looks at one job's notifications can tell a
+redundant notification from the one another job depends on. Every sound repair moves a
+decision the accepted architecture made:
+
+- record when a declined notification was last presented (a column on `outbox_events`),
+  and have re-notification skip a job whose notification is still being declined, which
+  bounds the live set per job without deleting anything another job needs (ADR-0011 and
+  the schema);
+- give the broker a retention period near a few re-notification intervals, which bounds
+  the live set by infrastructure alone (the queue settings, and PR #31's Terraform);
+- per-scope broker queues, or a scope in the envelope with workers releasing what is not
+  theirs, which fixes the first half (ADR-0003, the broker interface, configuration);
+- cap or back off re-notification per generation, which slows the growth but repairs a
+  lost notification more slowly too (ADR-0011).
+
+The first two together address both halves' cost; the first half's latency remains until
+the third.
+
+### An option for worker-failure recovery, recorded and not taken
+
+PROJECT_SPEC §7's recovery target (< 30 s) is missed on the shipped 30 s lease because an
+abandoned attempt is found only when its lease expires. The code shows a lease can be dead
+sooner: once its session leaves `HEALTHY` (marked `UNHEALTHY` when stale, `OFFLINE` when
+replaced), every operation that could use the lease refuses it (`lockFence` and the
+mutating halves of `Succeed`, `Fail` and `AcknowledgeCancellation` require a healthy
+session), and nothing returns a session to `HEALTHY` (`Heartbeat` and a replayed `Register`
+both refuse). Reconciling such a lease at once would put a crash's recovery near the stale
+threshold (`TASKFORGE_SESSION_STALE_AFTER`, 15 s) plus a reconciler pass (2 s), without
+changing a default, and would shorten the mechanism ADR-0024 found behind the 50.04 s
+outlier, since a restarted boot would be charged for its dead boot's lease only until the
+next pass rather than until that lease expired.
+
+It is not taken because it gives something up. Waiting for `expires_at` means a worker that
+is alive but cut off has reached its own conservative local deadline, and cancelled a
+cooperative handler, before any replacement can be claimed; reconciling at session end
+would let the replacement start while that handler may still run. Duplicate execution is
+already allowed (PROJECT_SPEC §2); that non-overlap is not promised, but nothing written
+gives it up either. It would amend ADR-0009 and ADR-0025, change when the outcome-precedence
+instants are taken, need re-measurement, and is the owner's decision with the shipped
+timings.
+
+### Verification
+
+**Second round**, after `origin/main` (the Go 1.27.3 toolchain, PR #32) was merged into the
+branch and the review change above was made, on 2026-10-26, against the stack `make up`
+starts, on the same Apple M3 (on AC power when the round ended; when it switched from
+battery was not recorded):
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...`, exit 0; `gofmt -l` empty |
+| `make test-unit` | PASS | every package `ok`, including `tests/verification` (the matrix drift check) |
+| `make test-integration` | PASS | `ok .../tests/integration 109.982s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 109.083s` |
+| `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)` |
+| `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
+| `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
+| `make images-smoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
+| `make topology-smoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
+| `make scan` in a fresh full-history clone of the branch alone | PASS | govulncheck `no findings (go1.27.3 ...)`; gitleaks `no findings (full git history, all refs)`; pip-audit and npm audit `no findings` |
+| `make scan` in this worktree | **FAIL** | gitleaks `stripe-access-token` in commit `11c451e8`, which only the local, never-pushed branch `backup-pre-fix` holds (not this branch's history, no remote branch); the other three `no findings` |
+
+**First round**, on 2026-10-25 before the merge, on Go 1.27.2 and on battery: the same
+gates passed (integration `140.127s`; race on the changed packages; `make sdk-lint` and
+`make sdk-test`, `179 passed`; `make dash-lint` and `make dash-test`, `79 passed (79)`), and
+`make scan` failed on govulncheck `GO-2026-6809` (stdlib 1.27.2, fixed in 1.27.3), which
+the merged PR #32 resolves, as well as on the same local gitleaks finding. The SDK and the
+dashboard are unchanged by the merge and by the review change, so they were not rerun.
+
+`make bench` was not run: a recorded run needs a clean tree on power, and neither change
+alters what either recorded run measured.
+
+### Audited and found consistent with the architecture
+
+The claim (advisory identity lock, then queue → session → job → attempt → lease, a
+post-lock `clock_timestamp()`, capacity counted from active leases); `Start`, `Succeed`,
+`Fail` and `AcknowledgeCancellation` (replays answered from history before liveness,
+foreign outcome identities refused, one dead-letter funnel); renewal (authority validated
+before a replay is recognized); the timeout sweep and the expired-lease precedence; public
+cancellation; scheduler promotion and re-notification (generation-fenced); the outbox
+(claim, publish outside a transaction, mark); submission and replay idempotency (primary
+keys, the loser's rollback leaves no orphan); and the API's request ids, body cap, request
+timeout and server timeouts. Every write that moves a job out of `LEASED`, `RUNNING` or
+`CANCEL_REQUESTED` ends its lease in the same transaction, so the reconcilers' skipped
+candidates cannot hold a scan slot for long. Smaller observations, none changed: a
+reconciliation or scheduling pass stops at its first failing candidate and retries on the
+next tick; result retrieval reads the whole object into memory, with no size cap on
+results; and an event whose publish failed is retried on its own backoff, which reaches
+`TASKFORGE_OUTBOX_BACKOFF_MAX` (5 minutes by default, ±20 % jitter) at the tenth failure on
+the default base and multiplier, so after a
+broker outage of that length a job can wait up to that long once the broker is back, and
+re-notification cannot step in while the event is still `PENDING`.
+
+### Changed: the outbox drains a backlog within one interval
+
+**What was wrong.** `Publisher.Run` ran one pass per tick, so however much was due, it
+delivered at most `TASKFORGE_OUTBOX_BATCH_SIZE` events per `TASKFORGE_OUTBOX_POLL_INTERVAL`:
+50 a second on the defaults. A backlog left by a broker outage, or a burst of submissions,
+drained at that rate while new work queued behind it; at the 1,000 jobs a minute the
+benchmark offers, a ten-minute outage's 10,000 events take about five minutes to clear.
+
+**The change** (`internal/outbox/publisher.go`). After a pass that claimed a full batch and
+delivered every event in it, the loop runs the next pass at once; a short batch, a failed
+event or a pass error ends the drain until the next tick. Neither recorded benchmark is
+affected: both offer about 17 jobs a second, so a pass never claims a full batch of 50.
+[ARCHITECTURE.md](ARCHITECTURE.md) §7 states the rule.
+
+**Measured**, as a mechanism probe and not a recorded benchmark: 1,000 jobs submitted
+through `jobs.Store.Submit` in one scope, then `outbox.Publisher.Run` with the shipped
+publisher settings (batch 50, poll 1 s, claim timeout 30 s, backoff 1 s to 5 min) against a
+broker queue of its own on the local ElasticMQ, timed from `Run` starting until no event is
+`PENDING`, polled every 25 ms. On an Apple M3 with 8 GB, **on battery** (Low Power Mode
+off), so the figures are indicative only:
+
+| | Runs | Drain time |
+| --- | --- | --- |
+| Before (`main`) | 3 | 20.09 s, 20.08 s, 20.08 s: 20 passes, one per tick |
+| After | 13 | 12 runs from 1.93 s to 2.31 s (median 2.04 s), each with no event published more than once and no failed publish; **one run of 14.32 s, unexplained** |
+
+The 14.32 s run was the first after the change, and the counters that would show a failed
+publish were added only after it; it did not recur in the twelve runs that followed. A
+drain ends at a failed publish or a pass error, and the next tick is a second away, so about
+twelve such stops would account for it, but nothing recorded shows that.
+
+**Tests and mutations** (`tests/integration/outbox_drain_test.go`, a file of its own so the
+lines [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md) cites in `outbox_test.go` stay where
+they are): `TestOutbox_RunLoopPublishesABacklogOfSeveralBatchesInOneTick` (30 events,
+batches of 10, a 3 s poll, a broker queue of its own: all published before the second tick)
+fails on `main`'s loop (`condition never became true within 5.5s`), and
+`TestOutbox_RunLoopDoesNotDrainWhileTheBrokerIsDown` (a broker that fails every publish at
+once: one batch of attempts per tick) fails with the failure condition removed from the
+drain (`expected: 10, actual: 30`). Two corrections were made on the way, and are recorded
+because each changed what the tests prove. A first version of the second test failed
+through the flaky proxy, and did not catch that mutation: the SDK's retries made each failed
+publish slow enough to hide the loop. And one run of the `TestOutbox_` group, the first
+after the tests moved to their own file, reported `FAIL` without the failing test being
+captured; three reruns were clean. The first test then used the shared broker queue and
+counted exactly 30 deliveries, which a delivery left in flight by another test would break,
+and had 1.5 s of margin after the first tick; it now has a queue of its own and 2.5 s.
+
+---
+
 ## Verification
 
 ### M5A gates
@@ -6870,6 +7150,10 @@ watched from the dashboard.
 Open, and not any milestone's deliverable: whether the shipped lease and outbox
 interval should change is a question the two M8A records answer only as numbers, not
 as a decision, and changing the defaults would require re-measuring.
+
+Also open, for the owner: how to repair notification reachability across scopes and for
+unclaimable jobs ("Correctness audit after M8C2" above). Each repair it names amends
+ADR-0011, ADR-0003, the schema or the broker queue's settings, so none is started.
 
 Smaller items available to whoever wants them, none blocking M8:
 
