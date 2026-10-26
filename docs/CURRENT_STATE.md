@@ -123,9 +123,9 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   so an upload that outlasted the lease's remaining window cost the attempt a success that
   had already happened, and a job whose every attempt succeeded could dead-letter. The
   outbox now drains a backlog within one poll interval instead of one batch per interval.
-  The audit also records, for the owner, a limitation it does not fix: a worker of another
-  scope deletes a notification it cannot use, and an unclaimable job's notifications
-  accumulate without bound. See "Correctness audit after M8C2" below.
+  The audit also records two open defects it does not fix, which need an owner decision:
+  a worker of another scope deletes a notification it cannot use, and an unclaimable job's
+  notifications accumulate without bound. See "Correctness audit after M8C2" below.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -5099,20 +5099,25 @@ rather than left implicit:**
   refuses once cancellation has won, and the job waited for its lease to lapse and the
   reconciler's fallback. The terminal outcome is `CANCELED` either way; it now comes from
   the worker, with the lease `RELEASED` rather than `EXPIRED`, as ADR-0010's precedence
-  intends.
+  intends. The directive also stops an upload in progress: once the handler has returned,
+  the attempt's registry entry is bound to the upload's context (a review of the first
+  version found it ran on until the next renewal noticed the cancellation, up to one renewal
+  interval).
 
-**Tests and mutations.** Three unit tests in `internal/worker/renewal_test.go` use barriers,
+**Tests and mutations.** Four unit tests in `internal/worker/renewal_test.go` use barriers,
 not sleeps: `TestRenewal_ContinuesWhileALargeResultUploads` (the upload returns only after
 three renewals committed after the handler returned),
-`TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` and
-`TestRenewal_CancellationDuringTheUploadIsAcknowledged`. Each mutation was applied alone and
-reverted:
+`TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess`,
+`TestRenewal_CancellationDuringTheUploadIsAcknowledged` and
+`TestRenewal_CancellationStopsAnUploadInProgress` (renewal keeps succeeding, so only the
+directive can end the upload). Each mutation was applied alone and reverted:
 
 | Mutation | Fails |
 | --- | --- |
 | the runner from `main` (upload after renewal stops) | `TestRenewal_ContinuesWhileALargeResultUploads` (`an upload that outlasted the claim's lease window must still report a fenced success`), `TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` (`losing lease authority must cancel the upload`), and the integration test above |
 | renewal kept running, but the upload given the unbound completion context | `TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` |
 | the cancellation re-read removed | `TestRenewal_CancellationDuringTheUploadIsAcknowledged` |
+| the registry not bound to the upload | `TestRenewal_CancellationStopsAnUploadInProgress` (`a cancellation directive must stop the upload in progress`) |
 
 M8D4's worker-path analysis ("Worker-path analysis (for option (b))", above) cites
 `runner.go` lines as they stood on its branch; its rows for a success whose report or upload
@@ -5120,7 +5125,7 @@ fails now describe the old order. Its conclusion is unchanged: renewal still sto
 any report, and the upload is bounded by the attempt's deadline, so a live worker still
 cannot hold a lease past `timeout_at` and ADR-0025's reasoning stands.
 
-### Known limitation, for the owner: notification reachability across scopes and for unclaimable jobs
+### Open issue, unresolved: notification reachability across scopes and for unclaimable jobs
 
 Both halves come from one gap. A claim decides whether a notification is safe to delete
 relative to the **claiming worker**, while bounded re-notification assumes a published
@@ -5153,12 +5158,14 @@ Neither can lose a job or corrupt state; both cost reachability, and the second 
 
 **Pinned, not fixed**, in `tests/integration/notification_reachability_test.go`, each on a
 broker queue of its own with the real API, publisher, scheduler and workers. Both are named
-`TestLimitation_*`; when the limitation is fixed they must be inverted, not deleted.
+`TestOpenDefect_*`: what they assert is the wrong behavior observed today, not a
+requirement, and each failure message says so. When the defects are fixed they must be
+inverted, not deleted.
 
-- `TestLimitation_AnotherScopesWorkerDeletesTheOnlyNotification`: a scope-B worker deletes
+- `TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification`: a scope-B worker deletes
   the only notification; a healthy scope-A worker then sits beside a `QUEUED` job with no
   broker message, no pending event and no attempt.
-- `TestLimitation_AnUnclaimableJobsNotificationsAccumulate`: a `gpu` job beside a cpu-only
+- `TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate`: a `gpu` job beside a cpu-only
   worker, with re-notification every 300 ms. Live messages on the queue, every 1.5 s:
   `[5 10 15 19]`, from 19 outbox events.
 
@@ -5206,23 +5213,31 @@ timings.
 
 ### Verification
 
-Run on 2026-10-25 on the branch, with both changes in, against the stack `make up` starts,
-on an Apple M3 on battery:
+**Second round**, after `origin/main` (the Go 1.27.3 toolchain, PR #32) was merged into the
+branch and the review change above was made, on 2026-10-26, against the stack `make up`
+starts, on the same Apple M3 (on AC power when the round ended; when it switched from
+battery was not recorded):
 
 | Command | Result | Real output |
 | --- | --- | --- |
 | `make lint` | PASS | `go vet ./...`, exit 0; `gofmt -l` empty |
 | `make test-unit` | PASS | every package `ok`, including `tests/verification` (the matrix drift check) |
-| `make test-integration` | PASS | `ok .../tests/integration 140.127s` |
-| `go test -race` on `internal/outbox`, `internal/worker`, `internal/workers`, and the new and outbox integration tests | PASS | each `ok` |
-| `make sdk-lint`, `make sdk-test` | PASS | `All checks passed!`; mypy `no issues found in 21 source files`; `179 passed` |
-| `make dash-lint`, `make dash-test` | PASS | Biome `Checked 44 files`; Vitest `79 passed (79)` |
+| `make test-integration` | PASS | `ok .../tests/integration 109.982s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 109.083s` |
 | `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)` |
 | `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
 | `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
 | `make images-smoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
 | `make topology-smoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
-| `make scan` | **FAIL** | govulncheck `GO-2026-6809` (stdlib 1.27.2, fixed in 1.27.3), the finding PR #32 addresses; and gitleaks `stripe-access-token` in commit `11c451e8`, which only the local branch `backup-pre-fix` holds (no remote branch and not this branch's history); pip-audit and npm audit `no findings` |
+| `make scan` in a fresh full-history clone of the branch alone | PASS | govulncheck `no findings (go1.27.3 ...)`; gitleaks `no findings (full git history, all refs)`; pip-audit and npm audit `no findings` |
+| `make scan` in this worktree | **FAIL** | gitleaks `stripe-access-token` in commit `11c451e8`, which only the local, never-pushed branch `backup-pre-fix` holds (not this branch's history, no remote branch); the other three `no findings` |
+
+**First round**, on 2026-10-25 before the merge, on Go 1.27.2 and on battery: the same
+gates passed (integration `140.127s`; race on the changed packages; `make sdk-lint` and
+`make sdk-test`, `179 passed`; `make dash-lint` and `make dash-test`, `79 passed (79)`), and
+`make scan` failed on govulncheck `GO-2026-6809` (stdlib 1.27.2, fixed in 1.27.3), which
+the merged PR #32 resolves, as well as on the same local gitleaks finding. The SDK and the
+dashboard are unchanged by the merge and by the review change, so they were not rerun.
 
 `make bench` was not run: a recorded run needs a clean tree on power, and neither change
 alters what either recorded run measured.
