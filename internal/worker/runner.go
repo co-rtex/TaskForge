@@ -557,12 +557,18 @@ func (r *Runner) processMessage(ctx context.Context, session workers.Session, me
 	// window the handler had, so an upload that outlasts one lease window cannot
 	// cost the attempt a success that already happened: the lease would lapse,
 	// the attempt would be abandoned, and the abandonment would consume budget.
-	// Losing authority, or reaching the attempt's deadline, cancels the upload.
+	// Losing authority, or reaching the attempt's deadline, cancels the upload,
+	// and so does a cancellation directive: the attempt's registry entry is bound
+	// to the upload once the handler has returned, and bind applies a directive
+	// that arrived in between.
 	var result *workers.ResultRef
 	resultReady := false
 	if handlerErr == nil && !canceled && !errors.Is(cause, errUserCanceled) &&
 		!errors.Is(cause, errAttemptTimedOut) && !errors.Is(cause, errAuthorityLost) {
-		result, resultReady = r.prepareResult(executionCtx, fence, assignment.Scope, handlerResult)
+		uploadCtx, cancelUpload := context.WithCancelCause(executionCtx)
+		r.attempts.bind(fence.AttemptID, cancelUpload)
+		result, resultReady = r.prepareResult(uploadCtx, fence, assignment.Scope, handlerResult)
+		cancelUpload(nil)
 	}
 	cancelExecution()
 	// Stopping the renewal loop before reporting the outcome is what serializes

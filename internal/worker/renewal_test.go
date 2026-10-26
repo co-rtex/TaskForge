@@ -827,3 +827,51 @@ func TestRenewal_CancellationDuringTheUploadIsAcknowledged(t *testing.T) {
 	require.True(t, acknowledged.Load(), "a cancellation delivered during the upload must be acknowledged")
 	require.False(t, succeeded.Load(), "cancellation outranks the success it interrupted")
 }
+
+// TestRenewal_CancellationStopsAnUploadInProgress is the prompt half of the
+// test above: a directive that arrives mid-upload stops the upload itself,
+// rather than waiting for the next renewal to discover the cancellation.
+// Renewal keeps succeeding here, so only the directive can end the upload
+// before its own safety timeout.
+func TestRenewal_CancellationStopsAnUploadInProgress(t *testing.T) {
+	session := testSession(1)
+	assignment := testAssignment(session)
+	var acknowledged, succeeded, uploadCanceled atomic.Bool
+	control := &fakeControl{
+		claim: func(context.Context, workers.ClaimRequest) (workers.ClaimResult, error) {
+			return workers.ClaimResult{Disposition: workers.Claimed, Assignment: assignment}, nil
+		},
+		cancelAck: func(_ context.Context, ack workers.CancelAcknowledgment) (workers.OutcomeResult, error) {
+			acknowledged.Store(true)
+			return workers.OutcomeResult{
+				JobID: ack.Fence.JobID, JobStatus: "CANCELED", AttemptStatus: workers.AttemptCanceled,
+			}, nil
+		},
+		succeed: func(context.Context, workers.Fence, *workers.ResultRef) error {
+			succeeded.Store(true)
+			return nil
+		},
+	}
+	registry := NewRegistry()
+	require.NoError(t, registry.Register("demo.echo", largeResultHandler()))
+	objects := &fakeObjectStore{}
+	runner := uploadingRunner(control, registry, objects)
+	objects.put = func(ctx context.Context, _, _ string, _ []byte, _ string) error {
+		runner.deliverCancellations([]workers.CancellationDirective{{
+			JobID: assignment.JobID, AttemptID: assignment.AttemptID, LeaseID: assignment.LeaseID,
+		}})
+		select {
+		case <-ctx.Done():
+			uploadCanceled.Store(true)
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+			return errors.New("the upload kept running after its job was canceled")
+		}
+	}
+
+	require.NoError(t, runner.processMessage(context.Background(), session,
+		queue.Message{ReceiptHandle: "r1", Body: notificationBody(t, "default")}))
+	require.True(t, uploadCanceled.Load(), "a cancellation directive must stop the upload in progress")
+	require.True(t, acknowledged.Load())
+	require.False(t, succeeded.Load())
+}
