@@ -83,17 +83,18 @@ func liveBrokerMessages(t *testing.T, queueURL string) int {
 	return total
 }
 
-// TestLimitation_AnotherScopesWorkerDeletesTheOnlyNotification pins a known
-// limitation recorded in docs/CURRENT_STATE.md ("Notification reachability across
-// scopes and for unclaimable jobs"). It is not a property to keep: when the
-// limitation is fixed, this test must be inverted, not deleted.
+// TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification pins an open,
+// unresolved defect recorded in docs/CURRENT_STATE.md ("Open issue, unresolved:
+// notification reachability across scopes and for unclaimable jobs"). What it
+// asserts is the WRONG behavior, observed today; it is not a requirement. When
+// the defect is fixed, this test must be inverted, not deleted.
 //
 // Every scope's notifications go to one broker queue, but a claim answers
 // QUEUE_EMPTY for the claiming worker's own scope. A worker of another scope
 // therefore deletes a notification it could never use, and the job it named sits
 // QUEUED, beside a worker of its own scope, with nothing left to wake that worker
 // until bounded re-notification (60 s by default) creates another.
-func TestLimitation_AnotherScopesWorkerDeletesTheOnlyNotification(t *testing.T) {
+func TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification(t *testing.T) {
 	registry := workerruntime.NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", workerruntime.DemoEcho{}))
 	// Long enough that bounded re-notification cannot repair anything inside
@@ -130,22 +131,24 @@ func TestLimitation_AnotherScopesWorkerDeletesTheOnlyNotification(t *testing.T) 
 	var status string
 	require.NoError(t, testPool.QueryRow(context.Background(),
 		`SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&status))
-	require.Equal(t, "QUEUED", status)
-	require.Equal(t, 0, liveBrokerMessages(t, queueURL))
-	require.Equal(t, 0, countPendingOutbox(t))
-	require.Equal(t, 0, countRows(t, "job_attempts"))
+	const defect = "open defect, pinned as observed (not correct behavior): " +
+		"the job's only notification was deleted by another scope's worker"
+	require.Equal(t, "QUEUED", status, defect)
+	require.Equal(t, 0, liveBrokerMessages(t, queueURL), defect)
+	require.Equal(t, 0, countPendingOutbox(t), defect)
+	require.Equal(t, 0, countRows(t, "job_attempts"), defect)
 }
 
-// TestLimitation_AnUnclaimableJobsNotificationsAccumulate pins the second half
-// of the same recorded limitation, and must likewise be inverted when it is
-// fixed.
+// TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate pins the second half
+// of the same open defect. It too asserts the wrong behavior observed today, and
+// must likewise be inverted when it is fixed.
 //
 // NO_ELIGIBLE_JOB is never acknowledged, so the notification of a job no running
 // worker can take stays live and is redelivered every visibility timeout. Bounded
 // re-notification sees only that the job is still QUEUED with no PENDING event,
 // because the live notification was published, and adds another every interval.
 // Nothing deletes any of them while the job waits.
-func TestLimitation_AnUnclaimableJobsNotificationsAccumulate(t *testing.T) {
+func TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate(t *testing.T) {
 	registry := workerruntime.NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", workerruntime.DemoEcho{}))
 	stack := startE2EStack(t, registry, 300*time.Millisecond)
@@ -170,6 +173,8 @@ func TestLimitation_AnUnclaimableJobsNotificationsAccumulate(t *testing.T) {
 		`SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&status))
 	require.Equal(t, "QUEUED", status)
 	require.Equal(t, 0, countRows(t, "job_attempts"))
-	require.Greater(t, samples[0], 1, "re-notification adds to a notification that is still live")
-	require.Greater(t, samples[len(samples)-1], samples[0], "and keeps adding while the job waits")
+	require.Greater(t, samples[0], 1,
+		"open defect, pinned as observed (not correct behavior): re-notification adds to a notification that is still live")
+	require.Greater(t, samples[len(samples)-1], samples[0],
+		"open defect, pinned as observed (not correct behavior): the live set keeps growing while the job waits")
 }
