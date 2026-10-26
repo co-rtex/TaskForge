@@ -5109,6 +5109,52 @@ decision the accepted architecture made:
 The first two together address both halves' cost; the first half's latency remains until
 the third.
 
+### An option for worker-failure recovery, recorded and not taken
+
+PROJECT_SPEC §7's recovery target (< 30 s) is missed on the shipped 30 s lease because an
+abandoned attempt is found only when its lease expires. The code shows a lease can be dead
+sooner: once its session leaves `HEALTHY` (marked `UNHEALTHY` when stale, `OFFLINE` when
+replaced), every operation that could use the lease refuses it (`lockFence` and the
+mutating halves of `Succeed`, `Fail` and `AcknowledgeCancellation` require a healthy
+session), and nothing returns a session to `HEALTHY` (`Heartbeat` and a replayed `Register`
+both refuse). Reconciling such a lease at once would put a crash's recovery near the stale
+threshold (`TASKFORGE_SESSION_STALE_AFTER`, 15 s) plus a reconciler pass (2 s), without
+changing a default, and would shorten the mechanism ADR-0024 found behind the 50.04 s
+outlier, since a restarted boot would be charged for its dead boot's lease only until the
+next pass rather than until that lease expired.
+
+It is not taken because it gives something up. Waiting for `expires_at` means a worker that
+is alive but cut off has reached its own conservative local deadline, and cancelled a
+cooperative handler, before any replacement can be claimed; reconciling at session end
+would let the replacement start while that handler may still run. Duplicate execution is
+already allowed (PROJECT_SPEC §2); that non-overlap is not promised, but nothing written
+gives it up either. It would amend ADR-0009 and ADR-0025, change when the outcome-precedence
+instants are taken, need re-measurement, and is the owner's decision with the shipped
+timings.
+
+### Verification
+
+Run on 2026-10-25 on the branch, with both changes in, against the stack `make up` starts,
+on an Apple M3 on battery:
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...`, exit 0; `gofmt -l` empty |
+| `make test-unit` | PASS | every package `ok`, including `tests/verification` (the matrix drift check) |
+| `make test-integration` | PASS | `ok .../tests/integration 140.127s` |
+| `go test -race` on `internal/outbox`, `internal/worker`, `internal/workers`, and the new and outbox integration tests | PASS | each `ok` |
+| `make sdk-lint`, `make sdk-test` | PASS | `All checks passed!`; mypy `no issues found in 21 source files`; `179 passed` |
+| `make dash-lint`, `make dash-test` | PASS | Biome `Checked 44 files`; Vitest `79 passed (79)` |
+| `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)` |
+| `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
+| `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
+| `make images-smoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
+| `make topology-smoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
+| `make scan` | **FAIL** | govulncheck `GO-2026-6809` (stdlib 1.27.2, fixed in 1.27.3), the finding PR #32 addresses; and gitleaks `stripe-access-token` in commit `11c451e8`, which only the local branch `backup-pre-fix` holds (no remote branch and not this branch's history); pip-audit and npm audit `no findings` |
+
+`make bench` was not run: a recorded run needs a clean tree on power, and neither change
+alters what either recorded run measured.
+
 ### Audited and found consistent with the architecture
 
 The claim (advisory identity lock, then queue → session → job → attempt → lease, a
