@@ -2,8 +2,8 @@
 
 This document is the source of truth for what is runnable now and what remains
 planned. It records the implemented state through M8C2, including the Go 1.27.2
-toolchain bump that came between M8D3 and M8D4 and the correctness audit that followed
-M8C2. Each milestone's line
+toolchain bump that came between M8D3 and M8D4, the Go 1.27.3 bump after M8C2, and the
+correctness audit that followed it. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -115,6 +115,9 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   show needs no shell but a writable root filesystem
   ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)). Defaults are
   byte-identical. See "M8C2" below. M8C3 (the Terraform) is planned.
+- **Go 1.27.3 toolchain (maintenance after M8C2, not a milestone):** see PR #32. `go.mod`
+  and the image builder move to Go 1.27.3 for GO-2026-6809, and `make scan` passes again.
+  No behavior changed. See "Go 1.27.3 toolchain" below.
 - **Correctness audit (maintenance after M8C2, not a milestone):** see PR #33. A worker now renews its
   lease while it uploads a large result. Before, renewal stopped when the handler returned,
   so an upload that outlasted the lease's remaining window cost the attempt a success that
@@ -4966,6 +4969,75 @@ Each was applied alone, its failing output recorded, and reverted, with `git sta
 - **Recorded for M8C3, unbuilt here:** `sslmode=require` without server verification, and
   the database password in Terraform state.
 
+## Go 1.27.3 toolchain
+
+Maintenance after M8C2, not a milestone: `make scan` turned red on `main` (`92cada2`) once
+the vulnerability database modified 2026-10-21T00:27:29Z carried GO-2026-6809, and this
+change makes it pass. Like the Go 1.27.2 change above, it follows
+[ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md)'s rule that the image
+builder is pinned to exactly `go.mod`'s Go, and changes no behavior. See PR #32.
+
+### What changed
+
+- **`go.mod`:** `go 1.27.3`, still with no `toolchain` line. 1.27.3 is the first release
+  fixed for GO-2026-6809 (crypto/x509: distrust compromised intermediate certificates),
+  which govulncheck reaches through `crypto/x509.Certificate.Verify` from
+  `internal/worker/client.go:540` (`Ping`). `go mod tidy` under 1.27.3 changes nothing
+  else: no requirement and no `go.sum` line moved.
+- **`Dockerfile`:** the builder is `golang:1.27.3@sha256:f20d83a83e18dbd2a4714b8ffd4b30b287b6243962dd75608e86abcc63ba4efc`,
+  the official image's multi-platform index (linux/amd64 and linux/arm64/v8 among its nine
+  platforms), resolved on 2026-10-21 with `docker buildx imagetools inspect golang:1.27.3`.
+  `tests/verification` holds it equal to `go.mod`.
+- **`scripts/scan`:** govulncheck stays at v1.8.0, which builds with 1.27.3. Its comment
+  no longer calls v1.8.0 the newest tag: v1.9.0 now exists, and adopting it is not part of
+  this change.
+- **`README.md`** and "Local environment" below: the prerequisite is Go 1.27.3 or newer.
+- **M8C2's scan record is not edited.** Its `make scan` passed against the database it ran
+  with; GO-2026-6809 is in a later one.
+
+### Evidence
+
+**The scan, before and after**, each in a fresh full clone (not shallow), with a Python
+3.14 first on `PATH`:
+
+| Commit | Go | govulncheck | Reachable findings | gitleaks, pip-audit, npm audit | Result |
+| --- | --- | --- | --- | --- | --- |
+| `92cada2` (`main`) | 1.27.2 | v1.8.0 | 1: GO-2026-6809, `crypto/x509.Certificate.Verify@v1.27.2` from `internal/worker/client.go:540` (`Ping`), fixed in v1.27.3 | no findings | **FAIL** |
+| `5a3ff1d` (this change) | 1.27.3 | v1.8.0 | **0** | no findings | **PASS** |
+
+The vulnerability database was the one modified 2026-10-21T00:27:29Z in both.
+
+**The invariant.** With the Dockerfile's builder set back to `golang:1.27.2` and `go.mod` at
+1.27.3, `TestDockerfile_BuilderGoVersionIsExactlyGoMods` fails (expected `"1.27.3"`, actual
+`"1.27.2"`); reverted, the tree is clean and it passes.
+
+**Gates**, run on 2026-10-21 in a fresh full clone of `5a3ff1d`, the last commit that is
+not documentation, every one under `GOTOOLCHAIN=go1.27.3` with `go version` printing
+`go1.27.3 darwin/arm64` in the same shell. PostgreSQL 16, ElasticMQ and the object store
+from `make up`, with no other TaskForge process running. The host was on battery power;
+none of these gates is a timed benchmark run.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no diff (0 lines) |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries, each stamped `go1.27.3` |
+| `make test-unit` | PASS: 32 packages `ok` |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  105.901s` |
+| `make test-race` | PASS: 32 packages `ok`; `ok  …/tests/integration  90.736s`; no `DATA RACE` |
+| `make images-smoke` | PASS: `RESULT: PASS (47 of 47 checks met)`, labelled with revision `5a3ff1d`, built `FROM golang:1.27.3@sha256:f20d83a8…`; the worker binary copied out of its image reports `go1.27.3` |
+| `make scan` | PASS in a fresh full clone of `5a3ff1d` (above); the final head's run is in the pull request |
+| `make demo`, `make bench-smoke`, `make topology-smoke` | NOT RUN: the change is the compiler patch release alone, and the task named the gates above |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change, and neither builds with Go |
+
+### Limitations
+
+- **No benchmark was re-run.** Whether 1.27.3 moves any recorded figure is not measured.
+- **govulncheck v1.9.0 is not adopted.** v1.8.0 builds with 1.27.3 and reports against the
+  same database; moving the scanner is a separate decision.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
+  own CI result: the pull request's checks are the record.
+
 ---
 
 ## Correctness audit after M8C2
@@ -7025,7 +7097,7 @@ moves.
 
 ## Local environment
 
-- Go 1.27.2 or newer (`go.mod` names the patch release; an older toolchain downloads
+- Go 1.27.3 or newer (`go.mod` names the patch release; an older toolchain downloads
   it under the default `GOTOOLCHAIN=auto`)
 - PostgreSQL 16 on `localhost:5442`
 - ElasticMQ on `localhost:9324`
