@@ -115,7 +115,7 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   show needs no shell but a writable root filesystem
   ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md)). Defaults are
   byte-identical. See "M8C2" below. M8C3 (the Terraform) is planned.
-- **Correctness audit (maintenance after M8C2, not a milestone):** a worker now renews its
+- **Correctness audit (maintenance after M8C2, not a milestone):** see PR #33. A worker now renews its
   lease while it uploads a large result. Before, renewal stopped when the handler returned,
   so an upload that outlasted the lease's remaining window cost the attempt a success that
   had already happened, and a job whose every attempt succeeded could dead-letter. The
