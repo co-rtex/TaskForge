@@ -20,8 +20,8 @@ import (
 // else.
 const (
 	// govulncheck runs under the Go in go.mod, so its tag must be one that builds
-	// with that Go: v1.8.0, the newest tag, declares go 1.26.0 and builds with
-	// go.mod's 1.27.2. Raise this when go.mod's Go does.
+	// with that Go: v1.8.0 declares go 1.26.0 and builds with go.mod's 1.27.3.
+	// Raise this when go.mod's Go does.
 	govulncheckVersion = "v1.8.0"
 
 	// gitleaks runs from its published container image, pinned by version and by
