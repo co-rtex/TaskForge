@@ -5482,7 +5482,8 @@ On 2026-11-16, in this session's Linux container, against the stack `make up` st
 | `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
 | `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
 | `make bench` | PASS (exit 0; 3 targets met, 2 missed as before) | record `2026-11-16-a6c9973`, above |
-| `make images-smoke`, `make topology-smoke`, `make scan`, `make sdk-*`, `make dash-*` | NOT RUN | the topology smoke's queue handling changed (it now also creates and deletes its address queue) and is not exercised here; the SDK and the dashboard are untouched |
+| `make images-smoke`, `make topology-smoke`, `make scan`, `make sdk-*`, `make dash-*` | NOT RUN locally | the topology smoke's queue handling changed (it now also creates and deletes its address queue) and is not exercised here; the SDK and the dashboard are untouched |
+| Hosted CI on PR #34 at `93ea644` (run 43796116115) | 7 of 8 PASS; supply-chain scan **FAIL** | lint/build/unit/OpenAPI, migrations and integration (with the demonstrations and bench smoke), race, container images, dashboard, and both SDK jobs pass. The scan fails on govulncheck `GO-2026-6859` (stdlib `net/http`, Go 1.27.3, fixed in 1.27.4; database modified 2026-11-11), reached through `internal/worker/client.go` `Ping`, which is unchanged on `main`; gitleaks, pip-audit and npm audit report no findings. It is a new advisory against the toolchain, not this change, and is left to a toolchain bump of its own, as PRs #26 and #32 were. |
 
 ### Limitations
 
