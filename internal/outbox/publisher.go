@@ -29,7 +29,7 @@ type PublisherConfig struct {
 // are safe because claiming is serialized by the database.
 type Publisher struct {
 	store  *Store
-	broker queue.Publisher
+	broker queue.Router
 	cfg    PublisherConfig
 	log    *slog.Logger
 	rnd    *rand.Rand
@@ -58,7 +58,9 @@ type Stats struct {
 
 // NewPublisher builds a Publisher. Passing the random source in keeps jitter
 // deterministic under test.
-func NewPublisher(store *Store, broker queue.Publisher, cfg PublisherConfig, log *slog.Logger, rnd *rand.Rand) *Publisher {
+//
+// broker routes each event to the broker queue of its address (ADR-0029).
+func NewPublisher(store *Store, broker queue.Router, cfg PublisherConfig, log *slog.Logger, rnd *rand.Rand) *Publisher {
 	if cfg.BatchSize < 1 {
 		cfg.BatchSize = 50
 	}
@@ -108,7 +110,23 @@ func (p *Publisher) RunOnce(ctx context.Context) (Stats, error) {
 			continue
 		}
 
-		if err := p.broker.Publish(ctx, body); err != nil {
+		// An event with no job reference names no address. It can only be a
+		// row written before notifications carried job_id (migration 0009),
+		// and it is failed rather than guessed at: retried with backoff, it
+		// stays visible in the pending count instead of reaching a queue no
+		// claim could attribute it to.
+		if e.Address == (queue.Address{}) {
+			stats.Failed++
+			p.recordFailure(ctx, e, errors.New("event has no job reference to route by"))
+			continue
+		}
+		target, err := p.broker.Route(ctx, e.Address)
+		if err != nil {
+			stats.Failed++
+			p.recordFailure(ctx, e, err)
+			continue
+		}
+		if err := target.Publish(ctx, body); err != nil {
 			stats.Failed++
 			p.recordFailure(ctx, e, err)
 			continue

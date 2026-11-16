@@ -51,7 +51,7 @@ func TestResults_AnUploadLongerThanTheLeaseStillSucceedsOnTheFirstAttempt(t *tes
 		})))
 	stack := startE2EStack(t, registry, time.Hour)
 
-	runner := workerruntime.NewRunner(stack.control, stack.broker, registry,
+	runner := workerruntime.NewRunner(stack.control, stack.router, registry,
 		slowObjectStore{delay: e2eLease * 3 / 2, next: testObjects}, workerruntime.RunnerConfig{
 			Registration: workers.Registration{
 				SessionID: uuid.New(), Name: "slow-upload-worker", Hostname: "slow-upload.local",

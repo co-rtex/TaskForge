@@ -54,6 +54,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/scripts/internal/stack"
 )
 
@@ -202,13 +203,26 @@ func (s *smoke) setUp(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The services derive the queue of the smoke's (scope, "default") address
+	// from the base name and create it on demand (ADR-0029). Creating it here
+	// first means the smoke knows its URL and deletes it with the base.
+	notificationName := queue.NotificationQueueName(queueName, queue.Address{Scope: scope, Queue: "default"})
+	notificationURL, err := createQueue(ctx, infra.BrokerEndpoint, notificationName)
 	s.onCleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		if notificationURL != "" {
+			if err := deleteQueue(cleanupCtx, infra.BrokerEndpoint, notificationURL); err != nil {
+				s.say("could not delete queue %s: %v", notificationName, err)
+			}
+		}
 		if err := deleteQueue(cleanupCtx, infra.BrokerEndpoint, queueURL); err != nil {
 			s.say("could not delete queue %s: %v", queueName, err)
 		}
 	})
+	if err != nil {
+		return err
+	}
 
 	network := s.name("net")
 	if out, err := docker(ctx, "network", "create", network); err != nil || out.exit != 0 {

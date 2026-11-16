@@ -3,7 +3,8 @@
 This document is the source of truth for what is runnable now and what remains
 planned. It records the implemented state through M8C2, including the Go 1.27.2
 toolchain bump that came between M8D3 and M8D4, the Go 1.27.3 bump after M8C2, the
-correctness audit that followed it, and the Go 1.27.4 bump after the audit. Each milestone's line
+correctness audit that followed it, the Go 1.27.4 bump after the audit, and the
+notification reachability repair that resolved the audit's two open defects. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -129,6 +130,14 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   The audit also records two open defects it does not fix, which need an owner decision:
   a worker of another scope deletes a notification it cannot use, and an unclaimable job's
   notifications accumulate without bound. See "Correctness audit after M8C2" below.
+- **Notification reachability repair (maintenance after the audit, not a milestone):**
+  complete; see PR #34. Both of the audit's open defects are resolved
+  ([ADR-0029](adr/0029-scope-addressed-notification-streams.md)): each (scope, queue) address
+  has a broker queue of its own, so no worker receives a notification it cannot use; a claim
+  decides relative to the notification it was woken by (`FOREIGN_NOTIFICATION`,
+  `STALE_NOTIFICATION`); and re-notification creates a replacement only when some current
+  session could claim the job. The two pinned `TestOpenDefect_*` tests are inverted into
+  positive tests. See "Notification reachability repair (ADR-0029)" below.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -5197,7 +5206,11 @@ fails now describe the old order. Its conclusion is unchanged: renewal still sto
 any report, and the upload is bounded by the attempt's deadline, so a live worker still
 cannot hold a lease past `timeout_at` and ADR-0025's reasoning stands.
 
-### Open issue, unresolved: notification reachability across scopes and for unclaimable jobs
+### Open issue, resolved by ADR-0029: notification reachability across scopes and for unclaimable jobs
+
+**Resolved in PR #34**; see "Notification reachability repair (ADR-0029)" below. The text that
+follows records the defect as the audit found it and is kept as that record; the tests it
+names were inverted, not deleted, and now carry the names given in that section.
 
 Both halves come from one gap. A claim decides whether a notification is safe to delete
 relative to the **claiming worker**, while bounded re-notification assumes a published
@@ -5381,6 +5394,262 @@ after the tests moved to their own file, reported `FAIL` without the failing tes
 captured; three reruns were clean. The first test then used the shared broker queue and
 counted exactly 30 deliveries, which a delivery left in flight by another test would break,
 and had 1.5 s of margin after the first tick; it now has a queue of its own and 2.5 s.
+
+## Notification reachability repair (ADR-0029)
+
+Maintenance after the correctness audit, not a milestone. It resolves both open defects the
+audit pinned, with [ADR-0029](adr/0029-scope-addressed-notification-streams.md) recording
+the decision, the alternatives and the invariants.
+
+### Reproduced first
+
+On `98dbe3f` (`main`, PR #33 merged), against the stack `make up` starts, both pinned tests
+passed, which is to say both defects reproduced:
+`TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification` (`PASS`, 2.13 s) and
+`TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate` (`PASS`; live broker messages
+every 1.5 s `[5 10 15 20]`, 20 outbox events for one job).
+
+**Root cause, both halves.** A claim decided whether a notification was safe to delete
+relative to the claiming worker (`QUEUE_EMPTY` in the worker's own scope), while every scope
+shared one broker queue; and re-notification assumed a published notification was either
+consumed or lost, never held live by workers declining it (`NO_ELIGIBLE_JOB`,
+`CAPACITY_EXHAUSTED`) or unread by a fleet with no free slot or no worker at all.
+
+### What changed
+
+| Area | Change |
+| --- | --- |
+| `internal/queue/route.go` | `Address{Scope, Queue}`, `Router`, `NotificationQueueName` (`<base>-<16 hex of SHA-256(scope NUL queue)>`), `ValidateBaseQueueName` (≤ 63 characters, the SQS alphabet) |
+| `internal/queue/sqsbroker` | `Router`: resolves an address's queue, or creates it with the base queue's visibility timeout, retention, delay, wait, size and encryption attributes; idempotent under concurrent creators; `Ping` and readiness use the base queue |
+| `internal/outbox` | `ClaimDue` joins `jobs` for each event's address; the publisher routes by it; an event with no job reference (pre-0009 only) is failed with backoff rather than guessed at |
+| `internal/worker` | the runner resolves its own `(session scope, TASKFORGE_WORKER_QUEUE)` after registration and reads nothing else; a route failure is fatal before any receive; the client accepts the two new outcomes with their acknowledgement contract |
+| `internal/workers`, `internal/api`, `api/openapi.yaml` | `Session.Scope`, returned as `scope` by registration; `FOREIGN_NOTIFICATION` and `STALE_NOTIFICATION`; a consumed event presented by another address is answered `FOREIGN_NOTIFICATION` rather than ADR-0007's conflict error |
+| `internal/jobs/schedule.go`, `internal/scheduler` | the claimability gate; `Deferred` in the pass statistics and the scheduler's log line |
+| `migrations/0019_claimability_gated_renotification.sql` | `jobs.renotify_checked_at`; `jobs_renotify_due_idx` replaces `jobs_stranded_queued_idx`; `worker_sessions_healthy_scope_idx` |
+| `internal/config` | `TASKFORGE_BROKER_QUEUE_NAME` validated as a base name |
+| `scripts/internal/stack`, `scripts/topologysmoke` | create the run's address queue up front with the base's attributes, measure it (`Stack.QueueAttributes`, used by the recovery probe), and delete it with the base |
+
+Defaults are unchanged: the same variables, the same base queue name, the same timings. The
+broker wire contract is unchanged.
+
+### Tests
+
+The two pinned tests, inverted (same arrangement, opposite assertions):
+
+- `TestReachability_AnotherScopesWorkerCannotTakeTheOnlyNotification`: the other scope's
+  worker running alone for 2 s leaves the notification live on the job's own address queue
+  (1) and its own queue empty (0); the job's own worker then completes the job from that one
+  notification, with re-notification an hour away.
+- `TestReachability_AnUnclaimableJobsNotificationsStayBounded`: the gpu job beside a cpu-only
+  worker, re-notification every 300 ms, is deferred, and holds live messages `[1 1 1 1]`
+  with one outbox event; a gpu worker then joins and completes it.
+
+New, on the real PostgreSQL and ElasticMQ:
+
+| Test | Asserts |
+| --- | --- |
+| `TestClaim_AForeignNotificationClaimsNothingAndIsNotAcknowledged` | both old answers are gone: no `QUEUE_EMPTY` when scope B has nothing due, no claim of B's job under A's event id; A can still claim with it |
+| `TestClaim_ConcurrentForeignPresentationsCannotStealTheWakeup` | 8 scope-B sessions and A's session present A's one event at once, each on its own connection: one `CLAIMED` (A's job), 8 `FOREIGN_NOTIFICATION`, no scope-B lease. Its first run found that, once A's claim committed, the others got `ErrClaimConflict` from the replay check rather than the defined outcome; `foreignOrConflict` fixes that |
+| `TestClaim_AStaleNotificationNobodyCanUseIsReleased` | the fungible swap: a cpu worker claims a cpu job with a stuck gpu job's notification; the cpu job's leftover is `STALE_NOTIFICATION`; the gpu job is deferred, then repaired and claimed once a gpu session exists |
+| `TestClaim_ARequeuedJobsOlderNotificationIsStale` | a generation bump makes the older event stale while the current one is held |
+| `TestClaim_AnUnattributedClaimKeepsItsDisposition` | a claim id that is not an event keeps `NO_ELIGIBLE_JOB` |
+| `TestScheduler_DefersAJobNoSessionCouldClaim` | deferred with no session, a session without the capability, without the job type, of another scope, and at capacity; re-notified once the slot frees |
+| `TestScheduler_DeferredJobsDoNotStarveAClaimableOne` | four deferred jobs ahead of a claimable one, batch 2: the claimable one is repaired on the third pass |
+| `TestRouting_AnAddressQueueInheritsTheBaseQueuesAttributes` | `VisibilityTimeout` 7 on the base is 7 on the derived queue |
+| `TestRouting_IndependentProcessesMeetOnOneQueuePerAddress` | six routers racing to create one address all resolve one queue; a message crosses routers; another scope's queue is distinct and empty |
+| `TestMultiTenantDispatch_EveryScopesJobsAreClaimedWithoutRenotification` | 4 scopes × 5 jobs, interleaved, re-notification an hour away: all 20 claimed, none under another scope's notification, one event per job |
+
+Unit tests: `TestRunner_ReadsOnlyItsOwnScopesAddress`,
+`TestRunner_AnUnresolvableAddressIsFatalBeforeAnyReceive`, the client's acknowledgement
+contract for both outcomes, `TestSafeToAcknowledge_NotificationRelativeDispositions`, and
+`internal/queue/route_test.go` (stable and distinct names, the 80-character limit, base-name
+validation).
+
+Existing tests changed, and why, none weakened: three re-notification tests and the M3
+upgrade test register a session that could claim their jobs before expecting a replacement,
+because that is now a precondition and the deferral has tests of its own; the migration-count
+pins move from 18 to 19; the M4 index assertion follows the replaced index and also asserts
+the old one is gone; the M5A upgrade digest of `jobs` excludes the column 0019 adds, as the
+M6B digest of `outbox_events` already did for its added columns. Eleven distinct
+verification-matrix line citations moved with their assertions; each was checked by content
+against `main`, not only by the drift check, which accepts any assertion line in the named
+test and passed for four citations (five occurrences) that had silently shifted onto a
+different assertion of the same test.
+
+**Mutations**, each applied alone against the new tests and reverted:
+
+| Mutation | Fails |
+| --- | --- |
+| every address resolves to the base queue | `TestReachability_AnotherScopesWorkerCannotTakeTheOnlyNotification`, `TestMultiTenantDispatch_...`, both `TestRouting_` tests |
+| the foreign guard disabled | `TestClaim_AForeignNotificationClaimsNothingAndIsNotAcknowledged` |
+| stale release disabled | `TestClaim_AStaleNotificationNobodyCanUseIsReleased`, `TestClaim_ARequeuedJobsOlderNotificationIsStale` |
+| the claimability gate disabled | `TestReachability_AnUnclaimableJobsNotificationsStayBounded`, `TestScheduler_DefersAJobNoSessionCouldClaim`, `TestScheduler_DeferredJobsDoNotStarveAClaimableOne`, `TestClaim_AStaleNotificationNobodyCanUseIsReleased` |
+| the deferral not stamped | `TestReachability_AnUnclaimableJobsNotificationsStayBounded`, `TestScheduler_DefersAJobNoSessionCouldClaim`, `TestScheduler_DeferredJobsDoNotStarveAClaimableOne` |
+
+### Measured: the multi-tenant workload, before and after
+
+`TestMultiTenantDispatch_EveryScopesJobsAreClaimedWithoutRenotification`, the same file run
+on a worktree of `98dbe3f` (adapted only by copying one read helper) against a database of
+its own, and on this branch. Each scope has one worker of concurrency 2; jobs are submitted
+interleaved across scopes; re-notification is an hour away; the window is 20 s. Dispatch
+latency is the first lease's `acquired_at` minus the job's `created_at`, PostgreSQL time,
+over claimed jobs only, so `main`'s figures omit exactly the stranded jobs. Run in a Linux
+container (Docker 29.9.2, the compose stack), not the Apple M3 the recorded benchmarks used:
+
+| Workload | Commit | Runs | Claimed within 20 s | Leases under another scope's notification | p50 / p99 ms (claimed only) |
+| --- | --- | --- | --- | --- | --- |
+| 4 scopes × 5 | `98dbe3f` | 3 | 18, 18, 18 of 20 | 11, 13, 13 | 94.8/191.1, 112.1/180.5, 73.6/166.7 |
+| 4 scopes × 5 | this branch | 3 | 20, 20, 20 of 20 | 0, 0, 0 | 129.4/194.0, 122.8/189.7, 116.6/176.3 |
+| 8 scopes × 10 | `98dbe3f` | 1 | 57 of 80 | 51 | 77.7/472.4 |
+| 8 scopes × 10 | this branch | 1 | 80 of 80 (in about 1 s) | 0 | 50.7/143.3 |
+
+On `main` the unclaimed jobs waited for re-notification (an hour here; 60 s shipped), and
+most leases were taken under another scope's event id. The latency of jobs that were
+claimed is not an improvement claim: the samples are small and `main`'s exclude its slowest
+jobs.
+
+### Recorded benchmark
+
+[2026-11-16-a6c9973](benchmarks/2026-11-16-a6c9973.md), `make bench` (ADR-0020), the shipped
+defaults, seed 20261002, at `a6c9973` with a clean tree and binaries stamped from it, in this
+session's Linux container (Intel Xeon @ 2.30 GHz, 4 logical CPUs, 15.7 GiB, Ubuntu 24.04.5,
+Go 1.27.3, PostgreSQL 16.16):
+
+| Target | [d796722](benchmarks/2026-10-05-d796722.md) (Apple M3, before) | a6c9973 (Linux container, after) |
+| --- | --- | --- |
+| Sustained throughput, 1,000/min | 999.83 jobs/min, Met | 999.99 jobs/min, Met |
+| Dispatch latency, p95 < 500 ms | p95 963.7 ms, p50 552.2 ms, p99 1.01 s; **missed** | p95 926.8 ms, p50 537.4 ms, p99 992.5 ms; **missed** |
+| Fault-injection volume, 10,000 | 10,000, 24 kills, Met | 10,000, 24 kills, Met |
+| Completion under faults, ≥ 99.7 % | 100.000 %, Met | 100.000 %, Met |
+| Worker-failure recovery, < 30 s | worst 50.04 s, p50 32.02 s, 16 attempts; **missed** | worst 36.04 s, p50 32.07 s, 18 attempts; **missed** |
+
+**The two columns are not a before-and-after measurement**: different hardware and OS, so no
+figure here is claimed as an improvement or a regression. What the run does establish is that
+the repaired architecture meets the same three targets on the shipped defaults, misses the
+same two for the reasons already recorded (the outbox poll interval for dispatch; the 30 s
+lease for recovery), dispatches every in-window job (0 never claimed), and replaces every
+abandoned attempt (0 never replaced). The benchmark runs one scope on one queue, so the
+per-address routing it exercises is one address queue; the claimability gate reads
+`worker_sessions` and `leases` only for re-notification candidates, of which a run that
+dispatches everything within a second has essentially none. Its cost was not separately
+measured under a large stranded backlog.
+
+A first attempt was interrupted at 292 s, during the throughput phase, and recorded nothing:
+`make build` was run in the same tree while it ran, so the workers its fault phase would
+start would have been built from an uncommitted tree, contradicting the provenance a record
+states. The run above was started afterwards on a clean tree and nothing was built during it.
+
+### Verification
+
+On 2026-11-16, in this session's Linux container, against the stack `make up` starts
+(PostgreSQL 16, ElasticMQ 1.6.11, LocalStack S3), Go 1.27.3:
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make test-unit` | PASS | 33 packages `ok`, including `tests/verification` |
+| `make test-integration` | PASS | `ok .../tests/integration 114.441s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 106.571s` |
+| `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)`; it created and deleted the run's address queue |
+| `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
+| `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
+| `make bench` | PASS (exit 0; 3 targets met, 2 missed as before) | record `2026-11-16-a6c9973`, above |
+| `make images-smoke`, `make topology-smoke`, `make scan`, `make sdk-*`, `make dash-*` | NOT RUN locally | the topology smoke's queue handling changed (it now also creates and deletes its address queue) and is not exercised here; the SDK and the dashboard are untouched |
+| Hosted CI on PR #34 at `93ea644` (run 43796116115) | 7 of 8 PASS; supply-chain scan **FAIL** | lint/build/unit/OpenAPI, migrations and integration (with the demonstrations and bench smoke), race, container images, dashboard, and both SDK jobs pass. The scan fails on govulncheck `GO-2026-6859` (stdlib `net/http`, Go 1.27.3, fixed in 1.27.4; database modified 2026-11-11), reached through `internal/worker/client.go` `Ping`, which is unchanged on `main`; gitleaks, pip-audit and npm audit report no findings. It is a new advisory against the toolchain, not this change, and is left to a toolchain bump of its own, as PRs #26 and #32 were. |
+
+### Review round (second session, 2026-11-16)
+
+An independent review of the branch, reading the code rather than the tests, with the
+missing smokes and the AWS audit. What it found and did:
+
+- **Fixed: an address's queue that disappeared stalled delivery until restart.** Routes
+  were resolved once and cached, so after the local ElasticMQ restarts (it keeps queues in
+  memory and recreates only the configured base) or an operator deletes one, the publisher
+  failed every event and a worker every receive until each process restarted; before
+  ADR-0029 the one queue came back with the broker. No job could be lost (the events stay
+  `PENDING` in PostgreSQL), but nothing was delivered. An address's broker now re-resolves,
+  creating the queue from the base's attributes again, when an operation reports the queue
+  missing, and retries once. `TestRouting_AnAddressQueueThatDisappearsIsRecreated` failed
+  before (the publish returned the missing-queue error) and passes after;
+  `TestRouting_AnAddressResolvesOnceTheBrokerIsBack` pins that a resolution attempted while
+  the broker is unreachable fails and is not cached.
+- **Fixed: two concurrent tests asserted from spawned goroutines,** where `require` cannot
+  stop a test; their racers now hand errors back to the test goroutine, and the routing race
+  also asserts that every racer resolved. One matrix citation moved with its assertion.
+- **Fixed: the ADR number.** PR #31 (dated 2026-10-17) already holds ADR-0028, so this
+  change's record is ADR-0029. Migration 0019's comments carried the number; 0019 has run
+  only against throwaway test databases, so they were corrected before it ships.
+- **Fixed: ADR-0029 claimed the gate's cost was measured.** It was not under a stranded
+  backlog; the ADR now says what was measured.
+- **Found, outside this branch:** PR #31's task roles granted SQS actions on the base queue
+  alone, so with this change every address would be refused. PR #36, stacked on #31, grants
+  exactly what the code calls on `<base>-*` and records rollout and rollback. See
+  "Limitations".
+- **Checked and left as is:** the re-notification scan uses `jobs_renotify_due_idx` at
+  volume (20,000 `QUEUED` jobs, analyzed, inside a rolled-back transaction: `Index Scan
+  using jobs_renotify_due_idx`, 50 rows, 52 shared buffer hits, 0.088 ms) and the gate's
+  session lookup is an index-only scan on `worker_sessions_healthy_scope_idx`; the
+  publisher can create a queue only for an address some job has, since `jobs.queue`
+  references `queues`; a stale or foreign decision rests only on immutable or monotone
+  columns; legacy events without a job reference keep their old claim answers; an old api
+  returns no `scope`, and a new worker then exits rather than guess a queue (rollout order
+  below).
+
+**Gates**, on `fc84287` in this session's Linux container (Go 1.27.3, which `main` pinned then;
+Docker 29.9.2), against the stack `make up` starts:
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...` silent |
+| `make test-unit` | PASS | 33 packages `ok`; matrix check 32 rows (I1–I20, S1–S12) |
+| `make test-integration` | PASS | `ok .../tests/integration 108.987s` |
+| `make test-race` | PASS | every package `ok`; `ok .../tests/integration 119.818s`; no `DATA RACE` |
+| `make demo`, `make demo-failure`, `make bench-smoke` | PASS | 21 of 21, 25 of 25, 14 of 14 |
+| images, then `go run ./scripts/imagesmoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
+| `go run ./scripts/topologysmoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
+| broker queues after all of the above | clean | `ListQueues` returns only `taskforge-work-available`: every derived queue the tests, demonstrations, smokes and bench smoke created was deleted |
+| `make scan` | NOT RUN locally | the network policy refuses `vuln.go.dev` and the gitleaks image's blob host; hosted CI runs it |
+
+`make images` could not run unmodified here: the dashboard's Node build container does not
+trust this environment's TLS proxy. The images were built with the same targets and
+revision label from copies of the two Dockerfiles that add the proxy CA to the Go builder
+and Node deps stages only, never a runtime stage; hosted CI builds them from the committed
+files, and its "Container images" job runs both smokes.
+
+**The supply-chain check and PR #35.** On Go 1.27.3 the check failed on GO-2026-6859 alone.
+PR #35 moved `go.mod` and the builder to 1.27.4 (its hosted CI passed all eight checks, the
+scan reporting `govulncheck no findings (go1.27.4, scanner v1.8.0, database modified
+2026-11-11T02:51:11Z)`), and `main` with that change was merged into this branch in
+`00bd7d5`, whose only conflict was this document's opening sentence. This branch's checks
+after that merge are recorded on the pull request, since a commit cannot contain its own CI
+result.
+
+### Limitations
+
+- **Upgrade.** Messages already on the old shared queue are not read by new workers; each
+  such job is repaired by re-notification within one interval once a new worker that could
+  claim it is registered. Apply 0019 and roll the api first (a new worker needs the `scope`
+  registration returns, and exits without it), then the outbox and the workers together.
+  Rolling back leaves 0019, which the old code ignores except that its stranded-job scan
+  loses the index 0019 replaced; old re-notification re-advertises each job onto the base
+  queue within one interval, and the address queues stay behind, unread.
+- **AWS.** The outbox needs `sqs:GetQueueUrl`, `sqs:CreateQueue` and `sqs:SendMessage` on
+  `<base>-*`, the workers `sqs:GetQueueUrl`, `sqs:CreateQueue`, `sqs:ReceiveMessage` and
+  `sqs:DeleteMessage`, and both keep their base-queue grants. PR #31 as drafted lacks them;
+  PR #36 adds them and must be in #31 before it is applied. Address queues are outside
+  Terraform state and never deleted by TaskForge. Queue creation, attribute copying (SSE-SQS
+  among them), the missing-queue re-creation and the creation race were exercised on
+  ElasticMQ only, not on AWS SQS; AWS's 60 s refusal to recreate a deleted name is
+  documented behavior, not observed here.
+- **Within one address**, workers with different capabilities still share a queue, so a
+  held notification reaches a minority-capable worker at random; the bound is now
+  ADR-0029's I4 (one re-notification interval after such a worker could claim) rather than
+  the accumulation that used to shorten it.
+- **The gate does not know a session's TaskForge queue**, so a job in a queue served only by
+  sessions of the same group configured for another queue is still re-notified once per
+  interval. Recording the queue at registration would close it (a schema and API change).
+- **A deferral** can delay the repair of a genuinely lost notification by up to one more
+  interval after a session that could claim the job appears.
 
 ---
 
@@ -7223,9 +7492,11 @@ Open, and not any milestone's deliverable: whether the shipped lease and outbox
 interval should change is a question the two M8A records answer only as numbers, not
 as a decision, and changing the defaults would require re-measuring.
 
-Also open, for the owner: how to repair notification reachability across scopes and for
-unclaimable jobs ("Correctness audit after M8C2" above). Each repair it names amends
-ADR-0011, ADR-0003, the schema or the broker queue's settings, so none is started.
+Notification reachability across scopes and for unclaimable jobs, which the audit left open
+for the owner, is resolved (PR #34, ADR-0029). What it leaves open, for the owner: whether to
+record a session's TaskForge queue at registration so the claimability gate can see it.
+The IAM grants PR #31's Terraform needs for per-address queues are in PR #36, stacked on it,
+and the Go 1.27.4 toolchain is PR #35 ("Go 1.27.4 toolchain" above).
 
 Smaller items available to whoever wants them, none blocking M8:
 

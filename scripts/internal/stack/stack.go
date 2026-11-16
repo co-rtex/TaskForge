@@ -35,6 +35,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/scripts/readdb"
 )
 
@@ -73,8 +74,14 @@ type Stack struct {
 	LogDir  string
 	WorkDir string // an empty directory: the working directory of every child
 
-	QueueName, QueueURL string
-	queueAttributes     map[string]string
+	// QueueName is the run's base broker queue. Every service derives the
+	// queue of each (scope, queue) address from it (ADR-0029); the run's own
+	// jobs are advertised on NotificationQueueName, the queue of (Scope,
+	// "default"), which Setup creates up front so it can be measured and
+	// deleted like the base.
+	QueueName, QueueURL                         string
+	NotificationQueueName, NotificationQueueURL string
+	queueAttributes                             map[string]string
 
 	APIAddr, OutboxAddr, SchedulerAddr, ReconcilerAddr string
 	APIURL                                             string
@@ -269,6 +276,15 @@ func (s *Stack) Setup(ctx context.Context) error {
 		return fmt.Errorf("create this run's broker queue: %w", err)
 	}
 	s.Say("Created broker queue %s for this run alone.", s.QueueName)
+	// Created with the same attributes the services would copy from the base
+	// queue, so whoever reaches it first finds the same queue.
+	s.NotificationQueueName = queue.NotificationQueueName(s.QueueName,
+		queue.Address{Scope: s.Scope, Queue: "default"})
+	if s.NotificationQueueURL, err = createQueue(ctx, s.Infra.BrokerEndpoint,
+		s.NotificationQueueName, s.queueAttributes); err != nil {
+		return fmt.Errorf("create this run's notification queue: %w", err)
+	}
+	s.Say("Created notification queue %s for this run's scope.", s.NotificationQueueName)
 
 	if s.DB, err = readdb.Open(ctx, s.Infra.DatabaseURL); err != nil {
 		return err
@@ -302,11 +318,12 @@ func (s *Stack) Setup(ctx context.Context) error {
 	return s.createKeys(ctx)
 }
 
-// QueueAttributes reads the run's own broker queue's attributes with
+// QueueAttributes reads the attributes of the broker queue this run's jobs are
+// advertised on, its scope's default-queue notification queue (ADR-0029), with
 // GetQueueAttributes: its message counts and its configuration, as the broker
 // reports them at that moment.
 func (s *Stack) QueueAttributes(ctx context.Context) (map[string]string, error) {
-	return queueAttributes(ctx, s.Infra.BrokerEndpoint, s.QueueURL)
+	return queueAttributes(ctx, s.Infra.BrokerEndpoint, s.NotificationQueueURL)
 }
 
 // createKeys mints this run's credentials with taskforge-cli. The scope is
@@ -358,11 +375,16 @@ func (s *Stack) Cleanup() {
 		if s.DB != nil {
 			s.DB.Close()
 		}
-		if s.QueueURL != "" {
-			if err := deleteQueue(context.Background(), s.Infra.BrokerEndpoint, s.QueueURL); err != nil {
-				s.Say("Could not delete broker queue %s: %v", s.QueueName, err)
+		for _, q := range []struct{ name, url string }{
+			{s.NotificationQueueName, s.NotificationQueueURL}, {s.QueueName, s.QueueURL},
+		} {
+			if q.url == "" {
+				continue
+			}
+			if err := deleteQueue(context.Background(), s.Infra.BrokerEndpoint, q.url); err != nil {
+				s.Say("Could not delete broker queue %s: %v", q.name, err)
 			} else {
-				s.Say("Deleted broker queue %s, which only this run used.", s.QueueName)
+				s.Say("Deleted broker queue %s, which only this run used.", q.name)
 			}
 		}
 	})

@@ -452,7 +452,9 @@ Publisher loop:
    dies mid-flight releases its events automatically once it lapses. It is
    deliberately not the retry backoff — a claim is not a failure.
 2. Publish to the broker **outside** the transaction, so no lock is held across
-   network I/O.
+   network I/O, on the broker queue of the event's **address**: the scope and queue of
+   the job it advertises, read from `jobs` in the claim statement
+   ([ADR-0029](adr/0029-scope-addressed-notification-streams.md)).
 3. Mark the event published in a second transaction.
 
 The loop runs a pass on every poll interval, and a pass that claimed a full batch and
@@ -483,6 +485,18 @@ Provider-neutral, exposing only capabilities actually needed: **publish**,
 define a universal `Nack`, because SQS provides no such primitive. Redelivery is
 expressed through visibility timeout.
 
+### Notification addresses
+
+Each (scope, queue) pair, the set of jobs one claim chooses among, has a broker queue
+of its own, `<TASKFORGE_BROKER_QUEUE_NAME>-<16 hex of SHA-256(scope NUL queue)>`
+(`queue.NotificationQueueName`), resolved or created on demand by `queue.Router` with
+the base queue's attributes. The publisher routes every event by its job's address; a
+worker reads only the queue of its own scope (from registration) and configured queue.
+So every consumer of a queue claims from exactly the address its notifications
+advertise, and "safe to acknowledge for this worker" means "safe to acknowledge for this
+notification". The base queue must exist: it is the template and the readiness target.
+See [ADR-0029](adr/0029-scope-addressed-notification-streams.md).
+
 ---
 
 ## 8. Scheduling and claim — [IMPLEMENTED]
@@ -504,6 +518,14 @@ Delayed and retry-waiting jobs deliberately carry no notification while they
 wait. Advertising work no worker may claim yet is a wasted round trip a worker
 must then decline to acknowledge.
 
+The same reasoning bounds re-notification: a replacement is created only when some
+`HEALTHY` session of the job's scope could claim it now (worker group, capabilities,
+job type, a free slot on its logical worker, and room under the queue's concurrency
+limit). A job nobody could claim is deferred, stamped `renotify_checked_at` so the
+oldest-first scan moves past it, and reconsidered one interval later; its existing
+notification is held by declining workers or waits unread, and is not multiplied. See
+[ADR-0029](adr/0029-scope-addressed-notification-streams.md).
+
 The claim operation, in one transaction:
 
 - accepts only a current, healthy worker session with free capacity;
@@ -518,6 +540,11 @@ ORDER BY priority DESC, available_at ASC, created_at ASC, id ASC
 
 - globally consumes the durable notification event id, so duplicate delivery to a
   different session cannot reserve a second job;
+- decides relative to the notification as well as the worker: an event of another
+  scope or queue claims nothing and is not acknowledged (`FOREIGN_NOTIFICATION`), and
+  when nothing due is eligible for the session, an event whose advertisement has ended
+  (its job left `QUEUED` or was requeued under a newer generation) is released
+  (`STALE_NOTIFICATION`) while a current one is held (`NO_ELIGIBLE_JOB`);
 - creates the attempt and active lease atomically; active leases are the capacity ledger;
 - moves exactly one job from `QUEUED` to `LEASED`;
 - returns the payload and fencing identifiers only after commit.
@@ -795,7 +822,7 @@ plus the transactional recovery event are the record of what happened; a dedicat
 ## 12. Reliability invariants — [IMPLEMENTED]
 
 Each of these must have an automated test that asserts durable state. All
-eighteen are implemented, and [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
+twenty are implemented, and [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
 maps each one to its proving tests. Invariants 13 and 14 were M4's to close:
 retry scheduling is durable PostgreSQL state that no process holds, and a
 canceled job cannot later become successful because `CANCEL_REQUESTED` stops
@@ -819,6 +846,10 @@ success from committing and terminal `CANCELED` is never left.
 16. Reconciliation operations are idempotent.
 17. No correctness property depends solely on in-memory state.
 18. Worker-supplied time is not authoritative for leases or heartbeat staleness.
+19. A broker notification is acknowledged, and a lease created under it, only by a claim in
+    its own scope and queue ([ADR-0029](adr/0029-scope-addressed-notification-streams.md)).
+20. A queued job that no current worker session could claim receives no replacement
+    notification ([ADR-0029](adr/0029-scope-addressed-notification-streams.md)).
 
 ---
 
@@ -828,7 +859,9 @@ success from committing and terminal `CANCELED` is never left.
 | --- | --- |
 | Broker unavailable after DB commit | Job stays durable; outbox event stays pending and retries. No loss. |
 | Broker duplicates a notification | Globally idempotent event-id consumption admits one claim; another session gets a safe duplicate outcome. |
-| Broker loses a notification | The scheduler re-notifies a stranded queued job once the bounded interval elapses, using a new event id on the job's current notification generation. Reachability is repaired; nothing was ever at risk of corruption. |
+| Broker loses a notification | The scheduler re-notifies a stranded queued job once the bounded interval elapses and some session could claim it, using a new event id on the job's current notification generation. Reachability is repaired; nothing was ever at risk of corruption. |
+| A notification reaches a worker of another scope or queue | Cannot happen through routing: each (scope, queue) address has its own broker queue. If routing is wrong (a digest collision, a pre-ADR-0029 shared queue), the claim answers `FOREIGN_NOTIFICATION`: nothing claimed, nothing deleted. |
+| A job no worker can claim (capability, job type, no worker, saturated fleet) | Its notification is held or unread, and re-notification defers the job instead of adding one per interval. When a session that could claim it appears or a slot frees, the next scan re-advertises it. Leftover notifications of jobs that are no longer current are released at their first presentation. |
 | Publisher crashes mid-publish | Event republished after the claim timeout/visibility window lapses. Documented at-least-once window. |
 | Worker crashes mid-execution | Its session goes stale and its lease expires on server time; reconciliation marks the attempt `ABANDONED`, releases capacity, and requeues the job with a fresh notification (or dead-letters it if the budget is gone). This holds even when the attempt's deadline is due by the time reconciliation reaches it, as long as the lease expired strictly before the deadline ([ADR-0025](adr/0025-a-lease-that-lapsed-before-the-deadline-is-an-abandonment.md)). A crash after a renewal whose deadline comes before the renewed expiry ends differently: the lease is still live when the deadline arrives, so the timeout sweep records the attempt `TIMED_OUT` against its persisted deadline and applies the retry policy, before the lease ever expires. |
 | Handler returns an error | The worker reports a fenced failure under a retained outcome identity. With budget remaining the job enters `RETRY_WAIT` with a persisted jittered delay; a permanent classification or an exhausted budget dead-letters it with exactly one DLQ entry. |

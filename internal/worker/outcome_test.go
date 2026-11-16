@@ -239,7 +239,7 @@ func TestFailure_RetriesReuseOneOutcomeIdentity(t *testing.T) {
 		},
 	}
 
-	runner := NewRunner(control, &fakeBroker{},
+	runner := resolvedRunner(control, &fakeBroker{},
 		handlerReturning(t, Retryable("upstream_5xx", "upstream returned 502")), nil,
 		RunnerConfig{Queue: "default", PollWait: time.Second, RetryAttempts: 3, ShutdownTimeout: time.Second},
 		discardWorkerLogger())
@@ -304,7 +304,7 @@ func TestCancellation_DeliveredWhileExecutingStopsTheHandlerAndAcknowledges(t *t
 		},
 	}
 
-	runner := NewRunner(control, &fakeBroker{}, registry, nil,
+	runner := resolvedRunner(control, &fakeBroker{}, registry, nil,
 		RunnerConfig{Queue: "default", PollWait: time.Second, RetryAttempts: 2, ShutdownTimeout: time.Second},
 		discardWorkerLogger())
 

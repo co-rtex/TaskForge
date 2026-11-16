@@ -35,10 +35,16 @@ func publisherConfig() outbox.PublisherConfig {
 	}
 }
 
-func newPublisher(t *testing.T, broker queue.Publisher) *outbox.Publisher {
+func newPublisher(t *testing.T, broker queue.Broker) *outbox.Publisher {
+	t.Helper()
+	return newRoutedPublisher(t, oneQueue(broker))
+}
+
+// newRoutedPublisher is the real publisher over any router.
+func newRoutedPublisher(t *testing.T, router queue.Router) *outbox.Publisher {
 	t.Helper()
 	// A fixed seed keeps jittered backoff deterministic across runs.
-	return outbox.NewPublisher(outbox.NewStore(testPool), broker, publisherConfig(),
+	return outbox.NewPublisher(outbox.NewStore(testPool), router, publisherConfig(),
 		discardLogger(), rand.New(rand.NewSource(1)))
 }
 

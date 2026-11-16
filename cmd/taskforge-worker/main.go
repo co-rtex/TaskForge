@@ -92,7 +92,10 @@ func run() int {
 		}
 	}()
 
-	broker, err := sqsbroker.New(ctx, sqsbroker.OptionsFromConfig(shared))
+	// The runner reads only its own (scope, queue) address's broker queue,
+	// which it resolves through this router once registration names its scope
+	// (ADR-0029). The base queue must exist; it is the readiness target.
+	broker, err := sqsbroker.NewRouter(ctx, sqsbroker.OptionsFromConfig(shared))
 	if err != nil {
 		log.Error("connect to broker", slog.String("error", err.Error()))
 		return 1
@@ -105,8 +108,8 @@ func run() int {
 	}
 	// A worker uploads large results, so its boot must fail on a
 	// misconfigured or unreachable bucket now rather than on the first
-	// attempt to report one -- the same reasoning sqsbroker.New above
-	// resolves its queue URL for.
+	// attempt to report one -- the same reasoning sqsbroker.NewRouter above
+	// resolves its base queue URL for.
 	if err := objects.EnsureBucket(ctx, shared.ResultsBucket); err != nil {
 		log.Error("connect to result object store", slog.String("error", err.Error()))
 		return 1

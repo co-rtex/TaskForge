@@ -85,7 +85,7 @@ func startResultWorker(t *testing.T, apiURL string, broker queue.Broker, thresho
 	control := workerruntime.NewClient(apiURL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
 	registry := workerruntime.NewRegistry()
 	require.NoError(t, registry.Register("demo.echo", workerruntime.DemoEcho{}))
-	runner := workerruntime.NewRunner(control, broker, registry, newObjectStore(t), workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, oneQueue(broker), registry, newObjectStore(t), workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: "results-e2e-worker-" + uuid.New().String(), Hostname: "e2e.local",
 			WorkerGroup: "default", ConcurrencyLimit: 2, Capabilities: []string{"cpu"},

@@ -119,6 +119,7 @@ func (s *Store) Register(ctx context.Context, scope string, registration Registr
 	session := Session{
 		ID:                reg.SessionID,
 		WorkerID:          workerID,
+		Scope:             scope,
 		Name:              reg.Name,
 		Hostname:          reg.Hostname,
 		WorkerGroup:       reg.WorkerGroup,
@@ -155,14 +156,14 @@ func (s *Store) Register(ctx context.Context, scope string, registration Registr
 func readSessionForUpdate(ctx context.Context, tx pgx.Tx, id uuid.UUID) (Session, error) {
 	var session Session
 	err := tx.QueryRow(ctx, `
-		SELECT s.id, s.worker_id, w.name, s.hostname, s.worker_group,
+		SELECT s.id, s.worker_id, s.scope, w.name, s.hostname, s.worker_group,
 		       s.concurrency_limit, s.capabilities, s.supported_job_types,
 		       s.status, s.registered_at, s.last_heartbeat_at
 		FROM worker_sessions s
 		JOIN workers w ON w.id = s.worker_id
 		WHERE s.id = $1
 		FOR UPDATE OF s`, id,
-	).Scan(&session.ID, &session.WorkerID, &session.Name, &session.Hostname,
+	).Scan(&session.ID, &session.WorkerID, &session.Scope, &session.Name, &session.Hostname,
 		&session.WorkerGroup, &session.ConcurrencyLimit, &session.Capabilities,
 		&session.SupportedJobTypes, &session.Status, &session.RegisteredAt,
 		&session.LastHeartbeatAt)
@@ -239,7 +240,7 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 	// assignment is re-read under locks below; this read carries no authority.
 	if existing, err := s.lookupClaim(ctx, s.pool, req.ClaimRequestID, false); err == nil {
 		if existing.Scope != scope || existing.Queue != req.Queue {
-			return ClaimResult{}, ErrClaimConflict
+			return foreignOrConflict(ctx, s.pool, req, scope)
 		}
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return ClaimResult{}, fmt.Errorf("preflight claim replay: %w", err)
@@ -299,7 +300,7 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 	// than reserving a second job.
 	if existing, err := s.lookupClaim(ctx, tx, req.ClaimRequestID, true); err == nil {
 		if existing.Scope != scope || existing.Queue != req.Queue {
-			return ClaimResult{}, ErrClaimConflict
+			return foreignOrConflict(ctx, tx, req, scope)
 		}
 		if existing.WorkerID != req.WorkerID || existing.SessionID != req.SessionID {
 			return commitNoClaim(ctx, tx, DuplicateNotification)
@@ -315,8 +316,24 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 		return ClaimResult{}, fmt.Errorf("read claim replay: %w", err)
 	}
 
+	// Decide relative to the NOTIFICATION, not only to the claiming worker
+	// (ADR-0029). A claim identity that is a work.available event names the
+	// job it advertises, and that job's scope and queue are immutable, so
+	// this read needs no lock. A claim identity that is not an outbox event
+	// (an unattributed claim) keeps the pre-ADR-0029 behavior exactly.
+	notice, err := readPresentedNotification(ctx, tx, req.ClaimRequestID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	if notice.found && (notice.scope != scope || notice.queue != req.Queue) {
+		// Neither claim this scope's work under another scope's event id,
+		// which would spend that scope's wakeup on this scope's job, nor
+		// answer QUEUE_EMPTY for this scope, which would delete it.
+		return commitNoClaim(ctx, tx, ForeignNotification)
+	}
+
 	if workerGroup != queueGroup {
-		return commitNoClaim(ctx, tx, NoEligibleJob)
+		return commitNoClaim(ctx, tx, notice.ineligible())
 	}
 
 	var activeForQueue int
@@ -377,7 +394,7 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 		if !anyDue {
 			return commitNoClaim(ctx, tx, QueueEmpty)
 		}
-		return commitNoClaim(ctx, tx, NoEligibleJob)
+		return commitNoClaim(ctx, tx, notice.ineligible())
 	}
 	if err != nil {
 		return ClaimResult{}, fmt.Errorf("select eligible job: %w", err)
@@ -446,6 +463,71 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 		return ClaimResult{}, fmt.Errorf("commit job claim: %w", err)
 	}
 	return ClaimResult{Disposition: Claimed, Assignment: assignment}, nil
+}
+
+// presentedNotification is what a claim learns about the notification it was
+// woken by: the scope and queue of the job the event advertises, and whether
+// that advertisement is still current.
+type presentedNotification struct {
+	found   bool
+	scope   string
+	queue   string
+	current bool
+}
+
+// readPresentedNotification reads the event a claim identity names, if it is
+// one. "Current" means the advertised job is still QUEUED in the generation
+// the event was written for. Generations only grow, so once an event is not
+// current it never becomes current again, which is why a plain read at READ
+// COMMITTED is enough for the stale decision built on it.
+func readPresentedNotification(ctx context.Context, q rowQuerier, eventID uuid.UUID) (presentedNotification, error) {
+	var notice presentedNotification
+	err := q.QueryRow(ctx, `
+		SELECT j.scope, j.queue,
+		       j.status = 'QUEUED' AND j.notification_generation = o.notification_generation
+		FROM outbox_events o
+		JOIN jobs j ON j.id = o.job_id
+		WHERE o.id = $1 AND o.event_type = 'work.available'`, eventID,
+	).Scan(&notice.scope, &notice.queue, &notice.current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return presentedNotification{}, nil
+	}
+	if err != nil {
+		return presentedNotification{}, fmt.Errorf("read presented notification: %w", err)
+	}
+	notice.found = true
+	return notice, nil
+}
+
+// foreignOrConflict answers a claim whose identity was already consumed by a
+// claim of another scope or queue. When the identity is a notification of
+// another address, that is the routing mistake FOREIGN_NOTIFICATION names, and
+// the answer is the same whether or not its own address has already claimed
+// with it: not safe to acknowledge, nothing claimed. Any other reuse of an id
+// across scopes or queues stays ADR-0007's conflict. The decision rests only on
+// immutable columns, so it needs no lock and commits nothing.
+func foreignOrConflict(ctx context.Context, q rowQuerier, req ClaimRequest, scope string) (ClaimResult, error) {
+	notice, err := readPresentedNotification(ctx, q, req.ClaimRequestID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	if notice.found && (notice.scope != scope || notice.queue != req.Queue) {
+		return ClaimResult{Disposition: ForeignNotification}, nil
+	}
+	return ClaimResult{}, ErrClaimConflict
+}
+
+// ineligible is the disposition for "this session can claim nothing due in its
+// scope and queue". A notification that still advertises a QUEUED job must stay
+// in the broker for a worker that can take it. One whose advertisement has
+// ended is released: the job it named no longer depends on it, and every job
+// that is QUEUED now has its own current notification or bounded
+// re-notification to depend on instead.
+func (n presentedNotification) ineligible() ClaimDisposition {
+	if n.found && !n.current {
+		return StaleNotification
+	}
+	return NoEligibleJob
 }
 
 type rowQuerier interface {

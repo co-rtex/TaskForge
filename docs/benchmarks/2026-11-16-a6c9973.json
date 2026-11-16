@@ -1,0 +1,578 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-11-16T03:05:42.555741488Z",
+  "commit": "a6c9973d09dae5015603d06442e063d43b0c74dd",
+  "working_tree_clean_at_start": true,
+  "binaries_built_from_this_commit": true,
+  "command": "go run ./scripts/bench throughput faults --record",
+  "profile": "shipped",
+  "seed": 20261002,
+  "taskforge_timing_settings": {
+    "TASKFORGE_API_REQUEST_TIMEOUT": "25s",
+    "TASKFORGE_HEARTBEAT_INTERVAL": "5s",
+    "TASKFORGE_JOB_RETRY_BASE": "1s",
+    "TASKFORGE_JOB_RETRY_JITTER": "0.2",
+    "TASKFORGE_JOB_RETRY_MAX": "5m0s",
+    "TASKFORGE_JOB_RETRY_MULTIPLIER": "2",
+    "TASKFORGE_LEASE_DURATION": "30s",
+    "TASKFORGE_LEASE_RENEW_INTERVAL": "10s",
+    "TASKFORGE_OUTBOX_CLAIM_TIMEOUT": "30s",
+    "TASKFORGE_OUTBOX_POLL_INTERVAL": "1s",
+    "TASKFORGE_RECONCILER_POLL_INTERVAL": "2s",
+    "TASKFORGE_SCHEDULER_POLL_INTERVAL": "2s",
+    "TASKFORGE_SCHEDULER_RENOTIFY_AFTER": "1m0s",
+    "TASKFORGE_SESSION_STALE_AFTER": "15s",
+    "TASKFORGE_WORKER_POLL_WAIT": "10s",
+    "TASKFORGE_WORKER_REQUEST_TIMEOUT": "10s",
+    "TASKFORGE_WORKER_SHUTDOWN_TIMEOUT": "15s"
+  },
+  "environment": {
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.30GHz",
+    "logical_cores": 4,
+    "memory_bytes": 16869146624,
+    "os": "Ubuntu 24.04.5 LTS",
+    "power_source": "not read on this platform",
+    "low_power_mode": "unknown",
+    "go_version": "go1.27.3 linux/amd64",
+    "docker_client_version": "29.9.2",
+    "docker_server_version": "29.9.2",
+    "docker_vm_cpus": 4,
+    "docker_vm_memory_bytes": 16869146624,
+    "postgresql_server_version": "16.16",
+    "compose_images": [
+      "localstack/localstack:4.14.0",
+      "postgres:16-alpine",
+      "softwaremill/elasticmq-native:1.6.11"
+    ]
+  },
+  "throughput": {
+    "profile": "shipped",
+    "workers": 12,
+    "concurrency_per_worker": 4,
+    "target_jobs_per_minute": 1000,
+    "warmup_seconds": 30.001231,
+    "steady_window_seconds": 300.001497,
+    "drain_seconds": 1.014896,
+    "window_start": "2026-11-16T02:50:23.742602Z",
+    "window_end": "2026-11-16T02:55:23.744099Z",
+    "jobs_submitted": 5501,
+    "submit_errors": 0,
+    "submit_retries": 0,
+    "pacer_max_lateness_ms": 4.768917,
+    "jobs_created_in_window": 5001,
+    "offered_jobs_per_minute": 1000.1950090269049,
+    "jobs_succeeded_in_window": 5000,
+    "throughput_jobs_per_minute": 999.9950100248999,
+    "dispatch_latency_ms": {
+      "n": 5001,
+      "p50": 537.394,
+      "p95": 926.793,
+      "p99": 992.499,
+      "max": 995.212
+    },
+    "dispatch_latency_to_lease_ms": {
+      "n": 5001,
+      "p50": 547.008,
+      "p95": 930.701,
+      "p99": 995.841,
+      "max": 998.822
+    },
+    "jobs_in_window_never_claimed": 0,
+    "claims_before_submission": 0,
+    "final_statuses": {
+      "SUCCEEDED": 5501
+    },
+    "dlq_reasons": {},
+    "jobs_not_terminal_at_drain_end": 0,
+    "clock_divergence_ms": 0.01882,
+    "valid": true,
+    "problems": []
+  },
+  "faults": {
+    "profile": "shipped",
+    "seed": 20261002,
+    "workers": 12,
+    "concurrency_per_worker": 4,
+    "target_jobs_per_minute": 1000,
+    "jobs_target": 10000,
+    "jobs_accepted_by_the_api": 10000,
+    "submit_errors": 0,
+    "submit_retries": 0,
+    "jobs_in_database": 10000,
+    "kills_scheduled": 24,
+    "kills_done": 24,
+    "kills": [
+      {
+        "index": 0,
+        "scheduled_offset_seconds": 37.105,
+        "killed_at_postgresql_time": "2026-11-16T02:56:03.857145Z",
+        "worker": "w02",
+        "killed_session": "7401bff3-5624-418a-a586-45657b9b2654",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          31.9917
+        ],
+        "restart_ms": 117.113625
+      },
+      {
+        "index": 1,
+        "scheduled_offset_seconds": 60.973,
+        "killed_at_postgresql_time": "2026-11-16T02:56:27.190571Z",
+        "worker": "w02",
+        "killed_session": "4e8fe86d-a6e1-4b61-8ccb-88feefcdfc25",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 106.757297
+      },
+      {
+        "index": 2,
+        "scheduled_offset_seconds": 83.924,
+        "killed_at_postgresql_time": "2026-11-16T02:56:50.851289Z",
+        "worker": "w01",
+        "killed_session": "3e65d5b5-e00e-4255-93b0-dd9cfa9df55f",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          33.012973
+        ],
+        "restart_ms": 105.691629
+      },
+      {
+        "index": 3,
+        "scheduled_offset_seconds": 99.625,
+        "killed_at_postgresql_time": "2026-11-16T02:57:05.840861Z",
+        "worker": "w01",
+        "killed_session": "ed1a91f2-ca0f-42c3-b222-df769ec6e2ed",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 107.61708
+      },
+      {
+        "index": 4,
+        "scheduled_offset_seconds": 122.834,
+        "killed_at_postgresql_time": "2026-11-16T02:57:29.853665Z",
+        "worker": "w06",
+        "killed_session": "d0f8f1f2-e14d-4328-932a-812039281422",
+        "attempts_held_when_chosen": 2,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 2,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          32.067402,
+          32.063893
+        ],
+        "restart_ms": 107.886866
+      },
+      {
+        "index": 5,
+        "scheduled_offset_seconds": 153.083,
+        "killed_at_postgresql_time": "2026-11-16T02:57:59.299673Z",
+        "worker": "w06",
+        "killed_session": "dbe191e3-ea82-4074-9e05-442d09f52a45",
+        "attempts_held_when_chosen": 2,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 106.73731
+      },
+      {
+        "index": 6,
+        "scheduled_offset_seconds": 170.054,
+        "killed_at_postgresql_time": "2026-11-16T02:58:16.851006Z",
+        "worker": "w07",
+        "killed_session": "6bc2a79e-739a-423e-baa4-4491bce5b79f",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          33.020846
+        ],
+        "restart_ms": 108.019802
+      },
+      {
+        "index": 7,
+        "scheduled_offset_seconds": 189.246,
+        "killed_at_postgresql_time": "2026-11-16T02:58:35.463482Z",
+        "worker": "w07",
+        "killed_session": "5b5dacf7-e177-4f77-9b7c-5314194033d8",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 106.752472
+      },
+      {
+        "index": 8,
+        "scheduled_offset_seconds": 224.888,
+        "killed_at_postgresql_time": "2026-11-16T02:59:11.854542Z",
+        "worker": "w05",
+        "killed_session": "606a997c-4be5-455d-b023-956394ef5968",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          32.053641
+        ],
+        "restart_ms": 115.582838
+      },
+      {
+        "index": 9,
+        "scheduled_offset_seconds": 249.979,
+        "killed_at_postgresql_time": "2026-11-16T02:59:36.196762Z",
+        "worker": "w05",
+        "killed_session": "c213c9bc-83f7-4d8d-a1fd-79a6e570ab66",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 105.659025
+      },
+      {
+        "index": 10,
+        "scheduled_offset_seconds": 263.565,
+        "killed_at_postgresql_time": "2026-11-16T02:59:49.854348Z",
+        "worker": "w09",
+        "killed_session": "1be6bab6-ab57-4d97-8829-c07915205354",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          31.991782
+        ],
+        "restart_ms": 106.808824
+      },
+      {
+        "index": 11,
+        "scheduled_offset_seconds": 296.007,
+        "killed_at_postgresql_time": "2026-11-16T03:00:22.853556Z",
+        "worker": "w09",
+        "killed_session": "a6d0480c-06d7-4edf-bdcb-d5ef152d3f90",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          33.012698
+        ],
+        "restart_ms": 110.171552
+      },
+      {
+        "index": 12,
+        "scheduled_offset_seconds": 327.592,
+        "killed_at_postgresql_time": "2026-11-16T03:00:53.808593Z",
+        "worker": "w09",
+        "killed_session": "af6948cd-2a32-437d-99fc-80db0f6c4de7",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 117.966751
+      },
+      {
+        "index": 13,
+        "scheduled_offset_seconds": 339.304,
+        "killed_at_postgresql_time": "2026-11-16T03:01:05.851514Z",
+        "worker": "w08",
+        "killed_session": "a4c398c6-627f-4112-bceb-6ef6ad841cd4",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          32.030108
+        ],
+        "restart_ms": 113.236458
+      },
+      {
+        "index": 14,
+        "scheduled_offset_seconds": 371.066,
+        "killed_at_postgresql_time": "2026-11-16T03:01:37.851892Z",
+        "worker": "w12",
+        "killed_session": "11add097-f71e-4e27-8f9c-74d367a9a910",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          32.017746
+        ],
+        "restart_ms": 105.530898
+      },
+      {
+        "index": 15,
+        "scheduled_offset_seconds": 388.157,
+        "killed_at_postgresql_time": "2026-11-16T03:01:54.372599Z",
+        "worker": "w12",
+        "killed_session": "4c798950-2eb2-4439-a83a-f6aeb3a222c9",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 106.091643
+      },
+      {
+        "index": 16,
+        "scheduled_offset_seconds": 413.992,
+        "killed_at_postgresql_time": "2026-11-16T03:02:20.856749Z",
+        "worker": "w03",
+        "killed_session": "5d46c972-93de-4b3d-af4a-41b2e0515c93",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          32.991103
+        ],
+        "restart_ms": 113.150478
+      },
+      {
+        "index": 17,
+        "scheduled_offset_seconds": 446.281,
+        "killed_at_postgresql_time": "2026-11-16T03:02:52.49728Z",
+        "worker": "w03",
+        "killed_session": "383565d1-5f90-4270-99b6-11a9595f23a7",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 108.235114
+      },
+      {
+        "index": 18,
+        "scheduled_offset_seconds": 474.117,
+        "killed_at_postgresql_time": "2026-11-16T03:03:20.852534Z",
+        "worker": "w08",
+        "killed_session": "499c160a-f39e-4c29-9c60-78a4acc484d1",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          34.035702
+        ],
+        "restart_ms": 105.737175
+      },
+      {
+        "index": 19,
+        "scheduled_offset_seconds": 484.685,
+        "killed_at_postgresql_time": "2026-11-16T03:03:30.90113Z",
+        "worker": "w06",
+        "killed_session": "ff3a2155-ec97-45eb-84c9-369112bac44d",
+        "attempts_held_when_chosen": 2,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 3,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          33.944284,
+          33.947959,
+          33.946374
+        ],
+        "restart_ms": 107.47388
+      },
+      {
+        "index": 20,
+        "scheduled_offset_seconds": 505.266,
+        "killed_at_postgresql_time": "2026-11-16T03:03:51.4824Z",
+        "worker": "w08",
+        "killed_session": "fdfd6214-ec04-4f86-8a3a-e3af7bc8a194",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 107.258274
+      },
+      {
+        "index": 21,
+        "scheduled_offset_seconds": 543.744,
+        "killed_at_postgresql_time": "2026-11-16T03:04:29.962611Z",
+        "worker": "w03",
+        "killed_session": "98cdfac3-135a-4181-9ccf-fa02d909b339",
+        "attempts_held_when_chosen": 2,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 2,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          31.923894,
+          31.920827
+        ],
+        "restart_ms": 106.577323
+      },
+      {
+        "index": 22,
+        "scheduled_offset_seconds": 558.264,
+        "killed_at_postgresql_time": "2026-11-16T03:04:44.480181Z",
+        "worker": "w03",
+        "killed_session": "6a704fd9-55bc-4137-b0f3-bae7dd49f0b8",
+        "attempts_held_when_chosen": 2,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 0,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [],
+        "restart_ms": 106.281517
+      },
+      {
+        "index": 23,
+        "scheduled_offset_seconds": 578.897,
+        "killed_at_postgresql_time": "2026-11-16T03:05:05.852843Z",
+        "worker": "w01",
+        "killed_session": "0d7203f4-6926-4633-93f6-e5207ccbe2fe",
+        "attempts_held_when_chosen": 1,
+        "chosen_because_it_held_an_attempt": true,
+        "abandoned_attempts": 1,
+        "abandoned_attempts_never_replaced": 0,
+        "recovery_seconds": [
+          36.040738
+        ],
+        "restart_ms": 108.117158
+      }
+    ],
+    "submission_seconds": 599.942570894,
+    "completion_deadline_seconds_after_last_submission": 300,
+    "completion_deadline_at_postgresql_time": "2026-11-16T03:10:26.157368Z",
+    "ended_by": "all jobs terminal",
+    "jobs_succeeded": 10000,
+    "completion_percent": 100,
+    "final_statuses": {
+      "SUCCEEDED": 10000
+    },
+    "dlq_reasons": {},
+    "abandoned_attempts_total": 18,
+    "abandoned_attempts_never_replaced": 0,
+    "recovery_ms": {
+      "n": 18,
+      "p50": 32067.402,
+      "p95": 36040.738,
+      "p99": 36040.738,
+      "max": 36040.738
+    },
+    "valid": true,
+    "problems": []
+  },
+  "targets": [
+    {
+      "target": "Sustained throughput",
+      "value": "1,000 jobs/minute across 12 workers",
+      "measured": "999.99 jobs/min completed (offered 1000.19/min; 5000 finished in the 5m0s window)",
+      "verdict": "Met",
+      "governed_by": [
+        {
+          "name": "workers",
+          "value": "12"
+        },
+        {
+          "name": "TASKFORGE_WORKER_CONCURRENCY",
+          "value": "4"
+        },
+        {
+          "name": "TASKFORGE_WORKER_POLL_WAIT",
+          "value": "10s"
+        }
+      ]
+    },
+    {
+      "target": "Dispatch latency",
+      "value": "p95 \u003c 500 ms",
+      "measured": "p95 926.8 ms (n=5001; p50 537.4 ms, p99 992.5 ms, max 995.2 ms; 0 never claimed)",
+      "verdict": "MISSED",
+      "governed_by": [
+        {
+          "name": "TASKFORGE_OUTBOX_POLL_INTERVAL",
+          "value": "1s"
+        },
+        {
+          "name": "TASKFORGE_OUTBOX_CLAIM_TIMEOUT",
+          "value": "30s"
+        },
+        {
+          "name": "TASKFORGE_WORKER_POLL_WAIT",
+          "value": "10s"
+        }
+      ]
+    },
+    {
+      "target": "Fault-injection volume",
+      "value": "10,000 jobs",
+      "measured": "10000 jobs accepted by the API, 10000 in the database, 24 workers killed",
+      "verdict": "Met",
+      "governed_by": [
+        {
+          "name": "jobs submitted",
+          "value": "10000"
+        }
+      ]
+    },
+    {
+      "target": "Completion under fault injection",
+      "value": "≥ 99.7%",
+      "measured": "10000 of 10000 jobs SUCCEEDED (100.000%) by the deadline, 5m0s after the last submission",
+      "verdict": "Met",
+      "governed_by": [
+        {
+          "name": "max_attempts per job",
+          "value": "3"
+        },
+        {
+          "name": "TASKFORGE_LEASE_DURATION",
+          "value": "30s"
+        },
+        {
+          "name": "TASKFORGE_SESSION_STALE_AFTER",
+          "value": "15s"
+        },
+        {
+          "name": "TASKFORGE_JOB_RETRY_BASE",
+          "value": "1s"
+        }
+      ]
+    },
+    {
+      "target": "Worker-failure recovery",
+      "value": "\u003c 30 s",
+      "measured": "worst 36.04 s, p95 36.04 s, p50 32.07 s; 18 abandoned attempts replaced, 0 never replaced; 24 kills",
+      "verdict": "MISSED",
+      "governed_by": [
+        {
+          "name": "TASKFORGE_LEASE_DURATION",
+          "value": "30s"
+        },
+        {
+          "name": "TASKFORGE_LEASE_RENEW_INTERVAL",
+          "value": "10s"
+        },
+        {
+          "name": "TASKFORGE_SESSION_STALE_AFTER",
+          "value": "15s"
+        },
+        {
+          "name": "TASKFORGE_RECONCILER_POLL_INTERVAL",
+          "value": "2s"
+        },
+        {
+          "name": "TASKFORGE_OUTBOX_POLL_INTERVAL",
+          "value": "1s"
+        }
+      ]
+    }
+  ]
+}
