@@ -81,8 +81,10 @@ is weighed in ADR-0028.
   consumed foreign event fell into the older conflict error rather than the defined
   outcome.
 
-- The recorded benchmark at this branch is in CURRENT_STATE.md, with the comparison to the
-  committed headline record.
+- A recorded benchmark at the fix (shipped defaults, 10,000 jobs, 24 worker kills) met the
+  same three targets as the committed headline record and missed the same two, for the same
+  recorded reasons, with every job completed. It ran on different hardware, so it shows the
+  repair did not break the measured behavior; it is not an improvement claim.
 
 ## 8. Costs and limitations
 

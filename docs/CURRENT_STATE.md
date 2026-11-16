@@ -5438,11 +5438,34 @@ jobs.
 
 ### Recorded benchmark
 
-A recorded `make bench` (ADR-0020) runs at this branch's head and is added in the commit that
-follows this one, with its record under `docs/benchmarks/`. A first attempt was interrupted
-at 292 s, during the throughput phase, and recorded nothing: `make build` was run in the
-same tree while it ran, so the workers its fault phase would start would have been built
-from an uncommitted tree, contradicting the provenance a record states.
+[2026-11-16-a6c9973](benchmarks/2026-11-16-a6c9973.md), `make bench` (ADR-0020), the shipped
+defaults, seed 20261002, at `a6c9973` with a clean tree and binaries stamped from it, in this
+session's Linux container (Intel Xeon @ 2.30 GHz, 4 logical CPUs, 15.7 GiB, Ubuntu 24.04.5,
+Go 1.27.3, PostgreSQL 16.16):
+
+| Target | [d796722](benchmarks/2026-10-05-d796722.md) (Apple M3, before) | a6c9973 (Linux container, after) |
+| --- | --- | --- |
+| Sustained throughput, 1,000/min | 999.83 jobs/min, Met | 999.99 jobs/min, Met |
+| Dispatch latency, p95 < 500 ms | p95 963.7 ms, p50 552.2 ms, p99 1.01 s; **missed** | p95 926.8 ms, p50 537.4 ms, p99 992.5 ms; **missed** |
+| Fault-injection volume, 10,000 | 10,000, 24 kills, Met | 10,000, 24 kills, Met |
+| Completion under faults, ≥ 99.7 % | 100.000 %, Met | 100.000 %, Met |
+| Worker-failure recovery, < 30 s | worst 50.04 s, p50 32.02 s, 16 attempts; **missed** | worst 36.04 s, p50 32.07 s, 18 attempts; **missed** |
+
+**The two columns are not a before-and-after measurement**: different hardware and OS, so no
+figure here is claimed as an improvement or a regression. What the run does establish is that
+the repaired architecture meets the same three targets on the shipped defaults, misses the
+same two for the reasons already recorded (the outbox poll interval for dispatch; the 30 s
+lease for recovery), dispatches every in-window job (0 never claimed), and replaces every
+abandoned attempt (0 never replaced). The benchmark runs one scope on one queue, so the
+per-address routing it exercises is one address queue; the claimability gate reads
+`worker_sessions` and `leases` only for re-notification candidates, of which a run that
+dispatches everything within a second has essentially none. Its cost was not separately
+measured under a large stranded backlog.
+
+A first attempt was interrupted at 292 s, during the throughput phase, and recorded nothing:
+`make build` was run in the same tree while it ran, so the workers its fault phase would
+start would have been built from an uncommitted tree, contradicting the provenance a record
+states. The run above was started afterwards on a clean tree and nothing was built during it.
 
 ### Verification
 
@@ -5458,6 +5481,7 @@ On 2026-11-16, in this session's Linux container, against the stack `make up` st
 | `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)`; it created and deleted the run's address queue |
 | `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
 | `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
+| `make bench` | PASS (exit 0; 3 targets met, 2 missed as before) | record `2026-11-16-a6c9973`, above |
 | `make images-smoke`, `make topology-smoke`, `make scan`, `make sdk-*`, `make dash-*` | NOT RUN | the topology smoke's queue handling changed (it now also creates and deletes its address queue) and is not exercised here; the SDK and the dashboard are untouched |
 
 ### Limitations
