@@ -822,7 +822,7 @@ plus the transactional recovery event are the record of what happened; a dedicat
 ## 12. Reliability invariants — [IMPLEMENTED]
 
 Each of these must have an automated test that asserts durable state. All
-eighteen are implemented, and [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
+twenty are implemented, and [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
 maps each one to its proving tests. Invariants 13 and 14 were M4's to close:
 retry scheduling is durable PostgreSQL state that no process holds, and a
 canceled job cannot later become successful because `CANCEL_REQUESTED` stops
@@ -846,6 +846,10 @@ success from committing and terminal `CANCELED` is never left.
 16. Reconciliation operations are idempotent.
 17. No correctness property depends solely on in-memory state.
 18. Worker-supplied time is not authoritative for leases or heartbeat staleness.
+19. A broker notification is acknowledged, and a lease created under it, only by a claim in
+    its own scope and queue ([ADR-0028](adr/0028-scope-addressed-notification-streams.md)).
+20. A queued job that no current worker session could claim receives no replacement
+    notification ([ADR-0028](adr/0028-scope-addressed-notification-streams.md)).
 
 ---
 

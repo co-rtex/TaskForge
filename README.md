@@ -66,14 +66,18 @@ PostgreSQL is the single authoritative store for job, attempt, lease, worker-ses
 idempotency, and outbox state. The broker carries only small advisory
 work-availability notifications — never authoritative job state — and every state
 change that requires a notification writes it in the same transaction that changes
-the state.
+the state. Each scope's queue has a broker queue of its own, so a worker only ever
+receives notifications it could act on
+([ADR-0028](docs/adr/0028-scope-addressed-notification-streams.md)).
 Workers **pull**: a worker with a free slot asks the control plane, and one SQL
 transaction enforces capacity, matches capabilities, picks the highest-priority
 eligible job, and creates the attempt and lease. A running attempt renews that lease
 under a fence that makes an ambiguous retry safe, and reports its outcome under an
 identity retained for the lifetime of attempt history, so an ambiguous failure
 report cannot consume a second attempt. A scheduler promotes work that becomes
-eligible later and re-notifies queued work whose notification was lost, and a
+eligible later and re-notifies queued work whose notification was lost (but only
+when some worker could claim it, so a job nobody can take does not pile up
+notifications), and a
 reconciler repairs what no live process will: stale sessions, attempts past their
 deadline, unacknowledged cancellations, and leases that expired with work
 unfinished. Correctness never depends on queue ordering, process memory, or a
