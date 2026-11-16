@@ -141,7 +141,7 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// The upgrade, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 10, applied, "0009 through 0018 are pending from 0008")
+	require.Equal(t, 11, applied, "0009 through 0019 are pending from 0008")
 
 	eventGeneration := func(id uuid.UUID) int {
 		var generation *int
@@ -213,6 +213,13 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// The whole point of the two corrections above: the scheduler's own query,
 	// run against the upgraded database, must not manufacture work.
 	store := jobs.NewStore(poolFor(t, freshDSN))
+	// A session that could claim the seeded jobs, as a running deployment has:
+	// since ADR-0028 a replacement is only created for a job some session could
+	// claim, and what this test is about is which jobs count as stranded.
+	_, err = workers.NewStore(poolFor(t, freshDSN), workers.StoreConfig{
+		LeaseDuration: integrationLeaseDuration, RetryPolicy: integrationRetryPolicy(),
+	}).Register(ctx, "m3-renotify", workerRegistration("m3-worker", 1, nil, []string{"demo.echo"}))
+	require.NoError(t, err)
 
 	t.Run("the first scheduler pass repairs only what is genuinely stranded", func(t *testing.T) {
 		_, recentBefore := jobNotification(recentlyRequeuedJob)
@@ -442,8 +449,8 @@ func TestMigrations_PerJobReconstructionSurvivesMixedState(t *testing.T) {
 	// The upgrade, through the real runner: 0011 then 0012.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 8, applied,
-		"exactly 0011 through 0018 are pending from 0010")
+	require.Equal(t, 9, applied,
+		"exactly 0011 through 0019 are pending from 0010")
 
 	t.Run("M4-authored notification metadata is untouched", func(t *testing.T) {
 		require.Equal(t, advancedBefore, readNotificationState(t, ctx, conn, advancedJob),
@@ -520,7 +527,7 @@ func TestMigrations_PerJobReconstructionIsCorrectFromAnEmptyDatabase(t *testing.
 	freshDSN := withFreshDatabase(t)
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err)
-	require.Equal(t, 18, applied, "a fresh database applies every migration")
+	require.Equal(t, 19, applied, "a fresh database applies every migration")
 
 	cfg, err := pgx.ParseConfig(freshDSN)
 	require.NoError(t, err)
@@ -805,6 +812,6 @@ func TestMigrations_RestoreReplayNotificationTimestampsRewoundBy0012(t *testing.
 		otherDSN := withFreshDatabase(t)
 		applied, err := database.Migrate(ctx, otherDSN, discardLogger())
 		require.NoError(t, err)
-		require.Equal(t, 18, applied, "0001 through 0018 apply to an empty database")
+		require.Equal(t, 19, applied, "0001 through 0019 apply to an empty database")
 	})
 }

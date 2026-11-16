@@ -1,7 +1,13 @@
 # ADR-0007: Globally idempotent notification claims
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded
 - **Date:** 2026-08-29
+- **Superseded in part by:**
+  - [ADR-0028](0028-scope-addressed-notification-streams.md) — replaces "Reusing an
+    event id for a different scope or queue is a conflict" for an id that is a
+    notification of another scope or queue: that is answered
+    `FOREIGN_NOTIFICATION` (nothing claimed, not safe to acknowledge). Any other
+    cross-scope or cross-queue reuse remains a conflict.
 
 ## Context
 

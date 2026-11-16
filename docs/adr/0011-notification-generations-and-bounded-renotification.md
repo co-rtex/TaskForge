@@ -1,7 +1,13 @@
 # ADR-0011: Notification generations and bounded re-notification
 
-- **Status:** Accepted
+- **Status:** Accepted, partially superseded
 - **Date:** 2026-09-01
+- **Superseded in part by:**
+  - [ADR-0028](0028-scope-addressed-notification-streams.md) — adds a fourth bound
+    to "Re-notification is bounded three ways": some current session could claim
+    the job now. A deferred job is stamped `renotify_checked_at`, and the candidate
+    scan orders by the later of it and `last_notification_at`. The three bounds and
+    everything else here stand.
 
 ## Context
 

@@ -21,7 +21,7 @@ import (
 // renewingRunner builds a runner whose loops tick fast enough for a test to
 // observe them. The assertions below are all driven by channel barriers or by
 // the fake control plane being called, never by sleeping for a guessed duration.
-func renewingRunner(control ControlPlane, broker queue.Broker, registry *Registry, cfg RunnerConfig) *Runner {
+func renewingRunner(control ControlPlane, broker *fakeBroker, registry *Registry, cfg RunnerConfig) *Runner {
 	cfg.Queue = "default"
 	cfg.PollWait = time.Second
 	if cfg.RetryAttempts == 0 {
@@ -39,7 +39,9 @@ func renewingRunner(control ControlPlane, broker queue.Broker, registry *Registr
 	if cfg.SessionStaleAfter == 0 {
 		cfg.SessionStaleAfter = time.Minute
 	}
-	return NewRunner(control, broker, registry, nil, cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	runner := NewRunner(control, broker, registry, nil, cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	runner.broker = broker
+	return runner
 }
 
 // TestRenewal_LongHandlerSurvivesSeveralLeaseWindows is the property M3 exists

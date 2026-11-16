@@ -17,7 +17,7 @@ import (
 
 // drainingPublisher publishes in batches of ten every three seconds, so a backlog
 // of several batches tells one pass per tick apart from draining within a tick.
-func drainingPublisher(t *testing.T, broker queue.Publisher) *outbox.Publisher {
+func drainingPublisher(t *testing.T, broker queue.Broker) *outbox.Publisher {
 	t.Helper()
 	cfg := publisherConfig()
 	cfg.BatchSize = 10
@@ -25,7 +25,7 @@ func drainingPublisher(t *testing.T, broker queue.Publisher) *outbox.Publisher {
 	// Long enough that an event whose publish failed is not due again inside
 	// the test, so every attempt counted below is a first attempt.
 	cfg.Backoff = outbox.BackoffPolicy{Base: time.Minute, Max: time.Minute, Multiplier: 2}
-	return outbox.NewPublisher(outbox.NewStore(testPool), broker, cfg,
+	return outbox.NewPublisher(outbox.NewStore(testPool), oneQueue(broker), cfg,
 		discardLogger(), rand.New(rand.NewSource(1)))
 }
 
@@ -58,7 +58,7 @@ func TestOutbox_RunLoopPublishesABacklogOfSeveralBatchesInOneTick(t *testing.T) 
 // unreachableBroker fails every publish at once, the way a refused connection
 // does. Failing instantly is the point: a failure that took seconds would hide a
 // loop that spun on failures behind its own slowness.
-type unreachableBroker struct{}
+type unreachableBroker struct{ queue.Broker }
 
 func (unreachableBroker) Publish(context.Context, []byte) error {
 	return errors.New("broker unreachable")

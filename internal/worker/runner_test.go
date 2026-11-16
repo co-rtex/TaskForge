@@ -113,6 +113,27 @@ type fakeBroker struct {
 	deleted      []string
 	deletedCh    chan string
 	onDelete     func()
+	routed       []queue.Address
+	routeErr     error
+}
+
+// Route makes a fakeBroker its own router: every address resolves to it, and
+// the addresses asked for are recorded so a test can assert which one a runner
+// chose.
+func (b *fakeBroker) Route(_ context.Context, address queue.Address) (queue.Broker, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.routed = append(b.routed, address)
+	if b.routeErr != nil {
+		return nil, b.routeErr
+	}
+	return b, nil
+}
+
+func (b *fakeBroker) routedAddresses() []queue.Address {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]queue.Address(nil), b.routed...)
 }
 
 func (b *fakeBroker) Publish(context.Context, []byte) error { return nil }
@@ -173,11 +194,23 @@ func testAssignment(session workers.Session) *workers.Assignment {
 	}
 }
 
-func testRunner(control ControlPlane, broker queue.Broker, registry *Registry) *Runner {
-	return NewRunner(control, broker, registry, nil, RunnerConfig{
+// resolvedRunner is NewRunner for a test that drives processMessage directly:
+// the runner's address is already resolved to router, as Run would resolve it.
+func resolvedRunner(control ControlPlane, router *fakeBroker, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
+	runner := NewRunner(control, router, registry, objects, cfg, log)
+	runner.broker = router
+	return runner
+}
+
+// testRunner builds a runner whose address is already resolved to broker, for
+// tests that drive processMessage directly rather than through Run.
+func testRunner(control ControlPlane, broker *fakeBroker, registry *Registry) *Runner {
+	runner := NewRunner(control, broker, registry, nil, RunnerConfig{
 		Queue: "default", PollWait: time.Second, RetryAttempts: 2,
 		ShutdownTimeout: time.Second,
 	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	runner.broker = broker
+	return runner
 }
 
 func TestProcessMessage_OrdersClaimAckStartHandlerAndSuccess(t *testing.T) {
@@ -477,6 +510,51 @@ func TestRunner_SessionReplacementIsFatalAndDropsReadiness(t *testing.T) {
 	require.Equal(t, int32(1), broker.receiveCount.Load())
 }
 
+// TestRunner_ReadsOnlyItsOwnScopesAddress pins ADR-0028 on the worker side: the
+// broker queue a runner reads is the one of the scope its registration returned
+// and the queue it was configured for, resolved before any receive. A runner
+// that read a shared queue, or another scope's, could delete a notification
+// another scope's worker needs.
+func TestRunner_ReadsOnlyItsOwnScopesAddress(t *testing.T) {
+	session := testSession(1)
+	session.Scope = "tenant-a"
+	control := &fakeControl{
+		register: func(context.Context, workers.Registration) (workers.Session, error) { return session, nil },
+	}
+	broker := &fakeBroker{messages: make(chan queue.Message)}
+	runner := NewRunner(control, broker, NewRegistry(), nil, RunnerConfig{
+		Registration: workers.Registration{SessionID: session.ID}, Queue: "batch",
+		PollWait: time.Second, RetryAttempts: 1, ShutdownTimeout: time.Second,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	require.Eventually(t, func() bool { return broker.receiveCount.Load() > 0 }, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+	require.Equal(t, []queue.Address{{Scope: "tenant-a", Queue: "batch"}}, broker.routedAddresses())
+}
+
+// TestRunner_AnUnresolvableAddressIsFatalBeforeAnyReceive: a runner that cannot
+// reach its own address's queue must not fall back to reading anything else.
+func TestRunner_AnUnresolvableAddressIsFatalBeforeAnyReceive(t *testing.T) {
+	session := testSession(1)
+	session.Scope = "tenant-a"
+	control := &fakeControl{
+		register: func(context.Context, workers.Registration) (workers.Session, error) { return session, nil },
+	}
+	broker := &fakeBroker{messages: make(chan queue.Message), routeErr: errors.New("broker refused CreateQueue")}
+	runner := NewRunner(control, broker, NewRegistry(), nil, RunnerConfig{
+		Registration: workers.Registration{SessionID: session.ID}, Queue: "default",
+		PollWait: time.Second, RetryAttempts: 2, RetryDelay: time.Millisecond, ShutdownTimeout: time.Second,
+	}, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	err := runner.Run(context.Background())
+	require.ErrorContains(t, err, "broker refused CreateQueue")
+	require.Len(t, broker.routedAddresses(), 2, "a route failure is retried like any dependency error")
+	require.Zero(t, broker.receiveCount.Load())
+	require.False(t, runner.Ready())
+}
+
 func TestRunner_ShutdownDrainsAndReportsInFlightSuccess(t *testing.T) {
 	session := testSession(1)
 	assignment := testAssignment(session)
@@ -655,7 +733,10 @@ func TestRunner_LocalPoolNeverPollsPastItsBound(t *testing.T) {
 }
 
 var _ ControlPlane = (*fakeControl)(nil)
-var _ queue.Broker = (*fakeBroker)(nil)
+var (
+	_ queue.Broker = (*fakeBroker)(nil)
+	_ queue.Router = (*fakeBroker)(nil)
+)
 
 // notificationBodyForEvent builds a work notification carrying a caller-chosen
 // durable event id so a test can deliver true duplicates of one event alongside

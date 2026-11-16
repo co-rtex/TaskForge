@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/co-rtex/TaskForge/internal/queue"
 )
 
 // Store is the outbox's PostgreSQL persistence.
@@ -113,15 +115,20 @@ func HasPendingWorkAvailableTx(ctx context.Context, tx pgx.Tx, jobID uuid.UUID, 
 //
 // The claim commits before publishing so that no row lock is held across network
 // I/O to the broker.
+//
+// Each event comes back with the address of the job it advertises, joined from
+// jobs in the same statement: the publisher routes by it (ADR-0028). A job's
+// scope and queue never change, so the join needs no lock of its own.
 func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Duration) ([]Event, error) {
 	rows, err := s.pool.Query(ctx, `
 		WITH due AS (
-			SELECT id
-			FROM outbox_events
-			WHERE status = 'PENDING'
-			  AND available_at <= now()
-			ORDER BY available_at, id
-			FOR UPDATE SKIP LOCKED
+			SELECT o.id, j.scope, j.queue
+			FROM outbox_events o
+			LEFT JOIN jobs j ON j.id = o.job_id
+			WHERE o.status = 'PENDING'
+			  AND o.available_at <= now()
+			ORDER BY o.available_at, o.id
+			FOR UPDATE OF o SKIP LOCKED
 			LIMIT $1
 		)
 		UPDATE outbox_events o
@@ -131,7 +138,7 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Durat
 		FROM due
 		WHERE o.id = due.id
 		RETURNING o.id, o.event_type, o.schema_version, o.payload, o.attempts, o.created_at,
-		          o.traceparent, o.tracestate`,
+		          o.traceparent, o.tracestate, due.scope, due.queue`,
 		limit, claimTimeout.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim due outbox events: %w", err)
@@ -141,9 +148,9 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Durat
 	var out []Event
 	for rows.Next() {
 		var e Event
-		var traceparent, tracestate *string
+		var traceparent, tracestate, scope, queueName *string
 		if err := rows.Scan(&e.ID, &e.Type, &e.SchemaVersion, &e.Data, &e.Attempts, &e.CreatedAt,
-			&traceparent, &tracestate); err != nil {
+			&traceparent, &tracestate, &scope, &queueName); err != nil {
 			return nil, fmt.Errorf("scan outbox event: %w", err)
 		}
 		// A NULL traceparent leaves Trace nil, which the envelope omits and the
@@ -155,6 +162,9 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Durat
 			if tracestate != nil {
 				e.Trace.Tracestate = *tracestate
 			}
+		}
+		if scope != nil && queueName != nil {
+			e.Address = queue.Address{Scope: *scope, Queue: *queueName}
 		}
 		out = append(out, e)
 	}

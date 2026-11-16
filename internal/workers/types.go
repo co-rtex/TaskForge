@@ -127,8 +127,13 @@ type Registration struct {
 
 // Session is the durable identity returned by registration.
 type Session struct {
-	ID                uuid.UUID
-	WorkerID          uuid.UUID
+	ID       uuid.UUID
+	WorkerID uuid.UUID
+	// Scope is the authorization scope the session's worker key belongs to. A
+	// worker learns it here, at registration, because it addresses the broker
+	// queue the worker reads: the one carrying its own scope's notifications
+	// for its queue (docs/adr/0028-scope-addressed-notification-streams.md).
+	Scope             string
 	Name              string
 	Hostname          string
 	WorkerGroup       string
@@ -150,8 +155,9 @@ type ClaimRequest struct {
 }
 
 // ClaimDisposition tells a broker consumer whether a notification is safe to
-// acknowledge. A committed assignment, a confirmed empty queue, and a globally
-// consumed duplicate notification are the only safe acknowledgements.
+// acknowledge. A committed assignment, a confirmed empty queue, a globally
+// consumed duplicate notification, and a stale notification nobody can use
+// are the only safe acknowledgements.
 type ClaimDisposition string
 
 const (
@@ -160,6 +166,22 @@ const (
 	DuplicateNotification ClaimDisposition = "DUPLICATE_NOTIFICATION"
 	NoEligibleJob         ClaimDisposition = "NO_ELIGIBLE_JOB"
 	CapacityExhausted     ClaimDisposition = "CAPACITY_EXHAUSTED"
+	// ForeignNotification: the presented notification advertises a job of
+	// another scope or queue. Nothing is claimed under it, and it is not safe
+	// to acknowledge: deleting it is exactly how one scope's worker used to
+	// strand another scope's job. Under ADR-0028's routing a worker never
+	// receives one; this is the guard for when routing is wrong (a digest
+	// collision, a misconfigured base queue, a pre-ADR-0028 shared queue).
+	ForeignNotification ClaimDisposition = "FOREIGN_NOTIFICATION"
+	// StaleNotification: no job in the worker's scope and queue is eligible
+	// for this session, and the presented notification advertises an
+	// eligibility transition that has already ended (its job left QUEUED, or
+	// was requeued under a newer generation). It is safe to acknowledge
+	// because no job depends on it: every job that is QUEUED now has its own
+	// current-generation notification or is repaired by bounded
+	// re-notification (ADR-0028). Releasing it is what keeps a job nobody can
+	// claim from holding an ever-growing set of other jobs' leftovers alive.
+	StaleNotification ClaimDisposition = "STALE_NOTIFICATION"
 )
 
 // Assignment is the authoritative job data and fencing tuple returned by a
@@ -198,7 +220,8 @@ type ClaimResult struct {
 // can leave no eligible work stranded.
 func (r ClaimResult) SafeToAcknowledge() bool {
 	return (r.Disposition == Claimed && r.Assignment != nil) ||
-		((r.Disposition == QueueEmpty || r.Disposition == DuplicateNotification) && r.Assignment == nil)
+		((r.Disposition == QueueEmpty || r.Disposition == DuplicateNotification ||
+			r.Disposition == StaleNotification) && r.Assignment == nil)
 }
 
 // Fence identifies the only attempt and lease allowed to mutate a job.

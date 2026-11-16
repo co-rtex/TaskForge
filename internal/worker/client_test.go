@@ -29,6 +29,16 @@ func TestValidateClaimResponse_RejectsInconsistentAckContracts(t *testing.T) {
 		"capacity marked safe": {
 			Outcome: string(workers.CapacityExhausted), SafeToAcknowledge: true,
 		},
+		// ADR-0028: deleting another address's notification is the defect.
+		"foreign marked safe": {
+			Outcome: string(workers.ForeignNotification), SafeToAcknowledge: true,
+		},
+		"stale but unsafe": {
+			Outcome: string(workers.StaleNotification), SafeToAcknowledge: false,
+		},
+		"stale with assignment": {
+			Outcome: string(workers.StaleNotification), SafeToAcknowledge: true, Assignment: assignment,
+		},
 		"unknown outcome": {Outcome: "NEWER_SERVER_OUTCOME"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -42,6 +52,8 @@ func TestValidateClaimResponse_RejectsInconsistentAckContracts(t *testing.T) {
 		{Outcome: string(workers.DuplicateNotification), SafeToAcknowledge: true},
 		{Outcome: string(workers.NoEligibleJob)},
 		{Outcome: string(workers.CapacityExhausted)},
+		{Outcome: string(workers.ForeignNotification)},
+		{Outcome: string(workers.StaleNotification), SafeToAcknowledge: true},
 	} {
 		require.NoError(t, validateClaimResponse(response))
 	}

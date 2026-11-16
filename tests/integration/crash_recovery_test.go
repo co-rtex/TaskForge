@@ -168,7 +168,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 
 	workerA := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second}, currentWorkerKey())
 	sessionA := uuid.New()
-	runnerA := workerruntime.NewRunner(workerA, broker, registry, nil, workerruntime.RunnerConfig{
+	runnerA := workerruntime.NewRunner(workerA, oneQueue(broker), registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: sessionA, Name: "crash-worker-a", Hostname: "a.local",
 			WorkerGroup: "default", ConcurrencyLimit: 1, Capabilities: []string{"cpu"},
@@ -260,7 +260,7 @@ func TestWorkerCrash_RecoversThroughTheRealOutboxAndBrokerPath(t *testing.T) {
 			return execution.Payload, nil
 		})))
 	workerB := workerruntime.NewClient(server.URL, &http.Client{Timeout: 5 * time.Second}, currentWorkerKey())
-	runnerB := workerruntime.NewRunner(workerB, broker, registryB, nil, workerruntime.RunnerConfig{
+	runnerB := workerruntime.NewRunner(workerB, oneQueue(broker), registryB, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: "crash-worker-b", Hostname: "b.local",
 			WorkerGroup: "default", ConcurrencyLimit: 1, Capabilities: []string{"cpu"},

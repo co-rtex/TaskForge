@@ -89,8 +89,12 @@ type deliveryFlight struct {
 // its handler is executing, so local concurrency cannot exceed registration's
 // declared limit even if the broker duplicates every notification.
 type Runner struct {
-	control   ControlPlane
-	broker    queue.Broker
+	control ControlPlane
+	router  queue.Router
+	// broker is the broker queue of this session's own address, resolved
+	// from router once registration has named the session's scope. Run sets
+	// it before any slot starts and never changes it afterwards.
+	broker    queue.Receiver
 	registry  *Registry
 	objects   ObjectStore
 	cfg       RunnerConfig
@@ -120,7 +124,11 @@ func (r *Runner) WithMetrics(m *metrics.Metrics) *Runner {
 	return r
 }
 
-func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
+// NewRunner builds a runner. router resolves the broker queue the runner reads
+// once registration has told it its scope: the queue of its own (scope, queue)
+// address, where no other scope's or queue's notifications are delivered
+// (docs/adr/0028-scope-addressed-notification-streams.md).
+func NewRunner(control ControlPlane, router queue.Router, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
 	if cfg.RetryAttempts < 1 {
 		cfg.RetryAttempts = 1
 	}
@@ -146,7 +154,7 @@ func NewRunner(control ControlPlane, broker queue.Broker, registry *Registry, ob
 		cfg.ResultInlineThresholdBytes = 64 * 1024
 	}
 	return &Runner{
-		control: control, broker: broker, registry: registry, objects: objects, cfg: cfg, log: log,
+		control: control, router: router, registry: registry, objects: objects, cfg: cfg, log: log,
 		flights:  make(map[uuid.UUID]*deliveryFlight),
 		attempts: newAttemptRegistry(),
 		now:      time.Now,
@@ -172,6 +180,21 @@ func (r *Runner) Run(ctx context.Context) error {
 	})
 	if err != nil {
 		return fmt.Errorf("register worker session: %w", err)
+	}
+	// Read only the broker queue of this session's own address. Every
+	// notification delivered there is one this session's claim decision is
+	// authoritative for, so acknowledging relative to this session is
+	// acknowledging relative to the notification.
+	address := queue.Address{Scope: session.Scope, Queue: r.cfg.Queue}
+	err = r.retry(ctx, func() error {
+		broker, err := r.router.Route(ctx, address)
+		if err == nil {
+			r.broker = broker
+		}
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("resolve this session's notification queue: %w", err)
 	}
 
 	r.ready.Store(true)

@@ -165,7 +165,7 @@ func TestControlListener_AWorkerOnANonLoopbackAddressRunsAJob(t *testing.T) {
 	require.NoError(t, registry.Register("demo.echo", workerruntime.DemoEcho{}))
 	control := workerruntime.NewClient(workerConfig.APIBaseURL, &http.Client{Timeout: 10 * time.Second}, workerKey.Raw)
 	registration := workerRegistration("control-listener-worker", 1, []string{"cpu"}, nil)
-	runner := workerruntime.NewRunner(control, broker, registry, nil, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, oneQueue(broker), registry, nil, workerruntime.RunnerConfig{
 		Registration: registration,
 		Queue:        "default", PollWait: time.Second,
 		RetryAttempts: 3, RetryDelay: 10 * time.Millisecond, ErrorBackoff: 10 * time.Millisecond,

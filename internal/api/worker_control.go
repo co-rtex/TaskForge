@@ -58,8 +58,12 @@ type registerWorkerSessionRequest struct {
 
 // WorkerSessionResponse is the internal representation returned to a worker.
 type WorkerSessionResponse struct {
-	WorkerID          string    `json:"worker_id"`
-	WorkerSessionID   string    `json:"worker_session_id"`
+	WorkerID        string `json:"worker_id"`
+	WorkerSessionID string `json:"worker_session_id"`
+	// Scope is the worker key's scope. The worker uses it only to address the
+	// broker queue of its own scope's notifications (ADR-0028); it is the
+	// worker's own scope, so it discloses nothing the key does not already own.
+	Scope             string    `json:"scope"`
 	WorkerName        string    `json:"worker_name"`
 	Hostname          string    `json:"hostname"`
 	WorkerGroup       string    `json:"worker_group"`
@@ -75,6 +79,7 @@ func toWorkerSessionResponse(session workers.Session) WorkerSessionResponse {
 	return WorkerSessionResponse{
 		WorkerID:          session.WorkerID.String(),
 		WorkerSessionID:   session.ID.String(),
+		Scope:             session.Scope,
 		WorkerName:        session.Name,
 		Hostname:          session.Hostname,
 		WorkerGroup:       session.WorkerGroup,

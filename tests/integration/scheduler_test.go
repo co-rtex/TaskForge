@@ -489,6 +489,12 @@ func TestContention_PromotionVersusCancellation(t *testing.T) {
 func TestScheduler_RenotifiesAQueuedJobWhoseNotificationWasLost(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
+	// A session that could claim the job exists throughout: a replacement is
+	// only worth creating for someone (ADR-0028; the deferral is pinned by
+	// TestScheduler_DefersAJobNoSessionCouldClaim).
+	store := controlStore()
+	session := registerWorker(t, store,
+		workerRegistration("stranded-worker", 1, nil, []string{"demo.echo"}))
 	jobID := createJob(t, "stranded", "demo.echo", 50, nil)
 
 	// The publisher delivered the only event and it was lost in transit.
@@ -527,9 +533,6 @@ func TestScheduler_RenotifiesAQueuedJobWhoseNotificationWasLost(t *testing.T) {
 	require.Len(t, eventsForJob(t, jobID), 2)
 
 	// And the work really is reachable again.
-	store := controlStore()
-	session := registerWorker(t, store,
-		workerRegistration("stranded-worker", 1, nil, []string{"demo.echo"}))
 	claim, err := store.Claim(ctx, testScope,
 		workers.ClaimRequest{
 			WorkerID: session.WorkerID, SessionID: session.ID,
@@ -619,6 +622,8 @@ func TestScheduler_AStalePendingEventDoesNotBlockANewTransition(t *testing.T) {
 func TestScheduler_RenotificationIsBatchLimited(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
+	registerWorker(t, controlStore(),
+		workerRegistration("batch-worker", 1, nil, []string{"demo.echo"}))
 
 	const jobCount = 5
 	for i := 0; i < jobCount; i++ {
@@ -695,4 +700,111 @@ func TestScheduler_RenotificationRacingAClaimCannotCorruptState(t *testing.T) {
 	require.Equal(t, "LEASED", readJob(t, jobID).status)
 	require.Equal(t, 1, countActiveLeases(t), "a re-notification can never create a second lease")
 	require.Len(t, eventsForJob(t, jobID), 1)
+}
+
+// strandAll marks every job's events delivered-and-lost and backdates every
+// job's notification, so each is a re-notification candidate.
+func strandAll(t *testing.T, ids ...uuid.UUID) {
+	t.Helper()
+	_, err := testPool.Exec(context.Background(),
+		`UPDATE outbox_events SET status = 'PUBLISHED', published_at = clock_timestamp()`)
+	require.NoError(t, err)
+	for _, id := range ids {
+		backdateNotification(t, id, 2*time.Minute)
+	}
+}
+
+// TestScheduler_DefersAJobNoSessionCouldClaim pins the claimability gate
+// (ADR-0028), the bound that keeps an unclaimable job from accumulating
+// notifications: no replacement while nobody could claim the job, for every
+// way "nobody" can hold, and a replacement as soon as somebody could.
+func TestScheduler_DefersAJobNoSessionCouldClaim(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	store := controlStore()
+	jobID := createJob(t, "needs-gpu", "demo.echo", 50, []string{"gpu"})
+	strandAll(t, jobID)
+
+	renotify := func(t *testing.T) jobs.SchedulerStats {
+		t.Helper()
+		// A millisecond interval: each pass is a fresh decision, so what is
+		// tested is the gate and not the rate limit.
+		time.Sleep(5 * time.Millisecond)
+		stats, err := jobStore().RenotifyStrandedQueued(ctx, time.Millisecond, 10)
+		require.NoError(t, err)
+		return stats
+	}
+	deferred := func(t *testing.T, why string) {
+		t.Helper()
+		stats := renotify(t)
+		require.Zerof(t, stats.Renotified, "%s: no replacement", why)
+		require.Equalf(t, 1, stats.Deferred, "%s: deferred, not skipped", why)
+		require.Lenf(t, eventsForJob(t, jobID), 1, "%s: no event written", why)
+		require.NotNil(t, renotifyCheckedAt(t, jobID), "the deferral is stamped so the scan moves past it")
+	}
+
+	deferred(t, "no session at all")
+
+	registerWorker(t, store, workerRegistration("cpu-worker", 1, []string{"cpu"}, []string{"demo.echo"}))
+	deferred(t, "a healthy session without the capability")
+
+	registerWorker(t, store, workerRegistration("no-handler", 1, []string{"gpu"}, []string{"demo.sleep"}))
+	deferred(t, "a session with the capability but not the job type")
+
+	otherScope, err := store.Register(ctx, "another-scope",
+		workerRegistration("other-scope-gpu", 1, []string{"gpu"}, []string{"demo.echo"}))
+	require.NoError(t, err)
+	require.Equal(t, "another-scope", otherScope.Scope)
+	deferred(t, "a capable session of another scope")
+
+	// A capable session of the job's own scope, at capacity: it is not polling.
+	busy := registerWorker(t, store, workerRegistration("busy-gpu", 1, []string{"gpu"}, []string{"demo.echo"}))
+	filler := createJob(t, "filler", "demo.echo", 99, nil)
+	fill, err := store.Claim(ctx, testScope, claimRequest(busy, "default"))
+	require.NoError(t, err)
+	require.Equal(t, workers.Claimed, fill.Disposition)
+	require.Equal(t, filler, fill.Assignment.JobID)
+	deferred(t, "the only capable session has no free slot")
+
+	// The slot frees: the capable session could claim now.
+	_, err = testPool.Exec(ctx, `UPDATE leases SET status = 'RELEASED', released_at = clock_timestamp()
+		WHERE id = $1`, fill.Assignment.LeaseID)
+	require.NoError(t, err)
+	stats := renotify(t)
+	require.Equal(t, 1, stats.Renotified, "a session that could claim it exists, so the lost notification is repaired")
+	require.Len(t, eventsForJob(t, jobID), 2)
+}
+
+// TestScheduler_DeferredJobsDoNotStarveAClaimableOne is the reason
+// renotify_checked_at exists. The scan reads the oldest stranded jobs first,
+// one batch at a time; a deferred job's last_notification_at does not move, so
+// without the deferral stamp the same unclaimable jobs would fill every batch
+// forever and the claimable job behind them would never be repaired.
+func TestScheduler_DeferredJobsDoNotStarveAClaimableOne(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	registerWorker(t, controlStore(), workerRegistration("cpu-worker", 1, nil, []string{"demo.echo"}))
+
+	var unclaimable []uuid.UUID
+	for i := 0; i < 4; i++ {
+		unclaimable = append(unclaimable, createJob(t, "gpu-"+uuid.NewString()[:8], "demo.echo", 50, []string{"gpu"}))
+	}
+	claimable := createJob(t, "cpu-job", "demo.echo", 50, nil)
+	strandAll(t, append(unclaimable, claimable)...)
+	// The claimable job is the newest-notified, so it sorts last.
+	backdateNotification(t, claimable, time.Minute+time.Second)
+
+	stats, err := jobStore().RenotifyStrandedQueued(ctx, time.Minute, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, stats.Deferred)
+	stats, err = jobStore().RenotifyStrandedQueued(ctx, time.Minute, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, stats.Deferred, "the next batch reaches the jobs behind the deferred ones")
+	stats, err = jobStore().RenotifyStrandedQueued(ctx, time.Minute, 2)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Renotified, "the claimable job is repaired within a bounded number of passes")
+	require.Len(t, eventsForJob(t, claimable), 2)
+	for _, id := range unclaimable {
+		require.Len(t, eventsForJob(t, id), 1)
+	}
 }

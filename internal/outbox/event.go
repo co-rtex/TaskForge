@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/co-rtex/TaskForge/internal/queue"
 )
 
 // Event types and their schema versions. A change to the shape of an event's
@@ -49,6 +51,13 @@ type Event struct {
 	Trace     *TraceContext
 	Attempts  int
 	CreatedAt time.Time
+	// Address is the notification stream this event belongs to: the scope and
+	// queue of the job it advertises, read from the authoritative jobs row
+	// when the event is claimed for publication, never from the envelope. It
+	// is the zero Address for a legacy event with no job reference. It is not
+	// serialized: the broker queue an event is published to is the address
+	// (docs/adr/0028-scope-addressed-notification-streams.md).
+	Address queue.Address
 }
 
 // WorkAvailableData tells a consumer that a queue may have claimable work.

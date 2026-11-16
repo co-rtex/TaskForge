@@ -320,6 +320,66 @@ func newBrokerForQueue(t *testing.T, queueName string) *sqsbroker.Broker {
 	return b
 }
 
+// oneQueue routes every notification address to b. It is for tests about
+// something other than routing -- outbox mechanics, claims, recovery -- that
+// run one scope's one queue, for which production routing resolves exactly one
+// broker queue anyway. Tests about routing use isolatedRouter.
+func oneQueue(b queue.Broker) queue.Router { return singleQueueRouter{b} }
+
+type singleQueueRouter struct{ queue.Broker }
+
+func (r singleQueueRouter) Route(context.Context, queue.Address) (queue.Broker, error) {
+	return r.Broker, nil
+}
+
+// isolatedRouter is production routing (sqsbroker.Router, ADR-0028) on a base
+// queue of the test's own. It deletes every per-address queue it resolved
+// when the test ends, because each was created on demand by the publisher or a
+// worker and reset() cannot drain what it does not know about.
+type isolatedRouter struct {
+	*sqsbroker.Router
+	t *testing.T
+
+	mu   sync.Mutex
+	urls map[string]bool
+}
+
+func newIsolatedRouter(t *testing.T, prefix string) *isolatedRouter {
+	t.Helper()
+	opts := brokerOptions()
+	opts.QueueName = createIsolatedBrokerQueue(t, prefix)
+	router, err := sqsbroker.NewRouter(context.Background(), opts)
+	require.NoError(t, err)
+	r := &isolatedRouter{Router: router, t: t, urls: map[string]bool{}}
+	t.Cleanup(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for queueURL := range r.urls {
+			deleteBrokerQueue(queueURL)
+		}
+	})
+	return r
+}
+
+func (r *isolatedRouter) Route(ctx context.Context, address queue.Address) (queue.Broker, error) {
+	b, err := r.Router.Route(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	r.urls[b.(*sqsbroker.Broker).QueueURL()] = true
+	r.mu.Unlock()
+	return b, nil
+}
+
+// address resolves (creating if needed) one address's broker queue.
+func (r *isolatedRouter) address(t *testing.T, scope, queueName string) *sqsbroker.Broker {
+	t.Helper()
+	b, err := r.Route(context.Background(), queue.Address{Scope: scope, Queue: queueName})
+	require.NoError(t, err)
+	return b.(*sqsbroker.Broker)
+}
+
 // reset clears all mutable state so each test starts from a known point.
 //
 // queues is preserved and re-seeded because it is reference data, not test

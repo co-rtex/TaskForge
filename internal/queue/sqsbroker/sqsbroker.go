@@ -8,12 +8,14 @@ package sqsbroker
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/co-rtex/TaskForge/internal/config"
 	"github.com/co-rtex/TaskForge/internal/queue"
@@ -161,3 +163,108 @@ func (b *Broker) Ping(ctx context.Context) error {
 	}
 	return nil
 }
+
+// templateAttributes are the base queue's attributes a per-address queue
+// inherits, so an operator configures the family once, on the base queue, and
+// every address's queue matches it: the visibility timeout every claim decision
+// is timed against, retention, delivery delay, long-poll default, size limit,
+// and server-side encryption. A redrive policy is deliberately not copied: a
+// notification is advisory, and a dead-letter queue would hold copies nothing
+// claims. Only the attributes the broker reports are copied, so a broker that
+// has no encryption attributes (ElasticMQ) is not asked to set them.
+var templateAttributes = []string{
+	"VisibilityTimeout",
+	"MessageRetentionPeriod",
+	"DelaySeconds",
+	"ReceiveMessageWaitTimeSeconds",
+	"MaximumMessageSize",
+	"SqsManagedSseEnabled",
+	"KmsMasterKeyId",
+	"KmsDataKeyReusePeriodSeconds",
+}
+
+// Router is an SQS-compatible queue.Router: one broker queue per
+// queue.Address, named by queue.NotificationQueueName from the configured base
+// queue, which must exist and serves as the family's template and readiness
+// target (docs/adr/0028-scope-addressed-notification-streams.md).
+type Router struct {
+	base     *Broker
+	baseName string
+
+	mu     sync.Mutex
+	routes map[queue.Address]*Broker
+}
+
+var _ queue.Router = (*Router)(nil)
+
+// NewRouter resolves the base queue at construction, exactly as New does, so a
+// misnamed or missing base queue still fails at startup.
+func NewRouter(ctx context.Context, opts Options) (*Router, error) {
+	base, err := New(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Router{base: base, baseName: opts.QueueName, routes: map[queue.Address]*Broker{}}, nil
+}
+
+// Route returns address's broker queue, creating it from the base queue's
+// attributes the first time any process needs it. Both the publisher and a
+// worker may be first, so creation is idempotent: a queue that already exists
+// is resolved, and a creation that lost a race to another process resolves the
+// winner's queue.
+func (r *Router) Route(ctx context.Context, address queue.Address) (queue.Broker, error) {
+	if address.Scope == "" || address.Queue == "" {
+		return nil, fmt.Errorf("route notification: scope and queue are both required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b, ok := r.routes[address]; ok {
+		return b, nil
+	}
+	name := queue.NotificationQueueName(r.baseName, address)
+	url, err := r.resolveOrCreate(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	b := &Broker{client: r.base.client, queueURL: url}
+	r.routes[address] = b
+	return b, nil
+}
+
+func (r *Router) resolveOrCreate(ctx context.Context, name string) (string, error) {
+	if out, err := r.base.client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)}); err == nil {
+		return aws.ToString(out.QueueUrl), nil
+	}
+	// Any lookup failure falls through to creation rather than being
+	// classified: CreateQueue either creates the queue, returns the existing
+	// one, or fails for a reason that is then reported.
+	template, err := r.base.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(r.base.queueURL),
+		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameAll},
+	})
+	if err != nil {
+		return "", fmt.Errorf("read base queue attributes for %q: %w", name, err)
+	}
+	attributes := map[string]string{}
+	for _, attribute := range templateAttributes {
+		if value, ok := template.Attributes[attribute]; ok {
+			attributes[attribute] = value
+		}
+	}
+	out, createErr := r.base.client.CreateQueue(ctx, &sqs.CreateQueueInput{
+		QueueName: aws.String(name), Attributes: attributes,
+	})
+	if createErr == nil {
+		return aws.ToString(out.QueueUrl), nil
+	}
+	if out, err := r.base.client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)}); err == nil {
+		return aws.ToString(out.QueueUrl), nil
+	}
+	return "", fmt.Errorf("create notification queue %q: %w", name, createErr)
+}
+
+// Ping checks the base queue, which every address's queue is created from.
+func (r *Router) Ping(ctx context.Context) error { return r.base.Ping(ctx) }
+
+// BaseQueueURL reports the base queue's URL. Useful for logs and tests.
+func (r *Router) BaseQueueURL() string { return r.base.queueURL }

@@ -88,12 +88,14 @@ func run() int {
 	}
 	defer pool.Close()
 
-	broker, err := sqsbroker.New(ctx, sqsbroker.OptionsFromConfig(cfg))
+	// Every event is published to the broker queue of its own (scope, queue)
+	// address, derived from the configured base queue (ADR-0028).
+	broker, err := sqsbroker.NewRouter(ctx, sqsbroker.OptionsFromConfig(cfg))
 	if err != nil {
 		log.Error("connect to broker", slog.String("error", err.Error()))
 		return 1
 	}
-	log.Info("broker resolved", slog.String("queue_url", broker.QueueURL()))
+	log.Info("broker resolved", slog.String("base_queue_url", broker.BaseQueueURL()))
 
 	store := outbox.NewStore(pool)
 	publisher := outbox.NewPublisher(store, broker, outbox.PublisherConfig{

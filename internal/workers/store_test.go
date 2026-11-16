@@ -52,3 +52,13 @@ func TestClassifyDatabaseError_TranslatesOnlyARealDeadline(t *testing.T) {
 		})
 	}
 }
+
+// TestSafeToAcknowledge_NotificationRelativeDispositions pins ADR-0028's two
+// dispositions into the acknowledgement contract: a foreign notification is
+// never released, a stale one always is, and neither may carry an assignment.
+func TestSafeToAcknowledge_NotificationRelativeDispositions(t *testing.T) {
+	require.False(t, ClaimResult{Disposition: ForeignNotification}.SafeToAcknowledge())
+	require.True(t, ClaimResult{Disposition: StaleNotification}.SafeToAcknowledge())
+	require.False(t, ClaimResult{Disposition: StaleNotification, Assignment: &Assignment{}}.SafeToAcknowledge())
+	require.False(t, ClaimResult{Disposition: NoEligibleJob}.SafeToAcknowledge())
+}
