@@ -510,7 +510,7 @@ func TestRunner_SessionReplacementIsFatalAndDropsReadiness(t *testing.T) {
 	require.Equal(t, int32(1), broker.receiveCount.Load())
 }
 
-// TestRunner_ReadsOnlyItsOwnScopesAddress pins ADR-0028 on the worker side: the
+// TestRunner_ReadsOnlyItsOwnScopesAddress pins ADR-0029 on the worker side: the
 // broker queue a runner reads is the one of the scope its registration returned
 // and the queue it was configured for, resolved before any receive. A runner
 // that read a shared queue, or another scope's, could delete a notification

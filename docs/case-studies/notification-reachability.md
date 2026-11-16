@@ -1,9 +1,9 @@
 # Case study: notification reachability across tenants
 
 A record of one correctness repair, written for an engineer reviewing the work. The
-decision is [ADR-0028](../adr/0028-scope-addressed-notification-streams.md); the evidence,
+decision is [ADR-0029](../adr/0029-scope-addressed-notification-streams.md); the evidence,
 commands and raw figures are in [CURRENT_STATE.md](../CURRENT_STATE.md), "Notification
-reachability repair (ADR-0028)". This page tells the story and does not restate either.
+reachability repair (ADR-0029)". This page tells the story and does not restate either.
 
 ## 1. The defect
 
@@ -50,7 +50,7 @@ delay grows with other tenants' worker counts); forwarding foreign notifications
 outbox (O(tenants) hops per job, infinite with no worker); tracking declines per
 notification (blind to unread notifications, and fungible swaps defeat it); exponential
 backoff or short broker retention (slows growth or deletes a stuck job's only wakeup). Each
-is weighed in ADR-0028.
+is weighed in ADR-0029.
 
 ## 6. The design
 
@@ -92,4 +92,4 @@ Per-address queues are created by the application, which needs `sqs:CreateQueue`
 prefix and leaves queue retirement to operators. Messages on the old shared queue are
 repaired by re-notification after an upgrade, not read. Within one address, workers with
 different capabilities still meet a held notification at random. The gate cannot see which
-queue a session polls. ADR-0028 records each, and none weakens a correctness guarantee.
+queue a session polls. ADR-0029 records each, and none weakens a correctness guarantee.

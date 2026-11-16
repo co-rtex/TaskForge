@@ -15,10 +15,10 @@ import (
 )
 
 // These tests pin the claim's decisions relative to the NOTIFICATION it was
-// woken by (ADR-0028), on the store directly so each disposition is
+// woken by (ADR-0029), on the store directly so each disposition is
 // deterministic. Routing makes a foreign notification unreachable in a correct
 // deployment; the guard is what keeps a routing mistake from becoming the
-// pre-ADR-0028 defect again.
+// pre-ADR-0029 defect again.
 
 const foreignScope = "integration-scope-b"
 
@@ -184,7 +184,7 @@ func TestClaim_AStaleNotificationNobodyCanUseIsReleased(t *testing.T) {
 	require.Equal(t, cpuJob, result.Assignment.JobID)
 
 	// The cpu job's own notification is now a leftover: its job is LEASED.
-	// Before ADR-0028 cpu-b answered NO_ELIGIBLE_JOB (the gpu job is due) and
+	// Before ADR-0029 cpu-b answered NO_ELIGIBLE_JOB (the gpu job is due) and
 	// it stayed live as long as the gpu job waited.
 	result = claimWith(t, store, testScope, cpuB, cpuEvent)
 	require.Equal(t, workers.StaleNotification, result.Disposition)
@@ -237,7 +237,7 @@ func TestClaim_ARequeuedJobsOlderNotificationIsStale(t *testing.T) {
 
 // TestClaim_AnUnattributedClaimKeepsItsDisposition: a claim identity that is
 // not an outbox event carries no notification to decide relative to, so its
-// answer is exactly the pre-ADR-0028 one.
+// answer is exactly the pre-ADR-0029 one.
 func TestClaim_AnUnattributedClaimKeepsItsDisposition(t *testing.T) {
 	reset(t)
 	store := controlStore()

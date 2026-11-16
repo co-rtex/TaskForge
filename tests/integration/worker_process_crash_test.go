@@ -286,7 +286,7 @@ func createIsolatedBrokerQueue(t *testing.T, prefix string) string {
 
 	t.Cleanup(func() {
 		// Services given this base create testScope's default-queue
-		// notification queue from it on demand (ADR-0028); delete that too,
+		// notification queue from it on demand (ADR-0029); delete that too,
 		// if anything created it.
 		derived := queue.NotificationQueueName(name, queue.Address{Scope: testScope, Queue: "default"})
 		if resolved, err := http.PostForm(brokerEndpoint()+"/", url.Values{

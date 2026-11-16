@@ -17,7 +17,7 @@ import (
 // notification addressed elsewhere can. Delivering each address on a broker
 // queue of its own is what makes "safe to acknowledge relative to the claiming
 // worker" coincide with "safe to acknowledge relative to the notification"
-// (docs/adr/0028-scope-addressed-notification-streams.md).
+// (docs/adr/0029-scope-addressed-notification-streams.md).
 type Address struct {
 	Scope string
 	Queue string
@@ -67,7 +67,7 @@ func ValidateBaseQueueName(base string) error {
 // apart; NUL cannot occur in a scope or a queue name.
 //
 // Correctness does not depend on the digest being collision-free. Two
-// addresses sharing a broker queue is exactly the pre-ADR-0028 arrangement,
+// addresses sharing a broker queue is exactly the pre-ADR-0029 arrangement,
 // and the claim's foreign-notification guard keeps that arrangement from
 // deleting another address's notification; a collision costs latency, not a
 // job. At 64 bits it needs about four billion addresses to become likely.

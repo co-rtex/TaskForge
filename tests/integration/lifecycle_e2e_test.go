@@ -45,7 +45,7 @@ type e2eStack struct {
 	baseURL string
 	// router is production routing on a base queue of this stack's own: the
 	// publisher publishes each event to its address's queue and every worker
-	// reads only its own (ADR-0028).
+	// reads only its own (ADR-0029).
 	router   *isolatedRouter
 	control  *workerruntime.Client
 	registry *workerruntime.Registry

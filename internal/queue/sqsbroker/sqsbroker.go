@@ -54,7 +54,7 @@ type Broker struct {
 	// recreate is set on an address's broker (Router.Route) and nil on the base
 	// queue's. It resolves the address's queue again, creating it from the base
 	// queue's attributes, and is called when an operation reports the queue
-	// missing (ADR-0028).
+	// missing (ADR-0029).
 	recreate func(context.Context) (string, error)
 }
 
@@ -238,7 +238,7 @@ var templateAttributes = []string{
 // Router is an SQS-compatible queue.Router: one broker queue per
 // queue.Address, named by queue.NotificationQueueName from the configured base
 // queue, which must exist and serves as the family's template and readiness
-// target (docs/adr/0028-scope-addressed-notification-streams.md).
+// target (docs/adr/0029-scope-addressed-notification-streams.md).
 type Router struct {
 	base     *Broker
 	baseName string

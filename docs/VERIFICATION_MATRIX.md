@@ -119,7 +119,7 @@ watching it fail, which is how M7A's new tests were checked (see
   worker), and a same-identity replacement boot whose predecessor's lease still
   holds its slot.
 - **I19 and I20.** Added with the notification reachability repair
-  ([ADR-0028](adr/0028-scope-addressed-notification-streams.md), PR #34), after the M7A audit,
+  ([ADR-0029](adr/0029-scope-addressed-notification-streams.md), PR #34), after the M7A audit,
   so COVERED here means the rows' tests were written with that change and shown, by
   mutation, to fail without it (see CURRENT_STATE.md, "Notification reachability repair").
   I19's durable evidence is the absence of a lease under a foreign event id and the

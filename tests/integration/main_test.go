@@ -332,7 +332,7 @@ func (r singleQueueRouter) Route(context.Context, queue.Address) (queue.Broker, 
 	return r.Broker, nil
 }
 
-// isolatedRouter is production routing (sqsbroker.Router, ADR-0028) on a base
+// isolatedRouter is production routing (sqsbroker.Router, ADR-0029) on a base
 // queue of the test's own. It deletes every per-address queue it resolved
 // when the test ends, because each was created on demand by the publisher or a
 // worker and reset() cannot drain what it does not know about.

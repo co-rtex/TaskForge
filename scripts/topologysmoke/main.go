@@ -204,7 +204,7 @@ func (s *smoke) setUp(ctx context.Context) error {
 		return err
 	}
 	// The services derive the queue of the smoke's (scope, "default") address
-	// from the base name and create it on demand (ADR-0028). Creating it here
+	// from the base name and create it on demand (ADR-0029). Creating it here
 	// first means the smoke knows its URL and deletes it with the base.
 	notificationName := queue.NotificationQueueName(queueName, queue.Address{Scope: scope, Queue: "default"})
 	notificationURL, err := createQueue(ctx, infra.BrokerEndpoint, notificationName)

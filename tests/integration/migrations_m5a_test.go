@@ -124,7 +124,7 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 		"queues", "jobs", "workers", "job_attempts",
 		"leases", "dlq_entries", "dlq_replays", "idempotency_records",
 	}
-	// jobs is digested without renotify_checked_at, which ADR-0028's 0019
+	// jobs is digested without renotify_checked_at, which ADR-0029's 0019
 	// added later in the same upgrade: as JSON with that one key removed, so
 	// the digest still covers every column jobs had before and the pure
 	// schema addition does not read as a changed row.

@@ -56,7 +56,7 @@ type Event struct {
 	// when the event is claimed for publication, never from the envelope. It
 	// is the zero Address for a legacy event with no job reference. It is not
 	// serialized: the broker queue an event is published to is the address
-	// (docs/adr/0028-scope-addressed-notification-streams.md).
+	// (docs/adr/0029-scope-addressed-notification-streams.md).
 	Address queue.Address
 }
 

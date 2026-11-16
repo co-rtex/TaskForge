@@ -295,7 +295,7 @@ func (c Config) Validate() error {
 	req("TASKFORGE_BROKER_REGION", c.BrokerRegion)
 	if c.BrokerQueueName != "" {
 		// The base of a family of broker queues, one per (scope, queue)
-		// address, so it must leave room for the address suffix (ADR-0028).
+		// address, so it must leave room for the address suffix (ADR-0029).
 		if err := queue.ValidateBaseQueueName(c.BrokerQueueName); err != nil {
 			problems = append(problems, "TASKFORGE_BROKER_QUEUE_NAME "+err.Error())
 		}

@@ -127,7 +127,7 @@ func (r *Runner) WithMetrics(m *metrics.Metrics) *Runner {
 // NewRunner builds a runner. router resolves the broker queue the runner reads
 // once registration has told it its scope: the queue of its own (scope, queue)
 // address, where no other scope's or queue's notifications are delivered
-// (docs/adr/0028-scope-addressed-notification-streams.md).
+// (docs/adr/0029-scope-addressed-notification-streams.md).
 func NewRunner(control ControlPlane, router queue.Router, registry *Registry, objects ObjectStore, cfg RunnerConfig, log *slog.Logger) *Runner {
 	if cfg.RetryAttempts < 1 {
 		cfg.RetryAttempts = 1

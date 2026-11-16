@@ -53,7 +53,7 @@ func TestClassifyDatabaseError_TranslatesOnlyARealDeadline(t *testing.T) {
 	}
 }
 
-// TestSafeToAcknowledge_NotificationRelativeDispositions pins ADR-0028's two
+// TestSafeToAcknowledge_NotificationRelativeDispositions pins ADR-0029's two
 // dispositions into the acknowledgement contract: a foreign notification is
 // never released, a stale one always is, and neither may carry an assignment.
 func TestSafeToAcknowledge_NotificationRelativeDispositions(t *testing.T) {

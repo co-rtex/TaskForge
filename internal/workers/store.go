@@ -317,10 +317,10 @@ func (s *Store) Claim(ctx context.Context, scope string, req ClaimRequest) (_ Cl
 	}
 
 	// Decide relative to the NOTIFICATION, not only to the claiming worker
-	// (ADR-0028). A claim identity that is a work.available event names the
+	// (ADR-0029). A claim identity that is a work.available event names the
 	// job it advertises, and that job's scope and queue are immutable, so
 	// this read needs no lock. A claim identity that is not an outbox event
-	// (an unattributed claim) keeps the pre-ADR-0028 behavior exactly.
+	// (an unattributed claim) keeps the pre-ADR-0029 behavior exactly.
 	notice, err := readPresentedNotification(ctx, tx, req.ClaimRequestID)
 	if err != nil {
 		return ClaimResult{}, err

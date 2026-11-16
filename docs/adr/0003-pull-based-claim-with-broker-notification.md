@@ -10,7 +10,7 @@
     M2 claim-identity and acknowledgement details. The durable outbox event id
     is the globally unique claim request id, and acknowledgement is driven by an
     explicit control-plane disposition.
-  - [ADR-0028](0028-scope-addressed-notification-streams.md) — replaces rule 5's
+  - [ADR-0029](0029-scope-addressed-notification-streams.md) — replaces rule 5's
     "the control plane confirms no eligible job remains", which held per claiming
     worker, with a decision relative to the notification: each (scope, queue)
     address has a broker queue of its own, a notification of another address is

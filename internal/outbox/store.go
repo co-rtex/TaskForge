@@ -117,7 +117,7 @@ func HasPendingWorkAvailableTx(ctx context.Context, tx pgx.Tx, jobID uuid.UUID, 
 // I/O to the broker.
 //
 // Each event comes back with the address of the job it advertises, joined from
-// jobs in the same statement: the publisher routes by it (ADR-0028). A job's
+// jobs in the same statement: the publisher routes by it (ADR-0029). A job's
 // scope and queue never change, so the join needs no lock of its own.
 func (s *Store) ClaimDue(ctx context.Context, limit int, claimTimeout time.Duration) ([]Event, error) {
 	rows, err := s.pool.Query(ctx, `

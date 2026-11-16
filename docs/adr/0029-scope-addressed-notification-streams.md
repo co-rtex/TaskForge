@@ -1,4 +1,4 @@
-# ADR-0028: Scope-addressed notification streams and claimability-gated re-notification
+# ADR-0029: Scope-addressed notification streams and claimability-gated re-notification
 
 - **Status:** Accepted
 - **Date:** 2026-11-16
@@ -85,7 +85,7 @@ is not current never becomes current again.
 
 - **`FOREIGN_NOTIFICATION`** (not safe to acknowledge, nothing claimed): the event belongs
   to another address. Under §1 a worker never receives one; this is the guard for when
-  routing is wrong (a digest collision, a misconfigured base name, a pre-ADR-0028 shared
+  routing is wrong (a digest collision, a misconfigured base name, a pre-ADR-0029 shared
   queue during an upgrade). It applies also when the event was already consumed by its own
   address, which ADR-0007 answered with a conflict error.
 - **`STALE_NOTIFICATION`** (safe to acknowledge): nothing due in the address is eligible for

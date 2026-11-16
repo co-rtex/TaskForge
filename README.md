@@ -68,7 +68,7 @@ work-availability notifications — never authoritative job state — and every 
 change that requires a notification writes it in the same transaction that changes
 the state. Each scope's queue has a broker queue of its own, so a worker only ever
 receives notifications it could act on
-([ADR-0028](docs/adr/0028-scope-addressed-notification-streams.md)).
+([ADR-0029](docs/adr/0029-scope-addressed-notification-streams.md)).
 Workers **pull**: a worker with a free slot asks the control plane, and one SQL
 transaction enforces capacity, matches capabilities, picks the highest-priority
 eligible job, and creates the attempt and lease. A running attempt renews that lease

@@ -214,7 +214,7 @@ func TestMigrations_ReconstructNotificationHistoryFromRealM3Events(t *testing.T)
 	// run against the upgraded database, must not manufacture work.
 	store := jobs.NewStore(poolFor(t, freshDSN))
 	// A session that could claim the seeded jobs, as a running deployment has:
-	// since ADR-0028 a replacement is only created for a job some session could
+	// since ADR-0029 a replacement is only created for a job some session could
 	// claim, and what this test is about is which jobs count as stranded.
 	_, err = workers.NewStore(poolFor(t, freshDSN), workers.StoreConfig{
 		LeaseDuration: integrationLeaseDuration, RetryPolicy: integrationRetryPolicy(),

@@ -59,7 +59,7 @@ type Stats struct {
 // NewPublisher builds a Publisher. Passing the random source in keeps jitter
 // deterministic under test.
 //
-// broker routes each event to the broker queue of its address (ADR-0028).
+// broker routes each event to the broker queue of its address (ADR-0029).
 func NewPublisher(store *Store, broker queue.Router, cfg PublisherConfig, log *slog.Logger, rnd *rand.Rand) *Publisher {
 	if cfg.BatchSize < 1 {
 		cfg.BatchSize = 50

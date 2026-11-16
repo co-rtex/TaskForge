@@ -89,7 +89,7 @@ func liveBrokerMessages(t *testing.T, queueURL string) int {
 // that a scope-B worker deleted scope A's only notification and left A's job
 // QUEUED, with nothing live, beside a healthy scope-A worker).
 //
-// Under ADR-0028 each (scope, queue) address has a broker queue of its own, so
+// Under ADR-0029 each (scope, queue) address has a broker queue of its own, so
 // a scope-B worker never receives scope A's notification. The test keeps the
 // original arrangement -- the other scope's worker running first, alone, with
 // re-notification an hour away so nothing can repair a deletion -- and asserts

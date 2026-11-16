@@ -2967,7 +2967,7 @@ components:
           description: |
             The worker key's authorization scope. A worker uses it only to
             address the broker queue that carries its own scope's
-            notifications for its queue (ADR-0028); it is never presented
+            notifications for its queue (ADR-0029); it is never presented
             back to the control plane, which reads the scope from the key.
         worker_name: { type: string }
         hostname: { type: string }
@@ -3087,7 +3087,7 @@ components:
             under it and it must not be acknowledged. `STALE_NOTIFICATION`:
             nothing due in this scope and queue is eligible for this session,
             and the notification advertises an eligibility transition that has
-            already ended; it is safe to acknowledge. See ADR-0028.
+            already ended; it is safe to acknowledge. See ADR-0029.
         safe_to_acknowledge:
           type: boolean
           description: True only for `CLAIMED` with an assignment, a PostgreSQL-confirmed `QUEUE_EMPTY`, `DUPLICATE_NOTIFICATION` already consumed by another session, or `STALE_NOTIFICATION`.

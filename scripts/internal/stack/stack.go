@@ -75,7 +75,7 @@ type Stack struct {
 	WorkDir string // an empty directory: the working directory of every child
 
 	// QueueName is the run's base broker queue. Every service derives the
-	// queue of each (scope, queue) address from it (ADR-0028); the run's own
+	// queue of each (scope, queue) address from it (ADR-0029); the run's own
 	// jobs are advertised on NotificationQueueName, the queue of (Scope,
 	// "default"), which Setup creates up front so it can be measured and
 	// deleted like the base.
@@ -319,7 +319,7 @@ func (s *Stack) Setup(ctx context.Context) error {
 }
 
 // QueueAttributes reads the attributes of the broker queue this run's jobs are
-// advertised on, its scope's default-queue notification queue (ADR-0028), with
+// advertised on, its scope's default-queue notification queue (ADR-0029), with
 // GetQueueAttributes: its message counts and its configuration, as the broker
 // reports them at that moment.
 func (s *Stack) QueueAttributes(ctx context.Context) (map[string]string, error) {

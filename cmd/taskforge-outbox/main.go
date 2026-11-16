@@ -89,7 +89,7 @@ func run() int {
 	defer pool.Close()
 
 	// Every event is published to the broker queue of its own (scope, queue)
-	// address, derived from the configured base queue (ADR-0028).
+	// address, derived from the configured base queue (ADR-0029).
 	broker, err := sqsbroker.NewRouter(ctx, sqsbroker.OptionsFromConfig(cfg))
 	if err != nil {
 		log.Error("connect to broker", slog.String("error", err.Error()))

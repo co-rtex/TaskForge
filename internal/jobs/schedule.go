@@ -25,7 +25,7 @@ type SchedulerStats struct {
 	// there first, a cancellation won, or a pending event still exists.
 	Skipped int
 	// Deferred counts stranded QUEUED jobs that got no replacement because no
-	// current worker session could claim them (ADR-0028). Each is reconsidered
+	// current worker session could claim them (ADR-0029). Each is reconsidered
 	// one re-notification interval later.
 	Deferred int
 }
@@ -180,7 +180,7 @@ func (s *Store) promoteDueJob(ctx context.Context, jobID uuid.UUID) (bool, error
 //   - still QUEUED, revalidated under locks;
 //   - the configured interval has elapsed since its last notification;
 //   - no PENDING event exists for its CURRENT generation;
-//   - some current worker session could claim it now (ADR-0028).
+//   - some current worker session could claim it now (ADR-0029).
 //
 // That last condition is why events carry a generation. Checking only "is there
 // a pending event for this job" would let a stale event left behind by the

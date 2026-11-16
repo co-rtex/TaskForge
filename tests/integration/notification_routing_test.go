@@ -133,7 +133,7 @@ func queueNameOf(t *testing.T, queueURL string) string {
 // TestRouting_AnAddressQueueThatDisappearsIsRecreated: a broker restart (the
 // local ElasticMQ keeps queues in memory and recreates only the configured
 // base) or an operator's deletion removes an address's queue after the
-// publisher and a worker resolved it. Before ADR-0028 the one queue came back
+// publisher and a worker resolved it. Before ADR-0029 the one queue came back
 // with the broker; an address's queue must come back too, through the handles
 // both sides already hold, or the publisher fails every event and the worker
 // every receive until each process restarts.

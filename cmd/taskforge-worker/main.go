@@ -94,7 +94,7 @@ func run() int {
 
 	// The runner reads only its own (scope, queue) address's broker queue,
 	// which it resolves through this router once registration names its scope
-	// (ADR-0028). The base queue must exist; it is the readiness target.
+	// (ADR-0029). The base queue must exist; it is the readiness target.
 	broker, err := sqsbroker.NewRouter(ctx, sqsbroker.OptionsFromConfig(shared))
 	if err != nil {
 		log.Error("connect to broker", slog.String("error", err.Error()))

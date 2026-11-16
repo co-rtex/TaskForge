@@ -129,12 +129,12 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
   notifications accumulate without bound. See "Correctness audit after M8C2" below.
 - **Notification reachability repair (maintenance after the audit, not a milestone):**
   complete; see PR #34. Both of the audit's open defects are resolved
-  ([ADR-0028](adr/0028-scope-addressed-notification-streams.md)): each (scope, queue) address
+  ([ADR-0029](adr/0029-scope-addressed-notification-streams.md)): each (scope, queue) address
   has a broker queue of its own, so no worker receives a notification it cannot use; a claim
   decides relative to the notification it was woken by (`FOREIGN_NOTIFICATION`,
   `STALE_NOTIFICATION`); and re-notification creates a replacement only when some current
   session could claim the job. The two pinned `TestOpenDefect_*` tests are inverted into
-  positive tests. See "Notification reachability repair (ADR-0028)" below.
+  positive tests. See "Notification reachability repair (ADR-0029)" below.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -5134,9 +5134,9 @@ fails now describe the old order. Its conclusion is unchanged: renewal still sto
 any report, and the upload is bounded by the attempt's deadline, so a live worker still
 cannot hold a lease past `timeout_at` and ADR-0025's reasoning stands.
 
-### Open issue, resolved by ADR-0028: notification reachability across scopes and for unclaimable jobs
+### Open issue, resolved by ADR-0029: notification reachability across scopes and for unclaimable jobs
 
-**Resolved in PR #34**; see "Notification reachability repair (ADR-0028)" below. The text that
+**Resolved in PR #34**; see "Notification reachability repair (ADR-0029)" below. The text that
 follows records the defect as the audit found it and is kept as that record; the tests it
 names were inverted, not deleted, and now carry the names given in that section.
 
@@ -5323,10 +5323,10 @@ captured; three reruns were clean. The first test then used the shared broker qu
 counted exactly 30 deliveries, which a delivery left in flight by another test would break,
 and had 1.5 s of margin after the first tick; it now has a queue of its own and 2.5 s.
 
-## Notification reachability repair (ADR-0028)
+## Notification reachability repair (ADR-0029)
 
 Maintenance after the correctness audit, not a milestone. It resolves both open defects the
-audit pinned, with [ADR-0028](adr/0028-scope-addressed-notification-streams.md) recording
+audit pinned, with [ADR-0029](adr/0029-scope-addressed-notification-streams.md) recording
 the decision, the alternatives and the invariants.
 
 ### Reproduced first
@@ -5497,7 +5497,7 @@ On 2026-11-16, in this session's Linux container, against the stack `make up` st
   on ElasticMQ only, not on AWS SQS.
 - **Within one address**, workers with different capabilities still share a queue, so a
   held notification reaches a minority-capable worker at random; the bound is now
-  ADR-0028's I4 (one re-notification interval after such a worker could claim) rather than
+  ADR-0029's I4 (one re-notification interval after such a worker could claim) rather than
   the accumulation that used to shorten it.
 - **The gate does not know a session's TaskForge queue**, so a job in a queue served only by
   sessions of the same group configured for another queue is still re-notified once per
@@ -7347,7 +7347,7 @@ interval should change is a question the two M8A records answer only as numbers,
 as a decision, and changing the defaults would require re-measuring.
 
 Notification reachability across scopes and for unclaimable jobs, which the audit left open
-for the owner, is resolved (PR #34, ADR-0028). What it leaves open, for the owner: whether to
+for the owner, is resolved (PR #34, ADR-0029). What it leaves open, for the owner: whether to
 record a session's TaskForge queue at registration so the claimability gate can see it, and
 the IAM and wildcard-resource grants PR #31's Terraform needs for per-address queues.
 

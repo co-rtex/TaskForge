@@ -29,7 +29,7 @@ func TestValidateClaimResponse_RejectsInconsistentAckContracts(t *testing.T) {
 		"capacity marked safe": {
 			Outcome: string(workers.CapacityExhausted), SafeToAcknowledge: true,
 		},
-		// ADR-0028: deleting another address's notification is the defect.
+		// ADR-0029: deleting another address's notification is the defect.
 		"foreign marked safe": {
 			Outcome: string(workers.ForeignNotification), SafeToAcknowledge: true,
 		},

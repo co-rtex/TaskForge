@@ -23,7 +23,7 @@ import (
 // scope of its own, which is exactly why none of them showed the defect.
 //
 // Re-notification is an hour away, so every job must be discovered from its own
-// submission notification. Before ADR-0028 a scope's notification could be
+// submission notification. Before ADR-0029 a scope's notification could be
 // deleted by another scope's worker answering QUEUE_EMPTY, or spent claiming
 // that worker's own job, and the job then waited for re-notification.
 //

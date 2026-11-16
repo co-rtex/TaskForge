@@ -490,7 +490,7 @@ func TestScheduler_RenotifiesAQueuedJobWhoseNotificationWasLost(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
 	// A session that could claim the job exists throughout: a replacement is
-	// only worth creating for someone (ADR-0028; the deferral is pinned by
+	// only worth creating for someone (ADR-0029; the deferral is pinned by
 	// TestScheduler_DefersAJobNoSessionCouldClaim).
 	store := controlStore()
 	session := registerWorker(t, store,
@@ -715,7 +715,7 @@ func strandAll(t *testing.T, ids ...uuid.UUID) {
 }
 
 // TestScheduler_DefersAJobNoSessionCouldClaim pins the claimability gate
-// (ADR-0028), the bound that keeps an unclaimable job from accumulating
+// (ADR-0029), the bound that keeps an unclaimable job from accumulating
 // notifications: no replacement while nobody could claim the job, for every
 // way "nobody" can hold, and a replacement as soon as somebody could.
 func TestScheduler_DefersAJobNoSessionCouldClaim(t *testing.T) {

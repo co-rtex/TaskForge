@@ -1,6 +1,6 @@
 -- 0019_claimability_gated_renotification
 --
--- ADR-0028: bounded re-notification is gated on claimability. A QUEUED job
+-- ADR-0029: bounded re-notification is gated on claimability. A QUEUED job
 -- that no current worker session could claim right now -- no HEALTHY session
 -- of its scope has its worker group, capabilities and job type with a free
 -- slot, or its queue is at capacity -- gets no replacement notification: there
@@ -31,7 +31,7 @@ ALTER TABLE jobs
 
 COMMENT ON COLUMN jobs.renotify_checked_at IS
     'When bounded re-notification last deferred this job because no current '
-    'worker session could claim it (ADR-0028). Orders the re-notification scan '
+    'worker session could claim it (ADR-0029). Orders the re-notification scan '
     'together with last_notification_at; never authority for any transition.';
 
 -- Justified by jobs.Store.RenotifyStrandedQueued's candidate scan:
