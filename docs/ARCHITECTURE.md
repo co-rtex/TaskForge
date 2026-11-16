@@ -177,6 +177,18 @@ unchanged ([ADR-0027](adr/0027-aws-native-configuration-and-the-cli-sidecar.md))
 `make topology-smoke` mints its keys the same way, with the sidecar on `--network
 container:<api>`.
 
+**Deployment on AWS.** `deploy/terraform/` describes this topology on AWS: an
+internet-facing, HTTPS-only ALB in front of the api's public listener; the control listener
+reachable from the workers' security group only, as `api.taskforge.internal` in a Cloud Map
+private namespace; Fargate tasks in private subnets behind one NAT gateway; RDS, the SQS
+queue and the S3 bucket; the cli sidecar in the api task for ECS Exec; and a task role per
+service granting exactly its call sites. Each container's environment is
+`deploy/terraform/env/<service>.json`, held to `internal/config` by
+`tests/verification/terraform_env_test.go`. It is validated (`make tf-validate`, CI) and has
+never been planned or applied. The decisions are
+[ADR-0028](adr/0028-deployment-shape-on-aws.md); the order of operations is the
+[runbook](../deploy/terraform/RUNBOOK.md).
+
 **AWS-native mode.** With `TASKFORGE_AWS_DEFAULT_CHAIN=true` the broker and results
 endpoints and keys resolve to empty, so the SQS and S3 clients use the region's default
 endpoint and the AWS SDK's default credential chain (in ECS, the task role). Startup

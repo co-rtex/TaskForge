@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Every value below is a placeholder.
+
+aws_region          = "us-east-1"
+acm_certificate_arn = "arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000"
+image_tag           = "<the git commit the images were built from>"
+results_bucket_name = "<a globally unique bucket name>"
+
+# Closed by default. Name who may reach the load balancer, for example an office range.
+allowed_ingress_cidrs = ["198.51.100.0/24"]
+
+# Must match the architecture the images were built for (`docker image inspect`).
+cpu_architecture = "X86_64"
+
+# All services start at 0 tasks; RUNBOOK.md raises them in order.
+# api_desired_count        = 1
+# outbox_desired_count     = 1
+# reconciler_desired_count = 1
+# scheduler_desired_count  = 1
+# worker_desired_count     = 1
