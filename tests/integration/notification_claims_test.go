@@ -107,13 +107,19 @@ func TestClaim_ConcurrentForeignPresentationsCannotStealTheWakeup(t *testing.T) 
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	results := make(chan workers.ClaimResult, foreignSessions+1)
+	errs := make(chan error, foreignSessions+1)
+	// Only the test goroutine may stop the test, so the racers hand back what
+	// they got and every assertion runs after they finish.
 	present := func(scope string, session workers.Session) {
 		defer wg.Done()
 		<-start
 		result, err := store.Claim(context.Background(), scope, workers.ClaimRequest{
 			WorkerID: session.WorkerID, SessionID: session.ID, ClaimRequestID: eventA, Queue: "default",
 		})
-		require.NoError(t, err)
+		if err != nil {
+			errs <- err
+			return
+		}
 		results <- result
 	}
 	for _, session := range sessionsB {
@@ -125,6 +131,10 @@ func TestClaim_ConcurrentForeignPresentationsCannotStealTheWakeup(t *testing.T) 
 	close(start)
 	wg.Wait()
 	close(results)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 
 	claimed, foreign := 0, 0
 	for result := range results {

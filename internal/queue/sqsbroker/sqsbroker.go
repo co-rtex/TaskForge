@@ -7,8 +7,10 @@ package sqsbroker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -48,7 +50,44 @@ func OptionsFromConfig(cfg config.Config) Options {
 // Broker is an SQS-compatible queue.Broker.
 type Broker struct {
 	client   *sqs.Client
-	queueURL string
+	queueURL atomic.Pointer[string]
+	// recreate is set on an address's broker (Router.Route) and nil on the base
+	// queue's. It resolves the address's queue again, creating it from the base
+	// queue's attributes, and is called when an operation reports the queue
+	// missing (ADR-0028).
+	recreate func(context.Context) (string, error)
+}
+
+func newBroker(client *sqs.Client, url string, recreate func(context.Context) (string, error)) *Broker {
+	b := &Broker{client: client, recreate: recreate}
+	b.queueURL.Store(&url)
+	return b
+}
+
+// do runs op against the queue's current URL. An address's queue that has
+// disappeared since it was resolved (a broker restart that keeps queues in
+// memory, as the local ElasticMQ does, recreates only the configured base; an
+// operator may delete one) is resolved or created again and op is retried once
+// against it, so neither the publisher nor a worker needs a restart to reach
+// it. A queue AWS deleted less than a minute ago refuses re-creation; that
+// error is returned and the caller's own retry tries again later.
+func (b *Broker) do(ctx context.Context, op func(url string) error) error {
+	err := op(*b.queueURL.Load())
+	if err == nil || b.recreate == nil || !queueMissing(err) {
+		return err
+	}
+	url, recreateErr := b.recreate(ctx)
+	if recreateErr != nil {
+		return fmt.Errorf("%w (re-creating the queue failed: %v)", err, recreateErr)
+	}
+	b.queueURL.Store(&url)
+	return op(url)
+}
+
+// queueMissing reports whether err says the queue does not exist.
+func queueMissing(err error) bool {
+	var missing *types.QueueDoesNotExist
+	return errors.As(err, &missing)
 }
 
 var _ queue.Broker = (*Broker)(nil)
@@ -68,7 +107,7 @@ func New(ctx context.Context, opts Options) (*Broker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve queue url for %q: %w", opts.QueueName, err)
 	}
-	return &Broker{client: client, queueURL: aws.ToString(out.QueueUrl)}, nil
+	return newBroker(client, aws.ToString(out.QueueUrl), nil), nil
 }
 
 // newClient builds the SQS client New uses, and makes no network call. It is
@@ -98,13 +137,16 @@ func newClient(ctx context.Context, opts Options) (*sqs.Client, error) {
 }
 
 // QueueURL reports the resolved queue URL. Useful for logs and tests.
-func (b *Broker) QueueURL() string { return b.queueURL }
+func (b *Broker) QueueURL() string { return *b.queueURL.Load() }
 
 // Publish sends one notification body.
 func (b *Broker) Publish(ctx context.Context, body []byte) error {
-	_, err := b.client.SendMessage(ctx, &sqs.SendMessageInput{
-		QueueUrl:    aws.String(b.queueURL),
-		MessageBody: aws.String(string(body)),
+	err := b.do(ctx, func(url string) error {
+		_, err := b.client.SendMessage(ctx, &sqs.SendMessageInput{
+			QueueUrl:    aws.String(url),
+			MessageBody: aws.String(string(body)),
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("send message: %w", err)
@@ -120,10 +162,15 @@ func (b *Broker) Receive(ctx context.Context, max int, wait time.Duration) ([]qu
 	if max > 10 { // SQS hard limit
 		max = 10
 	}
-	out, err := b.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-		QueueUrl:            aws.String(b.queueURL),
-		MaxNumberOfMessages: int32(max),
-		WaitTimeSeconds:     int32(wait / time.Second),
+	var out *sqs.ReceiveMessageOutput
+	err := b.do(ctx, func(url string) error {
+		var err error
+		out, err = b.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+			QueueUrl:            aws.String(url),
+			MaxNumberOfMessages: int32(max),
+			WaitTimeSeconds:     int32(wait / time.Second),
+		})
+		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("receive messages: %w", err)
@@ -142,9 +189,14 @@ func (b *Broker) Receive(ctx context.Context, max int, wait time.Duration) ([]qu
 
 // Delete acknowledges a delivery.
 func (b *Broker) Delete(ctx context.Context, receiptHandle string) error {
-	_, err := b.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
-		QueueUrl:      aws.String(b.queueURL),
-		ReceiptHandle: aws.String(receiptHandle),
+	// A receipt from a queue that has since disappeared cannot delete anything
+	// in its replacement; the retry after re-creation only reports that.
+	err := b.do(ctx, func(url string) error {
+		_, err := b.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+			QueueUrl:      aws.String(url),
+			ReceiptHandle: aws.String(receiptHandle),
+		})
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("delete message: %w", err)
@@ -155,7 +207,7 @@ func (b *Broker) Delete(ctx context.Context, receiptHandle string) error {
 // Ping checks broker reachability within the caller's deadline.
 func (b *Broker) Ping(ctx context.Context) error {
 	_, err := b.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
-		QueueUrl:       aws.String(b.queueURL),
+		QueueUrl:       aws.String(b.QueueURL()),
 		AttributeNames: nil,
 	})
 	if err != nil {
@@ -226,7 +278,9 @@ func (r *Router) Route(ctx context.Context, address queue.Address) (queue.Broker
 	if err != nil {
 		return nil, err
 	}
-	b := &Broker{client: r.base.client, queueURL: url}
+	b := newBroker(r.base.client, url, func(ctx context.Context) (string, error) {
+		return r.resolveOrCreate(ctx, name)
+	})
 	r.routes[address] = b
 	return b, nil
 }
@@ -239,7 +293,7 @@ func (r *Router) resolveOrCreate(ctx context.Context, name string) (string, erro
 	// classified: CreateQueue either creates the queue, returns the existing
 	// one, or fails for a reason that is then reported.
 	template, err := r.base.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
-		QueueUrl:       aws.String(r.base.queueURL),
+		QueueUrl:       aws.String(r.base.QueueURL()),
 		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameAll},
 	})
 	if err != nil {
@@ -267,4 +321,4 @@ func (r *Router) resolveOrCreate(ctx context.Context, name string) (string, erro
 func (r *Router) Ping(ctx context.Context) error { return r.base.Ping(ctx) }
 
 // BaseQueueURL reports the base queue's URL. Useful for logs and tests.
-func (r *Router) BaseQueueURL() string { return r.base.queueURL }
+func (r *Router) BaseQueueURL() string { return r.base.QueueURL() }
