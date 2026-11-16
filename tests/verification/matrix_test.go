@@ -27,7 +27,7 @@ const (
 	repoRoot   = "../.."
 	matrixFile = "docs/VERIFICATION_MATRIX.md"
 
-	invariantCount = 18
+	invariantCount = 20
 	scenarioCount  = 12
 )
 

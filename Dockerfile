@@ -26,7 +26,7 @@
 # so the binaries that ship are compiled by the toolchain CI tests with. Bumping
 # either base is an edit to its FROM line alone.
 
-FROM golang:1.27.2@sha256:5bc7f572bbaa98885a3a1fd9c0aa76b59e3e14e8628bfc316bbfd0c701e4818c AS builder
+FROM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS builder
 WORKDIR /src
 # Modules first, so a source-only change does not re-download them.
 COPY go.mod go.sum ./

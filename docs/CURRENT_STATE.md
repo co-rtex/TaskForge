@@ -2,7 +2,9 @@
 
 This document is the source of truth for what is runnable now and what remains
 planned. It records the implemented state through M8C3, including the Go 1.27.2
-toolchain bump that came between M8D3 and M8D4. Each milestone's line
+toolchain bump that came between M8D3 and M8D4, the Go 1.27.3 bump after M8C2, the
+correctness audit that followed it, the Go 1.27.4 bump after the audit, and the
+notification reachability repair that resolved the audit's two open defects. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -120,8 +122,31 @@ complete, and with M8C3 **M8 is complete**.
   S3, Secrets Manager, least-privilege IAM, ECR) and passes `terraform fmt -check`, `init
   -backend=false` and `validate` locally and in a new CI job; it has never been planned or
   applied. A test holds every service's environment to what `internal/config` reads
-  ([ADR-0028](adr/0028-deployment-shape-on-aws.md)). No service code or image changed.
+  ([ADR-0028](adr/0028-deployment-shape-on-aws.md)), and the task roles grant the per-address
+  notification queues ADR-0029 introduced (PR #36). No service code or image changed.
   See "M8C3" below. With it, **M8 is complete.**
+- **Go 1.27.3 toolchain (maintenance after M8C2, not a milestone):** see PR #32. `go.mod`
+  and the image builder move to Go 1.27.3 for GO-2026-6809, and `make scan` passes again.
+  No behavior changed. See "Go 1.27.3 toolchain" below.
+- **Go 1.27.4 toolchain (maintenance after the correctness audit, not a milestone):** see
+  PR #35. `go.mod` and the image builder move to Go 1.27.4 for GO-2026-6859, the advisory
+  that turned `make scan` red. No behavior changed. See "Go 1.27.4 toolchain" below.
+- **Correctness audit (maintenance after M8C2, not a milestone):** see PR #33. A worker now renews its
+  lease while it uploads a large result. Before, renewal stopped when the handler returned,
+  so an upload that outlasted the lease's remaining window cost the attempt a success that
+  had already happened, and a job whose every attempt succeeded could dead-letter. The
+  outbox now drains a backlog within one poll interval instead of one batch per interval.
+  The audit also records two open defects it does not fix, which need an owner decision:
+  a worker of another scope deletes a notification it cannot use, and an unclaimable job's
+  notifications accumulate without bound. See "Correctness audit after M8C2" below.
+- **Notification reachability repair (maintenance after the audit, not a milestone):**
+  complete; see PR #34. Both of the audit's open defects are resolved
+  ([ADR-0029](adr/0029-scope-addressed-notification-streams.md)): each (scope, queue) address
+  has a broker queue of its own, so no worker receives a notification it cannot use; a claim
+  decides relative to the notification it was woken by (`FOREIGN_NOTIFICATION`,
+  `STALE_NOTIFICATION`); and re-notification creates a replacement only when some current
+  session could claim the job. The two pinned `TestOpenDefect_*` tests are inverted into
+  positive tests. See "Notification reachability repair (ADR-0029)" below.
 
 [ROADMAP.md](ROADMAP.md) records why M5 is split into five slices, M6 into four,
 M7 into two, and M8 into ten, and what each one owns, including why the CLI and the Python SDK — bundled under one M5D
@@ -4965,6 +4990,676 @@ Each was applied alone, its failing output recorded, and reverted, with `git sta
 - **Recorded for M8C3, unbuilt here:** `sslmode=require` without server verification, and
   the database password in Terraform state.
 
+## Go 1.27.3 toolchain
+
+Maintenance after M8C2, not a milestone: `make scan` turned red on `main` (`92cada2`) once
+the vulnerability database modified 2026-10-21T00:27:29Z carried GO-2026-6809, and this
+change makes it pass. Like the Go 1.27.2 change above, it follows
+[ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md)'s rule that the image
+builder is pinned to exactly `go.mod`'s Go, and changes no behavior. See PR #32.
+
+### What changed
+
+- **`go.mod`:** `go 1.27.3`, still with no `toolchain` line. 1.27.3 is the first release
+  fixed for GO-2026-6809 (crypto/x509: distrust compromised intermediate certificates),
+  which govulncheck reaches through `crypto/x509.Certificate.Verify` from
+  `internal/worker/client.go:540` (`Ping`). `go mod tidy` under 1.27.3 changes nothing
+  else: no requirement and no `go.sum` line moved.
+- **`Dockerfile`:** the builder is `golang:1.27.3@sha256:f20d83a83e18dbd2a4714b8ffd4b30b287b6243962dd75608e86abcc63ba4efc`,
+  the official image's multi-platform index (linux/amd64 and linux/arm64/v8 among its nine
+  platforms), resolved on 2026-10-21 with `docker buildx imagetools inspect golang:1.27.3`.
+  `tests/verification` holds it equal to `go.mod`.
+- **`scripts/scan`:** govulncheck stays at v1.8.0, which builds with 1.27.3. Its comment
+  no longer calls v1.8.0 the newest tag: v1.9.0 now exists, and adopting it is not part of
+  this change.
+- **`README.md`** and "Local environment" below: the prerequisite is Go 1.27.3 or newer.
+- **M8C2's scan record is not edited.** Its `make scan` passed against the database it ran
+  with; GO-2026-6809 is in a later one.
+
+### Evidence
+
+**The scan, before and after**, each in a fresh full clone (not shallow), with a Python
+3.14 first on `PATH`:
+
+| Commit | Go | govulncheck | Reachable findings | gitleaks, pip-audit, npm audit | Result |
+| --- | --- | --- | --- | --- | --- |
+| `92cada2` (`main`) | 1.27.2 | v1.8.0 | 1: GO-2026-6809, `crypto/x509.Certificate.Verify@v1.27.2` from `internal/worker/client.go:540` (`Ping`), fixed in v1.27.3 | no findings | **FAIL** |
+| `5a3ff1d` (this change) | 1.27.3 | v1.8.0 | **0** | no findings | **PASS** |
+
+The vulnerability database was the one modified 2026-10-21T00:27:29Z in both.
+
+**The invariant.** With the Dockerfile's builder set back to `golang:1.27.2` and `go.mod` at
+1.27.3, `TestDockerfile_BuilderGoVersionIsExactlyGoMods` fails (expected `"1.27.3"`, actual
+`"1.27.2"`); reverted, the tree is clean and it passes.
+
+**Gates**, run on 2026-10-21 in a fresh full clone of `5a3ff1d`, the last commit that is
+not documentation, every one under `GOTOOLCHAIN=go1.27.3` with `go version` printing
+`go1.27.3 darwin/arm64` in the same shell. PostgreSQL 16, ElasticMQ and the object store
+from `make up`, with no other TaskForge process running. The host was on battery power;
+none of these gates is a timed benchmark run.
+
+| Command | Result |
+| --- | --- |
+| `make fmt` | PASS: no diff (0 lines) |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make build` | PASS: seven binaries, each stamped `go1.27.3` |
+| `make test-unit` | PASS: 32 packages `ok` |
+| `make test-integration` | PASS: `ok  github.com/co-rtex/TaskForge/tests/integration  105.901s` |
+| `make test-race` | PASS: 32 packages `ok`; `ok  …/tests/integration  90.736s`; no `DATA RACE` |
+| `make images-smoke` | PASS: `RESULT: PASS (47 of 47 checks met)`, labelled with revision `5a3ff1d`, built `FROM golang:1.27.3@sha256:f20d83a8…`; the worker binary copied out of its image reports `go1.27.3` |
+| `make scan` | PASS in a fresh full clone of `5a3ff1d` (above); the final head's run is in the pull request |
+| `make demo`, `make bench-smoke`, `make topology-smoke` | NOT RUN: the change is the compiler patch release alone, and the task named the gates above |
+| `make sdk-test`, `make dash-test` | NOT RUN: the Python SDK and the dashboard did not change, and neither builds with Go |
+
+### Limitations
+
+- **No benchmark was re-run.** Whether 1.27.3 moves any recorded figure is not measured.
+- **govulncheck v1.9.0 is not adopted.** v1.8.0 builds with 1.27.3 and reports against the
+  same database; moving the scanner is a separate decision.
+- **Hosted CI on the final head is not recorded here,** because a commit cannot contain its
+  own CI result: the pull request's checks are the record.
+
+---
+
+## Go 1.27.4 toolchain
+
+Maintenance after the correctness audit, not a milestone: `make scan` turned red on `main`
+(`98dbe3f`) once the vulnerability database modified 2026-11-11T02:51:11Z carried
+GO-2026-6859, and this change is what makes it pass. Like the 1.27.2 and 1.27.3 changes, it
+follows [ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md)'s rule that the
+image builder is pinned to exactly `go.mod`'s Go, and changes no behavior. See PR #35.
+
+### What changed
+
+- **`go.mod`:** `go 1.27.4`, still with no `toolchain` line. 1.27.4 is the first 1.27
+  release fixed for GO-2026-6859 (CVE-2026-97054, `net/http`): when `MaxBytesReader`'s limit
+  is exceeded, the `Connection: close` header is set without synchronization and can race a
+  handler's own header write, crashing an HTTP/1 server. The report affects 1.27.0 through
+  1.27.3 (and releases before 1.26.11). govulncheck reaches it through `net/http.body.Close`
+  from `internal/worker/client.go` (`Ping`); `taskforge-api` also caps every request body
+  with `MaxBytesReader` (AGENTS.md section 10), so the server side is in scope too. `go mod
+  tidy` under 1.27.4 changes nothing else.
+- **`Dockerfile`:** the builder is `golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d`,
+  the official image's multi-platform index, resolved on 2026-11-16 with `docker buildx
+  imagetools inspect golang:1.27.4`. `tests/verification` holds it equal to `go.mod`.
+- **`scripts/scan`:** govulncheck stays at v1.8.0, which builds with 1.27.4; only its comment
+  names the new Go.
+- **`README.md`** and "Local environment" below: the prerequisite is Go 1.27.4 or newer.
+
+### Evidence
+
+**The advisory and the release.** The report (`data/reports/GO-2026-6859.yaml` in
+`golang.org/x/vulndb` at `v0.0.0-20261111025111-e91d8491530f`, fetched through the Go module
+proxy) lists `fixed: 1.27.4`, `vulnerable_at: 1.27.3`. Go 1.27.4 itself was fetched from the
+module proxy (`GOTOOLCHAIN=go1.27.4 go version` printed `go1.27.4 linux/amd64`).
+
+**The scan, before.** Hosted CI on PR #34 (run 43796116115), at a commit whose `go.mod` was
+`main`'s: `FAIL govulncheck GO-2026-6859 stdlib net/http.body.Close@v1.27.3, called from
+internal/worker/client.go:543 (Ping) ... (fixed in v1.27.4)`; gitleaks, pip-audit and npm
+audit `no findings`. **After:** hosted CI on this change's pull request, not recorded here
+because a commit cannot contain its own CI result.
+
+**The invariant.** With the builder set back to `golang:1.27.3` and `go.mod` at 1.27.4,
+`TestDockerfile_BuilderGoVersionIsExactlyGoMods` fails (expected `"1.27.4"`, actual
+`"1.27.3"`); reverted, it passes.
+
+**Gates**, on 2026-11-16 in a Linux container (Go 1.27.4 linux/amd64, Docker 29.9.2) against
+the stack `make up` starts, on `6dd59b1`:
+
+| Command | Result |
+| --- | --- |
+| `make build` | PASS: seven binaries, each `go version` = `go1.27.4` |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make test-unit` | PASS: 32 packages `ok` |
+| `make test-integration` | PASS: `ok  .../tests/integration  102.165s` |
+| `make test-race` | PASS: every package `ok`; `ok  .../tests/integration  121.563s`; no `DATA RACE` |
+| `make demo`, `make demo-failure`, `make bench-smoke` | PASS: 21 of 21, 25 of 25, 14 of 14 |
+| images, then `go run ./scripts/imagesmoke` | PASS: `RESULT: PASS (47 of 47 checks met)`; the api, worker and outbox binaries copied out of their images report `go1.27.4` |
+| `go run ./scripts/topologysmoke` | PASS: `7 of 7 rows passed; 52 of 52 checks met` |
+| `make scan` | pip-audit `no findings`; govulncheck, gitleaks and npm audit **NOT RUN**: this environment's network policy refuses `vuln.go.dev` and the gitleaks image's blob host, and the dashboard's Node build container does not trust its TLS proxy. Hosted CI runs all four |
+
+`make images` could not run unmodified here for the same TLS reason: the images were built
+with the same `docker build --target <service>` and the same revision label, from copies of
+the two Dockerfiles that add the environment's proxy CA to the Go builder and Node deps
+stages only, never to a runtime stage. Hosted CI builds them from the committed files.
+
+### Limitations
+
+- **No benchmark was re-run;** whether 1.27.4 moves any recorded figure is not measured.
+- **Local scanning was partial** (above); the authoritative scan is hosted CI's.
+
+---
+
+## Correctness audit after M8C2
+
+Maintenance after M8C2, not a milestone, like the Go 1.27.2 toolchain bump: a review of the
+claim, fenced-transition, reconciliation, scheduling, outbox and worker-runtime paths
+against [ARCHITECTURE.md](ARCHITECTURE.md)'s invariants. It fixes one defect, in the worker
+runtime; changes the outbox loop so a backlog drains within one interval; and records one
+limitation that needs an owner decision, because every sound fix for it amends [ADR-0011](adr/0011-notification-generations-and-bounded-renotification.md)
+or the data model. Nothing under `api/`, `migrations/`, `docs/benchmarks/` or
+`internal/api/testdata/` changed, and no ADR did.
+
+### Fixed: an upload that outlived the lease cost a success that had happened
+
+**What was wrong.** `Runner.processMessage` stopped the renewal loop as soon as the handler
+returned, and only then classified the result and, for one at or above
+`TASKFORGE_RESULT_INLINE_THRESHOLD_BYTES`, uploaded it to the object store with retries.
+Nothing renewed the lease during the upload. With the shipped timings (30 s lease, renewal
+every 10 s, a 1 s margin) the lease had 20–30 s left when the handler returned, so an upload
+slower than about 20 s, with no result-size cap and a 30 s per-request timeout against AWS
+plus the SDK's own retries, lost the lease: `Succeed` was refused, the reconciler abandoned
+the attempt, and, because an abandonment consumes the attempt budget
+([ADR-0009](adr/0009-abandoned-attempts-consume-the-attempt-budget.md)), a job whose handler
+succeeded every time could end `DEAD_LETTERED`.
+
+**Reproduced before the fix**, by
+`TestResults_AnUploadLongerThanTheLeaseStillSucceedsOnTheFirstAttempt`
+(`tests/integration/result_upload_lease_test.go`) with the runner from `main`: the real
+control plane, reconciler and object store, a 4 s lease, and an upload delayed 6 s. The job
+never reached `SUCCEEDED` (`condition never became true within 30s`), and the database held:
+
+```
+attempt | attempt status | lease status | renewal_version | error_code
+      1 | ABANDONED      | EXPIRED      |               0 | attempt_abandoned
+      2 | ABANDONED      | EXPIRED      |               0 | attempt_abandoned
+      3 | ABANDONED      | EXPIRED      |               0 | attempt_abandoned
+job: DEAD_LETTERED, max_attempts 3, dlq reason ATTEMPTS_EXHAUSTED; results rows: 0
+```
+
+**The change** (`internal/worker/runner.go`). The result is prepared before renewal stops,
+on the attempt's execution context, which is a child of the lease-authority context and
+carries the attempt's local deadline. Renewal keeps the lease alive through the upload; a
+definitive renewal rejection, or the local deadline, cancels the upload. Renewal still stops
+before `Succeed`, so renewal and a terminal report from this process are still never in
+flight together. With the fix the same test passes in about 6 s: one attempt, `SUCCEEDED`,
+its lease `COMPLETED` with `renewal_version` 2 or more, and an `object` results row of the
+handler's size.
+
+**Two departures from the old behavior, both consequences of the change, listed here
+rather than left implicit:**
+
+- The upload now runs inside the attempt's **local** deadline, which is up to 1 s before the
+  server's `timeout_at` (`executionBudget`'s margin). An upload that would have finished in
+  that last second, and been reported just before `timeout_at`, is now cancelled and left to
+  the timeout sweep. The handler itself already obeys the same deadline.
+- **Cancellation is read again after renewal stops.** A directive that arrives while the
+  result uploads (or between the handler returning and renewal stopping) is acknowledged
+  cooperatively. Before, the worker went on to report a success or failure that the server
+  refuses once cancellation has won, and the job waited for its lease to lapse and the
+  reconciler's fallback. The terminal outcome is `CANCELED` either way; it now comes from
+  the worker, with the lease `RELEASED` rather than `EXPIRED`, as ADR-0010's precedence
+  intends. The directive also stops an upload in progress: once the handler has returned,
+  the attempt's registry entry is bound to the upload's context (a review of the first
+  version found it ran on until the next renewal noticed the cancellation, up to one renewal
+  interval).
+
+**Tests and mutations.** Four unit tests in `internal/worker/renewal_test.go` use barriers,
+not sleeps: `TestRenewal_ContinuesWhileALargeResultUploads` (the upload returns only after
+three renewals committed after the handler returned),
+`TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess`,
+`TestRenewal_CancellationDuringTheUploadIsAcknowledged` and
+`TestRenewal_CancellationStopsAnUploadInProgress` (renewal keeps succeeding, so only the
+directive can end the upload). Each mutation was applied alone and reverted:
+
+| Mutation | Fails |
+| --- | --- |
+| the runner from `main` (upload after renewal stops) | `TestRenewal_ContinuesWhileALargeResultUploads` (`an upload that outlasted the claim's lease window must still report a fenced success`), `TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` (`losing lease authority must cancel the upload`), and the integration test above |
+| renewal kept running, but the upload given the unbound completion context | `TestRenewal_LostAuthorityCancelsTheUploadAndPreventsSuccess` |
+| the cancellation re-read removed | `TestRenewal_CancellationDuringTheUploadIsAcknowledged` |
+| the registry not bound to the upload | `TestRenewal_CancellationStopsAnUploadInProgress` (`a cancellation directive must stop the upload in progress`) |
+
+M8D4's worker-path analysis ("Worker-path analysis (for option (b))", above) cites
+`runner.go` lines as they stood on its branch; its rows for a success whose report or upload
+fails now describe the old order. Its conclusion is unchanged: renewal still stops before
+any report, and the upload is bounded by the attempt's deadline, so a live worker still
+cannot hold a lease past `timeout_at` and ADR-0025's reasoning stands.
+
+### Open issue, resolved by ADR-0029: notification reachability across scopes and for unclaimable jobs
+
+**Resolved in PR #34**; see "Notification reachability repair (ADR-0029)" below. The text that
+follows records the defect as the audit found it and is kept as that record; the tests it
+names were inverted, not deleted, and now carry the names given in that section.
+
+Both halves come from one gap. A claim decides whether a notification is safe to delete
+relative to the **claiming worker**, while bounded re-notification assumes a published
+notification is either consumed or lost, never held live by workers that decline it.
+Neither can lose a job or corrupt state; both cost reachability, and the second costs load.
+
+1. **A worker of another scope deletes a notification it cannot use.** Every scope's
+   notifications go to one broker queue (`TASKFORGE_BROKER_QUEUE_NAME`), and since
+   [ADR-0014](adr/0014-worker-control-authentication.md) each scope runs its own workers.
+   `Claim` selects and answers only within the worker's scope, so a worker of scope B that
+   receives scope A's notification gets `QUEUE_EMPTY` when B has nothing due, which is
+   safe to acknowledge, and deletes it; when B does have work, it claims B's job under A's
+   event id. Either way A's job is left with no notification until re-notification
+   (`TASKFORGE_SCHEDULER_RENOTIFY_AFTER`, 60 s), whose replacement can meet the same fate.
+   [ADR-0003](adr/0003-pull-based-claim-with-broker-notification.md)'s rule 5 ("only after
+   the claim succeeds or the control plane confirms no eligible job remains") holds per
+   scope, not per notification. `make demo`, `make bench` and the topology smoke each use a
+   broker queue of their own, which is why none of them shows it.
+2. **An unclaimable job's notifications accumulate.** `NO_ELIGIBLE_JOB` is never
+   acknowledged, so the notification of a job no running worker can take (a capability or
+   job type no worker has; submission checks only their format) stays live and is
+   redelivered every visibility timeout. Re-notification sees the job still `QUEUED` with
+   no `PENDING` event, because the live one was published, and adds another every
+   interval. Nothing deletes any of them while the job waits. On the shipped defaults that
+   is arithmetic, not a measurement: one more live message a minute per stuck job, each
+   claimed and declined every 30 s, so about 1,440 messages and 48 wasted claim
+   transactions a second per stuck job after a day. Any API key can create such a job. The
+   local queue has no retention or redrive setting, and the Terraform under review in
+   PR #31 sets neither, so on SQS only its default 4-day retention bounds it.
+
+**Pinned, not fixed**, in `tests/integration/notification_reachability_test.go`, each on a
+broker queue of its own with the real API, publisher, scheduler and workers. Both are named
+`TestOpenDefect_*`: what they assert is the wrong behavior observed today, not a
+requirement, and each failure message says so. When the defects are fixed they must be
+inverted, not deleted.
+
+- `TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification`: a scope-B worker deletes
+  the only notification; a healthy scope-A worker then sits beside a `QUEUED` job with no
+  broker message, no pending event and no attempt.
+- `TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate`: a `gpu` job beside a cpu-only
+  worker, with re-notification every 300 ms. Live messages on the queue, every 1.5 s:
+  `[5 10 15 19]`, from 19 outbox events.
+
+**Why it is not fixed here.** Claims are fungible within a scope: one notification may
+claim a different job, so no rule that looks at one job's notifications can tell a
+redundant notification from the one another job depends on. Every sound repair moves a
+decision the accepted architecture made:
+
+- record when a declined notification was last presented (a column on `outbox_events`),
+  and have re-notification skip a job whose notification is still being declined, which
+  bounds the live set per job without deleting anything another job needs (ADR-0011 and
+  the schema);
+- give the broker a retention period near a few re-notification intervals, which bounds
+  the live set by infrastructure alone (the queue settings, and PR #31's Terraform);
+- per-scope broker queues, or a scope in the envelope with workers releasing what is not
+  theirs, which fixes the first half (ADR-0003, the broker interface, configuration);
+- cap or back off re-notification per generation, which slows the growth but repairs a
+  lost notification more slowly too (ADR-0011).
+
+The first two together address both halves' cost; the first half's latency remains until
+the third.
+
+### An option for worker-failure recovery, recorded and not taken
+
+PROJECT_SPEC §7's recovery target (< 30 s) is missed on the shipped 30 s lease because an
+abandoned attempt is found only when its lease expires. The code shows a lease can be dead
+sooner: once its session leaves `HEALTHY` (marked `UNHEALTHY` when stale, `OFFLINE` when
+replaced), every operation that could use the lease refuses it (`lockFence` and the
+mutating halves of `Succeed`, `Fail` and `AcknowledgeCancellation` require a healthy
+session), and nothing returns a session to `HEALTHY` (`Heartbeat` and a replayed `Register`
+both refuse). Reconciling such a lease at once would put a crash's recovery near the stale
+threshold (`TASKFORGE_SESSION_STALE_AFTER`, 15 s) plus a reconciler pass (2 s), without
+changing a default, and would shorten the mechanism ADR-0024 found behind the 50.04 s
+outlier, since a restarted boot would be charged for its dead boot's lease only until the
+next pass rather than until that lease expired.
+
+It is not taken because it gives something up. Waiting for `expires_at` means a worker that
+is alive but cut off has reached its own conservative local deadline, and cancelled a
+cooperative handler, before any replacement can be claimed; reconciling at session end
+would let the replacement start while that handler may still run. Duplicate execution is
+already allowed (PROJECT_SPEC §2); that non-overlap is not promised, but nothing written
+gives it up either. It would amend ADR-0009 and ADR-0025, change when the outcome-precedence
+instants are taken, need re-measurement, and is the owner's decision with the shipped
+timings.
+
+### Verification
+
+**Second round**, after `origin/main` (the Go 1.27.3 toolchain, PR #32) was merged into the
+branch and the review change above was made, on 2026-10-26, against the stack `make up`
+starts, on the same Apple M3 (on AC power when the round ended; when it switched from
+battery was not recorded):
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...`, exit 0; `gofmt -l` empty |
+| `make test-unit` | PASS | every package `ok`, including `tests/verification` (the matrix drift check) |
+| `make test-integration` | PASS | `ok .../tests/integration 109.982s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 109.083s` |
+| `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)` |
+| `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
+| `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
+| `make images-smoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
+| `make topology-smoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
+| `make scan` in a fresh full-history clone of the branch alone | PASS | govulncheck `no findings (go1.27.3 ...)`; gitleaks `no findings (full git history, all refs)`; pip-audit and npm audit `no findings` |
+| `make scan` in this worktree | **FAIL** | gitleaks `stripe-access-token` in commit `11c451e8`, which only the local, never-pushed branch `backup-pre-fix` holds (not this branch's history, no remote branch); the other three `no findings` |
+
+**First round**, on 2026-10-25 before the merge, on Go 1.27.2 and on battery: the same
+gates passed (integration `140.127s`; race on the changed packages; `make sdk-lint` and
+`make sdk-test`, `179 passed`; `make dash-lint` and `make dash-test`, `79 passed (79)`), and
+`make scan` failed on govulncheck `GO-2026-6809` (stdlib 1.27.2, fixed in 1.27.3), which
+the merged PR #32 resolves, as well as on the same local gitleaks finding. The SDK and the
+dashboard are unchanged by the merge and by the review change, so they were not rerun.
+
+`make bench` was not run: a recorded run needs a clean tree on power, and neither change
+alters what either recorded run measured.
+
+### Audited and found consistent with the architecture
+
+The claim (advisory identity lock, then queue → session → job → attempt → lease, a
+post-lock `clock_timestamp()`, capacity counted from active leases); `Start`, `Succeed`,
+`Fail` and `AcknowledgeCancellation` (replays answered from history before liveness,
+foreign outcome identities refused, one dead-letter funnel); renewal (authority validated
+before a replay is recognized); the timeout sweep and the expired-lease precedence; public
+cancellation; scheduler promotion and re-notification (generation-fenced); the outbox
+(claim, publish outside a transaction, mark); submission and replay idempotency (primary
+keys, the loser's rollback leaves no orphan); and the API's request ids, body cap, request
+timeout and server timeouts. Every write that moves a job out of `LEASED`, `RUNNING` or
+`CANCEL_REQUESTED` ends its lease in the same transaction, so the reconcilers' skipped
+candidates cannot hold a scan slot for long. Smaller observations, none changed: a
+reconciliation or scheduling pass stops at its first failing candidate and retries on the
+next tick; result retrieval reads the whole object into memory, with no size cap on
+results; and an event whose publish failed is retried on its own backoff, which reaches
+`TASKFORGE_OUTBOX_BACKOFF_MAX` (5 minutes by default, ±20 % jitter) at the tenth failure on
+the default base and multiplier, so after a
+broker outage of that length a job can wait up to that long once the broker is back, and
+re-notification cannot step in while the event is still `PENDING`.
+
+### Changed: the outbox drains a backlog within one interval
+
+**What was wrong.** `Publisher.Run` ran one pass per tick, so however much was due, it
+delivered at most `TASKFORGE_OUTBOX_BATCH_SIZE` events per `TASKFORGE_OUTBOX_POLL_INTERVAL`:
+50 a second on the defaults. A backlog left by a broker outage, or a burst of submissions,
+drained at that rate while new work queued behind it; at the 1,000 jobs a minute the
+benchmark offers, a ten-minute outage's 10,000 events take about five minutes to clear.
+
+**The change** (`internal/outbox/publisher.go`). After a pass that claimed a full batch and
+delivered every event in it, the loop runs the next pass at once; a short batch, a failed
+event or a pass error ends the drain until the next tick. Neither recorded benchmark is
+affected: both offer about 17 jobs a second, so a pass never claims a full batch of 50.
+[ARCHITECTURE.md](ARCHITECTURE.md) §7 states the rule.
+
+**Measured**, as a mechanism probe and not a recorded benchmark: 1,000 jobs submitted
+through `jobs.Store.Submit` in one scope, then `outbox.Publisher.Run` with the shipped
+publisher settings (batch 50, poll 1 s, claim timeout 30 s, backoff 1 s to 5 min) against a
+broker queue of its own on the local ElasticMQ, timed from `Run` starting until no event is
+`PENDING`, polled every 25 ms. On an Apple M3 with 8 GB, **on battery** (Low Power Mode
+off), so the figures are indicative only:
+
+| | Runs | Drain time |
+| --- | --- | --- |
+| Before (`main`) | 3 | 20.09 s, 20.08 s, 20.08 s: 20 passes, one per tick |
+| After | 13 | 12 runs from 1.93 s to 2.31 s (median 2.04 s), each with no event published more than once and no failed publish; **one run of 14.32 s, unexplained** |
+
+The 14.32 s run was the first after the change, and the counters that would show a failed
+publish were added only after it; it did not recur in the twelve runs that followed. A
+drain ends at a failed publish or a pass error, and the next tick is a second away, so about
+twelve such stops would account for it, but nothing recorded shows that.
+
+**Tests and mutations** (`tests/integration/outbox_drain_test.go`, a file of its own so the
+lines [VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md) cites in `outbox_test.go` stay where
+they are): `TestOutbox_RunLoopPublishesABacklogOfSeveralBatchesInOneTick` (30 events,
+batches of 10, a 3 s poll, a broker queue of its own: all published before the second tick)
+fails on `main`'s loop (`condition never became true within 5.5s`), and
+`TestOutbox_RunLoopDoesNotDrainWhileTheBrokerIsDown` (a broker that fails every publish at
+once: one batch of attempts per tick) fails with the failure condition removed from the
+drain (`expected: 10, actual: 30`). Two corrections were made on the way, and are recorded
+because each changed what the tests prove. A first version of the second test failed
+through the flaky proxy, and did not catch that mutation: the SDK's retries made each failed
+publish slow enough to hide the loop. And one run of the `TestOutbox_` group, the first
+after the tests moved to their own file, reported `FAIL` without the failing test being
+captured; three reruns were clean. The first test then used the shared broker queue and
+counted exactly 30 deliveries, which a delivery left in flight by another test would break,
+and had 1.5 s of margin after the first tick; it now has a queue of its own and 2.5 s.
+
+## Notification reachability repair (ADR-0029)
+
+Maintenance after the correctness audit, not a milestone. It resolves both open defects the
+audit pinned, with [ADR-0029](adr/0029-scope-addressed-notification-streams.md) recording
+the decision, the alternatives and the invariants.
+
+### Reproduced first
+
+On `98dbe3f` (`main`, PR #33 merged), against the stack `make up` starts, both pinned tests
+passed, which is to say both defects reproduced:
+`TestOpenDefect_AnotherScopesWorkerDeletesTheOnlyNotification` (`PASS`, 2.13 s) and
+`TestOpenDefect_AnUnclaimableJobsNotificationsAccumulate` (`PASS`; live broker messages
+every 1.5 s `[5 10 15 20]`, 20 outbox events for one job).
+
+**Root cause, both halves.** A claim decided whether a notification was safe to delete
+relative to the claiming worker (`QUEUE_EMPTY` in the worker's own scope), while every scope
+shared one broker queue; and re-notification assumed a published notification was either
+consumed or lost, never held live by workers declining it (`NO_ELIGIBLE_JOB`,
+`CAPACITY_EXHAUSTED`) or unread by a fleet with no free slot or no worker at all.
+
+### What changed
+
+| Area | Change |
+| --- | --- |
+| `internal/queue/route.go` | `Address{Scope, Queue}`, `Router`, `NotificationQueueName` (`<base>-<16 hex of SHA-256(scope NUL queue)>`), `ValidateBaseQueueName` (≤ 63 characters, the SQS alphabet) |
+| `internal/queue/sqsbroker` | `Router`: resolves an address's queue, or creates it with the base queue's visibility timeout, retention, delay, wait, size and encryption attributes; idempotent under concurrent creators; `Ping` and readiness use the base queue |
+| `internal/outbox` | `ClaimDue` joins `jobs` for each event's address; the publisher routes by it; an event with no job reference (pre-0009 only) is failed with backoff rather than guessed at |
+| `internal/worker` | the runner resolves its own `(session scope, TASKFORGE_WORKER_QUEUE)` after registration and reads nothing else; a route failure is fatal before any receive; the client accepts the two new outcomes with their acknowledgement contract |
+| `internal/workers`, `internal/api`, `api/openapi.yaml` | `Session.Scope`, returned as `scope` by registration; `FOREIGN_NOTIFICATION` and `STALE_NOTIFICATION`; a consumed event presented by another address is answered `FOREIGN_NOTIFICATION` rather than ADR-0007's conflict error |
+| `internal/jobs/schedule.go`, `internal/scheduler` | the claimability gate; `Deferred` in the pass statistics and the scheduler's log line |
+| `migrations/0019_claimability_gated_renotification.sql` | `jobs.renotify_checked_at`; `jobs_renotify_due_idx` replaces `jobs_stranded_queued_idx`; `worker_sessions_healthy_scope_idx` |
+| `internal/config` | `TASKFORGE_BROKER_QUEUE_NAME` validated as a base name |
+| `scripts/internal/stack`, `scripts/topologysmoke` | create the run's address queue up front with the base's attributes, measure it (`Stack.QueueAttributes`, used by the recovery probe), and delete it with the base |
+
+Defaults are unchanged: the same variables, the same base queue name, the same timings. The
+broker wire contract is unchanged.
+
+### Tests
+
+The two pinned tests, inverted (same arrangement, opposite assertions):
+
+- `TestReachability_AnotherScopesWorkerCannotTakeTheOnlyNotification`: the other scope's
+  worker running alone for 2 s leaves the notification live on the job's own address queue
+  (1) and its own queue empty (0); the job's own worker then completes the job from that one
+  notification, with re-notification an hour away.
+- `TestReachability_AnUnclaimableJobsNotificationsStayBounded`: the gpu job beside a cpu-only
+  worker, re-notification every 300 ms, is deferred, and holds live messages `[1 1 1 1]`
+  with one outbox event; a gpu worker then joins and completes it.
+
+New, on the real PostgreSQL and ElasticMQ:
+
+| Test | Asserts |
+| --- | --- |
+| `TestClaim_AForeignNotificationClaimsNothingAndIsNotAcknowledged` | both old answers are gone: no `QUEUE_EMPTY` when scope B has nothing due, no claim of B's job under A's event id; A can still claim with it |
+| `TestClaim_ConcurrentForeignPresentationsCannotStealTheWakeup` | 8 scope-B sessions and A's session present A's one event at once, each on its own connection: one `CLAIMED` (A's job), 8 `FOREIGN_NOTIFICATION`, no scope-B lease. Its first run found that, once A's claim committed, the others got `ErrClaimConflict` from the replay check rather than the defined outcome; `foreignOrConflict` fixes that |
+| `TestClaim_AStaleNotificationNobodyCanUseIsReleased` | the fungible swap: a cpu worker claims a cpu job with a stuck gpu job's notification; the cpu job's leftover is `STALE_NOTIFICATION`; the gpu job is deferred, then repaired and claimed once a gpu session exists |
+| `TestClaim_ARequeuedJobsOlderNotificationIsStale` | a generation bump makes the older event stale while the current one is held |
+| `TestClaim_AnUnattributedClaimKeepsItsDisposition` | a claim id that is not an event keeps `NO_ELIGIBLE_JOB` |
+| `TestScheduler_DefersAJobNoSessionCouldClaim` | deferred with no session, a session without the capability, without the job type, of another scope, and at capacity; re-notified once the slot frees |
+| `TestScheduler_DeferredJobsDoNotStarveAClaimableOne` | four deferred jobs ahead of a claimable one, batch 2: the claimable one is repaired on the third pass |
+| `TestRouting_AnAddressQueueInheritsTheBaseQueuesAttributes` | `VisibilityTimeout` 7 on the base is 7 on the derived queue |
+| `TestRouting_IndependentProcessesMeetOnOneQueuePerAddress` | six routers racing to create one address all resolve one queue; a message crosses routers; another scope's queue is distinct and empty |
+| `TestMultiTenantDispatch_EveryScopesJobsAreClaimedWithoutRenotification` | 4 scopes × 5 jobs, interleaved, re-notification an hour away: all 20 claimed, none under another scope's notification, one event per job |
+
+Unit tests: `TestRunner_ReadsOnlyItsOwnScopesAddress`,
+`TestRunner_AnUnresolvableAddressIsFatalBeforeAnyReceive`, the client's acknowledgement
+contract for both outcomes, `TestSafeToAcknowledge_NotificationRelativeDispositions`, and
+`internal/queue/route_test.go` (stable and distinct names, the 80-character limit, base-name
+validation).
+
+Existing tests changed, and why, none weakened: three re-notification tests and the M3
+upgrade test register a session that could claim their jobs before expecting a replacement,
+because that is now a precondition and the deferral has tests of its own; the migration-count
+pins move from 18 to 19; the M4 index assertion follows the replaced index and also asserts
+the old one is gone; the M5A upgrade digest of `jobs` excludes the column 0019 adds, as the
+M6B digest of `outbox_events` already did for its added columns. Eleven distinct
+verification-matrix line citations moved with their assertions; each was checked by content
+against `main`, not only by the drift check, which accepts any assertion line in the named
+test and passed for four citations (five occurrences) that had silently shifted onto a
+different assertion of the same test.
+
+**Mutations**, each applied alone against the new tests and reverted:
+
+| Mutation | Fails |
+| --- | --- |
+| every address resolves to the base queue | `TestReachability_AnotherScopesWorkerCannotTakeTheOnlyNotification`, `TestMultiTenantDispatch_...`, both `TestRouting_` tests |
+| the foreign guard disabled | `TestClaim_AForeignNotificationClaimsNothingAndIsNotAcknowledged` |
+| stale release disabled | `TestClaim_AStaleNotificationNobodyCanUseIsReleased`, `TestClaim_ARequeuedJobsOlderNotificationIsStale` |
+| the claimability gate disabled | `TestReachability_AnUnclaimableJobsNotificationsStayBounded`, `TestScheduler_DefersAJobNoSessionCouldClaim`, `TestScheduler_DeferredJobsDoNotStarveAClaimableOne`, `TestClaim_AStaleNotificationNobodyCanUseIsReleased` |
+| the deferral not stamped | `TestReachability_AnUnclaimableJobsNotificationsStayBounded`, `TestScheduler_DefersAJobNoSessionCouldClaim`, `TestScheduler_DeferredJobsDoNotStarveAClaimableOne` |
+
+### Measured: the multi-tenant workload, before and after
+
+`TestMultiTenantDispatch_EveryScopesJobsAreClaimedWithoutRenotification`, the same file run
+on a worktree of `98dbe3f` (adapted only by copying one read helper) against a database of
+its own, and on this branch. Each scope has one worker of concurrency 2; jobs are submitted
+interleaved across scopes; re-notification is an hour away; the window is 20 s. Dispatch
+latency is the first lease's `acquired_at` minus the job's `created_at`, PostgreSQL time,
+over claimed jobs only, so `main`'s figures omit exactly the stranded jobs. Run in a Linux
+container (Docker 29.9.2, the compose stack), not the Apple M3 the recorded benchmarks used:
+
+| Workload | Commit | Runs | Claimed within 20 s | Leases under another scope's notification | p50 / p99 ms (claimed only) |
+| --- | --- | --- | --- | --- | --- |
+| 4 scopes × 5 | `98dbe3f` | 3 | 18, 18, 18 of 20 | 11, 13, 13 | 94.8/191.1, 112.1/180.5, 73.6/166.7 |
+| 4 scopes × 5 | this branch | 3 | 20, 20, 20 of 20 | 0, 0, 0 | 129.4/194.0, 122.8/189.7, 116.6/176.3 |
+| 8 scopes × 10 | `98dbe3f` | 1 | 57 of 80 | 51 | 77.7/472.4 |
+| 8 scopes × 10 | this branch | 1 | 80 of 80 (in about 1 s) | 0 | 50.7/143.3 |
+
+On `main` the unclaimed jobs waited for re-notification (an hour here; 60 s shipped), and
+most leases were taken under another scope's event id. The latency of jobs that were
+claimed is not an improvement claim: the samples are small and `main`'s exclude its slowest
+jobs.
+
+### Recorded benchmark
+
+[2026-11-16-a6c9973](benchmarks/2026-11-16-a6c9973.md), `make bench` (ADR-0020), the shipped
+defaults, seed 20261002, at `a6c9973` with a clean tree and binaries stamped from it, in this
+session's Linux container (Intel Xeon @ 2.30 GHz, 4 logical CPUs, 15.7 GiB, Ubuntu 24.04.5,
+Go 1.27.3, PostgreSQL 16.16):
+
+| Target | [d796722](benchmarks/2026-10-05-d796722.md) (Apple M3, before) | a6c9973 (Linux container, after) |
+| --- | --- | --- |
+| Sustained throughput, 1,000/min | 999.83 jobs/min, Met | 999.99 jobs/min, Met |
+| Dispatch latency, p95 < 500 ms | p95 963.7 ms, p50 552.2 ms, p99 1.01 s; **missed** | p95 926.8 ms, p50 537.4 ms, p99 992.5 ms; **missed** |
+| Fault-injection volume, 10,000 | 10,000, 24 kills, Met | 10,000, 24 kills, Met |
+| Completion under faults, ≥ 99.7 % | 100.000 %, Met | 100.000 %, Met |
+| Worker-failure recovery, < 30 s | worst 50.04 s, p50 32.02 s, 16 attempts; **missed** | worst 36.04 s, p50 32.07 s, 18 attempts; **missed** |
+
+**The two columns are not a before-and-after measurement**: different hardware and OS, so no
+figure here is claimed as an improvement or a regression. What the run does establish is that
+the repaired architecture meets the same three targets on the shipped defaults, misses the
+same two for the reasons already recorded (the outbox poll interval for dispatch; the 30 s
+lease for recovery), dispatches every in-window job (0 never claimed), and replaces every
+abandoned attempt (0 never replaced). The benchmark runs one scope on one queue, so the
+per-address routing it exercises is one address queue; the claimability gate reads
+`worker_sessions` and `leases` only for re-notification candidates, of which a run that
+dispatches everything within a second has essentially none. Its cost was not separately
+measured under a large stranded backlog.
+
+A first attempt was interrupted at 292 s, during the throughput phase, and recorded nothing:
+`make build` was run in the same tree while it ran, so the workers its fault phase would
+start would have been built from an uncommitted tree, contradicting the provenance a record
+states. The run above was started afterwards on a clean tree and nothing was built during it.
+
+### Verification
+
+On 2026-11-16, in this session's Linux container, against the stack `make up` starts
+(PostgreSQL 16, ElasticMQ 1.6.11, LocalStack S3), Go 1.27.3:
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...`, exit 0 |
+| `make test-unit` | PASS | 33 packages `ok`, including `tests/verification` |
+| `make test-integration` | PASS | `ok .../tests/integration 114.441s` |
+| `make test-race` | PASS | every unit package `ok`; `ok .../tests/integration 106.571s` |
+| `make demo` | PASS | `RESULT: PASS (21 of 21 expectations met)`; it created and deleted the run's address queue |
+| `make demo-failure` | PASS | `RESULT: PASS (25 of 25 expectations met)` |
+| `make bench-smoke` | PASS | `RESULT: PASS (14 of 14 checks met)`; records nothing |
+| `make bench` | PASS (exit 0; 3 targets met, 2 missed as before) | record `2026-11-16-a6c9973`, above |
+| `make images-smoke`, `make topology-smoke`, `make scan`, `make sdk-*`, `make dash-*` | NOT RUN locally | the topology smoke's queue handling changed (it now also creates and deletes its address queue) and is not exercised here; the SDK and the dashboard are untouched |
+| Hosted CI on PR #34 at `93ea644` (run 43796116115) | 7 of 8 PASS; supply-chain scan **FAIL** | lint/build/unit/OpenAPI, migrations and integration (with the demonstrations and bench smoke), race, container images, dashboard, and both SDK jobs pass. The scan fails on govulncheck `GO-2026-6859` (stdlib `net/http`, Go 1.27.3, fixed in 1.27.4; database modified 2026-11-11), reached through `internal/worker/client.go` `Ping`, which is unchanged on `main`; gitleaks, pip-audit and npm audit report no findings. It is a new advisory against the toolchain, not this change, and is left to a toolchain bump of its own, as PRs #26 and #32 were. |
+
+### Review round (second session, 2026-11-16)
+
+An independent review of the branch, reading the code rather than the tests, with the
+missing smokes and the AWS audit. What it found and did:
+
+- **Fixed: an address's queue that disappeared stalled delivery until restart.** Routes
+  were resolved once and cached, so after the local ElasticMQ restarts (it keeps queues in
+  memory and recreates only the configured base) or an operator deletes one, the publisher
+  failed every event and a worker every receive until each process restarted; before
+  ADR-0029 the one queue came back with the broker. No job could be lost (the events stay
+  `PENDING` in PostgreSQL), but nothing was delivered. An address's broker now re-resolves,
+  creating the queue from the base's attributes again, when an operation reports the queue
+  missing, and retries once. `TestRouting_AnAddressQueueThatDisappearsIsRecreated` failed
+  before (the publish returned the missing-queue error) and passes after;
+  `TestRouting_AnAddressResolvesOnceTheBrokerIsBack` pins that a resolution attempted while
+  the broker is unreachable fails and is not cached.
+- **Fixed: two concurrent tests asserted from spawned goroutines,** where `require` cannot
+  stop a test; their racers now hand errors back to the test goroutine, and the routing race
+  also asserts that every racer resolved. One matrix citation moved with its assertion.
+- **Fixed: the ADR number.** PR #31 (dated 2026-10-17) already holds ADR-0028, so this
+  change's record is ADR-0029. Migration 0019's comments carried the number; 0019 has run
+  only against throwaway test databases, so they were corrected before it ships.
+- **Fixed: ADR-0029 claimed the gate's cost was measured.** It was not under a stranded
+  backlog; the ADR now says what was measured.
+- **Found, outside this branch:** PR #31's task roles granted SQS actions on the base queue
+  alone, so with this change every address would be refused. PR #36, stacked on #31, grants
+  exactly what the code calls on `<base>-*` and records rollout and rollback. See
+  "Limitations".
+- **Checked and left as is:** the re-notification scan uses `jobs_renotify_due_idx` at
+  volume (20,000 `QUEUED` jobs, analyzed, inside a rolled-back transaction: `Index Scan
+  using jobs_renotify_due_idx`, 50 rows, 52 shared buffer hits, 0.088 ms) and the gate's
+  session lookup is an index-only scan on `worker_sessions_healthy_scope_idx`; the
+  publisher can create a queue only for an address some job has, since `jobs.queue`
+  references `queues`; a stale or foreign decision rests only on immutable or monotone
+  columns; legacy events without a job reference keep their old claim answers; an old api
+  returns no `scope`, and a new worker then exits rather than guess a queue (rollout order
+  below).
+
+**Gates**, on `fc84287` in this session's Linux container (Go 1.27.3, which `main` pinned then;
+Docker 29.9.2), against the stack `make up` starts:
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...` silent |
+| `make test-unit` | PASS | 33 packages `ok`; matrix check 32 rows (I1–I20, S1–S12) |
+| `make test-integration` | PASS | `ok .../tests/integration 108.987s` |
+| `make test-race` | PASS | every package `ok`; `ok .../tests/integration 119.818s`; no `DATA RACE` |
+| `make demo`, `make demo-failure`, `make bench-smoke` | PASS | 21 of 21, 25 of 25, 14 of 14 |
+| images, then `go run ./scripts/imagesmoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
+| `go run ./scripts/topologysmoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
+| broker queues after all of the above | clean | `ListQueues` returns only `taskforge-work-available`: every derived queue the tests, demonstrations, smokes and bench smoke created was deleted |
+| `make scan` | NOT RUN locally | the network policy refuses `vuln.go.dev` and the gitleaks image's blob host; hosted CI runs it |
+
+`make images` could not run unmodified here: the dashboard's Node build container does not
+trust this environment's TLS proxy. The images were built with the same targets and
+revision label from copies of the two Dockerfiles that add the proxy CA to the Go builder
+and Node deps stages only, never a runtime stage; hosted CI builds them from the committed
+files, and its "Container images" job runs both smokes.
+
+**The supply-chain check and PR #35.** On Go 1.27.3 the check failed on GO-2026-6859 alone.
+PR #35 moved `go.mod` and the builder to 1.27.4 (its hosted CI passed all eight checks, the
+scan reporting `govulncheck no findings (go1.27.4, scanner v1.8.0, database modified
+2026-11-11T02:51:11Z)`), and `main` with that change was merged into this branch in
+`00bd7d5`, whose only conflict was this document's opening sentence. This branch's checks
+after that merge are recorded on the pull request, since a commit cannot contain its own CI
+result.
+
+### Limitations
+
+- **Upgrade.** Messages already on the old shared queue are not read by new workers; each
+  such job is repaired by re-notification within one interval once a new worker that could
+  claim it is registered. Apply 0019 and roll the api first (a new worker needs the `scope`
+  registration returns, and exits without it), then the outbox and the workers together.
+  Rolling back leaves 0019, which the old code ignores except that its stranded-job scan
+  loses the index 0019 replaced; old re-notification re-advertises each job onto the base
+  queue within one interval, and the address queues stay behind, unread.
+- **AWS.** The outbox needs `sqs:GetQueueUrl`, `sqs:CreateQueue` and `sqs:SendMessage` on
+  `<base>-*`, the workers `sqs:GetQueueUrl`, `sqs:CreateQueue`, `sqs:ReceiveMessage` and
+  `sqs:DeleteMessage`, and both keep their base-queue grants. PR #31 as drafted lacks them;
+  PR #36 adds them and must be in #31 before it is applied. Address queues are outside
+  Terraform state and never deleted by TaskForge. Queue creation, attribute copying (SSE-SQS
+  among them), the missing-queue re-creation and the creation race were exercised on
+  ElasticMQ only, not on AWS SQS; AWS's 60 s refusal to recreate a deleted name is
+  documented behavior, not observed here.
+- **Within one address**, workers with different capabilities still share a queue, so a
+  held notification reaches a minority-capable worker at random; the bound is now
+  ADR-0029's I4 (one re-notification interval after such a worker could claim) rather than
+  the accumulation that used to shorten it.
+- **The gate does not know a session's TaskForge queue**, so a job in a queue served only by
+  sessions of the same group configured for another queue is still re-notified once per
+  interval. Recording the queue at registration would close it (a schema and API change).
+- **A deferral** can delay the repair of a genuinely lost notification by up to one more
+  interval after a session that could claim the job appears.
+
 ---
 
 ## M8C3 — deployment: Terraform, validated and not applied
@@ -6982,7 +7677,7 @@ moves.
 
 ## Local environment
 
-- Go 1.27.2 or newer (`go.mod` names the patch release; an older toolchain downloads
+- Go 1.27.4 or newer (`go.mod` names the patch release; an older toolchain downloads
   it under the default `GOTOOLCHAIN=auto`)
 - PostgreSQL 16 on `localhost:5442`
 - ElasticMQ on `localhost:9324`
@@ -7027,6 +7722,10 @@ Open, and not any milestone's deliverable:
   worker's `CreateBucket` outside `us-east-1` (which would lift the region validation), and
   **per-task worker identity** (for example the worker's name derived from its ECS task ID
   when `TASKFORGE_WORKER_NAME` is unset), which would lift the one-worker cap.
+- **Notification reachability** across scopes and for unclaimable jobs, which the correctness
+  audit left open, is resolved (PR #34, ADR-0029). It leaves one decision to the owner:
+  whether to record a session's TaskForge queue at registration so the claimability gate can
+  see it. The Go 1.27.4 toolchain is PR #35 ("Go 1.27.4 toolchain" above).
 
 Smaller items available to whoever wants them:
 

@@ -2958,10 +2958,17 @@ components:
 
     WorkerSession:
       type: object
-      required: [worker_id, worker_session_id, worker_name, hostname, worker_group, concurrency_limit, capabilities, supported_job_types, status, registered_at, last_heartbeat_at]
+      required: [worker_id, worker_session_id, scope, worker_name, hostname, worker_group, concurrency_limit, capabilities, supported_job_types, status, registered_at, last_heartbeat_at]
       properties:
         worker_id: { type: string, format: uuid }
         worker_session_id: { type: string, format: uuid }
+        scope:
+          type: string
+          description: |
+            The worker key's authorization scope. A worker uses it only to
+            address the broker queue that carries its own scope's
+            notifications for its queue (ADR-0029); it is never presented
+            back to the control plane, which reads the scope from the key.
         worker_name: { type: string }
         hostname: { type: string }
         worker_group: { type: string }
@@ -3073,10 +3080,17 @@ components:
       properties:
         outcome:
           type: string
-          enum: [CLAIMED, QUEUE_EMPTY, DUPLICATE_NOTIFICATION, NO_ELIGIBLE_JOB, CAPACITY_EXHAUSTED]
+          enum: [CLAIMED, QUEUE_EMPTY, DUPLICATE_NOTIFICATION, NO_ELIGIBLE_JOB, CAPACITY_EXHAUSTED, FOREIGN_NOTIFICATION, STALE_NOTIFICATION]
+          description: |
+            `FOREIGN_NOTIFICATION`: the `claim_request_id` is a notification
+            advertising a job of another scope or queue; nothing is claimed
+            under it and it must not be acknowledged. `STALE_NOTIFICATION`:
+            nothing due in this scope and queue is eligible for this session,
+            and the notification advertises an eligibility transition that has
+            already ended; it is safe to acknowledge. See ADR-0029.
         safe_to_acknowledge:
           type: boolean
-          description: True only for `CLAIMED` with an assignment, a PostgreSQL-confirmed `QUEUE_EMPTY`, or `DUPLICATE_NOTIFICATION` already consumed by another session.
+          description: True only for `CLAIMED` with an assignment, a PostgreSQL-confirmed `QUEUE_EMPTY`, `DUPLICATE_NOTIFICATION` already consumed by another session, or `STALE_NOTIFICATION`.
         replayed:
           type: boolean
           description: True when this claim request id returned its prior assignment.

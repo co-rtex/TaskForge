@@ -139,6 +139,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			s.log.Info("scheduler advanced durable work",
 				slog.Int("promoted_jobs", result.PromotedJobs),
 				slog.Int("renotified_jobs", result.Renotified),
+				slog.Int("deferred_unclaimable", result.Deferred),
 				slog.Int("skipped", result.Skipped))
 		}
 	}

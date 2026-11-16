@@ -34,7 +34,7 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 
 	migrations, err := database.LoadMigrations()
 	require.NoError(t, err)
-	require.Len(t, migrations, 18)
+	require.Len(t, migrations, 19)
 	require.Equal(t, 14, migrations[13].Version)
 	require.Equal(t, "0014_api_keys.sql", migrations[13].Name)
 	require.Equal(t, 15, migrations[14].Version)
@@ -124,12 +124,17 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 		"queues", "jobs", "workers", "job_attempts",
 		"leases", "dlq_entries", "dlq_replays", "idempotency_records",
 	}
+	// jobs is digested without renotify_checked_at, which ADR-0029's 0019
+	// added later in the same upgrade: as JSON with that one key removed, so
+	// the digest still covers every column jobs had before and the pure
+	// schema addition does not read as a changed row.
 	digest := func(t *testing.T, table string) string {
 		t.Helper()
 		var sum *string
 		require.NoErrorf(t, conn.QueryRow(ctx, fmt.Sprintf(
 			`SELECT md5(string_agg(row_data, '|' ORDER BY row_data))
-			 FROM (SELECT %s::text AS row_data FROM %s) rows`, table, table)).Scan(&sum),
+			 FROM (SELECT (to_jsonb(%s) - 'renotify_checked_at')::text AS row_data FROM %s) rows`,
+			table, table)).Scan(&sum),
 			"digest %s", table)
 		if sum == nil {
 			return "<empty>"
@@ -183,8 +188,8 @@ func TestMigrations_M5UpgradeAddsTwoEmptyCredentialTablesAndTouchesNothingElse(t
 	// The upgrade itself, through the real runner.
 	applied, err := database.Migrate(ctx, freshDSN, discardLogger())
 	require.NoError(t, err, "0014, 0015, and 0016 must apply to a database holding real M4 data")
-	require.Equal(t, 5, applied,
-		"0014, 0015, 0016, 0017, and 0018 are pending from an M4 database")
+	require.Equal(t, 6, applied,
+		"0014, 0015, 0016, 0017, 0018, and 0019 are pending from an M4 database")
 
 	t.Run("worker_sessions.worker_key_id exists, is nullable, and is NULL on every pre-existing row", func(t *testing.T) {
 		var nullCount, total int

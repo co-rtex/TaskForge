@@ -32,7 +32,7 @@ func (f *fakeObjectStore) Put(ctx context.Context, bucket, key string, body []by
 }
 
 func testRunnerWithObjects(objects ObjectStore, threshold int) *Runner {
-	return NewRunner(&fakeControl{}, &fakeBroker{}, NewRegistry(), objects, RunnerConfig{
+	return resolvedRunner(&fakeControl{}, &fakeBroker{}, NewRegistry(), objects, RunnerConfig{
 		Queue: "default", PollWait: time.Second, RetryAttempts: 2,
 		ShutdownTimeout: time.Second, ResultInlineThresholdBytes: threshold,
 		ResultsBucket: "taskforge-results",

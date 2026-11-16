@@ -30,6 +30,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/workers"
 )
 
@@ -284,15 +285,32 @@ func createIsolatedBrokerQueue(t *testing.T, prefix string) string {
 	require.Lenf(t, queueURL, 2, "CreateQueue returned no queue url: %s", body)
 
 	t.Cleanup(func() {
-		deleted, err := http.PostForm(brokerEndpoint()+"/", url.Values{
-			"Action": {"DeleteQueue"}, "QueueUrl": {queueURL[1]}, "Version": {"2012-11-05"},
-		})
-		if err == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(deleted.Body, 8*1024))
-			_ = deleted.Body.Close()
+		// Services given this base create testScope's default-queue
+		// notification queue from it on demand (ADR-0029); delete that too,
+		// if anything created it.
+		derived := queue.NotificationQueueName(name, queue.Address{Scope: testScope, Queue: "default"})
+		if resolved, err := http.PostForm(brokerEndpoint()+"/", url.Values{
+			"Action": {"GetQueueUrl"}, "QueueName": {derived}, "Version": {"2012-11-05"},
+		}); err == nil {
+			body, _ := io.ReadAll(io.LimitReader(resolved.Body, 8*1024))
+			_ = resolved.Body.Close()
+			if match := queueURLPattern.FindStringSubmatch(string(body)); len(match) == 2 {
+				deleteBrokerQueue(match[1])
+			}
 		}
+		deleteBrokerQueue(queueURL[1])
 	})
 	return name
+}
+
+func deleteBrokerQueue(queueURL string) {
+	deleted, err := http.PostForm(brokerEndpoint()+"/", url.Values{
+		"Action": {"DeleteQueue"}, "QueueUrl": {queueURL}, "Version": {"2012-11-05"},
+	})
+	if err == nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(deleted.Body, 8*1024))
+		_ = deleted.Body.Close()
+	}
 }
 
 var queueURLPattern = regexp.MustCompile(`<QueueUrl>([^<]+)</QueueUrl>`)

@@ -20,6 +20,7 @@ import (
 	"github.com/co-rtex/TaskForge/internal/hostallow"
 	"github.com/co-rtex/TaskForge/internal/lifecycle"
 	"github.com/co-rtex/TaskForge/internal/loopback"
+	"github.com/co-rtex/TaskForge/internal/queue"
 	"github.com/co-rtex/TaskForge/internal/telemetry"
 )
 
@@ -292,6 +293,13 @@ func (c Config) Validate() error {
 	req("TASKFORGE_API_ADDR", c.APIAddr)
 	req("TASKFORGE_BROKER_QUEUE_NAME", c.BrokerQueueName)
 	req("TASKFORGE_BROKER_REGION", c.BrokerRegion)
+	if c.BrokerQueueName != "" {
+		// The base of a family of broker queues, one per (scope, queue)
+		// address, so it must leave room for the address suffix (ADR-0029).
+		if err := queue.ValidateBaseQueueName(c.BrokerQueueName); err != nil {
+			problems = append(problems, "TASKFORGE_BROKER_QUEUE_NAME "+err.Error())
+		}
+	}
 	req("TASKFORGE_RESULTS_BUCKET", c.ResultsBucket)
 	req("TASKFORGE_RESULTS_REGION", c.ResultsRegion)
 	req("TASKFORGE_OUTBOX_ADDR", c.OutboxAddr)

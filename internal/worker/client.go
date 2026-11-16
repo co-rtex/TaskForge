@@ -83,7 +83,7 @@ func (c *Client) Register(ctx context.Context, registration workers.Registration
 		return workers.Session{}, fmt.Errorf("control plane returned invalid session id: %w", err)
 	}
 	return workers.Session{
-		ID: sessionID, WorkerID: workerID, Name: response.WorkerName,
+		ID: sessionID, WorkerID: workerID, Scope: response.Scope, Name: response.WorkerName,
 		Hostname: response.Hostname, WorkerGroup: response.WorkerGroup,
 		ConcurrencyLimit: response.ConcurrencyLimit, Capabilities: response.Capabilities,
 		SupportedJobTypes: response.SupportedJobTypes,
@@ -272,7 +272,11 @@ func validateClaimResponse(response api.ClaimResponse) error {
 		if hasAssignment || !response.SafeToAcknowledge {
 			return fmt.Errorf("control plane returned an inconsistent duplicate-notification response")
 		}
-	case workers.NoEligibleJob, workers.CapacityExhausted:
+	case workers.StaleNotification:
+		if hasAssignment || !response.SafeToAcknowledge {
+			return fmt.Errorf("control plane returned an inconsistent stale-notification response")
+		}
+	case workers.NoEligibleJob, workers.CapacityExhausted, workers.ForeignNotification:
 		if hasAssignment || response.SafeToAcknowledge {
 			return fmt.Errorf("control plane returned an inconsistent non-claim response")
 		}

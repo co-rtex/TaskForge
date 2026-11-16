@@ -24,6 +24,7 @@ import (
 
 	"github.com/co-rtex/TaskForge/internal/api"
 	"github.com/co-rtex/TaskForge/internal/queue"
+	"github.com/co-rtex/TaskForge/internal/queue/sqsbroker"
 	"github.com/co-rtex/TaskForge/internal/reconciler"
 	"github.com/co-rtex/TaskForge/internal/scheduler"
 	workerruntime "github.com/co-rtex/TaskForge/internal/worker"
@@ -41,8 +42,11 @@ const e2eLease = 4 * time.Second
 // Nothing here is simulated. A test that hand-wrote the recovery rows would
 // prove something about the test rather than about TaskForge.
 type e2eStack struct {
-	baseURL  string
-	broker   queue.Broker
+	baseURL string
+	// router is production routing on a base queue of this stack's own: the
+	// publisher publishes each event to its address's queue and every worker
+	// reads only its own (ADR-0029).
+	router   *isolatedRouter
 	control  *workerruntime.Client
 	registry *workerruntime.Registry
 
@@ -74,10 +78,10 @@ func startE2EStack(t *testing.T, registry *workerruntime.Registry, renotifyAfter
 	// flight for the queue's visibility timeout. reset() cannot drain what it
 	// cannot see, so sharing a queue would leak those deliveries into whichever
 	// test ran next.
-	broker := newBrokerForQueue(t, createIsolatedBrokerQueue(t, "taskforge-e2e-"))
+	router := newIsolatedRouter(t, "taskforge-e2e-")
 	stack := &e2eStack{
 		baseURL:  httpServer.URL,
-		broker:   broker,
+		router:   router,
 		control:  workerruntime.NewClient(httpServer.URL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey()),
 		registry: registry,
 	}
@@ -90,7 +94,7 @@ func startE2EStack(t *testing.T, registry *workerruntime.Registry, renotifyAfter
 	})
 
 	// The real publisher, scheduler, and reconciler, each on its own loop.
-	publisher := newPublisher(t, broker)
+	publisher := newRoutedPublisher(t, router)
 	stack.background.Add(1)
 	go func() {
 		defer stack.background.Done()
@@ -139,6 +143,13 @@ func startE2EStack(t *testing.T, registry *workerruntime.Registry, renotifyAfter
 	return stack
 }
 
+// ownQueue is the broker queue of testScope's default queue: where every job a
+// test submits through the stack's API is advertised.
+func (s *e2eStack) ownQueue(t *testing.T) *sqsbroker.Broker {
+	t.Helper()
+	return s.router.address(t, testScope, "default")
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -153,7 +164,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // startWorker runs a real DB-less worker against the stack until the test ends.
 func (s *e2eStack) startWorker(t *testing.T, name string, concurrency int) {
 	t.Helper()
-	runner := workerruntime.NewRunner(s.control, s.broker, s.registry, nil, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(s.control, s.router, s.registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: name, Hostname: name + ".local",
 			WorkerGroup: "default", ConcurrencyLimit: concurrency, Capabilities: []string{"cpu"},
@@ -365,7 +376,7 @@ func TestE2E_LostNotificationIsRepairedByBoundedRenotification(t *testing.T) {
 		events := eventsForJob(t, jobID)
 		return len(events) == 1 && events[0].Status == "PUBLISHED"
 	})
-	require.Positive(t, consumeAndDiscard(t, stack.broker, 20*time.Second),
+	require.Positive(t, consumeAndDiscard(t, stack.ownQueue(t), 20*time.Second),
 		"the delivery really happened before it was discarded")
 	require.Equal(t, "QUEUED", readJob(t, jobID).status,
 		"the job is claimable and unclaimed: reachable by nothing")
@@ -431,7 +442,7 @@ func TestE2E_CancellationReachesARunningHandlerThroughTheHeartbeat(t *testing.T)
 
 	// Drain the broker so nothing else could possibly wake the worker: whatever
 	// reaches it from here reaches it on the heartbeat.
-	drainBroker(t, stack.broker)
+	drainBroker(t, stack.ownQueue(t))
 
 	eventsBeforeCancel := len(eventsForJob(t, jobID))
 
@@ -637,7 +648,7 @@ func TestE2E_CancellingAQueuedJobStopsItBeforeAnyWorkerClaimsIt(t *testing.T) {
 func (s *e2eStack) startWorkerVia(t *testing.T, name string, concurrency int, controlURL string) {
 	t.Helper()
 	control := workerruntime.NewClient(controlURL, &http.Client{Timeout: 10 * time.Second}, currentWorkerKey())
-	runner := workerruntime.NewRunner(control, s.broker, s.registry, nil, workerruntime.RunnerConfig{
+	runner := workerruntime.NewRunner(control, s.router, s.registry, nil, workerruntime.RunnerConfig{
 		Registration: workers.Registration{
 			SessionID: uuid.New(), Name: name, Hostname: name + ".local",
 			WorkerGroup: "default", ConcurrencyLimit: concurrency, Capabilities: []string{"cpu"},

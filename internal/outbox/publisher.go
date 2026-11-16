@@ -29,7 +29,7 @@ type PublisherConfig struct {
 // are safe because claiming is serialized by the database.
 type Publisher struct {
 	store  *Store
-	broker queue.Publisher
+	broker queue.Router
 	cfg    PublisherConfig
 	log    *slog.Logger
 	rnd    *rand.Rand
@@ -58,7 +58,9 @@ type Stats struct {
 
 // NewPublisher builds a Publisher. Passing the random source in keeps jitter
 // deterministic under test.
-func NewPublisher(store *Store, broker queue.Publisher, cfg PublisherConfig, log *slog.Logger, rnd *rand.Rand) *Publisher {
+//
+// broker routes each event to the broker queue of its address (ADR-0029).
+func NewPublisher(store *Store, broker queue.Router, cfg PublisherConfig, log *slog.Logger, rnd *rand.Rand) *Publisher {
 	if cfg.BatchSize < 1 {
 		cfg.BatchSize = 50
 	}
@@ -108,7 +110,23 @@ func (p *Publisher) RunOnce(ctx context.Context) (Stats, error) {
 			continue
 		}
 
-		if err := p.broker.Publish(ctx, body); err != nil {
+		// An event with no job reference names no address. It can only be a
+		// row written before notifications carried job_id (migration 0009),
+		// and it is failed rather than guessed at: retried with backoff, it
+		// stays visible in the pending count instead of reaching a queue no
+		// claim could attribute it to.
+		if e.Address == (queue.Address{}) {
+			stats.Failed++
+			p.recordFailure(ctx, e, errors.New("event has no job reference to route by"))
+			continue
+		}
+		target, err := p.broker.Route(ctx, e.Address)
+		if err != nil {
+			stats.Failed++
+			p.recordFailure(ctx, e, err)
+			continue
+		}
+		if err := target.Publish(ctx, body); err != nil {
 			stats.Failed++
 			p.recordFailure(ctx, e, err)
 			continue
@@ -185,18 +203,36 @@ func (p *Publisher) Run(ctx context.Context) error {
 			p.log.Info("outbox publisher stopped")
 			return nil
 		case <-ticker.C:
-			stats, err := p.RunOnce(ctx)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				p.log.Error("outbox pass failed", slog.String("error", err.Error()))
-				continue
-			}
-			if stats.Published > 0 || stats.Failed > 0 || stats.AlreadyPublished > 0 {
-				p.log.Info("outbox pass complete",
-					slog.Int("claimed", stats.Claimed),
-					slog.Int("published", stats.Published),
-					slog.Int("failed", stats.Failed),
-					slog.Int("already_published", stats.AlreadyPublished))
-			}
+			p.drain(ctx)
+		}
+	}
+}
+
+// drain runs passes back to back for as long as each one claimed a full batch
+// and delivered every event in it.
+//
+// One pass per tick would cap delivery at BatchSize per PollInterval however
+// much is due, so a backlog left by a broker outage or a burst of submissions
+// would drain at that rate while new work queued behind it. A full batch is the
+// sign that more is due now; a short one means the backlog is gone. A failed
+// event ends the drain, so a broker that is down costs one batch of attempts per
+// tick, not a tight loop over the whole backlog.
+func (p *Publisher) drain(ctx context.Context) {
+	for {
+		stats, err := p.RunOnce(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			p.log.Error("outbox pass failed", slog.String("error", err.Error()))
+			return
+		}
+		if stats.Published > 0 || stats.Failed > 0 || stats.AlreadyPublished > 0 {
+			p.log.Info("outbox pass complete",
+				slog.Int("claimed", stats.Claimed),
+				slog.Int("published", stats.Published),
+				slog.Int("failed", stats.Failed),
+				slog.Int("already_published", stats.AlreadyPublished))
+		}
+		if err != nil || ctx.Err() != nil || stats.Claimed < p.cfg.BatchSize || stats.Failed > 0 {
+			return
 		}
 	}
 }
