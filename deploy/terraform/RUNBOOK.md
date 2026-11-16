@@ -44,6 +44,14 @@ Values in angle brackets are yours to fill in. Every command is run from
    `docker image inspect --format '{{.Architecture}}' taskforge-api:dev`.
 5. `cp terraform.tfvars.example terraform.tfvars` (gitignored) and fill it in. Leave every
    `*_desired_count` at 0 for the first apply.
+6. **Nothing in the account may stop the services creating SQS queues.** The outbox and the
+   worker create one queue per (scope, TaskForge queue), named
+   `taskforge-work-available-<16 hex>`, at run time, copying the base queue's attributes
+   (ADR-0029; the grants are in `iam.tf`, the reasons in ADR-0028, "Per-address notification
+   queues"). An SCP or permissions boundary that denies `sqs:CreateQueue`, or requires tags
+   on create, stops every notification for a new scope. The base queue is SSE-SQS, which is
+   copied and needs no KMS grant; moving it to SSE-KMS would need `kms:GenerateDataKey` and
+   `kms:Decrypt` on the key for both task roles, which `iam.tf` does not grant.
 
 ## 2. First deployment, in order
 
@@ -215,6 +223,14 @@ Every other container keeps a read-only root. Record the outcome in ADR-0028.
    new api an old worker, so a release may only ship if the api and the worker of adjacent
    versions work with each other. Configuration-only changes, such as the listeners and AWS
    mode (ADR-0026, ADR-0027), meet it; a change to the control protocol needs its own plan.
+   ADR-0029's per-address queues were such a change. A first deployment of this
+   configuration already runs them and needs no plan. Upgrading a deployment whose images
+   predate them has to run migration 0019 first, roll the api before the outbox and the
+   worker (a new worker needs the scope a new api returns, and exits without it), and accept
+   that notifications left on the base queue are not read: each such job is re-advertised
+   onto its own queue within `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` (60 s), and none is lost.
+   Rolling such an upgrade back leaves 0019 in place, which the old code ignores, and the
+   per-address queues behind, unread.
 
 ## 5. Known failure modes
 
@@ -236,19 +252,39 @@ Every other container keeps a read-only root. Record the outcome in ADR-0028.
   **unverified**.
 - **ECS Exec on Fargate is verified from the open-source EC2 agent's behavior, not
   Fargate's** (ADR-0027). If 2.5 fails with an error about a shell, record it in ADR-0028.
+- **Jobs stay `QUEUED` and the outbox or a worker logs `AccessDenied` on `CreateQueue` or
+  `GetQueueUrl`.** A per-address queue could not be created (prerequisite 6). Nothing is
+  lost: the job and its notification are in PostgreSQL, and the outbox retries with backoff
+  once the permission is fixed. A worker that cannot resolve its own queue exits, so its
+  service keeps restarting it until then.
+- **Per-address queue behavior is unverified on AWS.** Creating the queues, copying the base
+  queue's attributes (encryption among them), re-creating a queue that was deleted, and
+  AWS's 60 s refusal to reuse a deleted queue name were exercised against ElasticMQ only.
 
 ## 6. Teardown
 
 Deletion protection and the required final snapshot are deliberate. To destroy:
 
 1. Scale every service to 0: `terraform apply` with every `*_desired_count = 0`.
-2. Turn deletion protection off: `terraform apply -var db_deletion_protection=false`.
-3. Empty the results bucket (`aws s3 rm s3://<results-bucket> --recursive`) and delete the
+2. Delete the per-address notification queues. The services created them; they are not in
+   Terraform's state, and `terraform destroy` leaves them. With every service at 0 nothing
+   recreates them:
+
+   ```bash
+   for url in $(aws sqs list-queues --queue-name-prefix taskforge-work-available- \
+       --query 'QueueUrls[]' --output text); do
+     aws sqs delete-queue --queue-url "$url"
+   done
+   ```
+
+   The base queue, `taskforge-work-available`, is Terraform's and goes with step 5.
+3. Turn deletion protection off: `terraform apply -var db_deletion_protection=false`.
+4. Empty the results bucket (`aws s3 rm s3://<results-bucket> --recursive`) and delete the
    images in the seven ECR repositories. Neither is force-deleted by this configuration.
-4. `terraform destroy`. RDS takes the final snapshot `<name>-final`, which fails if a
+5. `terraform destroy`. RDS takes the final snapshot `<name>-final`, which fails if a
    snapshot of that name already exists; delete or rename the old one first. The snapshot
    is kept, and keeps costing storage, until you delete it.
-5. The two secrets enter their recovery window (`secret_recovery_window_days`, default
+6. The two secrets enter their recovery window (`secret_recovery_window_days`, default
    7). **Re-applying within that window fails**: the secret names `<name>/database-url` and
    `<name>/worker-key` are still taken by the deleted secrets. Wait the window out, restore
    them (`aws secretsmanager restore-secret`), or use a different `name`. The state bucket is

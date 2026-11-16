@@ -165,22 +165,25 @@ call with `BucketAlreadyOwnedByYou` or `IllegalLocationConstraintException` is
 The execution role (ECS itself) pulls from the seven repositories (`ecr:GetAuthorizationToken`
 has no resource-level permission and is `*`), writes to the seven log groups, and reads
 exactly the two secrets. Each task role grants what its binary's code calls, and nothing
-else; SQS and S3 grants name the one queue and the one bucket.
+else; SQS grants name the base queue and its per-address queues (`<base>-*`, ADR-0029), and S3
+grants the one bucket.
 
 | Role | Action | Resource | Call site (the binary reaches it through) |
 | --- | --- | --- | --- |
 | api | `s3:GetObject` | bucket `/*` | `internal/objectstore/objectstore.go:200`, via `s.objects.Get` at `internal/api/server.go:498` |
 | api | `ssmmessages:{Create,Open}{Control,Data}Channel` | `*` | not the binary: the SSM agent ECS Exec injects into the task ([ECS Exec permissions](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html#ecs-exec-required-iam-permissions)) |
-| outbox | `sqs:GetQueueUrl` | the queue | `internal/queue/sqsbroker/sqsbroker.go:65`, via `sqsbroker.New` at `cmd/taskforge-outbox/main.go:91` |
-| outbox | `sqs:SendMessage` | the queue | `sqsbroker.go:103`, via `p.broker.Publish` at `internal/outbox/publisher.go:111` |
-| outbox | `sqs:GetQueueAttributes` | the queue | `sqsbroker.go:155` (`Ping`), via the readiness check at `cmd/taskforge-outbox/main.go:117` |
-| worker | `sqs:GetQueueUrl` | the queue | `sqsbroker.go:65`, via `sqsbroker.New` at `cmd/taskforge-worker/main.go:95` |
-| worker | `sqs:ReceiveMessage` | the queue | `sqsbroker.go:121`, via `r.broker.Receive` at `internal/worker/runner.go:271` |
-| worker | `sqs:DeleteMessage` | the queue | `sqsbroker.go:143`, via `r.broker.Delete` at `internal/worker/runner.go:798` |
-| worker | `sqs:GetQueueAttributes` | the queue | `sqsbroker.go:155` (`Ping`), via the readiness check at `cmd/taskforge-worker/main.go:158` |
-| worker | `s3:CreateBucket` | the bucket | `internal/objectstore/objectstore.go:148` (`EnsureBucket`), at `cmd/taskforge-worker/main.go:110` |
-| worker | `s3:ListBucket` (authorizes `HeadBucket`) | the bucket | `objectstore.go:171` (`Ping`), via the readiness check at `cmd/taskforge-worker/main.go:160` |
-| worker | `s3:PutObject` | bucket `/*` | `objectstore.go:183`, via `r.objects.Put` at `internal/worker/runner.go:667` |
+| outbox | `sqs:GetQueueUrl` | the base queue | `internal/queue/sqsbroker/sqsbroker.go:106`, via `sqsbroker.NewRouter` at `cmd/taskforge-outbox/main.go:93` |
+| outbox | `sqs:GetQueueAttributes` | the base queue | `sqsbroker.go:209` (`Ping`), via the readiness check at `cmd/taskforge-outbox/main.go:119`; and `sqsbroker.go:295`, the template read when an address's queue is created |
+| outbox | `sqs:GetQueueUrl`, `sqs:CreateQueue` | `<base>-*` | `sqsbroker.go:289`, `:308`, `:314` (`Router.resolveOrCreate`), via `p.broker.Route` at `internal/outbox/publisher.go:123`, and again from `Broker.do` (`sqsbroker.go:74`) when a queue has disappeared |
+| outbox | `sqs:SendMessage` | `<base>-*` | `sqsbroker.go:145`, via `target.Publish` at `internal/outbox/publisher.go:129` |
+| worker | `sqs:GetQueueUrl` | the base queue | `sqsbroker.go:106`, via `sqsbroker.NewRouter` at `cmd/taskforge-worker/main.go:98` |
+| worker | `sqs:GetQueueAttributes` | the base queue | `sqsbroker.go:209` (`Ping`), via the readiness check at `cmd/taskforge-worker/main.go:161`; and `sqsbroker.go:295`, the creation template |
+| worker | `sqs:GetQueueUrl`, `sqs:CreateQueue` | `<base>-*` | `sqsbroker.go:289`, `:308`, `:314`, via `r.router.Route` at `internal/worker/runner.go:190`, and again from `Broker.do` |
+| worker | `sqs:ReceiveMessage` | `<base>-*` | `sqsbroker.go:168`, via `r.broker.Receive` at `internal/worker/runner.go:294` |
+| worker | `sqs:DeleteMessage` | `<base>-*` | `sqsbroker.go:195`, via `r.broker.Delete` at `internal/worker/runner.go:844` |
+| worker | `s3:CreateBucket` | the bucket | `internal/objectstore/objectstore.go:148` (`EnsureBucket`), at `cmd/taskforge-worker/main.go:113` |
+| worker | `s3:ListBucket` (authorizes `HeadBucket`) | the bucket | `objectstore.go:171` (`Ping`), via the readiness check at `cmd/taskforge-worker/main.go:162` |
+| worker | `s3:PutObject` | bucket `/*` | `objectstore.go:183`, via `r.objects.Put` at `internal/worker/runner.go:713` |
 | reconciler, scheduler | none | | their mains import neither `internal/queue/sqsbroker` nor `internal/objectstore` |
 | migrate | no task role | | it calls no AWS API |
 
@@ -190,17 +193,17 @@ policy (`operator_exec_policy_arn`, output, attached to no one) allows `ecs:Exec
 only where `ecs:container-name` is `cli`, plus `ecs:ListTasks` and `ecs:DescribeTasks` in
 the cluster.
 
-### Per-address notification queues (PR #34)
+### Per-address notification queues (ADR-0029)
 
-PR #34 (its ADR, "Scope-addressed notification streams and claimability-gated
-re-notification") gives each (scope, queue) address a broker queue of its own, named
+[ADR-0029](0029-scope-addressed-notification-streams.md) (PR #34) gives each (scope, queue)
+address a broker queue of its own, named
 `<TASKFORGE_BROKER_QUEUE_NAME>-<16 hex>`, which the outbox and the workers resolve and, if it
 does not exist yet, create, copying the base queue's `VisibilityTimeout`,
 `MessageRetentionPeriod`, `DelaySeconds`, `ReceiveMessageWaitTimeSeconds`,
 `MaximumMessageSize` and encryption attributes. `iam.tf` grants what that code calls, on
 `<base queue ARN>-*` only:
 
-| Role | Action | Resource | Call site (PR #34's `internal/queue/sqsbroker/sqsbroker.go`) |
+| Role | Action | Resource | Call site (`internal/queue/sqsbroker/sqsbroker.go`) |
 | --- | --- | --- | --- |
 | outbox, worker | `sqs:GetQueueUrl` | `<base>-*` | `Router.resolveOrCreate`, first lookup and after a lost creation race |
 | outbox, worker | `sqs:CreateQueue` | `<base>-*` | `Router.resolveOrCreate`, and again when an operation reports the queue missing (`Broker.do`) |
@@ -208,11 +211,13 @@ does not exist yet, create, copying the base queue's `VisibilityTimeout`,
 | outbox | `sqs:SendMessage` | `<base>-*` | `Broker.Publish` on an address's queue |
 | worker | `sqs:ReceiveMessage`, `sqs:DeleteMessage` | `<base>-*` | `Broker.Receive` and `Broker.Delete` on its own address's queue |
 
-The base-queue grants are kept unchanged, so this policy is correct whether this branch or
-PR #34 reaches `main` first. Once both are in, the base queue's `SendMessage`,
-`ReceiveMessage` and `DeleteMessage` are unused and can be removed, and the call-site table
-above should be refreshed against the merged code (the `terraform_env_test.go` guard on the
-binaries that import `sqsbroker` will fail when PR #34's code arrives, which is the prompt).
+The base queue's `SendMessage`, `ReceiveMessage` and `DeleteMessage` grants (the
+`PublishNotifications` and `ConsumeNotifications` statements) are no longer called by the code:
+since ADR-0029 every send, receive and delete is on an address's queue. They are kept because
+removing them is a separate least-privilege change, and the call-site table above lists only
+what the code calls. The `terraform_env_test.go` guard on which binaries import `sqsbroker`
+still holds, because ADR-0029 changed what the outbox and the worker call, not which binaries
+call it; a change to the calls themselves is caught only by reviewing this table.
 
 What this means for operating it, none of it verified against AWS (the only broker these
 queues were exercised against is the local ElasticMQ):
