@@ -20,7 +20,7 @@ import (
 // else.
 const (
 	// govulncheck runs under the Go in go.mod, so its tag must be one that builds
-	// with that Go: v1.8.0 declares go 1.26.0 and builds with go.mod's 1.27.3.
+	// with that Go: v1.8.0 declares go 1.26.0 and builds with go.mod's 1.27.4.
 	// Raise this when go.mod's Go does.
 	govulncheckVersion = "v1.8.0"
 
