@@ -5595,7 +5595,7 @@ missing smokes and the AWS audit. What it found and did:
   returns no `scope`, and a new worker then exits rather than guess a queue (rollout order
   below).
 
-**Gates**, on `fc84287` in this session's Linux container (Go 1.27.3, as `main` still pins;
+**Gates**, on `fc84287` in this session's Linux container (Go 1.27.3, which `main` pinned then;
 Docker 29.9.2), against the stack `make up` starts:
 
 | Command | Result | Real output |
@@ -5616,11 +5616,13 @@ revision label from copies of the two Dockerfiles that add the proxy CA to the G
 and Node deps stages only, never a runtime stage; hosted CI builds them from the committed
 files, and its "Container images" job runs both smokes.
 
-**The supply-chain check depends on PR #35.** It fails on GO-2026-6859 in Go 1.27.3, which
-`main` still pins. PR #35 moves `go.mod` and the builder to 1.27.4, and its hosted CI passes
-all eight checks, the scan reporting `govulncheck no findings (go1.27.4, scanner v1.8.0,
-database modified 2026-11-11T02:51:11Z)`. Once it is on `main` and `main` is merged into this
-branch, this branch's scan is expected to pass; that has not been observed yet.
+**The supply-chain check and PR #35.** On Go 1.27.3 the check failed on GO-2026-6859 alone.
+PR #35 moved `go.mod` and the builder to 1.27.4 (its hosted CI passed all eight checks, the
+scan reporting `govulncheck no findings (go1.27.4, scanner v1.8.0, database modified
+2026-11-11T02:51:11Z)`), and `main` with that change was merged into this branch in
+`00bd7d5`, whose only conflict was this document's opening sentence. This branch's checks
+after that merge are recorded on the pull request, since a commit cannot contain its own CI
+result.
 
 ### Limitations
 
@@ -7494,7 +7496,7 @@ Notification reachability across scopes and for unclaimable jobs, which the audi
 for the owner, is resolved (PR #34, ADR-0029). What it leaves open, for the owner: whether to
 record a session's TaskForge queue at registration so the claimability gate can see it.
 The IAM grants PR #31's Terraform needs for per-address queues are in PR #36, stacked on it,
-and the Go 1.27.4 toolchain this branch's supply-chain check waits on is PR #35.
+and the Go 1.27.4 toolchain is PR #35 ("Go 1.27.4 toolchain" above).
 
 Smaller items available to whoever wants them, none blocking M8:
 
