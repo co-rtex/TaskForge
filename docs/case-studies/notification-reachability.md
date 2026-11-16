@@ -89,7 +89,10 @@ is weighed in ADR-0029.
 ## 8. Costs and limitations
 
 Per-address queues are created by the application, which needs `sqs:CreateQueue` on a name
-prefix and leaves queue retirement to operators. Messages on the old shared queue are
+prefix (PR #36 grants it in the draft Terraform) and leaves queue retirement to operators. A
+review pass found that a queue disappearing after it was resolved stalled delivery until
+restart; an address's queue is now recreated by the next operation that finds it missing.
+None of the per-address queue behavior was exercised on AWS SQS, only on ElasticMQ. Messages on the old shared queue are
 repaired by re-notification after an upgrade, not read. Within one address, workers with
 different capabilities still meet a held notification at random. The gate cannot see which
 queue a session polls. ADR-0029 records each, and none weakens a correctness guarantee.

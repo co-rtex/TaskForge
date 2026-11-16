@@ -5485,16 +5485,88 @@ On 2026-11-16, in this session's Linux container, against the stack `make up` st
 | `make images-smoke`, `make topology-smoke`, `make scan`, `make sdk-*`, `make dash-*` | NOT RUN locally | the topology smoke's queue handling changed (it now also creates and deletes its address queue) and is not exercised here; the SDK and the dashboard are untouched |
 | Hosted CI on PR #34 at `93ea644` (run 43796116115) | 7 of 8 PASS; supply-chain scan **FAIL** | lint/build/unit/OpenAPI, migrations and integration (with the demonstrations and bench smoke), race, container images, dashboard, and both SDK jobs pass. The scan fails on govulncheck `GO-2026-6859` (stdlib `net/http`, Go 1.27.3, fixed in 1.27.4; database modified 2026-11-11), reached through `internal/worker/client.go` `Ping`, which is unchanged on `main`; gitleaks, pip-audit and npm audit report no findings. It is a new advisory against the toolchain, not this change, and is left to a toolchain bump of its own, as PRs #26 and #32 were. |
 
+### Review round (second session, 2026-11-16)
+
+An independent review of the branch, reading the code rather than the tests, with the
+missing smokes and the AWS audit. What it found and did:
+
+- **Fixed: an address's queue that disappeared stalled delivery until restart.** Routes
+  were resolved once and cached, so after the local ElasticMQ restarts (it keeps queues in
+  memory and recreates only the configured base) or an operator deletes one, the publisher
+  failed every event and a worker every receive until each process restarted; before
+  ADR-0029 the one queue came back with the broker. No job could be lost (the events stay
+  `PENDING` in PostgreSQL), but nothing was delivered. An address's broker now re-resolves,
+  creating the queue from the base's attributes again, when an operation reports the queue
+  missing, and retries once. `TestRouting_AnAddressQueueThatDisappearsIsRecreated` failed
+  before (the publish returned the missing-queue error) and passes after;
+  `TestRouting_AnAddressResolvesOnceTheBrokerIsBack` pins that a resolution attempted while
+  the broker is unreachable fails and is not cached.
+- **Fixed: two concurrent tests asserted from spawned goroutines,** where `require` cannot
+  stop a test; their racers now hand errors back to the test goroutine, and the routing race
+  also asserts that every racer resolved. One matrix citation moved with its assertion.
+- **Fixed: the ADR number.** PR #31 (dated 2026-10-17) already holds ADR-0028, so this
+  change's record is ADR-0029. Migration 0019's comments carried the number; 0019 has run
+  only against throwaway test databases, so they were corrected before it ships.
+- **Fixed: ADR-0029 claimed the gate's cost was measured.** It was not under a stranded
+  backlog; the ADR now says what was measured.
+- **Found, outside this branch:** PR #31's task roles granted SQS actions on the base queue
+  alone, so with this change every address would be refused. PR #36, stacked on #31, grants
+  exactly what the code calls on `<base>-*` and records rollout and rollback. See
+  "Limitations".
+- **Checked and left as is:** the re-notification scan uses `jobs_renotify_due_idx` at
+  volume (20,000 `QUEUED` jobs, analyzed, inside a rolled-back transaction: `Index Scan
+  using jobs_renotify_due_idx`, 50 rows, 52 shared buffer hits, 0.088 ms) and the gate's
+  session lookup is an index-only scan on `worker_sessions_healthy_scope_idx`; the
+  publisher can create a queue only for an address some job has, since `jobs.queue`
+  references `queues`; a stale or foreign decision rests only on immutable or monotone
+  columns; legacy events without a job reference keep their old claim answers; an old api
+  returns no `scope`, and a new worker then exits rather than guess a queue (rollout order
+  below).
+
+**Gates**, on `fc84287` in this session's Linux container (Go 1.27.3, as `main` still pins;
+Docker 29.9.2), against the stack `make up` starts:
+
+| Command | Result | Real output |
+| --- | --- | --- |
+| `make lint` | PASS | `go vet ./...` silent |
+| `make test-unit` | PASS | 33 packages `ok`; matrix check 32 rows (I1–I20, S1–S12) |
+| `make test-integration` | PASS | `ok .../tests/integration 108.987s` |
+| `make test-race` | PASS | every package `ok`; `ok .../tests/integration 119.818s`; no `DATA RACE` |
+| `make demo`, `make demo-failure`, `make bench-smoke` | PASS | 21 of 21, 25 of 25, 14 of 14 |
+| images, then `go run ./scripts/imagesmoke` | PASS | `RESULT: PASS (47 of 47 checks met)` |
+| `go run ./scripts/topologysmoke` | PASS | `7 of 7 rows passed; 52 of 52 checks met` |
+| broker queues after all of the above | clean | `ListQueues` returns only `taskforge-work-available`: every derived queue the tests, demonstrations, smokes and bench smoke created was deleted |
+| `make scan` | NOT RUN locally | the network policy refuses `vuln.go.dev` and the gitleaks image's blob host; hosted CI runs it |
+
+`make images` could not run unmodified here: the dashboard's Node build container does not
+trust this environment's TLS proxy. The images were built with the same targets and
+revision label from copies of the two Dockerfiles that add the proxy CA to the Go builder
+and Node deps stages only, never a runtime stage; hosted CI builds them from the committed
+files, and its "Container images" job runs both smokes.
+
+**The supply-chain check depends on PR #35.** It fails on GO-2026-6859 in Go 1.27.3, which
+`main` still pins. PR #35 moves `go.mod` and the builder to 1.27.4, and its hosted CI passes
+all eight checks, the scan reporting `govulncheck no findings (go1.27.4, scanner v1.8.0,
+database modified 2026-11-11T02:51:11Z)`. Once it is on `main` and `main` is merged into this
+branch, this branch's scan is expected to pass; that has not been observed yet.
+
 ### Limitations
 
 - **Upgrade.** Messages already on the old shared queue are not read by new workers; each
   such job is repaired by re-notification within one interval once a new worker that could
-  claim it is registered. Upgrade the workers and the outbox together.
-- **AWS.** The outbox's and workers' roles need `sqs:GetQueueUrl`, `sqs:CreateQueue` and
-  `sqs:GetQueueAttributes` on `<base>-*`, and an address's queue is never deleted by
-  TaskForge. The Terraform under review in PR #31 is not changed here and must add these
-  before it is applied. Attribute copying, including the encryption attributes, was verified
-  on ElasticMQ only, not on AWS SQS.
+  claim it is registered. Apply 0019 and roll the api first (a new worker needs the `scope`
+  registration returns, and exits without it), then the outbox and the workers together.
+  Rolling back leaves 0019, which the old code ignores except that its stranded-job scan
+  loses the index 0019 replaced; old re-notification re-advertises each job onto the base
+  queue within one interval, and the address queues stay behind, unread.
+- **AWS.** The outbox needs `sqs:GetQueueUrl`, `sqs:CreateQueue` and `sqs:SendMessage` on
+  `<base>-*`, the workers `sqs:GetQueueUrl`, `sqs:CreateQueue`, `sqs:ReceiveMessage` and
+  `sqs:DeleteMessage`, and both keep their base-queue grants. PR #31 as drafted lacks them;
+  PR #36 adds them and must be in #31 before it is applied. Address queues are outside
+  Terraform state and never deleted by TaskForge. Queue creation, attribute copying (SSE-SQS
+  among them), the missing-queue re-creation and the creation race were exercised on
+  ElasticMQ only, not on AWS SQS; AWS's 60 s refusal to recreate a deleted name is
+  documented behavior, not observed here.
 - **Within one address**, workers with different capabilities still share a queue, so a
   held notification reaches a minority-capable worker at random; the bound is now
   ADR-0029's I4 (one re-notification interval after such a worker could claim) rather than
@@ -7348,8 +7420,9 @@ as a decision, and changing the defaults would require re-measuring.
 
 Notification reachability across scopes and for unclaimable jobs, which the audit left open
 for the owner, is resolved (PR #34, ADR-0029). What it leaves open, for the owner: whether to
-record a session's TaskForge queue at registration so the claimability gate can see it, and
-the IAM and wildcard-resource grants PR #31's Terraform needs for per-address queues.
+record a session's TaskForge queue at registration so the claimability gate can see it.
+The IAM grants PR #31's Terraform needs for per-address queues are in PR #36, stacked on it,
+and the Go 1.27.4 toolchain this branch's supply-chain check waits on is PR #35.
 
 Smaller items available to whoever wants them, none blocking M8:
 

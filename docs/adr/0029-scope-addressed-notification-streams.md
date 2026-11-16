@@ -64,8 +64,11 @@ claim chooses among. Each address is delivered on its own broker queue, named
   it with `CreateQueue`, copying the base queue's visibility timeout, retention, delay,
   long-poll default, size limit and encryption attributes, so the operator configures the
   family once, on the base queue. Either side may be first; creation is idempotent and a
-  lost creation race resolves the winner's queue. The base queue must still exist: it is
-  the template and the readiness target.
+  lost creation race resolves the winner's queue. An address's queue that disappears after
+  it was resolved (a broker restart that keeps queues in memory, as ElasticMQ does, brings
+  back only the configured base; an operator may delete one) is resolved or created again
+  by the next operation that reports it missing, which is then retried once. The base queue
+  must still exist: it is the template and the readiness target.
 - `TASKFORGE_BROKER_QUEUE_NAME` is validated as a standard-queue name of at most 63
   characters, so every derived name fits SQS's 80.
 
@@ -194,22 +197,38 @@ tenants' worker counts. Re-notification traffic is proportional to claimable str
 
 **Negative and operational.**
 
-- One broker queue per address, created by the application. On AWS the outbox's and the
-  workers' roles need `sqs:GetQueueUrl`, `sqs:CreateQueue` and `sqs:GetQueueAttributes` on
-  `arn:aws:sqs:<region>:<account>:<base>-*` besides the existing send/receive/delete, and a
-  queue is never deleted by TaskForge: retiring a scope's queues is an operator action. The
-  Terraform under review in PR #31 is not changed by this record and must add these grants
-  and the wildcard resource before it is applied.
+- One broker queue per address, created by the application. On AWS the outbox needs
+  `sqs:GetQueueUrl`, `sqs:CreateQueue` and `sqs:SendMessage` on
+  `arn:aws:sqs:<region>:<account>:<base>-*`, and the workers `sqs:GetQueueUrl`,
+  `sqs:CreateQueue`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` there; both keep
+  `sqs:GetQueueUrl` and `sqs:GetQueueAttributes` on the base queue (the template and
+  readiness). PR #31's Terraform granted SQS actions on the base queue alone, which would
+  refuse every address; PR #36, stacked on it, adds exactly these grants. A queue is never
+  deleted by TaskForge or by `terraform destroy`: the address queues are outside Terraform
+  state, and retiring them is an operator action. Their number is bounded by scopes that
+  have jobs × configured queues (`jobs.queue` references `queues`), plus one stray, empty
+  queue per misspelt `TASKFORGE_WORKER_QUEUE` a worker is started with.
+- Only the attributes listed in §1 are copied: not a redrive policy (deliberately), not a
+  queue access policy, not tags. An organization that requires tags on create would refuse
+  `CreateQueue`. A base queue on SSE-KMS would make the creating roles need the key's
+  `kms:GenerateDataKey` and `kms:Decrypt`. None of this was exercised on AWS SQS; every
+  routing test ran against ElasticMQ.
 - An upgrade is not seamless for messages already on the old shared queue: new workers do
   not read it. Each such job is repaired by re-notification within one interval, into its
   address's queue, as soon as a new worker that could claim it is registered. Old workers
   that keep reading the shared queue receive `FOREIGN_NOTIFICATION` for other scopes'
   events (they treat an unknown outcome as a claim error and do not acknowledge, which is
-  safe), and old workers ignore the new `scope` field. Upgrade the workers and the outbox
-  together.
+  safe), and old workers ignore the new `scope` field. Order: apply migration 0019 and roll
+  the api first, since a new worker needs the `scope` registration now returns and exits
+  when it is absent; then roll the outbox and the workers together. Rolling the code back
+  leaves 0019 in place, which the old code ignores, apart from its stranded-job scan losing
+  the index 0019 replaced; the old, ungated re-notification re-advertises each `QUEUED` job
+  onto the base queue within one interval, and the address queues stay behind, unread.
 - A deferral costs a job up to one more re-notification interval after a session that could
-  claim it appears, when its earlier notification was genuinely lost. Measured cost of the
-  extra reads is recorded in [CURRENT_STATE.md](../CURRENT_STATE.md).
+  claim it appears, when its earlier notification was genuinely lost. The gate's extra reads
+  were not measured under a large stranded backlog; [CURRENT_STATE.md](../CURRENT_STATE.md)
+  records that the scan uses its index at 20,000 queued jobs and that the recorded benchmark,
+  which has no stranded backlog, met the same targets.
 
 **Known and accepted.**
 
