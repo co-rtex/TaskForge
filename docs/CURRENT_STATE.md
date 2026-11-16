@@ -2,8 +2,8 @@
 
 This document is the source of truth for what is runnable now and what remains
 planned. It records the implemented state through M8C2, including the Go 1.27.2
-toolchain bump that came between M8D3 and M8D4, the Go 1.27.3 bump after M8C2, and the
-correctness audit that followed it. Each milestone's line
+toolchain bump that came between M8D3 and M8D4, the Go 1.27.3 bump after M8C2, the
+correctness audit that followed it, and the Go 1.27.4 bump after the audit. Each milestone's line
 below says whether it is complete and names the pull request that holds its
 review; none says anything about merge state, which a document cannot keep
 current. M6 as a whole was already complete with M6D, its last slice; M6E is a
@@ -118,6 +118,9 @@ M8D1, M8D2, M8D3, M8D4, M8D5, M8C1 and M8C2 are complete and M8C3 is planned.
 - **Go 1.27.3 toolchain (maintenance after M8C2, not a milestone):** see PR #32. `go.mod`
   and the image builder move to Go 1.27.3 for GO-2026-6809, and `make scan` passes again.
   No behavior changed. See "Go 1.27.3 toolchain" below.
+- **Go 1.27.4 toolchain (maintenance after the correctness audit, not a milestone):** see
+  PR #35. `go.mod` and the image builder move to Go 1.27.4 for GO-2026-6859, the advisory
+  that turned `make scan` red. No behavior changed. See "Go 1.27.4 toolchain" below.
 - **Correctness audit (maintenance after M8C2, not a milestone):** see PR #33. A worker now renews its
   lease while it uploads a large result. Before, renewal stopped when the handler returned,
   so an upload that outlasted the lease's remaining window cost the attempt a success that
@@ -5040,6 +5043,75 @@ none of these gates is a timed benchmark run.
 
 ---
 
+## Go 1.27.4 toolchain
+
+Maintenance after the correctness audit, not a milestone: `make scan` turned red on `main`
+(`98dbe3f`) once the vulnerability database modified 2026-11-11T02:51:11Z carried
+GO-2026-6859, and this change is what makes it pass. Like the 1.27.2 and 1.27.3 changes, it
+follows [ADR-0021](adr/0021-container-images-and-supply-chain-scanning.md)'s rule that the
+image builder is pinned to exactly `go.mod`'s Go, and changes no behavior. See PR #35.
+
+### What changed
+
+- **`go.mod`:** `go 1.27.4`, still with no `toolchain` line. 1.27.4 is the first 1.27
+  release fixed for GO-2026-6859 (CVE-2026-97054, `net/http`): when `MaxBytesReader`'s limit
+  is exceeded, the `Connection: close` header is set without synchronization and can race a
+  handler's own header write, crashing an HTTP/1 server. The report affects 1.27.0 through
+  1.27.3 (and releases before 1.26.11). govulncheck reaches it through `net/http.body.Close`
+  from `internal/worker/client.go` (`Ping`); `taskforge-api` also caps every request body
+  with `MaxBytesReader` (AGENTS.md section 10), so the server side is in scope too. `go mod
+  tidy` under 1.27.4 changes nothing else.
+- **`Dockerfile`:** the builder is `golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d`,
+  the official image's multi-platform index, resolved on 2026-11-16 with `docker buildx
+  imagetools inspect golang:1.27.4`. `tests/verification` holds it equal to `go.mod`.
+- **`scripts/scan`:** govulncheck stays at v1.8.0, which builds with 1.27.4; only its comment
+  names the new Go.
+- **`README.md`** and "Local environment" below: the prerequisite is Go 1.27.4 or newer.
+
+### Evidence
+
+**The advisory and the release.** The report (`data/reports/GO-2026-6859.yaml` in
+`golang.org/x/vulndb` at `v0.0.0-20261111025111-e91d8491530f`, fetched through the Go module
+proxy) lists `fixed: 1.27.4`, `vulnerable_at: 1.27.3`. Go 1.27.4 itself was fetched from the
+module proxy (`GOTOOLCHAIN=go1.27.4 go version` printed `go1.27.4 linux/amd64`).
+
+**The scan, before.** Hosted CI on PR #34 (run 43796116115), at a commit whose `go.mod` was
+`main`'s: `FAIL govulncheck GO-2026-6859 stdlib net/http.body.Close@v1.27.3, called from
+internal/worker/client.go:543 (Ping) ... (fixed in v1.27.4)`; gitleaks, pip-audit and npm
+audit `no findings`. **After:** hosted CI on this change's pull request, not recorded here
+because a commit cannot contain its own CI result.
+
+**The invariant.** With the builder set back to `golang:1.27.3` and `go.mod` at 1.27.4,
+`TestDockerfile_BuilderGoVersionIsExactlyGoMods` fails (expected `"1.27.4"`, actual
+`"1.27.3"`); reverted, it passes.
+
+**Gates**, on 2026-11-16 in a Linux container (Go 1.27.4 linux/amd64, Docker 29.9.2) against
+the stack `make up` starts, on `6dd59b1`:
+
+| Command | Result |
+| --- | --- |
+| `make build` | PASS: seven binaries, each `go version` = `go1.27.4` |
+| `make lint` | PASS: `go vet ./...` silent |
+| `make test-unit` | PASS: 32 packages `ok` |
+| `make test-integration` | PASS: `ok  .../tests/integration  102.165s` |
+| `make test-race` | PASS: every package `ok`; `ok  .../tests/integration  121.563s`; no `DATA RACE` |
+| `make demo`, `make demo-failure`, `make bench-smoke` | PASS: 21 of 21, 25 of 25, 14 of 14 |
+| images, then `go run ./scripts/imagesmoke` | PASS: `RESULT: PASS (47 of 47 checks met)`; the api, worker and outbox binaries copied out of their images report `go1.27.4` |
+| `go run ./scripts/topologysmoke` | PASS: `7 of 7 rows passed; 52 of 52 checks met` |
+| `make scan` | pip-audit `no findings`; govulncheck, gitleaks and npm audit **NOT RUN**: this environment's network policy refuses `vuln.go.dev` and the gitleaks image's blob host, and the dashboard's Node build container does not trust its TLS proxy. Hosted CI runs all four |
+
+`make images` could not run unmodified here for the same TLS reason: the images were built
+with the same `docker build --target <service>` and the same revision label, from copies of
+the two Dockerfiles that add the environment's proxy CA to the Go builder and Node deps
+stages only, never to a runtime stage. Hosted CI builds them from the committed files.
+
+### Limitations
+
+- **No benchmark was re-run;** whether 1.27.4 moves any recorded figure is not measured.
+- **Local scanning was partial** (above); the authoritative scan is hosted CI's.
+
+---
+
 ## Correctness audit after M8C2
 
 Maintenance after M8C2, not a milestone, like the Go 1.27.2 toolchain bump: a review of the
@@ -7112,7 +7184,7 @@ moves.
 
 ## Local environment
 
-- Go 1.27.3 or newer (`go.mod` names the patch release; an older toolchain downloads
+- Go 1.27.4 or newer (`go.mod` names the patch release; an older toolchain downloads
   it under the default `GOTOOLCHAIN=auto`)
 - PostgreSQL 16 on `localhost:5442`
 - ElasticMQ on `localhost:9324`
