@@ -1,7 +1,8 @@
 # IAM, least privilege. docs/adr/0028-deployment-shape-on-aws.md maps every task-role action
 # below to the file:line call site in the binary that needs it, and every such call site to
-# an action here. SQS and S3 grants name the one queue and the one bucket; nothing on them
-# is "*".
+# an action here. SQS and S3 grants name the base queue, the base queue's per-address queues
+# ("<base>-*", see "Per-address notification queues" in that ADR) and the one bucket;
+# nothing on them is "*".
 
 data "aws_iam_policy_document" "ecs_tasks_assume" {
   statement {
@@ -93,6 +94,14 @@ data "aws_iam_policy_document" "outbox" {
     actions   = ["sqs:GetQueueUrl", "sqs:SendMessage", "sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.work_available.arn]
   }
+  # Per-address queues (PR #34): each (scope, queue) address has a queue named
+  # "<base>-<16 hex>", which the outbox resolves, creates from the base queue's attributes
+  # (read with GetQueueAttributes above) when it does not exist yet, and publishes to.
+  statement {
+    sid       = "PublishToAddressQueues"
+    actions   = ["sqs:GetQueueUrl", "sqs:CreateQueue", "sqs:SendMessage"]
+    resources = ["${aws_sqs_queue.work_available.arn}-*"]
+  }
 }
 
 data "aws_iam_policy_document" "worker" {
@@ -100,6 +109,14 @@ data "aws_iam_policy_document" "worker" {
     sid       = "ConsumeNotifications"
     actions   = ["sqs:GetQueueUrl", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.work_available.arn]
+  }
+  # Per-address queues (PR #34): a worker reads only the queue of its own scope and
+  # TASKFORGE_WORKER_QUEUE, and creates it from the base queue's attributes if the outbox has
+  # not yet.
+  statement {
+    sid       = "ConsumeAddressQueue"
+    actions   = ["sqs:GetQueueUrl", "sqs:CreateQueue", "sqs:ReceiveMessage", "sqs:DeleteMessage"]
+    resources = ["${aws_sqs_queue.work_available.arn}-*"]
   }
   # CreateBucket (EnsureBucket at startup) and ListBucket (which authorizes HeadBucket,
   # the readiness check) act on the bucket itself.

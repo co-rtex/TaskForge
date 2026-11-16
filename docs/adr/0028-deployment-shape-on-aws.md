@@ -190,6 +190,65 @@ policy (`operator_exec_policy_arn`, output, attached to no one) allows `ecs:Exec
 only where `ecs:container-name` is `cli`, plus `ecs:ListTasks` and `ecs:DescribeTasks` in
 the cluster.
 
+### Per-address notification queues (PR #34)
+
+PR #34 (its ADR, "Scope-addressed notification streams and claimability-gated
+re-notification") gives each (scope, queue) address a broker queue of its own, named
+`<TASKFORGE_BROKER_QUEUE_NAME>-<16 hex>`, which the outbox and the workers resolve and, if it
+does not exist yet, create, copying the base queue's `VisibilityTimeout`,
+`MessageRetentionPeriod`, `DelaySeconds`, `ReceiveMessageWaitTimeSeconds`,
+`MaximumMessageSize` and encryption attributes. `iam.tf` grants what that code calls, on
+`<base queue ARN>-*` only:
+
+| Role | Action | Resource | Call site (PR #34's `internal/queue/sqsbroker/sqsbroker.go`) |
+| --- | --- | --- | --- |
+| outbox, worker | `sqs:GetQueueUrl` | `<base>-*` | `Router.resolveOrCreate`, first lookup and after a lost creation race |
+| outbox, worker | `sqs:CreateQueue` | `<base>-*` | `Router.resolveOrCreate`, and again when an operation reports the queue missing (`Broker.do`) |
+| outbox, worker | `sqs:GetQueueAttributes` | the base queue (granted above) | `Router.resolveOrCreate` reads the template; `Ping` stays on the base |
+| outbox | `sqs:SendMessage` | `<base>-*` | `Broker.Publish` on an address's queue |
+| worker | `sqs:ReceiveMessage`, `sqs:DeleteMessage` | `<base>-*` | `Broker.Receive` and `Broker.Delete` on its own address's queue |
+
+The base-queue grants are kept unchanged, so this policy is correct whether this branch or
+PR #34 reaches `main` first. Once both are in, the base queue's `SendMessage`,
+`ReceiveMessage` and `DeleteMessage` are unused and can be removed, and the call-site table
+above should be refreshed against the merged code (the `terraform_env_test.go` guard on the
+binaries that import `sqsbroker` will fail when PR #34's code arrives, which is the prompt).
+
+What this means for operating it, none of it verified against AWS (the only broker these
+queues were exercised against is the local ElasticMQ):
+
+- **Encryption.** `work_available` uses SSE-SQS (`sqs_managed_sse_enabled = true`), which is
+  copied, so every address's queue is SSE-SQS and no role needs KMS. A base queue moved to
+  SSE-KMS would hand `KmsMasterKeyId` to `CreateQueue`, and the creating roles would then
+  need `kms:GenerateDataKey` and `kms:Decrypt` on that key, which `iam.tf` does not grant.
+- **Not copied:** a redrive policy (deliberately), a queue access policy and tags. If an
+  organization requires tags on create (an SCP on `aws:RequestTag`), `CreateQueue` is refused
+  and no notification is delivered for a new address until the queue is created by hand
+  with the derived name and the base's attributes.
+- **Ownership and cleanup.** The address queues are created by the application, are not in
+  Terraform state, and are never deleted by TaskForge or by `terraform destroy`. An empty
+  queue costs nothing; retiring a scope's queues is an operator task. Their number is
+  scopes x TaskForge queues, plus one per distinct `TASKFORGE_WORKER_QUEUE` a worker of a
+  scope is started with (a misspelt queue name creates a stray, empty queue).
+- **A queue that disappears** (deleted by an operator) is created again by the next publish
+  or receive. AWS refuses to recreate a deleted name for 60 s; the publisher's backoff and
+  the worker's receive loop retry until it succeeds.
+
+**Rollout.** Apply migration 0019 and roll the api first (it returns the session scope the
+new workers need; an older api's registration has none and a new worker exits). Then roll
+the outbox and the workers together. Notifications already on the base queue are not read
+by new workers; each such job is re-advertised into its address's queue by re-notification
+within `TASKFORGE_SCHEDULER_RENOTIFY_AFTER` (60 s) once a new worker that could claim it is
+registered. Nothing is lost: every job is still `QUEUED` in PostgreSQL.
+
+**Rollback.** Code rolls back without touching the schema (migrations are forward-only and
+the old code ignores `renotify_checked_at`). Old workers read only the base queue again;
+notifications on address queues are stranded there and the old scheduler's ungated
+re-notification re-advertises each job onto the base queue within one interval. Two costs
+remain until a later migration addresses them: the old scheduler's stranded-job scan loses
+its index (0019 replaced `jobs_stranded_queued_idx`), and the address queues stay behind,
+unread, until an operator deletes them.
+
 ### Network
 
 Two AZs, public and private subnets, one NAT gateway (ADR-0027 Q6). Security groups:
